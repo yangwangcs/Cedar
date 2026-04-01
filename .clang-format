@@ -1,0 +1,69 @@
+---
+Language:        Cpp
+BasedOnStyle:    Google
+
+# Indentation
+IndentWidth:     2
+TabWidth:        2
+UseTab:          Never
+AccessModifierOffset: -1
+
+# Line length
+ColumnLimit:     100
+
+# Braces
+BreakBeforeBraces: Attach
+
+# Namespaces
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+# Functions and methods
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortLambdasOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Classes
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+
+# Pointer alignment
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# Includes
+IncludeBlocks:   Preserve
+SortIncludes:    true
+
+# Templates
+AlwaysBreakTemplateDeclarations: Yes
+
+# Other
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+BreakStringLiterals: true
+CompactNamespaces: false
+Cpp11BracedListStyle: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+ReflowComments:  true
+SortUsingDeclarations: true
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 2
+SpacesInAngles:  false
+SpacesInCStyleCastParentheses: false
+SpacesInContainerLiterals: true
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+Standard:        c++17
+...

@@ -1,0 +1,70 @@
+name: ci
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: >-
+      CI
+      ${{ matrix.os }}
+      ${{ matrix.compiler }}
+      ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+            build_type: Release
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+            build_type: Release
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+            build_type: Release
+
+    env:
+      CMAKE_BUILD_DIR: ${{ github.workspace }}/build
+      CMAKE_BUILD_TYPE: ${{ matrix.build_type }}
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies on Linux
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake pkg-config liblz4-dev libprotobuf-dev protobuf-compiler libgrpc++-dev libgtest-dev
+
+    - name: Install dependencies on macOS
+      if: runner.os == 'macOS'
+      run: |
+        brew install cmake pkg-config lz4 grpc googletest
+
+    - name: Generate build config
+      run: >-
+        cmake -S "${{ github.workspace }}" -B "${{ env.CMAKE_BUILD_DIR }}"
+        -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }}
+        -DBUILD_EXAMPLES=ON
+        -DBUILD_TESTS=ON
+
+    - name: Build
+      run: >-
+        cmake --build "${{ env.CMAKE_BUILD_DIR }}"
+        --config "${{ env.CMAKE_BUILD_TYPE }}"
+        --parallel
+
+    - name: Run Tests
+      working-directory: ${{ github.workspace }}/build
+      run: ctest -C "${{ env.CMAKE_BUILD_TYPE }}" --output-on-failure

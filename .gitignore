@@ -1,0 +1,47 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Generated protobuf files (will be regenerated during build)
+*.pb.cc
+*.pb.h
+*.grpc.pb.cc
+*.grpc.pb.h
+
+# Test data and databases
+test_data/
+*.db/
+*.sst
+*.log
+WAL/
+
+# Dataset files
+dataset/
+*.csv
+*.tsv
+*.json
+!package.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp

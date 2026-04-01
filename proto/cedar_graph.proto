@@ -1,0 +1,305 @@
+// Copyright (c) 2025 The CedarGraph Authors. All rights reserved.
+// CedarGraph gRPC Service Protocol Buffers Definition
+
+syntax = "proto3";
+
+// 使用单独的命名空间避免与 cedar 内部类冲突
+package cedargrpc;
+
+option csharp_namespace = "CedarGraph";
+option go_package = "cedarpb/cedargrpc";
+option java_package = "com.cedar.graph.grpc";
+option java_multiple_files = true;
+
+// ============================================================================
+// 基础类型
+// ============================================================================
+
+message Empty {}
+
+// GrpcStatus - 内部状态 (重命名为避免与 cedar::Status 冲突)
+message GrpcStatus {
+    bool ok = 1;
+    int32 code = 2;
+    string message = 3;
+    string details = 4;
+}
+
+message NodeId {
+    uint64 id = 1;
+}
+
+message EdgeId {
+    uint64 source = 1;
+    uint64 target = 2;
+}
+
+// 属性键值对
+message Property {
+    string key = 1;
+    string value = 2;
+}
+
+message PropertyMap {
+    repeated Property properties = 1;
+}
+
+// 时间戳
+message Timestamp {
+    uint64 value = 1;
+}
+
+// ============================================================================
+// 节点 (Node)
+// ============================================================================
+
+message Node {
+    uint64 id = 1;
+    PropertyMap properties = 2;
+    uint64 timestamp = 3;
+    uint64 version = 4;
+}
+
+message NodeList {
+    repeated Node nodes = 1;
+}
+
+message GetNodeRequest {
+    uint64 id = 1;
+    Timestamp as_of = 2;
+}
+
+message PutNodeRequest {
+    uint64 id = 1;
+    PropertyMap properties = 2;
+}
+
+message DeleteNodeRequest {
+    uint64 id = 1;
+}
+
+message QueryNodesRequest {
+    string label = 1;
+    uint64 offset = 2;
+    uint64 limit = 3;
+    PropertyMap filter = 4;
+}
+
+// ============================================================================
+// 边 (Edge)
+// ============================================================================
+
+message Edge {
+    EdgeId edge_id = 1;
+    PropertyMap properties = 2;
+    uint64 timestamp = 3;
+    uint64 version = 4;
+    int32 edge_type = 5;
+}
+
+message EdgeList {
+    repeated Edge edges = 1;
+}
+
+message GetEdgeRequest {
+    EdgeId edge_id = 1;
+    Timestamp as_of = 2;
+}
+
+message PutEdgeRequest {
+    EdgeId edge_id = 1;
+    int32 edge_type = 2;
+    PropertyMap properties = 3;
+}
+
+message DeleteEdgeRequest {
+    EdgeId edge_id = 1;
+}
+
+message QueryEdgesRequest {
+    uint64 source = 1;
+    uint64 target = 2;
+    uint64 limit = 3;
+    PropertyMap filter = 4;
+}
+
+// ============================================================================
+// 图遍历 (Graph Traversal)
+// ============================================================================
+
+message GetNeighborsRequest {
+    uint64 node_id = 1;
+    int32 depth = 2;
+    bool incoming = 3;  // false = outgoing, true = incoming
+    int32 edge_type = 4;
+}
+
+message GetNeighborsResponse {
+    repeated uint64 neighbor_ids = 1;
+    repeated Edge edges = 2;
+}
+
+message ShortestPathRequest {
+    uint64 source = 1;
+    uint64 target = 2;
+    int32 edge_type = 3;
+    int32 max_depth = 4;
+}
+
+message ShortestPathResponse {
+    repeated uint64 path = 1;
+    uint64 distance = 2;
+}
+
+message BfsRequest {
+    uint64 start = 1;
+    int32 edge_type = 2;
+    int32 max_depth = 3;
+}
+
+message BfsResponse {
+    repeated NodeLevel levels = 1;
+}
+
+message NodeLevel {
+    repeated uint64 node_ids = 1;
+}
+
+// ============================================================================
+// Cypher 查询
+// ============================================================================
+
+message CypherQueryRequest {
+    string query = 1;
+    map<string, string> params = 2;
+}
+
+message CypherQueryResponse {
+    bool success = 1;
+    string result_json = 2;
+    int64 execution_time_ms = 3;
+    int32 row_count = 4;
+}
+
+// ============================================================================
+// 事务 (Transaction)
+// ============================================================================
+
+message BeginTransactionRequest {
+    IsolationLevel isolation_level = 1;
+    uint64 timeout_ms = 2;
+}
+
+enum IsolationLevel {
+    READ_UNCOMMITTED = 0;
+    READ_COMMITTED = 1;
+    REPEATABLE_READ = 2;
+    SNAPSHOT = 3;
+    SERIALIZABLE = 4;
+}
+
+message Transaction {
+    bytes txn_id = 1;
+    IsolationLevel isolation_level = 2;
+    uint64 start_time = 3;
+    bool committed = 4;
+}
+
+message CommitRequest {
+    bytes txn_id = 1;
+}
+
+message RollbackRequest {
+    bytes txn_id = 1;
+}
+
+// ============================================================================
+// 数据库管理
+// ============================================================================
+
+message FlushRequest {}
+
+message CompactRequest {}
+
+message GetStatsRequest {}
+
+message DatabaseStats {
+    uint64 total_nodes = 1;
+    uint64 total_edges = 2;
+    uint64 storage_size_bytes = 3;
+    uint64 sst_file_count = 4;
+    uint64 blob_file_count = 5;
+    uint64 memtable_size_bytes = 6;
+    double cache_hit_rate = 7;
+}
+
+// ============================================================================
+// 服务器管理
+// ============================================================================
+
+message ServerConfig {
+    string host = 1;
+    uint32 port = 2;
+    uint32 thread_count = 3;
+    uint32 max_connections = 4;
+    bool enable_tls = 5;
+    string cert_file = 6;
+    string key_file = 7;
+}
+
+message ServerStats {
+    uint64 total_requests = 1;
+    uint64 active_connections = 2;
+    uint64 total_bytes_sent = 3;
+    uint64 total_bytes_recv = 4;
+    string uptime = 5;
+}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    uint64 timestamp = 2;
+    string version = 3;
+    bool database_connected = 4;
+}
+
+// ============================================================================
+// CedarGraph gRPC 服务
+// ============================================================================
+
+service CedarGraphService {
+    // 节点 CRUD
+    rpc GetNode(GetNodeRequest) returns (Node);
+    rpc PutNode(PutNodeRequest) returns (GrpcStatus);
+    rpc DeleteNode(DeleteNodeRequest) returns (GrpcStatus);
+    rpc QueryNodes(QueryNodesRequest) returns (NodeList);
+    
+    // 边 CRUD
+    rpc GetEdge(GetEdgeRequest) returns (Edge);
+    rpc PutEdge(PutEdgeRequest) returns (GrpcStatus);
+    rpc DeleteEdge(DeleteEdgeRequest) returns (GrpcStatus);
+    rpc QueryEdges(QueryEdgesRequest) returns (EdgeList);
+    
+    // 图遍历
+    rpc GetNeighbors(GetNeighborsRequest) returns (GetNeighborsResponse);
+    rpc GetInNeighbors(GetNeighborsRequest) returns (GetNeighborsResponse);
+    rpc ShortestPath(ShortestPathRequest) returns (ShortestPathResponse);
+    rpc Bfs(BfsRequest) returns (BfsResponse);
+    
+    // Cypher 查询
+    rpc ExecuteCypher(CypherQueryRequest) returns (CypherQueryResponse);
+    rpc ExplainCypher(CypherQueryRequest) returns (CypherQueryResponse);
+    
+    // 事务
+    rpc BeginTransaction(BeginTransactionRequest) returns (Transaction);
+    rpc Commit(CommitRequest) returns (GrpcStatus);
+    rpc Rollback(RollbackRequest) returns (GrpcStatus);
+    
+    // 数据库管理
+    rpc Flush(FlushRequest) returns (GrpcStatus);
+    rpc Compact(CompactRequest) returns (GrpcStatus);
+    rpc GetStats(GetStatsRequest) returns (DatabaseStats);
+    
+    // 服务器管理
+    rpc HealthCheck(Empty) returns (HealthCheckResponse);
+    rpc GetServerStats(Empty) returns (ServerStats);
+}

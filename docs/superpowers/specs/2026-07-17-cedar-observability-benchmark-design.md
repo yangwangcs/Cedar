@@ -2,12 +2,12 @@
 
 Date: 2026-07-17
 
-Status: Approved design, pending implementation plan
+Status: Approved authoritative design; functional implementation substantially complete; release/paper closure remains incomplete and is tracked in `docs/superpowers/plans/2026-07-22-cedar-six-design-completion-matrix.md`
 
 Depends on:
 
 - `2026-07-17-cedar-htap-design.md`
-- `2026-07-17-cedar-columnar-v2-design.md`
+- `2026-07-17-cedar-columnar-design.md`
 - `2026-07-17-cedar-tcypher-vectorized-execution-design.md`
 - `2026-07-17-cedar-temporal-index-cbo-design.md`
 - `2026-07-17-cedar-htap-resource-scheduling-design.md`
@@ -44,7 +44,7 @@ This stage adds:
 
 ### 2.1 Authoritative Runtime Contracts
 
-The correctness kernel, columnar v2, T-Cypher V1, temporal index/CBO, and HTAP scheduler define the events and operations being measured. This document does not change their semantics.
+The correctness kernel, columnar, T-Cypher V1, temporal index/CBO, and HTAP scheduler define the events and operations being measured. This document does not change their semantics.
 
 In particular:
 

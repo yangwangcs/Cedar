@@ -69,6 +69,42 @@ std::string Status::ToString() const {
       case kConflict:
         type = "Conflict: ";
         break;
+      case kSchemaMismatch:
+        type = "SchemaMismatch: ";
+        break;
+      case kParseError:
+        type = "ParseError: ";
+        break;
+      case kBindError:
+        type = "BindError: ";
+        break;
+      case kBlobCorruption:
+        type = "BlobCorruption: ";
+        break;
+      case kQueryCancelled:
+        type = "QueryCancelled: ";
+        break;
+      case kQueryMemoryLimit:
+        type = "QueryMemoryLimit: ";
+        break;
+      case kWriteStalled:
+        type = "WriteStalled: ";
+        break;
+      case kResourceExhausted:
+        type = "ResourceExhausted: ";
+        break;
+      case kIndeterminate:
+        type = "Indeterminate: ";
+        break;
+      case kRecoveryRequired:
+        type = "RecoveryRequired: ";
+        break;
+      case kShutdownInProgress:
+        type = "ShutdownInProgress: ";
+        break;
+      case kMaintenanceBackoff:
+        type = "MaintenanceBackoff: ";
+        break;
       default:
         snprintf(tmp, sizeof(tmp), "Unknown code(%d): ",
                  static_cast<int>(code()));

@@ -56,6 +56,44 @@ class Status {
   static Status Conflict(const Slice& msg, const Slice& msg2 = Slice()) {
     return Status(kConflict, msg, msg2);
   }
+  static Status SchemaMismatch(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kSchemaMismatch, msg, msg2);
+  }
+  static Status ParseError(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kParseError, msg, msg2);
+  }
+  static Status BindError(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kBindError, msg, msg2);
+  }
+  static Status BlobCorruption(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kBlobCorruption, msg, msg2);
+  }
+  static Status QueryCancelled(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kQueryCancelled, msg, msg2);
+  }
+  static Status QueryMemoryLimit(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kQueryMemoryLimit, msg, msg2);
+  }
+  static Status WriteStalled(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kWriteStalled, msg, msg2);
+  }
+  static Status ResourceExhausted(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kResourceExhausted, msg, msg2);
+  }
+  static Status Indeterminate(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kIndeterminate, msg, msg2);
+  }
+  static Status RecoveryRequired(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kRecoveryRequired, msg, msg2);
+  }
+  static Status ShutdownInProgress(const Slice& msg,
+                                   const Slice& msg2 = Slice()) {
+    return Status(kShutdownInProgress, msg, msg2);
+  }
+  static Status MaintenanceBackoff(const Slice& msg,
+                                   const Slice& msg2 = Slice()) {
+    return Status(kMaintenanceBackoff, msg, msg2);
+  }
 
   // Returns true iff the status indicates success.
   bool ok() const { return (state_ == nullptr); }
@@ -77,6 +115,18 @@ class Status {
 
   // Returns true iff the status indicates a Conflict (OCC).
   bool IsConflict() const { return code() == kConflict; }
+  bool IsSchemaMismatch() const { return code() == kSchemaMismatch; }
+  bool IsParseError() const { return code() == kParseError; }
+  bool IsBindError() const { return code() == kBindError; }
+  bool IsBlobCorruption() const { return code() == kBlobCorruption; }
+  bool IsQueryCancelled() const { return code() == kQueryCancelled; }
+  bool IsQueryMemoryLimit() const { return code() == kQueryMemoryLimit; }
+  bool IsWriteStalled() const { return code() == kWriteStalled; }
+  bool IsResourceExhausted() const { return code() == kResourceExhausted; }
+  bool IsIndeterminate() const { return code() == kIndeterminate; }
+  bool IsRecoveryRequired() const { return code() == kRecoveryRequired; }
+  bool IsShutdownInProgress() const { return code() == kShutdownInProgress; }
+  bool IsMaintenanceBackoff() const { return code() == kMaintenanceBackoff; }
 
   // Return a string representation of this status suitable for printing.
   // Returns the string "OK" for success.
@@ -93,7 +143,19 @@ class Status {
     kNotSupported = 3,
     kInvalidArgument = 4,
     kIOError = 5,
-    kConflict = 6  // OCC transaction conflict
+    kConflict = 6,
+    kSchemaMismatch = 7,
+    kParseError = 8,
+    kBindError = 9,
+    kBlobCorruption = 10,
+    kQueryCancelled = 11,
+    kQueryMemoryLimit = 12,
+    kWriteStalled = 13,
+    kResourceExhausted = 14,
+    kIndeterminate = 15,
+    kRecoveryRequired = 16,
+    kShutdownInProgress = 17,
+    kMaintenanceBackoff = 18
   };
 
   Code code() const {
@@ -157,6 +219,11 @@ class StatusOr {
   T& ValueOrDie() {
     assert(ok());
     return value_;
+  }
+
+  T ConsumeValueOrDie() {
+    assert(ok());
+    return std::move(value_);
   }
 
   const T& value() const {

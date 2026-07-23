@@ -2,16 +2,16 @@
 
 Date: 2026-07-17
 
-Status: Approved design, pending implementation plan
+Status: Approved authoritative design; functional implementation substantially complete; release/paper closure remains incomplete and is tracked in `docs/superpowers/plans/2026-07-22-cedar-six-design-completion-matrix.md`
 
 Depends on:
 
 - `2026-07-17-cedar-htap-design.md`
-- `2026-07-17-cedar-columnar-v2-design.md`
+- `2026-07-17-cedar-columnar-design.md`
 
 ## 1. Purpose
 
-This document defines Cedar's third design stage: a clean-break T-Cypher language and a morsel-driven, vectorized temporal graph execution engine. It connects the correctness kernel and Zone-Columnar SST v2 to one end-to-end query and mutation path.
+This document defines Cedar's third design stage: a clean-break T-Cypher language and a morsel-driven, vectorized temporal graph execution engine. It connects the correctness kernel and Zone-Columnar SST to one end-to-end query and mutation path.
 
 The design replaces the current row-at-a-time Cypher implementation. It does not add a vectorized adapter under the old parser or preserve the old execution API. The new path begins with a new T-Cypher tokenizer and ends at the typed, snapshot-aware storage and transaction contracts defined by the first two designs.
 
@@ -22,7 +22,7 @@ The stage adds:
 - a typed AST, binder, logical planner, and bounded cost optimizer;
 - vectorized graph and temporal operators using `ColumnBatch`;
 - morsel-driven parallel pipelines with bounded memory and spill;
-- batch storage scans, property gathers, and adjacency expansion over SST v2;
+- batch storage scans, property gathers, and adjacency expansion over SST;
 - stable `SYSTEM_TIME` queries backed by a durable HLC commit timeline;
 - end-to-end correctness, recovery, cancellation, and observability tests.
 
@@ -36,7 +36,7 @@ The correctness-kernel design remains authoritative for:
 - Manifest, VersionSet, recovery, tombstones, flush, and compaction correctness;
 - edge visibility as the intersection of the edge and both endpoint existence facts.
 
-The columnar-v2 design remains authoritative for:
+The columnar design remains authoritative for:
 
 - SST partitioning, Block and Page format, schema epochs, and typed values;
 - Entity, Target, ValidFrom, CommitSeq, Operation, and value pages;
@@ -47,7 +47,7 @@ The columnar-v2 design remains authoritative for:
 This design makes two normative refinements:
 
 1. A committed DecisionLog record also persists a monotonic `system_time_hlc`. This does not replace `commit_seq`; it supplies the user-facing `SYSTEM_TIME` index.
-2. The scalar storage methods sketched in columnar v2 are refined into batch query contracts. Scalar convenience methods may exist inside tests, but no production query path may use them to recreate row-at-a-time execution.
+2. The scalar storage methods sketched in columnar are refined into batch query contracts. Scalar convenience methods may exist inside tests, but no production query path may use them to recreate row-at-a-time execution.
 
 If a term in this document appears to grant visibility beyond the correctness kernel, the correctness kernel wins. In particular, a system-time lookup is always capped by the query's captured `visible_seq`.
 
@@ -309,7 +309,7 @@ T-Cypher text
   -> Pipeline Graph
   -> Morsel Scheduler
   -> Vectorized Storage Query API
-  -> Zone-Columnar SST v2 / MemTables / Blob v2
+  -> Zone-Columnar SST / MemTables / Blob
 ```
 
 ### 7.1 Parser
@@ -946,7 +946,7 @@ This is a clean implementation and API break. Completion requires removal of:
 - duplicate graph-facade Cypher entry points;
 - the old plan cache and any old-plan conversion logic;
 - `ExecuteCypher()` compatibility entry points;
-- Descriptor-returning query paths already rejected by columnar v2;
+- Descriptor-returning query paths already rejected by columnar;
 - dual-engine build flags, runtime format switches, and fallback behavior.
 
 The new entry point is `ExecuteTcypher()` and the new result is `QueryResultStream<ResultBatch>`. No compatibility adapter or migration utility is provided.
@@ -1105,7 +1105,7 @@ The future implementation plan must respect this dependency order:
 
 1. Extend DecisionLog and recovery with HLC, CommitTimeline, and checkpoints.
 2. Introduce new query/runtime types, `ColumnBatch`, vectors, `ResultBatch`, and status contracts.
-3. Build vectorized storage scan, temporal merge, gather, and Expand contracts over columnar v2.
+3. Build vectorized storage scan, temporal merge, gather, and Expand contracts over columnar.
 4. Build the new tokenizer, AST, binder, and temporal scope resolver.
 5. Implement logical plans, demand analysis, and deterministic rewrites.
 6. Implement Scan, Resolve, Filter, Project, and Result pipelines.
@@ -1138,4 +1138,4 @@ The T-Cypher vectorized execution stage is complete only when:
 12. results remain stable across flush, compaction, restart, and Blob relocation;
 13. `EXPLAIN ANALYZE` verifies page, Blob, vector, morsel, and spill behavior;
 14. all old Cypher APIs, implementations, adapters, and fallback switches are removed;
-15. the approved correctness-kernel and columnar-v2 invariants remain intact.
+15. the approved correctness-kernel and columnar invariants remain intact.

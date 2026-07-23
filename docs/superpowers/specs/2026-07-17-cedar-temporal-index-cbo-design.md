@@ -2,12 +2,12 @@
 
 Date: 2026-07-17
 
-Status: Approved design, pending implementation plan
+Status: Approved authoritative design; functional implementation substantially complete; release/paper closure remains incomplete and is tracked in `docs/superpowers/plans/2026-07-22-cedar-six-design-completion-matrix.md`
 
 Depends on:
 
 - `2026-07-17-cedar-htap-design.md`
-- `2026-07-17-cedar-columnar-v2-design.md`
+- `2026-07-17-cedar-columnar-design.md`
 - `2026-07-17-cedar-tcypher-vectorized-execution-design.md`
 
 ## 1. Purpose
@@ -36,9 +36,9 @@ The correctness kernel owns:
 - snapshot pinning and file lifetime;
 - flush, compaction, recovery, and tombstone retention.
 
-Columnar v2 owns:
+Columnar owns:
 
-- SST v2 format, Block/Page layout, typed schema epochs, and file identities;
+- SST format, Block/Page layout, typed schema epochs, and file identities;
 - file and Block Bloom filters, BlockIndex, zone maps, and typed page statistics;
 - BlobHashIndex, BlobRefSet, Blob GC, and the rule that Blob hashes are authoritative.
 
@@ -61,10 +61,10 @@ This stage adds a logical property-index catalog and optimizer. It does not repl
 
 The current repository contains multiple unrelated experiments rather than one index subsystem:
 
-1. `schema_v2.h` exposes an `IndexType` enum and template flags, but no durable index definition or query contract consumes them.
+1. `legacy schema header` exposes an `IndexType` enum and template flags, but no durable index definition or query contract consumes them.
 2. `VersionChainIndex` and `AsyncIndexBuilder` build per-entity version-chain skip structures, not property predicate indexes.
 3. `TemporalBloomFilter` and `SSTTemporalFilter` have overlapping ownership and are not tied to Manifest or the new visible-prefix snapshot.
-4. The old `ZoneColumnar` Bloom and zone maps are whole-file experiments, not the portable SST v2 sidecar format.
+4. The old `ZoneColumnar` Bloom and zone maps are whole-file experiments, not the portable SST sidecar format.
 5. Asynchronous index tasks reference raw MemTable version nodes and can outlive the state they describe; there is no immutable source identity or crash protocol.
 6. Existing index settings are runtime toggles rather than SchemaRegistry or IndexCatalog state.
 7. The current planner has no statistics provider, cost budget, or alternative physical access paths.
@@ -217,14 +217,18 @@ Registration and removal are durable Manifest edits. The API rejects a type or c
 
 ### 7.2 Index State
 
-The catalog state machine is:
+The persisted catalog state machine is:
 
 ```text
-DECLARED -> BUILDING -> ACTIVE -> DROPPING -> RETIRED
+DECLARED -> BUILDING -> ACTIVE
                 \-> FAILED
 ```
 
 `BUILDING` definitions are not used by cached plans. A definition enters `FAILED` when its build cannot satisfy schema or format requirements. `ACTIVE` permits partial coverage: the planner sees the exact coverage map and builds a hybrid plan for gaps. An individual failed or corrupt Fragment is removed from the usable coverage set and scheduled for rebuild without changing the whole definition to `FAILED`.
+
+Drop does not persist transitional `DROPPING` or `RETIRED` definitions. One
+generation-CAS Manifest edit removes the definition and all of its fragments;
+pre-drop snapshots provide the retirement lifetime for physical sidecars.
 
 ### 7.3 IndexCatalogSnapshot
 
@@ -711,7 +715,7 @@ tcypher/physical/
 
 Dependency rules:
 
-- index readers depend on SST v2 system-column and schema contracts, not on T-Cypher AST;
+- index readers depend on SST system-column and schema contracts, not on T-Cypher AST;
 - optimizer depends on logical index definitions and stats snapshots, not on physical sidecar file names;
 - sidecar builders depend on immutable SST readers and BlobRef hashes, never on Blob payload reads;
 - Manifest owns index definition, fragment attachment, coverage, and retirement;
@@ -723,7 +727,7 @@ Dependency rules:
 
 The clean-break requirement applies to index code as well. The implementation must remove or replace:
 
-- `schema_v2.h` template index flags and old `IndexType` declarations;
+- `legacy schema header` template index flags and old `IndexType` declarations;
 - `AsyncIndexBuilder` and its raw `TemporalVersionNode*` task protocol;
 - `VersionChainIndex` as a query-facing secondary index;
 - `TemporalBloomFilter` and `SSTTemporalFilter` duplicate ownership;
@@ -732,7 +736,7 @@ The clean-break requirement applies to index code as well. The implementation mu
 - any index API that returns raw row pointers or assumes mutable version chains;
 - any planner branch that relies on a build threshold without an IndexCatalog snapshot.
 
-The new primary SST v2 Bloom, BlockIndex, zone maps, BlobHashIndex, and CommitTimeline remain because they have distinct ownership and semantics. They are not compatibility wrappers around the removed modules.
+The new primary SST Bloom, BlockIndex, zone maps, BlobHashIndex, and CommitTimeline remain because they have distinct ownership and semantics. They are not compatibility wrappers around the removed modules.
 
 ## 21. Mainstream Comparison
 
@@ -868,4 +872,4 @@ The temporal index and CBO stage is complete only when:
 11. runtime feedback and adaptation never change snapshot or event visibility;
 12. index maintenance respects foreground ingestion and storage resource budgets;
 13. all old index implementations, switches, and compatibility paths are removed;
-14. the correctness-kernel, columnar-v2, and T-Cypher V1 invariants remain intact.
+14. the correctness-kernel, columnar, and T-Cypher V1 invariants remain intact.

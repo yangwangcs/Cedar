@@ -2,7 +2,7 @@
 
 Date: 2026-07-17
 
-Status: Approved design, pending implementation plan
+Status: Approved authoritative design; functional implementation substantially complete; release/paper closure remains incomplete and is tracked in `docs/superpowers/plans/2026-07-22-cedar-six-design-completion-matrix.md`
 
 ## 1. Purpose
 
@@ -112,7 +112,7 @@ The database format metadata persists:
 - shard WAL locations;
 - DecisionLog and Manifest locations.
 
-The first stage uses a fixed shard count. A shard has a mutation latch protecting the current VSL MemTable and reservation structures. Different shards validate, persist, and install concurrently. This is sharded concurrency, not a lock-free VSL claim.
+The first stage uses a fixed shard count. A shard has a mutation latch protecting the current version-chain MemTable and reservation structures. Different shards validate, persist, and install concurrently. This is sharded concurrency, not a lock-free VSL claim.
 
 ## 6. Temporal Data and Read Semantics
 
@@ -134,7 +134,31 @@ Before that decision, a prepare record contains `PendingEvent` values with the s
 
 Existence and properties use separate logical keys. A multi-property change is atomic because the containing transaction commits all event records together.
 
-### 6.2 Implicit Valid-Time Intervals
+### 6.2 Version-Chain MemTable Adaptation
+
+Cedar retains the original CedarMemTable/VSL idea that one logical fact owns a complete in-memory history, but adapts its identity and ordering to the immutable bitemporal event model:
+
+```text
+TemporalMemTable {
+  ordered_map<LogicalKey, TemporalVersionChain>
+}
+
+TemporalVersionChain order:
+  valid_from DESC
+  commit_seq DESC
+```
+
+The `LogicalKey` identifies the fact timeline and includes complete canonical vertex or edge identity. Directional `EdgeIn` and `EdgeOut` views of the same edge map to the same logical chain. `valid_from` and `commit_seq` identify an event within that chain; `schema_epoch`, operation, and value are immutable event content.
+
+An exact replay of the same `(LogicalKey, valid_from, commit_seq)` and content is idempotent. The same identity with different schema, operation, value, or Blob content identity is corruption. A relocated Blob hint does not change event content identity.
+
+The active and frozen MemTables retain complete `TemporalEvent` values, including tombstones and out-of-order events. They do not reuse the old `Descriptor`, 16-bit sequence, raw-pointer linked nodes, or `DeltaVersionChain` value compression. Delta and dictionary encoding belong to immutable SST/page codecs, where reconstruction cost and corruption boundaries can be controlled.
+
+Readers pin immutable MemTable generations. If a pinned active generation exists, the next committed install uses copy-on-write before mutation. Freeze transfers one complete generation to the frozen slot and creates a new active generation; the frozen generation is released only after its SST is Manifest-live. Cursors traverse pinned generations directly in `(LogicalKey, valid_from DESC, commit_seq DESC)` order without materializing a second full snapshot.
+
+This is the MemTable semantic contract. Its internal ordered container may later be replaced by a tested skip-list or arena-backed chain without changing event identity, visibility, replay, cursor, or flush behavior. No implementation may claim lock-free progress unless insertion and reclamation satisfy a separately verified lock-free algorithm.
+
+### 6.3 Implicit Valid-Time Intervals
 
 An event at `valid_from = t` applies over the half-open interval:
 
@@ -146,7 +170,7 @@ The successor is derived from the next distinct `valid_from` for the same key in
 
 A `DELETE` event starts an interval of absence. A later `PUT` makes the key visible again. Flush and compaction retain both events.
 
-### 6.3 Bitemporal Selection
+### 6.4 Bitemporal Selection
 
 For `Get(logical_key, valid_time)` at `snapshot_seq`, the read path merges candidates from the active MemTable, frozen MemTables, and every relevant SST, then applies:
 
@@ -160,7 +184,7 @@ apply PUT or DELETE
 
 This rule must return the same result before and after flush, compaction, and restart.
 
-### 6.4 Edge Visibility
+### 6.5 Edge Visibility
 
 At a requested valid time, an edge is logically visible only when all three facts are visible:
 

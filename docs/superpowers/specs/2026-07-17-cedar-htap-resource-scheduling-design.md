@@ -2,12 +2,12 @@
 
 Date: 2026-07-17
 
-Status: Approved design, pending implementation plan
+Status: Approved authoritative design; functional implementation substantially complete; release/paper closure remains incomplete and is tracked in `docs/superpowers/plans/2026-07-22-cedar-six-design-completion-matrix.md`
 
 Depends on:
 
 - `2026-07-17-cedar-htap-design.md`
-- `2026-07-17-cedar-columnar-v2-design.md`
+- `2026-07-17-cedar-columnar-design.md`
 - `2026-07-17-cedar-tcypher-vectorized-execution-design.md`
 - `2026-07-17-cedar-temporal-index-cbo-design.md`
 
@@ -45,7 +45,7 @@ The correctness kernel remains authoritative for:
 - atomic flush and compaction edits;
 - the rule that a successful commit cannot be made invisible by scheduler delay.
 
-Columnar v2 and T-Cypher V1 remain authoritative for:
+Columnar and T-Cypher V1 remain authoritative for:
 
 - SST/Page and Blob I/O contracts;
 - PageCache, BlobLocationCache, and BlobValueCache ownership;
@@ -911,4 +911,4 @@ The single-node HTAP resource stage is complete only when:
 10. observability attributes queue delay, stalls, tail latency, cache behavior, and write amplification to resource causes;
 11. deterministic scheduler, HTAP stress, pressure, fault, recovery, and cache tests pass;
 12. all legacy ungoverned pools, caches, and bypass switches are removed;
-13. correctness-kernel, columnar-v2, T-Cypher, and temporal-index invariants remain intact.
+13. correctness-kernel, columnar, T-Cypher, and temporal-index invariants remain intact.

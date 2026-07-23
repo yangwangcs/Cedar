@@ -1,7 +1,11 @@
 # Build directories
 build/
+build-*/
 cmake-build-*/
 out/
+
+# Agent workflow state
+.superpowers/
 
 # IDE
 .vscode/

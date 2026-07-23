@@ -80,6 +80,7 @@
 #include "cedar/runtime/maintenance_executor.h"
 #include "cedar/cache/cache_manager.h"
 #include "cedar/observability/histogram.h"
+#include "cedar/observability/instrumentation_profile.h"
 #include "cedar/observability/metric_registry.h"
 #include "cedar/observability/event_ring.h"
 #include "cedar/observability/metric_exporter.h"
@@ -379,6 +380,30 @@ TEST(TransactionMeasurementTest,
   EXPECT_TRUE(BuildTransactionMeasurementWindow(after, before).status().IsCorruption());
 }
 
+TEST(TransactionMeasurementTest, WindowPreservesExplicitUnavailableReason) {
+  TransactionMeasurementSnapshot before;
+  TransactionMeasurementSnapshot after;
+  after.available = false;
+  after.availability_reason = "minimal_instrumentation";
+  const auto window = BuildTransactionMeasurementWindow(before, after);
+  ASSERT_TRUE(window.ok()) << window.status().ToString();
+  EXPECT_FALSE(window.ValueOrDie().available);
+  EXPECT_EQ(window.ValueOrDie().availability_reason,
+            "minimal_instrumentation");
+}
+
+TEST_F(DurableLogTest,
+       DatabaseMeasurementAvailabilityMatchesInstrumentationProfile) {
+  CedarDatabase database(path_, 1, 17);
+  ASSERT_TRUE(database.Open().ok());
+  const auto measurements = database.transaction_measurements();
+  ASSERT_TRUE(measurements.ok()) << measurements.status().ToString();
+  EXPECT_EQ(measurements.ValueOrDie().available,
+            !kCedarMinimalInstrumentation);
+  EXPECT_EQ(measurements.ValueOrDie().availability_reason,
+            kCedarMinimalInstrumentation ? "minimal_instrumentation" : "");
+}
+
 TEST_F(DurableLogTest, DecisionAppendReportsAttemptedFsyncDuration) {
   DecisionLog decisions(path_ + "/DECISION");
   ASSERT_TRUE(decisions.Open().ok());
@@ -414,6 +439,102 @@ TEST_F(DurableLogTest, CoordinatorRecordsCommittedTransactionBoundaries) {
   EXPECT_EQ(measurements.visible_prefix_wait_success.count(), 1U);
 }
 
+TEST_F(DurableLogTest,
+       CoordinatorRecordsDecisionFsyncAttemptWhenDecisionBecomesIndeterminate) {
+  TransactionCoordinator coordinator(path_, 1, 17);
+  ASSERT_TRUE(coordinator.Open().ok());
+  ColumnSchema registered;
+  ASSERT_TRUE(coordinator.RegisterColumn(
+      ColumnSchema{EntityType::Vertex, 8, 0, "score", PhysicalType::kInt64,
+                   4096, EncodingPolicy::kAdaptive, CompressionPolicy::kLz4},
+      &registered).ok());
+  coordinator.SetDecisionLogFaultInjectorForTesting(
+      [](DecisionLogFaultPoint point) {
+        return point == DecisionLogFaultPoint::kAfterRecordFsync
+            ? Status::IOError("test", "decision log failure after fsync")
+            : Status::OK();
+      });
+
+  const CommitResult result = coordinator.CommitWithResult(
+      coordinator.visible_seq(),
+      {PendingEvent::Put(LogicalKey::VertexProperty(1, 8), 10,
+                         registered.schema_epoch, Value::Int64(42))});
+  EXPECT_EQ(result.outcome, CommitOutcome::kIndeterminate)
+      << result.reason.ToString();
+  const TransactionMeasurementSnapshot measurements =
+      coordinator.transaction_measurements();
+  EXPECT_EQ(measurements.started, 1U);
+  EXPECT_EQ(measurements.indeterminate, 1U);
+  EXPECT_EQ(measurements.decision_latency.count(), 1U);
+  EXPECT_EQ(measurements.decision_fsync_latency.count(), 1U);
+}
+
+TEST_F(DurableLogTest, CoordinatorRecordsVisiblePrefixStallInMeasurementWindow) {
+  TransactionCoordinator coordinator(path_, 1, 17);
+  ASSERT_TRUE(coordinator.Open().ok());
+  ColumnSchema registered;
+  ASSERT_TRUE(coordinator.RegisterColumn(
+      ColumnSchema{EntityType::Vertex, 9, 0, "score", PhysicalType::kInt64,
+                   4096, EncodingPolicy::kAdaptive, CompressionPolicy::kLz4},
+      &registered).ok());
+  const TransactionMeasurementSnapshot before =
+      coordinator.transaction_measurements();
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool first_installing = false;
+  bool second_installing = false;
+  bool release_first = false;
+  coordinator.SetDecisionInstallHookForTesting(
+      [&](uint64_t commit_seq, bool installing) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (commit_seq == 1 && installing) {
+          first_installing = true;
+          changed.notify_all();
+          changed.wait(lock, [&] { return release_first; });
+        }
+        if (commit_seq == 2 && installing) {
+          second_installing = true;
+          changed.notify_all();
+        }
+      });
+
+  CommitResult first;
+  CommitResult second;
+  std::thread first_committer([&] {
+    first = coordinator.CommitWithResult(
+        0, {PendingEvent::Put(LogicalKey::VertexProperty(1, 9), 10,
+                              registered.schema_epoch, Value::Int64(1))});
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(changed.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return first_installing; }));
+  }
+  std::thread second_committer([&] {
+    second = coordinator.CommitWithResult(
+        0, {PendingEvent::Put(LogicalKey::VertexProperty(2, 9), 10,
+                              registered.schema_epoch, Value::Int64(2))});
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(changed.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return second_installing; }));
+    release_first = true;
+  }
+  changed.notify_all();
+  first_committer.join();
+  second_committer.join();
+  ASSERT_EQ(first.outcome, CommitOutcome::kCommitted) << first.reason.ToString();
+  ASSERT_EQ(second.outcome, CommitOutcome::kCommitted) << second.reason.ToString();
+
+  const auto window = BuildTransactionMeasurementWindow(
+      before, coordinator.transaction_measurements());
+  ASSERT_TRUE(window.ok()) << window.status().ToString();
+  EXPECT_EQ(window.ValueOrDie().visible_prefix_wait_success.sample_count, 2U);
+  EXPECT_GE(window.ValueOrDie().visible_prefix_nonzero_stalls, 1U);
+}
+
 TEST(BenchmarkArtifactTest,
      TransactionMeasurementsSerializeUndefinedWithoutZeroPercentiles) {
   BenchmarkArtifactSummary summary;
@@ -426,6 +547,52 @@ TEST(BenchmarkArtifactTest,
   EXPECT_NE(serialized.find("\"transaction_measurements\":{\"available\":false"),
             std::string::npos);
   EXPECT_NE(serialized.find("\"p99_ns\":null"), std::string::npos);
+}
+
+TEST(BenchmarkArtifactTest,
+     RejectsUnavailableTransactionMeasurementsWithObservedCounters) {
+  char pattern[] = "/tmp/cedar_benchmark_unavailable_txn_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string root = pattern;
+  BenchmarkRunManifest manifest;
+  manifest.dataset_id = "ci";
+  manifest.dataset_hash = "dataset";
+  manifest.workload_id = "point-read";
+  manifest.workload_hash = "workload";
+  manifest.execution_nonce = "unavailable-transaction-measurements";
+  BenchmarkArtifactSummary summary;
+  summary.transaction_measurements.available = false;
+  summary.transaction_measurements.availability_reason =
+      "minimal_instrumentation";
+  summary.phases.resize(11);
+  for (size_t index = 0; index < summary.phases.size(); ++index) {
+    summary.phases[index].phase = static_cast<BenchmarkPhase>(index);
+  }
+  BenchmarkVerification verification;
+  verification.load_passed = true;
+  verification.result_passed = true;
+  verification.reopen_passed = true;
+  const auto written = WriteBenchmarkArtifacts(
+      root, manifest, ProbeBenchmarkEnvironment(), summary, verification);
+  ASSERT_TRUE(written.ok()) << written.status().ToString();
+  const BenchmarkArtifactPaths& paths = written.ValueOrDie();
+  std::ifstream summary_input(paths.summary_path);
+  std::string archived((std::istreambuf_iterator<char>(summary_input)),
+                       std::istreambuf_iterator<char>());
+  const size_t counter = archived.find("\"started\":0");
+  ASSERT_NE(counter, std::string::npos);
+  archived.replace(counter, std::string("\"started\":0").size(),
+                   "\"started\":1");
+  std::ofstream(paths.summary_path, std::ios::trunc) << archived;
+  std::ofstream(paths.report_path, std::ios::trunc) << "sentinel report";
+
+  const Status regenerated = RegenerateBenchmarkReport(paths.run_directory);
+  EXPECT_TRUE(regenerated.IsCorruption()) << regenerated.ToString();
+  std::ifstream report_input(paths.report_path);
+  const std::string report((std::istreambuf_iterator<char>(report_input)),
+                           std::istreambuf_iterator<char>());
+  EXPECT_EQ(report, "sentinel report");
+  std::filesystem::remove_all(root);
 }
 
 Status PublishSchemaForTest(VersionSet* versions, SchemaRegistry* schemas,
@@ -21311,6 +21478,13 @@ TEST_F(DurableLogTest, BenchmarkWorkloadDriverRunsVerifiedPublicApiFamilies) {
     if (item.first == BenchmarkWorkloadFamily::kDurableIngestion) {
       EXPECT_TRUE(run.ValueOrDie().physical_write_bytes_available);
       EXPECT_GT(run.ValueOrDie().physical_write_bytes, 0U);
+      EXPECT_TRUE(run.ValueOrDie().transaction_measurements.available);
+      EXPECT_EQ(run.ValueOrDie().transaction_measurements.started,
+                dataset_config.vertex_count);
+      EXPECT_EQ(run.ValueOrDie().transaction_measurements.committed,
+                dataset_config.vertex_count);
+      EXPECT_EQ(run.ValueOrDie().transaction_measurements.commit_latency.sample_count,
+                dataset_config.vertex_count);
     }
     if (item.first == BenchmarkWorkloadFamily::kAnalyticalVertexCount ||
         item.first == BenchmarkWorkloadFamily::kGraphOneHop) {

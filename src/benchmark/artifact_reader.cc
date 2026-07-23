@@ -621,6 +621,24 @@ Status ReadTransactionMeasurements(const JsonValue& root,
   if (!measurements->available && measurements->availability_reason.empty()) {
     return Status::Corruption("benchmark artifact", "unavailable measurements lack reason");
   }
+  if (!measurements->available) {
+    const bool observed_counter = measurements->started != 0 ||
+        measurements->committed != 0 || measurements->aborted != 0 ||
+        measurements->indeterminate != 0 || measurements->conflicts != 0 ||
+        measurements->visible_prefix_nonzero_stalls != 0;
+    const bool observed_value = measurements->visible_prefix_max_lag_defined ||
+        measurements->conflict_abort_rate.defined;
+    bool observed_distribution = false;
+    for (const auto& distribution : distributions) {
+      observed_distribution = observed_distribution ||
+          distribution.second->defined || distribution.second->sample_count != 0;
+    }
+    if (observed_counter || observed_value || observed_distribution) {
+      return Status::Corruption(
+          "benchmark artifact",
+          "unavailable transaction measurements contain observed values");
+    }
+  }
   return Status::OK();
 }
 

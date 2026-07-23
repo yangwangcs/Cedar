@@ -414,7 +414,7 @@ bounds, concurrent relocation and every persistence boundary are missing. The
 static clean-break gate is archived. All twelve artifacts below
 `results/columnar-closure-20260722*` are rejected old format-2/V2 evidence.
 
-`results/release-closure-20260723-columnar-current-381a06f` is the current-HEAD
+`results/release-closure-20260723-columnar-final` is the frozen-HEAD
 functional root: its `-j1` 16/16 focused run binds selective and ordinal-block
 reads, metadata-only open, zero-payload reference-copy compaction assertions,
 bounded streaming, fixed-seed oracles, concurrent Blob publication/relocation,
@@ -442,7 +442,7 @@ now archived, but the full durability-boundary matrix, deterministic/random
 serializability corpus, single/multi-shard scaling, abort rate, prepare/decision
 fsync latency, visible-prefix stalls and write amplification remain missing.
 
-`results/release-closure-20260723-htap-correctness-current-381a06f` binds a
+`results/release-closure-20260723-htap-correctness-final` binds a
 format-1 schema-3 `htap-balanced` benchmark artifact to the current source and
 a `-j1` 16/16 focused corpus for serializability/reservations, visible-prefix
 ordering, immutable MemTable pinning, commit faults, flush/compaction, reopen
@@ -476,7 +476,7 @@ disk/temp-space failures, all-class concurrent HTAP workload, scan-resistance,
 commit latency under analytical saturation, no-bypass proof, and production-
 scale fairness/resource evidence have not been produced.
 
-`results/release-closure-20260723-htap-resource-current-381a06f` adds a
+`results/release-closure-20260723-htap-resource-final` adds a
 current-HEAD format-1 hashed `-j1` 35/35 focused corpus covering production
 entry points, scheduler ownership, per-SST nonzero admission,
 rejection-before-I/O, release, cancellation, recovery and shutdown. Its
@@ -516,7 +516,7 @@ valid/system scopes, change, historical DML, temporal aggregates, bounded mixed
 paths, STRICT sessions, joins/spill, concurrent snapshots or the full EXPLAIN
 ANALYZE support matrix.
 
-`results/release-closure-20260723-tcypher-current-381a06f` adds a current-HEAD
+`results/release-closure-20260723-tcypher-final` adds a frozen-HEAD
 format-1 hashed `-j1` 27/27 support artifact for point/range/change,
 fixed/variable/mixed Expand, joins, spill, TRAIL and EXPLAIN ANALYZE. Its
 manifest passes `cedar_evidence_verify` and retains the two approved
@@ -552,7 +552,7 @@ atomic-drop focused selection passes 34/34 and the subsequent fresh normal
 matrix passes 856/856, both with `-j1`; these local results do not replace the
 still-missing release artifact or the deferred sanitizer refresh.
 
-`results/release-closure-20260723-temporal-index-cbo-current-381a06f` adds a
+`results/release-closure-20260723-temporal-index-cbo-final` adds a
 current-HEAD format-1 hashed `-j1` 26/26 focused artifact for
 base/hybrid/intersection/graph-order execution, random candidate completeness,
 Blob-hash bounds, automatic repair/drop/reopen, feedback generation isolation
@@ -565,7 +565,7 @@ distributions and the final matrices are attached.
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
 | 1 | PARTIAL | `MetricRegistry`, `TelemetryAggregator`, registered database/scheduler metrics; bounded-label tests | MISSING: complete production-subsystem instrumentation inventory |
-| 2 | COMPLETE | `CEDAR_MINIMAL_INSTRUMENTATION` builds `tier0-minimal`; manifests persist `instrumentation_profile_id`; `CompareInstrumentationOverheadRuns`, `WriteInstrumentationOverheadGate`, and `cedar_bench_pair --instrumentation-overhead` require a `tier0-minimal` baseline and `tier0-tier1` candidate, at least five valid pairs, and apply direct 2% median throughput / 5% p99 thresholds; `results/release-closure-20260723-observability-current-381a06f` binds ten current schema-3 strict-reader-validated paired runs | PARTIAL: the tiny smoke gate is `NOISY` and is not release evidence; archive an approved production-scale paired comparison |
+| 2 | COMPLETE | `CEDAR_MINIMAL_INSTRUMENTATION` builds `tier0-minimal`; manifests persist `instrumentation_profile_id`; `CompareInstrumentationOverheadRuns`, `WriteInstrumentationOverheadGate`, and `cedar_bench_pair --instrumentation-overhead` require a `tier0-minimal` baseline and `tier0-tier1` candidate, at least five valid pairs, and apply direct 2% median throughput / 5% p99 thresholds; `results/release-closure-20260723-observability-final` binds ten frozen schema-3 strict-reader-validated paired runs | PARTIAL: the tiny smoke gate is `NOISY` and is not release evidence; archive an approved production-scale paired comparison |
 | 3 | COMPLETE structure, PARTIAL execution | runtime profile contains row/interval/page/Blob/index/memory/spill/scheduler dimensions and focused tests | MISSING: target workloads with required counters exercised and validated |
 | 4 | COMPLETE | `BenchmarkRunManifest`, writer/reader strict provenance tests | PROVEN for r3/r5 current-format artifacts |
 | 5 | COMPLETE | deterministic Cedar-TG and independent small oracle tests | PROVEN for r3 dataset hashes/checksums |

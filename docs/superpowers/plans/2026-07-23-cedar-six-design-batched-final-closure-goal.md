@@ -145,15 +145,15 @@
 
 ## Evidence Batch Status
 
-Current-HEAD evidence roots have been generated at commit `381a06f` and
-hash-validated:
+Frozen evidence roots are generated after the tracked source and documents are
+frozen, then hash-validated:
 
-- `results/release-closure-20260723-columnar-current-381a06f`: 16/16 focused physical-path and codec tests.
-- `results/release-closure-20260723-htap-correctness-current-381a06f`: 16/16 focused model, serializability, visible-prefix, fault and oracle tests plus a schema-3 HTAP benchmark artifact.
-- `results/release-closure-20260723-htap-resource-current-381a06f`: 35/35 database and scheduler/executor admission tests.
-- `results/release-closure-20260723-tcypher-current-381a06f`: 27/27 supported-shape and approved-exclusion tests.
-- `results/release-closure-20260723-temporal-index-cbo-current-381a06f`: 26/26 access-path, repair, feedback and resource tests.
-- `results/release-closure-20260723-observability-current-381a06f`: ten schema-3 strict-reader-validated paired runs.
+- `results/release-closure-20260723-columnar-final`: 16/16 focused physical-path and codec tests.
+- `results/release-closure-20260723-htap-correctness-final`: 16/16 focused model, serializability, visible-prefix, fault and oracle tests plus a schema-3 HTAP benchmark artifact.
+- `results/release-closure-20260723-htap-resource-final`: 35/35 database and scheduler/executor admission tests.
+- `results/release-closure-20260723-tcypher-final`: 27/27 supported-shape and approved-exclusion tests.
+- `results/release-closure-20260723-temporal-index-cbo-final`: 26/26 access-path, repair, feedback and resource tests.
+- `results/release-closure-20260723-observability-final`: ten schema-3 strict-reader-validated paired runs.
 
 Every CTest root declares database format 1, current clean-break naming,
 source/dirty identity, exact command, binary/log hashes and honest eligibility;

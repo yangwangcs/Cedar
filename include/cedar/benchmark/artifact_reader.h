@@ -5,6 +5,7 @@
 #define CEDAR_BENCHMARK_ARTIFACT_READER_H_
 
 #include <string>
+#include <string_view>
 
 #include "cedar/benchmark/artifact_writer.h"
 #include "cedar/core/status.h"
@@ -29,6 +30,10 @@ StatusOr<BenchmarkArtifactRecord> ReadBenchmarkArtifact(
 // and verification.json in run_directory. The archived schemas and manifest
 // run ID are validated before report.md is atomically replaced.
 Status RegenerateBenchmarkReport(const std::string& run_directory);
+
+// Validates the current clean-break release-evidence manifest structure.
+// File bytes remain bound by the accompanying SHA256SUMS verifier.
+Status ValidateReleaseEvidenceManifest(std::string_view manifest_json);
 
 }  // namespace cedar
 

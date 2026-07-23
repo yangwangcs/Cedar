@@ -549,6 +549,34 @@ TEST(BenchmarkArtifactTest,
   EXPECT_NE(serialized.find("\"p99_ns\":null"), std::string::npos);
 }
 
+TEST(BenchmarkArtifactTest, ReleaseEvidenceManifestRejectsOldFormatAndNaming) {
+  const std::string manifest = R"json({
+    "schema_version":1,
+    "artifact_id":"release-closure-columnar",
+    "release_gate_eligible":false,
+    "paper_gate_eligible":false,
+    "database_format_version":1,
+    "clean_break_naming":true,
+    "source":{"commit":"a0260680848483b0bd7898f7973014cc0a90761c"},
+    "execution":{"parallelism":1,"command":"ctest -j1","passed":1,"failed":0,
+      "binary":{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+      "log":{"sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}},
+    "audit":{"format_version":1,"sha256_verified":true,
+      "provenance_bound_to_current_binary":true}
+  })json";
+  EXPECT_TRUE(ValidateReleaseEvidenceManifest(manifest).ok());
+  std::string old_format = manifest;
+  old_format.replace(old_format.find("\"database_format_version\":1"),
+                     std::string("\"database_format_version\":1").size(),
+                     "\"database_format_version\":2");
+  EXPECT_TRUE(ValidateReleaseEvidenceManifest(old_format).IsNotSupportedError());
+  std::string old_naming = manifest;
+  old_naming.replace(old_naming.find("release-closure-columnar"),
+                     std::string("release-closure-columnar").size(),
+                     "cedar-v2-columnar");
+  EXPECT_TRUE(ValidateReleaseEvidenceManifest(old_naming).IsNotSupportedError());
+}
+
 TEST(BenchmarkArtifactTest,
      RejectsUnavailableTransactionMeasurementsWithObservedCounters) {
   char pattern[] = "/tmp/cedar_benchmark_unavailable_txn_XXXXXX";

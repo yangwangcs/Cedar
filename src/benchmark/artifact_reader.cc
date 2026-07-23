@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -642,6 +643,130 @@ Status ReadTransactionMeasurements(const JsonValue& root,
   return Status::OK();
 }
 
+bool IsSha256(const std::string& value) {
+  return value.size() == 64 && std::all_of(
+      value.begin(), value.end(), [](unsigned char character) {
+        return std::isxdigit(character) != 0;
+      });
+}
+
+bool HasLegacyExternalVersionName(const std::string& value) {
+  std::string lower;
+  lower.reserve(value.size());
+  for (unsigned char character : value) {
+    lower.push_back(static_cast<char>(std::tolower(character)));
+  }
+  return lower.find("v2") != std::string::npos ||
+      lower.find("legacy") != std::string::npos;
+}
+
+Status ValidateReleaseEvidenceManifestJson(const JsonValue& root) {
+  uint32_t schema_version = 0;
+  Status status = ReadU32(root, "schema_version", &schema_version);
+  if (!status.ok()) return status;
+  if (schema_version != 1) {
+    return Status::NotSupported("release evidence",
+                                "unsupported manifest schema");
+  }
+  std::string artifact_id;
+  status = ReadString(root, "artifact_id", &artifact_id);
+  if (!status.ok()) return status;
+  if (artifact_id.empty()) {
+    return Status::Corruption("release evidence", "artifact_id is empty");
+  }
+  if (HasLegacyExternalVersionName(artifact_id)) {
+    return Status::NotSupported("release evidence",
+                                "legacy external artifact naming");
+  }
+  bool flag = false;
+  status = ReadBool(root, "release_gate_eligible", &flag);
+  if (!status.ok()) return status;
+  status = ReadBool(root, "paper_gate_eligible", &flag);
+  if (!status.ok()) return status;
+  uint32_t database_format_version = 0;
+  status = ReadU32(root, "database_format_version", &database_format_version);
+  if (!status.ok()) return status;
+  if (database_format_version != kCedarDatabaseFormatVersion) {
+    return Status::NotSupported("release evidence",
+                                "unsupported database format version");
+  }
+  bool clean_break_naming = false;
+  status = ReadBool(root, "clean_break_naming", &clean_break_naming);
+  if (!status.ok()) return status;
+  if (!clean_break_naming) {
+    return Status::NotSupported("release evidence",
+                                "clean-break naming is required");
+  }
+
+  const auto source = Field(root, "source");
+  if (!source.ok()) return source.status();
+  std::string commit;
+  status = ReadString(*source.ValueOrDie(), "commit", &commit);
+  if (!status.ok()) return status;
+  if (commit.size() != 40 || !std::all_of(
+          commit.begin(), commit.end(), [](unsigned char character) {
+            return std::isxdigit(character) != 0;
+          })) {
+    return Status::Corruption("release evidence", "source commit is not a SHA-1");
+  }
+
+  const auto execution = Field(root, "execution");
+  if (!execution.ok()) return execution.status();
+  uint64_t parallelism = 0;
+  status = ReadU64(*execution.ValueOrDie(), "parallelism", &parallelism);
+  if (!status.ok()) return status;
+  if (parallelism != 1) {
+    return Status::Corruption("release evidence", "parallelism must be one");
+  }
+  std::string command;
+  status = ReadString(*execution.ValueOrDie(), "command", &command);
+  if (!status.ok()) return status;
+  if (command.empty()) {
+    return Status::Corruption("release evidence", "execution command is empty");
+  }
+  uint64_t passed = 0;
+  uint64_t failed = 0;
+  status = ReadU64(*execution.ValueOrDie(), "passed", &passed);
+  if (!status.ok()) return status;
+  status = ReadU64(*execution.ValueOrDie(), "failed", &failed);
+  if (!status.ok()) return status;
+  if (passed == 0 || failed != 0) {
+    return Status::Corruption("release evidence", "execution result is incomplete");
+  }
+  for (const char* field_name : {"binary", "log"}) {
+    const auto entry = Field(*execution.ValueOrDie(), field_name);
+    if (!entry.ok()) return entry.status();
+    std::string sha256;
+    status = ReadString(*entry.ValueOrDie(), "sha256", &sha256);
+    if (!status.ok()) return status;
+    if (!IsSha256(sha256)) {
+      return Status::Corruption("release evidence",
+                                std::string(field_name) + " SHA-256 is invalid");
+    }
+  }
+
+  const auto audit = Field(root, "audit");
+  if (!audit.ok()) return audit.status();
+  uint32_t audit_format_version = 0;
+  status = ReadU32(*audit.ValueOrDie(), "format_version", &audit_format_version);
+  if (!status.ok()) return status;
+  if (audit_format_version != 1) {
+    return Status::NotSupported("release evidence", "unsupported audit format");
+  }
+  bool sha256_verified = false;
+  status = ReadBool(*audit.ValueOrDie(), "sha256_verified", &sha256_verified);
+  if (!status.ok()) return status;
+  bool provenance_bound = false;
+  status = ReadBool(*audit.ValueOrDie(), "provenance_bound_to_current_binary",
+                    &provenance_bound);
+  if (!status.ok()) return status;
+  if (!sha256_verified || !provenance_bound) {
+    return Status::Corruption("release evidence",
+                              "hash or binary provenance is not verified");
+  }
+  return Status::OK();
+}
+
 StatusOr<BenchmarkPhase> ParsePhase(const std::string& name) {
   for (uint8_t value = static_cast<uint8_t>(BenchmarkPhase::kEnvironmentCheck);
        value <= static_cast<uint8_t>(BenchmarkPhase::kArtifactFinalize); ++value) {
@@ -919,6 +1044,16 @@ StatusOr<BenchmarkArtifactRecord> ReadBenchmarkArtifact(
   }
   record.protocol_complete = derived_protocol_complete;
   return record;
+}
+
+Status ValidateReleaseEvidenceManifest(std::string_view manifest_json) {
+  if (manifest_json.size() > kMaximumArtifactBytes) {
+    return Status::ResourceExhausted("release evidence",
+                                    "manifest exceeds 64 MiB");
+  }
+  const auto parsed = JsonParser(manifest_json).Parse();
+  if (!parsed.ok()) return parsed.status();
+  return ValidateReleaseEvidenceManifestJson(parsed.ValueOrDie());
 }
 
 Status RegenerateBenchmarkReport(const std::string& run_directory) {

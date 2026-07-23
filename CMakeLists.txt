@@ -190,6 +190,8 @@ add_executable(cedar_bench benchmarks/cedar_bench.cc)
 target_link_libraries(cedar_bench PRIVATE cedar)
 add_executable(cedar_bench_report benchmarks/cedar_bench_report.cc)
 target_link_libraries(cedar_bench_report PRIVATE cedar)
+add_executable(cedar_evidence_verify benchmarks/cedar_evidence_verify.cc)
+target_link_libraries(cedar_evidence_verify PRIVATE cedar)
 add_executable(cedar_bench_pair benchmarks/cedar_bench_pair.cc)
 target_link_libraries(cedar_bench_pair PRIVATE cedar)
 execute_process(

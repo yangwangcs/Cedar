@@ -145,20 +145,23 @@
 
 ## Evidence Batch Status
 
-Six current-format evidence roots have been generated and hash-validated:
+Current-HEAD evidence roots have been generated at commit `381a06f` and
+hash-validated:
 
-- `results/release-closure-20260723-columnar`: 12/12 focused physical-path tests.
-- `results/release-closure-20260723-htap-correctness`: 14/14 focused model, serializability, visible-prefix, fault and oracle tests.
-- `results/release-closure-20260723-htap-resource`: 34/34 database and scheduler/executor admission tests.
-- `results/release-closure-20260723-tcypher`: 27/27 supported-shape and approved-exclusion tests.
-- `results/release-closure-20260723-temporal-index-cbo`: 26/26 access-path, repair, feedback and resource tests.
-- `results/release-closure-20260723-observability`: 20/20 focused artifact/gate tests and ten strict-reader-validated paired runs.
+- `results/release-closure-20260723-columnar-current-381a06f`: 16/16 focused physical-path and codec tests.
+- `results/release-closure-20260723-htap-correctness-current-381a06f`: 16/16 focused model, serializability, visible-prefix, fault and oracle tests plus a schema-3 HTAP benchmark artifact.
+- `results/release-closure-20260723-htap-resource-current-381a06f`: 35/35 database and scheduler/executor admission tests.
+- `results/release-closure-20260723-tcypher-current-381a06f`: 27/27 supported-shape and approved-exclusion tests.
+- `results/release-closure-20260723-temporal-index-cbo-current-381a06f`: 26/26 access-path, repair, feedback and resource tests.
+- `results/release-closure-20260723-observability-current-381a06f`: ten schema-3 strict-reader-validated paired runs.
 
-Every root declares database format 1, current clean-break naming, source/dirty
-identity, environment, exact command, binary/log hashes and honest eligibility.
-They remain `release_gate_eligible: false`: the instrumentation smoke is
-`NOISY`; HTAP conflict-abort, PREPARE/decision fsync latency and visible-prefix
-stall measurement producers are absent; production fairness/deadline stress,
-an approved clean-break production baseline, external LDBC input and a
-separately provisioned paper/stress host remain open. Do not start Task 10
-until those gates are implemented or explicitly approved as tested exclusions.
+Every CTest root declares database format 1, current clean-break naming,
+source/dirty identity, exact command, binary/log hashes and honest eligibility;
+`cedar_evidence_verify` validates its manifest and `SHA256SUMS` binds its
+files. Benchmark roots are read by the schema-3 offline strict reader. They
+remain `release_gate_eligible: false`: the instrumentation smoke is `NOISY`;
+production conflict-abort, fairness/deadline stress, per-class queue/grant
+telemetry, an approved clean-break production baseline, external LDBC input
+and a separately provisioned paper/stress host remain open. Do not start Task
+10 until those gates are implemented or explicitly approved as tested
+exclusions.

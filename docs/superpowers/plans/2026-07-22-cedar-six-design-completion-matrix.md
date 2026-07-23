@@ -414,13 +414,15 @@ bounds, concurrent relocation and every persistence boundary are missing. The
 static clean-break gate is archived. All twelve artifacts below
 `results/columnar-closure-20260722*` are rejected old format-2/V2 evidence.
 
-The new `results/release-closure-20260723-columnar` root is current-format
-functional evidence: its 12/12 focused run binds selective reads, metadata-only
-open, zero-payload reference-copy compaction assertions, bounded streaming,
-fixed-seed oracles, concurrent Blob publication/relocation, corruption and
-clean-break rejection to a hashed binary/log/environment manifest. It is not
-release-eligible because it does not yet contain production-scale cache and
-compaction peak distributions or the final four verification matrices.
+`results/release-closure-20260723-columnar-current-381a06f` is the current-HEAD
+functional root: its `-j1` 16/16 focused run binds selective and ordinal-block
+reads, metadata-only open, zero-payload reference-copy compaction assertions,
+bounded streaming, fixed-seed oracles, concurrent Blob publication/relocation,
+corruption, codec startup capability checks and clean-break rejection. Its
+format-1 manifest is accepted by `cedar_evidence_verify` and its binary/log
+hashes verify through `SHA256SUMS`. It is explicitly non-release/non-paper
+evidence because production cache/compaction peaks, broader corruption
+boundaries and the final four verification matrices remain absent.
 
 ### HTAP correctness-kernel completion definition
 
@@ -440,12 +442,15 @@ now archived, but the full durability-boundary matrix, deterministic/random
 serializability corpus, single/multi-shard scaling, abort rate, prepare/decision
 fsync latency, visible-prefix stalls and write amplification remain missing.
 
-`results/release-closure-20260723-htap-correctness` adds a format-1 hashed
-14/14 focused corpus for serializability/reservations, visible-prefix ordering,
-immutable MemTable pinning, commit faults, flush/compaction, reopen and the
-independent oracle. It remains non-release evidence because the benchmark
-protocol still lacks dedicated conflict-abort-rate, PREPARE/decision fsync
-latency and visible-prefix-stall-duration producers.
+`results/release-closure-20260723-htap-correctness-current-381a06f` binds a
+format-1 schema-3 `htap-balanced` benchmark artifact to the current source and
+a `-j1` 16/16 focused corpus for serializability/reservations, visible-prefix
+ordering, immutable MemTable pinning, commit faults, flush/compaction, reopen
+and the independent oracle. The benchmark artifact is accepted by the offline
+strict reader and records prepare, decision, decision-fsync and visible-prefix
+measurement distributions; deterministic conflict-abort and stall paths are
+archived by the focused tests. It remains non-release evidence because a
+production conflict-abort workload and the final matrices are still absent.
 
 ### HTAP resource-scheduling completion definition
 
@@ -471,11 +476,13 @@ disk/temp-space failures, all-class concurrent HTAP workload, scan-resistance,
 commit latency under analytical saturation, no-bypass proof, and production-
 scale fairness/resource evidence have not been produced.
 
-`results/release-closure-20260723-htap-resource` adds a format-1 hashed 34/34
-focused corpus covering production entry points, scheduler ownership,
-per-SST nonzero admission, rejection-before-I/O, release, cancellation,
-recovery and shutdown. Production-scale weighted-fairness/deadline and
-analytical-saturation distributions remain open.
+`results/release-closure-20260723-htap-resource-current-381a06f` adds a
+current-HEAD format-1 hashed `-j1` 35/35 focused corpus covering production
+entry points, scheduler ownership, per-SST nonzero admission,
+rejection-before-I/O, release, cancellation, recovery and shutdown. Its
+manifest passes `cedar_evidence_verify`. Production-scale weighted-fairness,
+deadline lateness, per-class queue/grant telemetry and analytical-saturation
+distributions remain open.
 
 ### T-Cypher completion definition
 
@@ -509,11 +516,12 @@ valid/system scopes, change, historical DML, temporal aggregates, bounded mixed
 paths, STRICT sessions, joins/spill, concurrent snapshots or the full EXPLAIN
 ANALYZE support matrix.
 
-`results/release-closure-20260723-tcypher` adds a format-1 hashed 27/27 support
-artifact for point/range/change, fixed/variable/mixed Expand, joins, spill,
-TRAIL and EXPLAIN ANALYZE. It records the two approved `NotSupported`
-exclusions explicitly. The final sanitizer matrix and production-scale
-concurrent snapshot/disk-failure corpus remain open.
+`results/release-closure-20260723-tcypher-current-381a06f` adds a current-HEAD
+format-1 hashed `-j1` 27/27 support artifact for point/range/change,
+fixed/variable/mixed Expand, joins, spill, TRAIL and EXPLAIN ANALYZE. Its
+manifest passes `cedar_evidence_verify` and retains the two approved
+`NotSupported` exclusions explicitly. The final sanitizer matrix and
+production-scale concurrent snapshot/disk-failure corpus remain open.
 
 ### Temporal index/CBO completion definition
 
@@ -544,19 +552,20 @@ atomic-drop focused selection passes 34/34 and the subsequent fresh normal
 matrix passes 856/856, both with `-j1`; these local results do not replace the
 still-missing release artifact or the deferred sanitizer refresh.
 
-`results/release-closure-20260723-temporal-index-cbo` adds a format-1 hashed
-26/26 focused artifact for base/hybrid/intersection/graph-order execution,
-random candidate completeness, Blob-hash bounds, automatic repair/drop/reopen,
-feedback generation isolation and per-SST resource accounting. It remains
-non-release evidence until production access-path/resource distributions and
-the final matrices are attached.
+`results/release-closure-20260723-temporal-index-cbo-current-381a06f` adds a
+current-HEAD format-1 hashed `-j1` 26/26 focused artifact for
+base/hybrid/intersection/graph-order execution, random candidate completeness,
+Blob-hash bounds, automatic repair/drop/reopen, feedback generation isolation
+and per-SST resource accounting. Its manifest passes `cedar_evidence_verify`.
+It remains non-release evidence until production access-path/resource
+distributions and the final matrices are attached.
 
 ### Observability/benchmark completion definition
 
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
 | 1 | PARTIAL | `MetricRegistry`, `TelemetryAggregator`, registered database/scheduler metrics; bounded-label tests | MISSING: complete production-subsystem instrumentation inventory |
-| 2 | COMPLETE | `CEDAR_MINIMAL_INSTRUMENTATION` builds `tier0-minimal`; manifests persist `instrumentation_profile_id`; `CompareInstrumentationOverheadRuns`, `WriteInstrumentationOverheadGate`, and `cedar_bench_pair --instrumentation-overhead` require a `tier0-minimal` baseline and `tier0-tier1` candidate, at least five valid pairs, and apply direct 2% median throughput / 5% p99 thresholds; `results/release-closure-20260723-observability` binds 20/20 focused tests and ten strict-reader-validated format-1 paired runs | PARTIAL: the tiny smoke gate is `NOISY` and is not release evidence; archive an approved production-scale paired comparison |
+| 2 | COMPLETE | `CEDAR_MINIMAL_INSTRUMENTATION` builds `tier0-minimal`; manifests persist `instrumentation_profile_id`; `CompareInstrumentationOverheadRuns`, `WriteInstrumentationOverheadGate`, and `cedar_bench_pair --instrumentation-overhead` require a `tier0-minimal` baseline and `tier0-tier1` candidate, at least five valid pairs, and apply direct 2% median throughput / 5% p99 thresholds; `results/release-closure-20260723-observability-current-381a06f` binds ten current schema-3 strict-reader-validated paired runs | PARTIAL: the tiny smoke gate is `NOISY` and is not release evidence; archive an approved production-scale paired comparison |
 | 3 | COMPLETE structure, PARTIAL execution | runtime profile contains row/interval/page/Blob/index/memory/spill/scheduler dimensions and focused tests | MISSING: target workloads with required counters exercised and validated |
 | 4 | COMPLETE | `BenchmarkRunManifest`, writer/reader strict provenance tests | PROVEN for r3/r5 current-format artifacts |
 | 5 | COMPLETE | deterministic Cedar-TG and independent small oracle tests | PROVEN for r3 dataset hashes/checksums |

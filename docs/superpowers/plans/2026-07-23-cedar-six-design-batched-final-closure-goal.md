@@ -122,10 +122,10 @@
 - Modify: `docs/superpowers/plans/2026-07-22-cedar-six-design-completion-matrix.md`
 - Modify: `.superpowers/sdd/progress.md`
 
-- [ ] Freeze functional and artifact changes before starting the final matrix.
-- [ ] Run normal, ASAN, UBSAN, and TSAN full CTest matrices once each with `-j1` and stable output logs.
-- [ ] Run the final fault/crash/reopen/oracle, scheduler/HTAP stress, and benchmark reproducibility aggregate gates.
-- [ ] Bind logs and binaries to the final manifest, validate hashes and provenance, and run `git diff --check`.
+- [x] Freeze functional and artifact changes before starting the final matrix at `66bf270efd6150fa80e713f4d4fd2d3ea1e75407`.
+- [x] Run normal, ASAN, UBSAN, and TSAN full CTest matrices once each with `-j1` and stable output logs; all four pass 886/886.
+- [x] Run the final fault/crash/reopen/oracle, scheduler/HTAP, and benchmark reproducibility aggregate gates; they pass 64/64, 80/80 and 28/28, with 11/11 offline strict-reader regenerations.
+- [x] Bind logs and binaries to `results/release-closure-20260723-final-matrix`, validate hashes and provenance, and run `git diff --check`.
 - [ ] Update every completion-matrix row to code/test/artifact evidence or an approved tested exclusion; mark the active goal complete only when no required row remains open.
 
 ## Verification Policy
@@ -138,7 +138,7 @@
 
 ## Current Baseline
 
-- Latest normal matrix: 873/873 passed with `-j1`.
+- Frozen final matrices: normal, ASAN, UBSAN and TSAN each pass 886/886 with `-j1` and execute once each.
 - Immutable maintenance resource admission: functionally complete; its 20 implementation steps are checked.
 - Functional slices 1-3 are complete: automatic index health repair, concurrent feedback generation isolation, and minimal-instrumentation overhead gating. The overhead runner records each arm profile and emits a dedicated gate; its five-pair tiny smoke was `NOISY`, so it is not release evidence.
 - Remaining release/paper scope: six evidence campaigns plus the final unified verification.
@@ -162,6 +162,11 @@ files. Benchmark roots are read by the schema-3 offline strict reader. They
 remain `release_gate_eligible: false`: the instrumentation smoke is `NOISY`;
 production conflict-abort, fairness/deadline stress, per-class queue/grant
 telemetry, an approved clean-break production baseline, external LDBC input
-and a separately provisioned paper/stress host remain open. Do not start Task
-10 until those gates are implemented or explicitly approved as tested
+and a separately provisioned paper/stress host remain open. Task 10's local
+verification is complete; these release/paper dependencies keep the overall
+goal active until they are produced or explicitly approved as tested
 exclusions.
+
+The exact external inputs, host profiles, prohibited substitutions, campaigns
+and acceptance rules are frozen in
+`docs/superpowers/plans/2026-07-23-cedar-external-release-evidence-contract.md`.

@@ -7,6 +7,9 @@ out/
 # Agent workflow state
 .superpowers/
 
+# Local design notes are not part of the public source tree
+docs/
+
 # IDE
 .vscode/
 .idea/

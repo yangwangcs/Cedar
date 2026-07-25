@@ -364,13 +364,8 @@ bool ProbeLinuxStorage(const std::filesystem::path& probed_path,
   const uint64_t device_minor = static_cast<uint64_t>(minor(status.st_dev));
   const std::string path = probed_path.string();
   const MountInfo* selected = nullptr;
-  const bool bind_mount_device_is_unavailable =
-      device_major == 0 && device_minor == 0;
   for (const MountInfo& mount : mounts) {
-    if (!PathIsWithin(path, mount.mount_point) ||
-        (!bind_mount_device_is_unavailable &&
-         (mount.device_major != device_major ||
-          mount.device_minor != device_minor))) {
+    if (!PathIsWithin(path, mount.mount_point)) {
       continue;
     }
     if (selected == nullptr ||

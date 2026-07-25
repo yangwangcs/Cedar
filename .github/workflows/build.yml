@@ -51,7 +51,7 @@ jobs:
       run: >-
         cmake --build "${{ env.CMAKE_BUILD_DIR }}"
         --config "${{ env.CMAKE_BUILD_TYPE }}"
-        --parallel
+        --parallel 1
 
     - name: Run Tests
       working-directory: ${{ github.workspace }}/build

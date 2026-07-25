@@ -143,6 +143,8 @@ StatusOr<CacheInsertResult> CacheManager::Insert(CacheKey key,
   state_->entries.emplace(canonical, State::Entry{key.kind, std::move(value), bytes,
                                                    state_->lru.begin(), std::move(reservation)});
   state_->stats.resident_bytes += bytes;
+  state_->stats.peak_resident_bytes = std::max(
+      state_->stats.peak_resident_bytes, state_->stats.resident_bytes);
   state_->stats.entries = state_->entries.size();
   if (key.kind == CacheKind::kPage) ++state_->stats.page_admissions;
   result.admitted = true;

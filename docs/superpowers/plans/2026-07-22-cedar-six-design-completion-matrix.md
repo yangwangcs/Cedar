@@ -1,6 +1,6 @@
 # Cedar Six-Design Completion Matrix
 
-Date: 2026-07-23
+Date: 2026-07-25
 
 Status: Audit baseline for the active release/paper closure goal.
 
@@ -12,12 +12,12 @@ reproducible artifact, provenance, and the declared statistical protocol.
 
 | Design | Current state | Remaining closure |
 |---|---|---|
-| Columnar | Typed SST/Blob, bounded reads, corruption, relocation and compaction have current format-1 focused evidence plus the final four sanitizer matrices | Produce production-scale observed-peak, full persistence-boundary and release capability artifacts |
+| Columnar | Typed SST/Blob, bounded reads, corruption, relocation and compaction have current format-1 focused evidence; the real `maintenance-cycle` campaign executes a two-SST merge and publishes nonzero compaction/cache peaks; current sanitizers pass | Produce production-scale observed-peak, full persistence-boundary and release capability artifacts |
 | HTAP correctness kernel | Transaction, reservation, visible-prefix, MemTable, flush/compaction and recovery protocols have schema-3 focused evidence plus final fault/oracle and sanitizer gates | Produce production-scale conflict/serializability/concurrent-ingestion and every-boundary crash evidence |
-| HTAP resource scheduling | Maintenance, T-Cypher morsels, commit PREPARE/install, public point reads, recovery, and the durable close body use typed shared admission; database sessions and lazy streams are lifecycle-safe; already-running optional maintenance observes task-scoped cancellation at durable safe boundaries | Produce production-scale fairness/deadline/HTAP stress and per-class resource artifacts |
-| T-Cypher vectorized execution | Typed parser/binder/planner/runtime and the approved point/range/change/Expand/join/spill shapes have a current format-1 focused artifact and final sanitizer coverage | Preserve two approved deterministic exclusions; produce production concurrent-snapshot and disk-failure release artifacts |
-| Temporal index/CBO | Catalog, CSI3 sidecars, candidate completeness, Blob-hash boundaries, hybrid/intersection/graph-order, repair, feedback isolation and per-SST admission have current focused evidence | Produce production-scale nonzero candidate/resource distributions and durable plan-choice evidence |
-| Observability/benchmark | Current artifact schema, CI corpus, cache modes, fault producers, paired driver, minimal-instrumentation build profile and dedicated 2% throughput / 5% p99 overhead gate are implemented | Archive an approved paired production comparison, workstation/paper/stress, external LDBC, nightly/PR evidence and claim-to-artifact mapping |
+| HTAP resource scheduling | Typed shared admission is complete; `scheduler-saturation` verifies 4:2:2:1 saturated fairness, EDF, a real worker-saturated deadline miss, and nonzero queue/service/CPU-grant activity for all 13 work classes; current sanitizers pass | Produce the same distributions at production scale and under concurrent HTAP load |
+| T-Cypher vectorized execution | Typed execution and approved query shapes have current focused evidence; one Blob-bearing corpus now crosses active MemTable, a snapshot pinned across the frozen handoff, one/many SST, flush, compaction, reopen, real Blob relocation and reopen-after-relocation; typed spill faults and current sanitizers pass | Retain two approved deterministic exclusions and produce production concurrent-snapshot/disk-pressure artifacts |
+| Temporal index/CBO | A public `index-path-matrix` campaign fail-closes unless all six required physical choices execute; a single lifecycle now compacts, repairs a corrupt sidecar, drops, reopens and proves index-ID non-reuse; CI emits nonzero candidates and current sanitizers pass | Produce production-scale plan-choice/resource-cost distributions |
+| Observability/benchmark | The versioned production metric census, fail-closed activity validator, CI workload artifacts, cache modes, fault producers, paired driver, minimal-instrumentation profile and dedicated 2% throughput / 5% p99 overhead gate are implemented | Archive an approved production-scale paired comparison and workstation/stress release evidence; paper and external LDBC are excluded from this goal |
 
 ## Completion Evidence by Design
 
@@ -78,7 +78,7 @@ records in one durable batch share one block and one segment fsync; INDEX
 deltas map hashes to block starts. Reopen validates every distinct referenced
 block once, and ordinary Put plus GC relocation share one block writer. Direct
 write estimates match actual segment, INDEX and ACTIVE bytes.
-The current normal correctness matrix passes 805/805. The focused Blob gate at
+The latest dirty-working-tree normal correctness matrix passes 928/928. The focused Blob gate at
 its archived sanitizer checkpoint passes 49/49 under
 ASAN, UBSAN and TSAN; the earlier focused SST/Manifest/page-format gate passes
 74/74 under each sanitizer. Schema registration now belongs to the clean-break
@@ -183,13 +183,12 @@ ordering now have deterministic coverage for cross-shard overlap, thread
 identity, partial failure, reopen, completion-grant, binding lifetime, typed
 counters, nested-worker progress, one-worker shutdown, query/session lifetime,
 and urgent-versus-optional maintenance ordering. The archived concentrated
-resource/shutdown/maintenance selection passes 48/48. The frozen final source
-now has one full normal, ASAN, UBSAN and TSAN execution each; all four discover
-886 tests and pass 886/886 with `-j1`, with no sanitizer or race report. The logs, binary
-hashes, exact commands, host/resource profile, deterministic algorithm-boundary
-coverage, and real Blob-GC cancellation/checkpoint/reopen verification are
-archived under
-`results/release-closure-20260723-maintenance-cancellation/`.
+resource/shutdown/maintenance selection passes 48/48. The latest dirty working
+tree has one full normal, ASAN, UBSAN and TSAN execution each; all four pass
+928/928 with `-j1`, with no sanitizer or race report. These latest logs are
+local verification only. The preceding self-contained 916/916 checkpoint
+remains archived under `results/release-closure-20260725-final-matrix-r10/`;
+its directory verifier passes all manifest, binary and log SHA-256 bindings.
 
 Index build and statistics merge now admit one immutable source SST per task.
 Columnar, index, statistics and Manifest owners provide checked estimates;
@@ -200,9 +199,12 @@ refusal returns typed `MaintenanceBackoff`, and each grant is released before
 the next SST. Stats publication uses expected generation plus projected-map
 write/fsync/rename/parent-directory-fsync before in-memory swap. Blob-backed
 distinct statistics use `BlobRef` content identity without payload reads.
-Focused admission/fault coverage passes 18/18; the final sanitizer refresh is
-closed by the 4 x 886 frozen matrix. Production-scale fairness, deadline,
-analytical-saturation and per-class lifecycle telemetry artifacts remain open.
+Focused admission/fault coverage passes 18/18. The current CI scheduler artifact
+`results/goal-current-scheduler-saturation/6ffee3ad18e4836d88c17b48b5ef045eab81c517ece2ae459e265da95f5e8218`
+passes strict reading and records all 13 queue/service/CPU-grant labels plus one
+interactive deadline miss. It verifies exact 4:2:2:1 fairness and EDF inside
+the workload, but is not production-scale evidence. Production-scale
+concurrent HTAP distributions remain open.
 
 ### T-Cypher Vectorized Execution
 
@@ -226,6 +228,15 @@ mixed fixed/variable `CHANGES`, whose event/path semantics are not approved,
 and property access on a variable relationship path, whose binding is a list
 rather than a scalar relationship. The remaining T-Cypher closure is artifact
 evidence, not a generic logical-runtime fallback.
+
+Typed spill-failure campaigns now exercise the actual `QuerySpillFile` write
+boundary and checksum reader. CI artifacts
+`results/goal-current-spill-fault/0fcd9d1b01d3d4a60e0bb8b9c7bdc2bf2e1422e9f7c845061060679f6ae73e54`
+and
+`results/goal-current-spill-fault/52cf4501a25d9d0b6101d3b5141e60c916ff268f57d325a0da7a37d31f308011`
+respectively inject ENOSPC and corrupt a valid spill record. Both pass strict
+reading, cleanup, reopen and persisted-value verification. Production-scale
+concurrent snapshots and disk-pressure campaigns remain open.
 
 ### Temporal Index and CBO
 
@@ -275,6 +286,12 @@ generation isolation, and functional per-SST index/statistics resource
 admission. Remaining gates are production-scale resource-accounting artifacts,
 production-scale HTAP/fairness, and release/paper benchmark
 evidence.
+
+The public CI workload artifact
+`results/goal-current-index-path-matrix/4fbeaaa84d1eea590c3a01fa58bf231f682b4372b2bc0e6727278393f3d742ae`
+passes strict reading with 6/6 verified paths, nonzero indexed candidates,
+interactive service/CPU grants, and successful load/result/reopen phases. It
+is functional CI evidence only, not a production-scale cost distribution.
 
 ### Observability and Benchmark
 
@@ -355,16 +372,18 @@ not be cited as release evidence: its `accepted_work_shutdown` artifact
 is INVALID because the injected fault did not stop at the selected durability
 boundary. Earlier r3/r4 fault corpora are superseded by r5 for this gate.
 
-The final frozen correctness baseline passes 886/886 in normal (84.09 seconds),
-ASAN (194.80 seconds), UBSAN (154.10 seconds), and TSAN (605.44 seconds). Each
-matrix ran once with `-j1`; no sanitizer or race report was emitted. Stable
-CTest `--output-log` files, binary/log SHA-256 bindings, source commit,
-database format `1`, host identity, exact commands and elapsed times are
-archived under `results/release-closure-20260723-final-matrix/`. Earlier
-sanitizer corpora are superseded for the current correctness checkpoint.
-Workstation, paper, and stress
-resource profiles, an approved production baseline/candidate comparison, and
-externally derived LDBC paper artifacts remain evidence-missing.
+The latest dirty-working-tree correctness baseline passes 928/928 in normal,
+ASAN, UBSAN and TSAN modes with `-j1`. No sanitizer or race diagnostic is
+present. This current matrix is not release evidence because the source is
+dirty and the logs are not sealed into a release root. The preceding stable
+logs, binary/log SHA-256 bindings, source commit, database format `1`, host
+identity, exact commands and elapsed times remain archived with all four
+corresponding binaries under
+`results/release-closure-20260725-final-matrix-r10/` at 916/916 plus the
+independent provenance regression 1/1.
+Workstation and stress resource profiles plus an approved production
+baseline/candidate comparison remain evidence-missing. Paper and externally
+derived LDBC artifacts are outside the active functional release goal.
 
 The current repository history does not contain an approvable prior production
 binary for the clean-break architecture. `main` and the current branch point at
@@ -397,13 +416,13 @@ identifies the artifact boundary still required.
 
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
-| 1 | COMPLETE | `BuildSst`, `BlobStore::PutBatch`, `FlushFrozenShard`; `FlushesCommittedShardEventsIntoPartitionedSstFiles`, `CoordinatorExternalizesLargeBinaryBeforePrepareAndRestoresIt` | PARTIAL: r3 ingestion/blob runs exercise public paths, but no writer inventory artifact proves every durable writer |
-| 2 | COMPLETE | `ReadSstFileMetadata`, `OpenSstEventCursor`, `ReadSstEventsAtOrdinals`; `SstMetadataOpenValidatesOwnershipWithoutDecodingDataBlocks`, `PointReadFetchesOnlyTheSelectedValuePageFragment` | MISSING: no current artifact records whole-SST reads/residency as zero |
-| 3 | COMPLETE | `TemporalReadMerger`, `GetChecked`; `RandomMultiSstSchemaEpochHistoryMatchesOracleAcrossCompactionAndReopen`, `RandomMultiSstEdgePathProvenanceMatchesOracleAcrossCompactionAndReopen` | PARTIAL: r3 point/range/graph artifacts do not archive full key/provenance oracle assertions |
-| 4 | COMPLETE | `DecodePage`, `ReadSstFileInternal`, `BlobStore::Get`; `RejectsCorruptPayloadSizesAndDirectoryOffsets`, `BlobPayloadDetectsCrcAndBlake3Corruption` | MISSING: no current-format page/Blob corruption artifact matrix |
-| 5 | COMPLETE | `CompactSstPartition`; `DatabaseExportsRealColumnarBlobCompactionAndGcMetrics`, `ExposesExactSortedBlobReferencesWithoutReadingPayloads` | MISSING: no artifact proves an executed reference-copy compaction with Blob payload reads equal to zero |
+| 1 | COMPLETE | `BuildSst`, `BlobStore::PutBatch`, `FlushFrozenShard`; `FlushesCommittedShardEventsIntoPartitionedSstFiles`, `CoordinatorExternalizesLargeBinaryBeforePrepareAndRestoresIt` | PROVEN for static ownership by `release-closure-20260725-source-contract-r1`: 11 database durable-mutation owners are separated from benchmark/result and temporary-spill writers by an exact fail-closed inventory; runtime workload evidence remains in r3/r10 |
+| 2 | COMPLETE | `ReadSstFileMetadata`, `OpenSstEventCursor`, `ReadSstEventsAtOrdinals`; `SstMetadataOpenValidatesOwnershipWithoutDecodingDataBlocks`, `PointReadFetchesOnlyTheSelectedValuePageFragment` | PROVEN at focused scale by the self-contained r10 selective-read root; production-scale residency distributions remain row 7 |
+| 3 | COMPLETE | `TemporalReadMerger`, `GetChecked`; `RandomMultiSstSchemaEpochHistoryMatchesOracleAcrossCompactionAndReopen`, `RandomMultiSstEdgePathProvenanceMatchesOracleAcrossCompactionAndReopen` | PROVEN at focused scale by r10, including full fixed-seed key/provenance oracle assertions across compaction and reopen |
+| 4 | COMPLETE | `DecodePage`, `ReadSstFileInternal`, `BlobStore::Get`; `RejectsCorruptPayloadSizesAndDirectoryOffsets`, `BlobPayloadDetectsCrcAndBlake3Corruption` | PROVEN at focused scale by the current-format r10 page/granule/SST/Blob corruption corpus; exhaustive injected persistence boundaries remain row 8 |
+| 5 | COMPLETE | `CompactSstPartition`; `DatabaseExportsRealColumnarBlobCompactionAndGcMetrics`, `ExposesExactSortedBlobReferencesWithoutReadingPayloads` | PROVEN at focused scale by r10 reference-copy compaction and zero Blob-payload-read assertions |
 | 6 | COMPLETE | `RelocateLiveHashes`, `BlobGarbageCollector::Collect`, `BlobReferenceCatalog`; `BlobGcConcurrentWriterRespectsLongSnapshotPinAndStaleReferences` | PARTIAL: r5 Blob-GC publication fault does not replace concurrent relocation/stale-SST-reference evidence |
-| 7 | PARTIAL | `CacheManager`, streaming compaction; `CompactionStreamsSortedSstBlocksWithBoundedEventBuffering`, `BypassesFirstScanAndProtectsPinnedSnapshotHandles` | MISSING: configured limits and observed peaks are not archived |
+| 7 | PARTIAL | `CacheManager`, streaming compaction; `CompactionStreamsSortedSstBlocksWithBoundedEventBuffering`, `BypassesFirstScanAndProtectsPinnedSnapshotHandles`; the real `maintenance-cycle` campaign archives nonzero compaction input/output, compaction peak and cache peak at CI scale | PARTIAL: production-scale configured-limit and observed-peak distributions remain missing |
 | 8 | PARTIAL | VersionSet/Blob/SST recovery and concurrency tests; r5 eight-scenario corpus; sanitizer artifact `release-closure-20260723-sanitizers` | PARTIAL: not every file-deletion/index/Blob/SST persistence boundary has artifact coverage |
 | 9 | COMPLETE | old Descriptor/v1/duplicate ownership sources are removed; old-format rejection tests include `DatabaseRejectsOldFormatMagicWithoutMutatingDirectory` and `SstTest.RejectsOldHeaderMagic` | PROVEN: artifact `release-closure-20260723-clean-break-scan` records zero forbidden external names, parallel runtimes and old-source references, with every retained term justified |
 | 10 | PARTIAL | strict transaction/snapshot tests such as `StrictTransactionsRejectDeterministicWriteSkew` and `DatabaseSessionReadsUseTheSnapshotCapturedAtBegin` | PARTIAL: depends on the still-open HTAP/resource completion rows |
@@ -411,84 +430,90 @@ identifies the artifact boundary still required.
 Columnar verification strategy §30 remains `PARTIAL`: golden/round-trip,
 continuation, corruption, multi-SST/schema, Blob, compaction and oracle tests
 exist. The current format-1 focused root covers selective I/O, reference-copy
-Blob avoidance, concurrent relocation, corruption and codec startup.
-Production cache/compaction peaks and every persistence boundary remain
-missing. The
-static clean-break gate is archived. All twelve artifacts below
+Blob avoidance, concurrent relocation, corruption, codec startup and the real
+CI maintenance peak campaign. Production-scale cache/compaction peak
+distributions and every persistence boundary remain missing. The
+static clean-break gate and the exact durable-writer/source-contract gate are
+archived. All twelve artifacts below
 `results/columnar-closure-20260722*` are rejected old format-2/V2 evidence.
 
-`results/release-closure-20260723-columnar-final` is the frozen-HEAD
-functional root: its `-j1` 16/16 focused run binds selective and ordinal-block
-reads, metadata-only open, zero-payload reference-copy compaction assertions,
-bounded streaming, fixed-seed oracles, concurrent Blob publication/relocation,
-corruption, codec startup capability checks and clean-break rejection. Its
-format-1 manifest is accepted by `cedar_evidence_verify` and its binary/log
-hashes verify through `SHA256SUMS`. It is explicitly non-release/non-paper
-evidence because production cache/compaction peaks and broader persistence
-boundaries remain absent; the final four verification matrices are archived in
-`results/release-closure-20260723-final-matrix/`.
+`results/release-closure-20260725-columnar-functional-r10` retains a current-source
+74/74 focused log for selective and ordinal-block reads,
+metadata-only open, zero-payload reference-copy compaction assertions, bounded
+streaming, fixed-seed oracles, concurrent Blob publication/relocation,
+corruption, codec startup capability checks, the real two-SST maintenance-cycle
+peak campaign, the fail-closed activity gate and clean-break rejection. Its
+binary, focused log, manifest, and ledger are self-contained and pass the
+current directory-level `cedar_evidence_verify`. Production-scale
+cache/compaction peak distributions, broader persistence boundaries, and a
+release-scale artifact remain absent.
 
 ### HTAP correctness-kernel completion definition
 
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
-| 1 | COMPLETE | `CedarDatabase::Put/Delete`, `TransactionSink::Submit`, `CommitInternal`; `TypedFacadeUsesOnlyNewTransactionAndSchemaContracts`, `TransactionSinkConvertsTypedMutationsAndCommitsAtomically` | PARTIAL: no archived all-writer call-path inventory |
+| 1 | COMPLETE | `CedarDatabase::Put/Delete`, `TransactionSink::Submit`, `CommitInternal`; `TypedFacadeUsesOnlyNewTransactionAndSchemaContracts`, `TransactionSinkConvertsTypedMutationsAndCommitsAtomically` | PARTIAL: `release-closure-20260725-source-contract-r1` archives the exact filesystem-mutation owner inventory, but a public-entry-to-writer call-path map remains missing |
 | 2 | PARTIAL | model, recovery, compaction, tombstone and concurrency tests including `CommitFaultMatrixReopensAndPreservesOnlyDurableOutcomes` and `RandomStrictDependencyCyclesNeverCommitEveryParticipant` | PARTIAL: r5 and sanitizer artifacts exist, but every-boundary crash and serializability-stress artifacts do not |
-| 3 | COMPLETE | Manifest publication through `VersionSet::ApplyEdit`; `CoordinatorPublishesSchemaOnlyThroughManifest`, `PublicationFaultMatrixCleansUnmanifestedSstAndSidecarOutputs` | PARTIAL: no archived publish/delete bypass scan |
+| 3 | COMPLETE | Manifest publication through `VersionSet::ApplyEdit`; `CoordinatorPublishesSchemaOnlyThroughManifest`, `PublicationFaultMatrixCleansUnmanifestedSstAndSidecarOutputs` | PROVEN for static ownership by `release-closure-20260725-source-contract-r1`: five `ApplyEdit` owners and all direct-delete owners are exact fail-closed inventories; the six persistent-delete owners are the reviewed semantic subset |
 | 4 | COMPLETE | database-format, Manifest, SST and Blob decoders; `CoordinatorRejectsUnknownPersistentFormatVersion`, `VersionSetRejectsUnframedManifestAsCorruption` | PARTIAL: no diagnostic-code/message stability corpus |
 | 5 | COMPLETE | public autocommit facade and T-Cypher DML; `ExecuteTcypherCreateCommitsExistenceAndPropertyAtomically` | PARTIAL: r3 covers finite workloads rather than the full public contract matrix |
-| 6 | COMPLETE | strict reservations in `CommitStrict`/`StorageShard`; write-skew, half-open interval, prepared-read and dependency-cycle tests | MISSING: no archived serializability checker/stress artifact |
-| 7 | COMPLETE | visible prefix and pinned immutable snapshots; `PinsImmutableMemtableGenerationAcrossWritesAndFlush`, `RetainedScheduledQueryStreamIsCancelledAfterDatabaseDestruction` | PARTIAL: r3 HTAP run does not archive concurrent snapshot-vs-ingestion oracle evidence |
+| 6 | COMPLETE | strict reservations in `CommitStrict`/`StorageShard`; write-skew, half-open interval, prepared-read and dependency-cycle tests | PROVEN at deterministic focused scale by r10; production serializability stress remains missing |
+| 7 | COMPLETE | visible prefix and pinned immutable snapshots; `PinsImmutableMemtableGenerationAcrossWritesAndFlush`, `RetainedScheduledQueryStreamIsCancelledAfterDatabaseDestruction` | PROVEN for functional pinned/frozen/session behavior by r10; production concurrent snapshot-vs-ingestion distributions remain missing |
 
 HTAP verification strategy §16 is `PARTIAL`. Model, transaction, crash,
 compaction, deterministic serializability, transaction measurement and final
 sanitizer sources are archived. Production-scale durability-boundary coverage,
-multi-shard scaling, nonzero conflict-abort rate, visible-prefix stalls and
-write amplification remain release evidence gaps.
+multi-shard scaling, production-scale conflict/stall distributions and write
+amplification remain release evidence gaps.
 
-`results/release-closure-20260723-htap-correctness-final` binds a
-format-1 schema-3 `htap-balanced` benchmark artifact to the current source and
-a `-j1` 16/16 focused corpus for serializability/reservations, visible-prefix
-ordering, immutable MemTable pinning, commit faults, flush/compaction, reopen
-and the independent oracle. The benchmark artifact is accepted by the offline
-strict reader and records prepare, decision, decision-fsync and visible-prefix
-measurement distributions; deterministic conflict-abort and stall paths are
-archived by the focused tests. It remains non-release evidence because a
-production conflict-abort workload is absent; the final matrices and
-fault/oracle aggregate are archived under
-`results/release-closure-20260723-final-matrix/`.
+`results/release-closure-20260725-htap-functional-r10` is a self-contained
+format-1 focused root with the current test binary and a `-j1` 36/36 corpus
+for serializability/reservations, visible-prefix ordering, immutable MemTable
+pinning, commit faults, the unified fault campaign, flush/compaction, reopen and
+independent oracles. Its
+ledger and manifest bindings pass the directory-level verifier. It remains
+non-release evidence because production-scale conflict/serializability,
+visible-prefix stall, all-boundary crash and multi-shard stress artifacts are
+absent. A real CI HTAP artifact at
+`results/goal-current-smoke/3898450af52a42e4bcc831bce8aab92b8b5ea0be9d4075a408311c01dcf17f27`
+records 102 started transactions, 101 commits, one strict conflict abort, 101
+nonzero visible-prefix waits and nonzero analytical/commit/flush/compaction/
+point-read/statistics CPU grants. The self-contained archived checkpoint is the
+normal/ASAN/UBSAN/TSAN 916/916 matrix under
+`results/release-closure-20260725-final-matrix-r10/`; the latest dirty working
+tree additionally passes 928/928 in all four modes but is not a release root.
 
 ### HTAP resource-scheduling completion definition
 
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
-| 1 | COMPLETE | maintenance/query morsels, commit PREPARE/install, public reads/snapshots, recovery, and the real close body use typed shared admission; `CloseRunsTheRealProtocolAsTypedShutdownWork`, point-read nested-progress, recovery-thread/counter, and cross-shard critical tests | MISSING: archived all-class production admission artifact |
+| 1 | COMPLETE | maintenance/query morsels, commit PREPARE/install, public reads/snapshots, recovery, and the real close body use typed shared admission; `scheduler-saturation` covers every work class | PROVEN at CI scale; production-scale admission artifact remains open |
 | 2 | COMPLETE | commit completion grant and critical `IoGovernor` reservation; `CommitAdmissionUsesComponentOwnedFramedLogBytes`, `BlobCommitAdmissionBudgetsProtectedBlobWrites` | PROVEN for the two commit durability boundaries by r5 prepare/decision artifacts |
-| 3 | PARTIAL | `Flush`, `CompactWithClass`, index/stats scheduling, Blob GC and `QueryRuntimeState::ScheduleAndWait`; queued/running registry plus cooperative cancellation safe points; focused admission/cancellation tests | MISSING: per-class production grant/queue and production-scale contention artifact |
+| 3 | PARTIAL | `Flush`, `CompactWithClass`, index/stats scheduling, Blob GC and `QueryRuntimeState::ScheduleAndWait`; queued/running registry plus cooperative cancellation safe points; all 13 queue/service/grant labels are active in the CI saturation artifact | MISSING: production-scale contention artifact |
 | 4 | PARTIAL | `ResourceGovernor` separately tracks total and noncritical-pool usage, `IoGovernor`, `QueryMemoryAccount`, spill files; atomic reserve/release and critical/shared-pool tests | MISSING: hierarchical-budget/emergency-reserve property artifact |
 | 5 | PARTIAL | `PressureController::Update`, `AdmitQuery`, pressure actions; pressure transition/write-stall tests | MISSING: end-to-end hysteresis, deadline and stall-cause artifact |
 | 6 | PARTIAL | commit obtains completion resources before PREPARE; commit admission/fault tests | MISSING: starvation/property proof across every prepared completion branch |
 | 7 | PARTIAL | `CacheManager`; `BypassesFirstScanAndProtectsPinnedSnapshotHandles` | MISSING: hot-point versus sequential-scan release comparison |
 | 8 | COMPLETE | scheme C quiesces admission, safely cancels/drains lazy streams, drains accepted session/commit/read work, cancels queued/running optional maintenance with task-scoped tokens, preserves urgent/correctness-critical work, checkpoints, and tears down idempotently; exact safe-boundary/publication-fence tests plus real Blob-GC close/reopen verification | PROVEN by `release-closure-20260723-maintenance-cancellation`; production-scale stress remains row 11 |
-| 9 | COMPLETE | WAL/decision/Manifest/Blob/SST recovery plus `ReopenReconstructsIndexAndStatsMaintenanceQueue`, typed recovery accounting, shutdown-checkpoint fault recovery, and partial Blob relocation reopen verification | PROVEN for the current implementation by the focused shutdown/reopen log and 849-test matrices; broader crash-boundary corpus remains an HTAP correctness release gate |
+| 9 | COMPLETE | WAL/decision/Manifest/Blob/SST recovery plus `ReopenReconstructsIndexAndStatsMaintenanceQueue`, typed recovery accounting, shutdown-checkpoint fault recovery, and partial Blob relocation reopen verification | PROVEN for the current implementation by the focused shutdown/reopen log and current 916-test matrices; broader crash-boundary corpus remains an HTAP correctness release gate |
 | 10 | PARTIAL | scheduler/resource/pressure metrics and `DatabaseExportsSchedulerResourceAndPressureMetrics` | MISSING: complete tail/stall/cache/read-amplification cause artifact |
-| 11 | PARTIAL | component scheduler/pressure/cache tests, r5 faults and final sanitizer artifact | MISSING: deterministic fairness/deadline and production-scale HTAP stress corpus |
-| 12 | COMPLETE | transaction production sources have no direct `std::thread`; PREPARE/install, public point reads, recovery and shutdown use the shared service | MISSING: refreshed archived production static/call-site gate |
-| 13 | PARTIAL | concentrated resource/shutdown/maintenance 48/48 and frozen normal/ASAN/UBSAN/TSAN 886/886 matrices with hashes/logs/exact commands | PARTIAL: fairness/deadline, production-scale HTAP stress, and per-class resource artifacts remain open |
+| 11 | PARTIAL | component scheduler/pressure/cache tests plus exact 4:2:2:1 fairness, EDF and deadline-miss CI artifact | MISSING: production-scale HTAP stress corpus |
+| 12 | COMPLETE | transaction/storage/Blob/index/statistics/database production sources have no direct `std::thread`, `std::jthread` or `std::async`; PREPARE/install, public point reads, recovery and shutdown use the shared service | PROVEN at current-source focused scale by `release-closure-20260725-production-thread-gate-r1`; production scheduler distributions remain row 13 |
+| 13 | PARTIAL | concentrated resource/shutdown/maintenance, current 57/57 focused evidence, latest dirty-working-tree normal/ASAN/UBSAN/TSAN 928/928 matrix and strict all-class saturation artifact | PARTIAL: production-scale distributions remain open |
 
 Resource verification strategy §20 is `PARTIAL`, with structural acceptance
-§20.6 `MISSING`. Virtual-clock weighted fairness/aging/deadlines, allocation and
+§20.6 covered at focused scale. Virtual-clock weighted fairness/aging/deadlines, allocation and
 disk/temp-space failures, all-class concurrent HTAP workload, scan-resistance,
 commit latency under analytical saturation, no-bypass proof, and production-
 scale fairness/resource evidence have not been produced.
 
-`results/release-closure-20260723-htap-resource-final` adds a
-current-HEAD format-1 hashed `-j1` 35/35 focused corpus covering production
-entry points, scheduler ownership, per-SST nonzero admission,
-rejection-before-I/O, release, cancellation, recovery and shutdown. Its
-manifest passes `cedar_evidence_verify`. Production-scale weighted-fairness,
-deadline lateness, per-class queue/grant telemetry and analytical-saturation
-distributions remain open.
+`results/release-closure-20260725-resource-functional-r10` retains a current-source
+`-j1` 57/57 focused corpus for production entry points, scheduler ownership,
+per-SST nonzero admission, rejection-before-I/O, release, cancellation,
+recovery, shutdown, exact saturated fairness, EDF, a real worker-saturated
+deadline miss and all 13 queue/service/grant labels. Its binary, focused log,
+manifest, and ledger are self-contained and pass the current directory-level
+verifier. Production-scale concurrent HTAP distributions remain open.
 
 ### T-Cypher completion definition
 
@@ -504,8 +529,8 @@ distributions remain open.
 | 8 | COMPLETE | `VectorExpand` and interval intersection; endpoint visibility/range tests | PARTIAL: r3 graph run covers only one-hop behavior |
 | 9 | PARTIAL | variable path frontier, TRAIL, spill and cancellation tests | MISSING: resource-limit/disk-failure release artifact |
 | 10 | COMPLETE | `TransactionSink::Submit`; atomic CREATE/SET/DELETE tests | PARTIAL: no full temporal DML corpus artifact |
-| 11 | PARTIAL | memory/spill/backpressure/cancellation tests | MISSING: disk-full/spill-corruption and all-stage cancellation corpus |
-| 12 | PARTIAL | reopen/pinning/Blob mechanisms and range/change reopen oracle | MISSING: one query corpus across MemTable/Frozen/SST/compaction/reopen/relocation |
+| 11 | PARTIAL | memory/spill/backpressure/cancellation tests plus typed ENOSPC and checksum-corruption campaigns through the real `QuerySpillFile` boundary | PROVEN at CI fault-campaign scale for cleanup/reopen/durable-value verification; MISSING: production disk pressure and all-stage cancellation corpus |
+| 12 | COMPLETE | `TcypherCorpusMatchesAcrossMemtableFrozenSstCompactionBlobRelocationAndReopen` runs one Blob-bearing corpus through active MemTable, a query snapshot pinned across the frozen handoff, one/many live VersionSet SSTs, repeated flushes, explicit compaction with increased input/output counters and reduced live-file count, reopen, real nonzero Blob relocation and reopen-after-relocation | PROVEN at focused scale by the self-contained r10 lifecycle root; production concurrency and disk pressure remain rows 6 and 11 |
 | 13 | PARTIAL | EXPLAIN ANALYZE serializers/counters and focused tests | MISSING: supported point/range/change/Expand/join/spill counter artifact matrix |
 | 14 | COMPLETE | old Cypher API/Record/fallback sources removed | PROVEN by `release-closure-20260723-clean-break-scan`; retained fallback terms are approved base-scan/value fallbacks, not an old executor |
 | 15 | PARTIAL | cross-design tests and sanitizer matrices | PARTIAL: resource/index/observability rows remain open |
@@ -516,81 +541,125 @@ path return deterministic `NotSupported` and are covered respectively by
 `MixedChangePathHasAnExactUnsupportedContract` and
 `VariableRelationshipPropertyHasAnExactUnsupportedContract`.
 
-T-Cypher verification strategy §23 is `PARTIAL`; §23.9 end-to-end corpus is
-`MISSING`. The existing r3 point/range/graph artifacts do not cover combined
-valid/system scopes, change, historical DML, temporal aggregates, bounded mixed
-paths, STRICT sessions, joins/spill, concurrent snapshots or the full EXPLAIN
-ANALYZE support matrix.
+T-Cypher verification strategy §23 is `PARTIAL`; §23.9 production end-to-end
+corpus is `MISSING`. The current focused root covers supported point/range/
+change, historical DML, temporal aggregates, bounded mixed paths, joins/spill,
+cancellation and EXPLAIN ANALYZE, but no single production-scale corpus carries
+those shapes across concurrent snapshots and sustained disk pressure.
 
-`results/release-closure-20260723-tcypher-final` adds a frozen-HEAD
-format-1 hashed `-j1` 27/27 support artifact for point/range/change,
-fixed/variable/mixed Expand, joins, spill, TRAIL and EXPLAIN ANALYZE. Its
-manifest passes `cedar_evidence_verify` and retains the two approved
-`NotSupported` exclusions explicitly. The final sanitizer matrix and
-production-scale concurrent snapshot/disk-failure corpus remain open.
+`results/release-closure-20260725-tcypher-functional-r10` retains a current-source `-j1`
+416/416 support log for point/range/change, fixed/variable/mixed Expand, joins,
+spill, TRAIL, EXPLAIN ANALYZE and the unified typed spill-fault campaign, with
+the two approved `NotSupported`
+exclusions recorded explicitly. Its binary, focused log, manifest, and ledger
+are self-contained and pass the current directory-level verifier.
+Production-scale concurrent-snapshot and disk-failure corpus remain open.
 
 ### Temporal index/CBO completion definition
 
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
-| 1 | COMPLETE | Manifest-owned `IndexCatalog`; `IndexCatalogValidatesSchemaAndPublishesLifecycleEdits` | MISSING: catalog lifecycle release artifact |
+| 1 | COMPLETE | Manifest-owned `IndexCatalog`; `IndexCatalogValidatesSchemaAndPublishesLifecycleEdits` | PROVEN at focused scale by the self-contained r10 catalog/lifecycle root |
 | 2 | COMPLETE | `BuildIndexSidecar`, verified reader, snapshot pins/source identity; sidecar round-trip/source mismatch tests | PARTIAL: r5 sidecar rename covers only publication fault |
 | 3 | COMPLETE | optional candidates plus base validation; incomplete-coverage fallback tests; deterministic randomized `RandomizedIndexCandidatesMatchFullEventScanAcrossBitemporalQueries` compares indexed/hybrid execution with an independent full-event scan across out-of-order/equal valid times, PUT/DELETE/restore, two immutable sources, a MemTable delta source, point/range/valid-change/system-change/combined scopes, and different batch capacities | MISSING: archive the randomized completeness run as a durable release artifact |
 | 4 | COMPLETE | postings store PUT candidate facts, not authoritative `valid_to`; successor-delete regression | PARTIAL: archive static format proof |
 | 5 | COMPLETE | `IndexCanonicalKind::kBlobHash`, CSI3 sidecars, Blob-aware `MemtableDeltaIndex`, source validation, pre-admitted predicate hash probes and legacy graph Blob materialization; `BlobEqualityUsesHashWithoutRangeOrPrefixExposure`, `BlobEqualityUsesHashAlongsideInlineValue`, bounded-work `RangeCursorNeverReturnsBlobHashPostings`, `TcypherIndexedBlobEqualityAvoidsPredicatePayloadReads`, `TcypherBlobEqualityAvoidsPredicatePayloadReadsWithoutIndex`, `TcypherBlobStringRangePredicatesMaterializePayload`, fixed-Expand predicate/projection plus legacy fallback coverage, and `AdvisoryLargeInDeltaCursorSeeksAcrossKeyQuanta` | MISSING: archive a current release artifact proving nonzero sidecar and MemTable hash candidates, zero predicate payload reads, one demanded projection read, range/prefix exclusion/materialization, bounded range work and probe-memory admission |
-| 6 | COMPLETE | hybrid/fallback and corrupt-sidecar repair tests | MISSING: hybrid/corruption release artifact |
-| 7 | COMPLETE | atomic `DropIndex()` removes the definition and all fragments in one generation-CAS Manifest edit; the durable `next_index_id` high-water mark prevents replacement-ID/sidecar collision; indeterminate publication gates mutations until reopen; pinned pre-drop snapshots defer old-sidecar reclamation; build/repair/drop scheduling and focused lifecycle tests include `DropIndexRetiresSidecarsAfterPinnedVersionSnapshotsRelease`, `IndexDropIndeterminateGatesMutationsAndReopenCleansSidecar`, and `RepairsCorruptIndexSidecarWhileQueriesRemainCorrect`; corrupt-sidecar health events are deduplicated by pinned catalog/source identity and schedule typed index-build repair while the detecting query falls back to the base scan | PARTIAL: drop/reopen/pinned retirement/ID non-reuse and automatic corrupt-fragment repair are functionally complete, but no archived compaction + repair/drop + reopen lifecycle artifact exists |
+| 6 | COMPLETE | hybrid/fallback and corrupt-sidecar repair tests | PROVEN at focused scale by r10, including real corrupt-sidecar repair and nonzero index candidates |
+| 7 | COMPLETE | atomic `DropIndex()` removes the definition and all fragments in one generation-CAS Manifest edit; the durable `next_index_id` high-water mark prevents replacement-ID/sidecar collision; indeterminate publication gates mutations until reopen; pinned pre-drop snapshots defer old-sidecar reclamation; `IndexLifecycleCompactsRepairsDropsAndReopensWithoutIdReuse` combines compaction with verified input/output counter growth and live-file reduction, real sidecar corruption/repair, drop, reopen and replacement-ID monotonicity | PROVEN at focused scale by the self-contained r10 lifecycle artifact; production-scale lifecycle stress remains row 14 |
 | 8 | COMPLETE | `StatsSnapshotStore`; pinned live-fragment and restart/corruption tests | MISSING: stats generation/rebuild artifact |
-| 9 | PARTIAL | access-path and graph-order cost decisions plus budget tests | MISSING: real base/index/hybrid/intersection/graph-order execution artifact |
-| 10 | PARTIAL | `CostVector` and runtime counters include resource dimensions | MISSING: interval-fragmentation, Blob avoidance and nonzero resource-cost evidence |
+| 9 | COMPLETE at CI scale | access-path and graph-order cost decisions plus budget tests; `index-path-matrix` fail-closes unless base, index, hybrid, intersection, index-first and adjacency-first all execute through the public API | PROVEN by the strict CI artifact and current focused root; MISSING: production-scale plan-choice distributions |
+| 10 | COMPLETE at CI scale | `CostVector` and runtime counters include resource dimensions; the strict path matrix emits nonzero candidates and interactive scheduler service/CPU grants | PROVEN for CI path activity; MISSING: production interval-fragmentation, Blob-avoidance and resource-cost distributions |
 | 11 | COMPLETE | `RuntimeFeedbackStore` implements two-observation confidence, 64-epoch decay, 256-epoch expiry and LRU separation; `RuntimeFeedbackKey` includes plan shape, schema epochs, Manifest/catalog generation and statistics snapshot ID; `PopulateTcypherContext` pins coherent VersionSet/catalog/statistics identities; `DurableLogTest.RuntimeFeedbackCompletionStaysInPinnedCatalogAndStatsGeneration` proves an old stream publishes only to its pinned generation while a concurrent drop/rebuild/flush query observes a distinct fresh key | PARTIAL: the functional concurrent generation-isolation regression is complete; a plan-choice feedback release artifact remains missing |
-| 12 | COMPLETE | index build and statistics merge use typed, cancellable, one-source-SST-per-task scheduling with component-owned checked estimates for nonzero peak memory, source/sidecar reads, temporary/output bytes, artifact/checkpoint/Manifest writes, descriptors, CPU and metadata operations; admission rejection precedes source I/O or mutation, pressure is refreshed between SSTs with typed `MaintenanceBackoff`, grants are released before the next source, and stats publication uses expected-generation copy-project checkpointing | PARTIAL: functional per-SST admission, accounting, yielding and publication are complete with focused regressions and the 873/873 normal matrix; a durable release artifact proving nonzero dimensions, rejection-before-I/O, between-SST pressure behavior and exact release remains missing |
+| 12 | COMPLETE | index build and statistics merge use typed, cancellable, one-source-SST-per-task scheduling with component-owned checked estimates for nonzero peak memory, source/sidecar reads, temporary/output bytes, artifact/checkpoint/Manifest writes, descriptors, CPU and metadata operations; admission rejection precedes source I/O or mutation, pressure is refreshed between SSTs with typed `MaintenanceBackoff`, grants are released before the next source, and stats publication uses expected-generation copy-project checkpointing | PARTIAL: focused regressions and the real indexed CI artifact prove nonzero CPU/memory/read/temp/write/descriptor/metadata dimensions; production-scale distributions remain missing |
 | 13 | COMPLETE | old index sources and switches are deleted | PROVEN by the zero-hit old-source and external-name scans in `release-closure-20260723-clean-break-scan` |
 | 14 | PARTIAL | focused cross-design tests and final sanitizer artifact | PARTIAL: preceding design requirements remain open |
 
 Temporal-index verification strategy §23 is `PARTIAL`; randomized candidate
-completeness and Blob-hash equality have focused implementation tests but no
-durable release artifact. Existing r3 `index-equality` and
-`graph-one-hop` profiles cannot close the gate: their total
-`index_candidates` is zero and they contain no graph-order field. Required
-artifacts must prove the intended physical candidate actually executed. The
+completeness and Blob-hash equality have focused implementation tests. The real
+CI path artifact at
+`results/goal-current-index-path-matrix/4fbeaaa84d1eea590c3a01fa58bf231f682b4372b2bc0e6727278393f3d742ae`
+passes strict reading, executes all six required physical choices and records
+nonzero `cedar_index_candidate_rows_total[all]`, interactive service and CPU
+grants. Required production artifacts must still prove plan-choice and cost
+distributions at release scale. The
 atomic-drop focused selection passes 34/34 and the subsequent fresh normal
-matrix passes 856/856, both with `-j1`; these local results do not replace the
-still-missing production release artifact; the final sanitizer matrices are
-already archived in the final-matrix root.
+matrix is superseded for local verification by the current 928/928 matrix;
+these dirty-working-tree results do not replace the still-missing production
+release artifact. The latest self-contained archived matrix remains r10 at
+916/916.
 
-`results/release-closure-20260723-temporal-index-cbo-final` adds a
-current-HEAD format-1 hashed `-j1` 26/26 focused artifact for
-base/hybrid/intersection/graph-order execution, random candidate completeness,
-Blob-hash bounds, automatic repair/drop/reopen, feedback generation isolation
-and per-SST resource accounting. Its manifest passes `cedar_evidence_verify`.
-It remains non-release evidence until production access-path/resource
-distributions and the final matrices are attached.
+`results/release-closure-20260725-temporal-index-cbo-functional-r10` retains a
+current-source `-j1` 57/57 focused log for real base/index/hybrid/intersection/
+index-first/adjacency-first execution, random candidate completeness, nonzero
+candidate/activity gates, Blob-hash bounds, automatic
+repair/drop/reopen, feedback generation isolation and per-SST resource
+accounting. Its binary, focused log, manifest, and ledger are self-contained
+and pass the current directory-level verifier. Production access-path/resource
+distributions remain open.
 
 ### Observability/benchmark completion definition
 
 | # | Implementation | Precise code and test evidence | Release/artifact status |
 |---|---|---|---|
-| 1 | PARTIAL | `MetricRegistry`, `TelemetryAggregator`, registered database/scheduler metrics; bounded-label tests | MISSING: complete production-subsystem instrumentation inventory |
+| 1 | COMPLETE | `ProductionMetricDefinitions`, `MetricRegistry`, `TelemetryAggregator`, registered database/scheduler/storage/index metrics, bounded-label schema audit and database registration regression | PROVEN at focused scale; production workload activity remains row 3 |
 | 2 | COMPLETE | `CEDAR_MINIMAL_INSTRUMENTATION` builds `tier0-minimal`; manifests persist `instrumentation_profile_id`; `CompareInstrumentationOverheadRuns`, `WriteInstrumentationOverheadGate`, and `cedar_bench_pair --instrumentation-overhead` require a `tier0-minimal` baseline and `tier0-tier1` candidate, at least five valid pairs, and apply direct 2% median throughput / 5% p99 thresholds; `results/release-closure-20260723-observability-final` binds ten frozen schema-3 strict-reader-validated paired runs | PARTIAL: the tiny smoke gate is `NOISY` and is not release evidence; archive an approved production-scale paired comparison |
-| 3 | COMPLETE structure, PARTIAL execution | runtime profile contains row/interval/page/Blob/index/memory/spill/scheduler dimensions and focused tests | MISSING: target workloads with required counters exercised and validated |
+| 3 | COMPLETE structure, PARTIAL production execution | runtime profile contains row/interval/page/Blob/index/memory/spill/scheduler dimensions; fail-closed activity validation covers the corrected HTAP, maintenance, scheduler-saturation and index-path CI campaigns | PROVEN across real CI campaigns; PARTIAL: production-scale target workloads and distributions remain missing |
 | 4 | COMPLETE | `BenchmarkRunManifest`, writer/reader strict provenance tests | PROVEN for r3/r5 current-format artifacts |
 | 5 | COMPLETE | deterministic Cedar-TG and independent small oracle tests | PROVEN for r3 dataset hashes/checksums |
-| 6 | COMPLETE at CI scale | public workload driver and r3 10-workload × 5 corpus | PROVEN only for CI scale, not workstation/release/paper |
+| 6 | COMPLETE at CI scale | public workload driver and r3 10-workload × 5 corpus | PROVEN only for CI scale, not workstation/release |
 | 7 | COMPLETE | open-loop arrival scheduler and intended/admitted/start/completion timestamps | PROVEN for r3 open-loop summaries |
 | 8 | COMPLETE | explicit `BenchmarkRatio` numerator/denominator serialization tests | PROVEN for r3 summaries |
-| 9 | PARTIAL | paired comparator/orchestrator and incompatibility/minimum-pair tests; ten schema-3 strict-reader-validated frozen pairs | MISSING: approved production baseline/candidate `regression-gate.json` and `paired-runs.json` (current gate is `NOISY`) |
-| 10 | PARTIAL | r5 faults, scheduler/HTAP aggregate 80/80, benchmark aggregate 28/28 and frozen four-matrix evidence | MISSING: production-scale scheduler/HTAP stress gate before performance aggregation |
+| 9 | PARTIAL | paired comparator plus fail-closed production orchestrator, binary-provenance preflight, strict resume validation and incompatibility/minimum-pair tests; ten schema-3 strict-reader-validated frozen pairs | MISSING: approved production baseline/candidate `regression-gate.json` and `paired-runs.json` (current gate is `NOISY`) |
+| 10 | PARTIAL | `cedar_production_campaign` freezes 65 paired workload/cache commands and ten typed fault/reopen commands, archives the three executables, and seals protocol/report files with SHA-256; r5 faults, scheduler/HTAP aggregate 80/80, benchmark aggregate 28/28 and frozen four-matrix evidence exist | MISSING: execute the runner on qualified workstation/stress hosts and archive the production-scale scheduler/HTAP stress gate before performance aggregation |
 | 11 | PARTIAL | artifact IDs and provenance exist for current CI/fault numbers | MISSING: published-claim-to-artifact ledger and release comparison |
-| 12 | PARTIAL | old source/claims are deleted or rejected in the dirty worktree | MISSING: archived duplicate-stats/trace/performance-claim scan |
+| 12 | PARTIAL | `release-closure-20260725-source-contract-r1` archives 16 retained `*Stats` views and zero direct `printf/fprintf`, ad-hoc latency/cache metric identifiers, or unbound numeric performance claims, with nine fail-closed negative fixtures plus stranded-output recovery coverage | PARTIAL: the static Stats/direct-diagnostic/performance-claim scan is proven; a separate duplicate-trace inventory remains missing |
 | 13 | COMPLETE | offline report reader/regenerator and focused test | PROVEN: artifact `release-closure-20260723-report-regeneration` records 63/63 PASS and deterministic two-pass report hashes |
 | 14 | MISSING | this matrix still contains functional and evidence gaps | MISSING until all preceding design rows close or receive explicit approved exclusions |
 
-Observability verification strategy status: metric schema `PARTIAL`,
+Observability verification strategy status: metric schema `COMPLETE`,
 instrumentation overhead implementation `COMPLETE` but production evidence
 `PARTIAL`, reproducibility `COMPLETE` for the accepted r3/cache/fault-r5
 corpora, correctness/fault `PARTIAL`, and regression harness `PARTIAL`. The
 tiny smoke's minimal binary does not replace an approved production baseline.
+
+`results/release-closure-20260725-observability-functional-r10` is a self-contained
+format-1 focused root with the current test binary and a `-j1` 58/58 corpus
+covering bounded metric registration/export, telemetry, database
+resource/storage metrics, the real maintenance/scheduler/index campaigns,
+benchmark-artifact provenance, byte-bound executable snapshots, namespaced-cgroup
+fail-close and paired-gate contracts. Its ledger and
+manifest bindings pass the directory-level verifier.
+It deliberately remains `release_gate_eligible: false`: the versioned census
+and CI target-workload activity gate are closed, while an approved
+production-scale paired baseline and production workload distributions remain
+missing.
+
+The production gate itself is now executable rather than documentary. Named
+workstation/stress profiles use exact dataset and worker contracts; runtime
+resource probes fail closed when process CPU/RAM limits or storage
+device/filesystem provenance are incomplete; production artifacts require a
+clean full source commit; and paired mode requires an externally approved,
+distinct baseline SHA-256. The self-contained negative root
+`results/release-closure-20260725-production-preflight-r2` proves rejection
+occurs before result-root creation for undersized workstation/stress hosts,
+missing approval, and a locally approved baseline on an undersized host. This
+does not replace positive production-scale executions or the missing approved
+baseline.
+
+`cedar_production_campaign` now makes that external execution deterministic and
+resumable: it covers all 13 public workloads across all five cache modes with
+at least five approved-baseline/candidate pairs, then all ten typed fault/reopen
+scenarios. It archives immutable baseline, candidate, and pair-runner bytes and,
+on Linux, executes the already verified snapshot descriptors. Resume requires
+the exact configuration and binary hashes, reconstructs both paired sample sets
+from strict-read child artifacts, reruns the regression comparison, and checks
+production identity/metrics plus offline report regeneration. The campaign
+index binds full argv, approval, complete host provenance, child paths and child
+hashes. The scoped campaign `SHA256SUMS` excludes database directories but binds
+the executables, configuration, states, gates, and artifact protocol/report
+files; write completion is followed by a safe exact-path-set readback. No
+qualified-host campaign has run yet, so all production evidence rows remain
+`PARTIAL` or `MISSING` as stated above.
 
 ### Observability release and paper gates
 
@@ -603,18 +672,18 @@ tiny smoke's minimal binary does not replace an approved production baseline.
 | Release cold/warm/durable/HTAP | PARTIAL | r3 is durable/cold and cache corpus covers one workload; no workstation/release profile |
 | Release five repetitions | PARTIAL | r3 has five candidate repetitions per CI workload; no approved paired production comparison |
 | Release checksums/stalls/telemetry/claims | PARTIAL | verification checksums exist; headline stall/drop and claims-link gates do not |
-| Paper external workload | MISSING | adapter/fixture tests exist, but no externally derived LDBC artifact/license/transform provenance |
-| Paper baseline notes/raw plots/CIs/failures/limitations | MISSING | no approved baseline, paper-scale corpus, plotting dataset/scripts or paper limitation package |
+| Paper/external LDBC | APPROVED-OOS | excluded from the active functional production-release goal by user direction |
 
 ## Required Final Evidence
 
 The active goal is complete only after this matrix is updated with artifact IDs
 and command output for every row, or an explicit approved out-of-scope decision
 with a tested failure contract. Normal, ASAN, UBSAN, TSAN, fault/recovery/oracle,
-scheduler/HTAP stress, benchmark reproducibility and paper profiles must all be
-run with `-j1`. No old runtime, external V2/Vn name, or legacy disk-layout
+scheduler/HTAP stress and benchmark reproducibility must all be run with `-j1`.
+No old runtime, external V2/Vn name, or legacy disk-layout
 compatibility path may be reintroduced.
 
-External baseline, LDBC and execution-host requirements are specified in
+Baseline and execution-host requirements are specified in
 `docs/superpowers/plans/2026-07-23-cedar-external-release-evidence-contract.md`;
 smoke, ablation and removed-runtime substitutes are explicitly prohibited.
+External LDBC and paper evidence are outside this active goal.

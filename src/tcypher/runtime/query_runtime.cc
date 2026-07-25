@@ -1274,9 +1274,11 @@ class QueryRuntimeState : public std::enable_shared_from_this<QueryRuntimeState>
       return SetTerminal(Status::QueryCancelled(
           "physical runtime", "query cancelled before dispatch"));
     }
-    const auto submitted = execution_service->Submit(
+    const auto work_class =
         context.options.workload_class == TcypherWorkloadClass::kAnalytical
-            ? WorkClass::kAnalyticalQuery : WorkClass::kInteractiveQuery,
+            ? WorkClass::kAnalyticalQuery : WorkClass::kInteractiveQuery;
+    const auto submitted = execution_service->Submit(
+        WorkTaskRequest{work_class, ResourceProfile{0, 0, 0, 0, 1}},
         [self = shared_from_this()] {
           const Status status = self->RunMorsel();
           if (self->context.options.execution_stats) {

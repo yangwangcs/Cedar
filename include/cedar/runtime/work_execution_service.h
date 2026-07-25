@@ -5,6 +5,7 @@
 #define CEDAR_RUNTIME_WORK_EXECUTION_SERVICE_H_
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -65,17 +66,23 @@ struct WorkExecutionStats {
   std::array<uint64_t, 13> rejected{};
   std::array<uint64_t, 13> cancelled{};
   std::array<uint64_t, 13> completed{};
+  std::array<uint64_t, 13> deadline_misses{};
+  std::array<ResourceProfile, 13> admitted_resources{};
 };
 
 class WorkExecutionService {
  public:
   explicit WorkExecutionService(WorkScheduler* scheduler, size_t worker_count = 1)
-      : scheduler_(scheduler), worker_count_(worker_count == 0 ? 1 : worker_count) {}
+      : scheduler_(scheduler), worker_count_(worker_count == 0 ? 1 : worker_count) {
+    InitializeQueueDelayHistograms();
+  }
   explicit WorkExecutionService(std::shared_ptr<WorkScheduler> scheduler,
                                 size_t worker_count = 1)
       : owned_scheduler_(std::move(scheduler)),
         scheduler_(owned_scheduler_.get()),
-        worker_count_(worker_count == 0 ? 1 : worker_count) {}
+        worker_count_(worker_count == 0 ? 1 : worker_count) {
+    InitializeQueueDelayHistograms();
+  }
   ~WorkExecutionService();
 
   WorkExecutionService(const WorkExecutionService&) = delete;
@@ -110,6 +117,8 @@ class WorkExecutionService {
     std::optional<ResourceLease> grant;
     bool preemptible = false;
     std::shared_ptr<WorkCancellation> cancellation;
+    ResourceProfile resources;
+    std::chrono::steady_clock::time_point enqueued_at;
   };
 
   struct RunningTask {
@@ -123,6 +132,9 @@ class WorkExecutionService {
       const std::shared_ptr<work_execution_internal::TaskCompletion>& completion,
       Status status);
   void ExecuteTask(RegisteredTask task);
+  void RecordDispatchLocked(const ScheduledExecutableWork& work,
+                            const RegisteredTask& task);
+  void InitializeQueueDelayHistograms();
   void WorkerLoop();
 
   std::shared_ptr<WorkScheduler> owned_scheduler_;
@@ -140,6 +152,10 @@ class WorkExecutionService {
   std::shared_ptr<ResourceGovernorExtension> resource_extension_;
   WorkExecutionStats stats_;
   WorkExecutionStats exported_stats_;
+  std::array<Histogram, 13> queue_delay_histograms_;
+  std::array<Histogram, 13> exported_queue_delay_histograms_;
+  std::array<Histogram, 13> service_histograms_;
+  std::array<Histogram, 13> exported_service_histograms_;
   std::array<bool, 13> preemptible_cancellation_requested_{};
   uint64_t outstanding_tasks_ = 0;
   bool running_ = false;

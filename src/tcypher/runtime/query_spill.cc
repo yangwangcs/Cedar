@@ -785,11 +785,14 @@ QuerySpillFile::QuerySpillFile(std::string directory,
                                std::shared_ptr<QueryCancellation> cancellation,
                                std::shared_ptr<ResourceGovernorExtension> resources,
                                std::shared_ptr<QueryMemoryAccount> memory_account,
-                               std::function<void(uint64_t)> write_observer)
+                               std::function<void(uint64_t)> write_observer,
+                               std::function<Status(QuerySpillFaultPoint)>
+                                   fault_injector)
     : directory_(std::move(directory)), cancellation_(std::move(cancellation)),
       resources_(std::move(resources)),
       memory_account_(std::move(memory_account)),
-      write_observer_(std::move(write_observer)) {}
+      write_observer_(std::move(write_observer)),
+      fault_injector_(std::move(fault_injector)) {}
 
 QuerySpillFile::~QuerySpillFile() { Close().IgnoreError(); }
 
@@ -843,6 +846,14 @@ Status QuerySpillFile::Open() {
   std::string header;
   PutU32(&header, kSpillMagic);
   PutU32(&header, kSpillVersion);
+  if (fault_injector_) {
+    const Status injected =
+        fault_injector_(QuerySpillFaultPoint::kBeforeHeaderWrite);
+    if (!injected.ok()) {
+      Close().IgnoreError();
+      return injected;
+    }
+  }
   const Status written = WriteAll(fd_, header, path_);
   if (!written.ok()) {
     Close().IgnoreError();
@@ -877,6 +888,11 @@ Status QuerySpillFile::AppendRecord(const std::string& payload) {
   std::string header;
   PutU32(&header, static_cast<uint32_t>(payload.size()));
   PutU32(&header, crc32c::Value(payload.data(), payload.size()));
+  if (fault_injector_) {
+    const Status injected =
+        fault_injector_(QuerySpillFaultPoint::kBeforeRecordWrite);
+    if (!injected.ok()) return injected;
+  }
   Status written = WriteAll(fd_, header, path_);
   if (written.ok()) written = WriteAll(fd_, payload, path_);
   if (!written.ok()) return written;

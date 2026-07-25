@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 #include "cedar/benchmark/artifact_writer.h"
+#include "cedar/benchmark/artifact_reader.h"
+#include "cedar/benchmark/build_provenance.h"
 #include "cedar/benchmark/cedar_tg.h"
 #include "cedar/benchmark/environment_probe.h"
 #include "cedar/benchmark/fault_campaign.h"
@@ -29,6 +31,8 @@
 #include "cedar/blob/blob_store.h"
 #include "cedar/db/cedar_database.h"
 #include "cedar/observability/histogram.h"
+#include "cedar/observability/instrumentation_profile.h"
+#include "cedar/transaction/database_format.h"
 
 #ifndef CEDAR_BENCH_VARIANT
 #define CEDAR_BENCH_VARIANT "default"
@@ -37,11 +41,10 @@
 namespace {
 
 bool ParseUnsigned(const char* text, uint64_t* value) {
-  if (text == nullptr || value == nullptr || *text == '\0') return false;
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(text, &end, 10);
-  if (end == nullptr || *end != '\0') return false;
-  *value = static_cast<uint64_t>(parsed);
+  if (text == nullptr || value == nullptr) return false;
+  const auto parsed = cedar::ParseBenchmarkUnsigned(text);
+  if (!parsed.ok()) return false;
+  *value = parsed.ValueOrDie();
   return true;
 }
 
@@ -172,6 +175,15 @@ cedar::Status RunBackgroundMaintenance(cedar::CedarDatabase* database) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--build-provenance") {
+    std::cout << "source_commit=" << CEDAR_SOURCE_COMMIT
+              << " source_dirty=" << (CEDAR_SOURCE_DIRTY != 0 ? 1 : 0)
+              << " instrumentation_profile_id="
+              << cedar::CedarInstrumentationProfileId()
+              << " database_format_version="
+              << cedar::kCedarDatabaseFormatVersion << "\n";
+    return 0;
+  }
   const bool ldbc_mode = argc >= 2 && std::string(argv[1]) == "--ldbc";
   const bool profile_mode = argc >= 2 && std::string(argv[1]) == "--profile";
   const bool fault_mode = argc >= 2 && std::string(argv[1]) == "--fault";
@@ -182,11 +194,11 @@ int main(int argc, char** argv) {
       (ldbc_mode && (argc < 5 || argc > 8))) {
     std::cerr << "usage: cedar_bench <seed> <vertices> <edges> <results-root> "
                  "[point-read|bitemporal-point-read|analytical-vertex-count|valid-time-range|graph-one-hop|blob-projection|"
-                 "durable-ingestion|index-equality|maintenance-cycle|htap-balanced|recovery]\n"
+                 "durable-ingestion|index-equality|index-path-matrix|scheduler-saturation|maintenance-cycle|htap-balanced|recovery]\n"
                  "       cedar_bench --profile <ci|workstation|paper|stress> "
                  "<seed> <results-root> [workload] [cache-mode]\n"
                  "       cedar_bench --fault "
-                 "<commit_after_prepare_durable|commit_after_decision_durable|manifest_after_rename|blob_index_partial_write|sst_after_rename|sidecar_after_rename|blob_gc_after_manifest_rename|accepted_work_shutdown> "
+                 "<commit_after_prepare_durable|commit_after_decision_durable|manifest_after_rename|blob_index_partial_write|sst_after_rename|sidecar_after_rename|blob_gc_after_manifest_rename|accepted_work_shutdown|tcypher_spill_disk_full|tcypher_spill_corruption> "
                  "<ci|workstation|paper|stress> <seed> <results-root>\n"
                  "       cedar_bench --ldbc <nodes.csv> <edges.csv> <results-root> "
                  "[workload] [source-license] [transform-policy]\n";
@@ -206,6 +218,7 @@ int main(int argc, char** argv) {
   cedar::BenchmarkCacheMode cache_mode =
       cedar::BenchmarkCacheMode::kColdProcessAndDatabase;
   std::optional<cedar::BenchmarkFaultScenario> fault_scenario;
+  std::optional<cedar::BenchmarkProfile> named_profile;
   if (ldbc_mode) {
     size_t next_argument = 5;
     if (argc > static_cast<int>(next_argument)) {
@@ -275,13 +288,13 @@ int main(int argc, char** argv) {
       std::cerr << "profile seed must be an unsigned integer\n";
       return 2;
     }
-    const cedar::BenchmarkProfile profile = cedar::ResolveBenchmarkProfile(
+    named_profile = cedar::ResolveBenchmarkProfile(
         parsed_profile.ValueOrDie(), config.seed);
-    config = profile.dataset;
-    dataset_profile_id = profile.name;
-    default_workers = profile.worker_count;
-    default_queue_capacity = profile.queue_capacity;
-    default_arrival_interval_ns = profile.arrival_interval_ns;
+    config = named_profile->dataset;
+    dataset_profile_id = named_profile->name;
+    default_workers = named_profile->worker_count;
+    default_queue_capacity = named_profile->queue_capacity;
+    default_arrival_interval_ns = named_profile->arrival_interval_ns;
     results_root = argv[results_argument];
     if (profile_mode && argc >= 6) workload_name = argv[5];
     if (profile_mode && argc == 7) {
@@ -292,12 +305,6 @@ int main(int argc, char** argv) {
       }
       cache_mode = parsed_cache.ValueOrDie();
     }
-    const auto dataset_or = cedar::GenerateCedarTg(config);
-    if (!dataset_or.ok()) {
-      std::cerr << dataset_or.status().ToString() << "\n";
-      return 1;
-    }
-    dataset = dataset_or.ValueOrDie();
   } else {
     if (!ParseUnsigned(argv[1], &config.seed) || !ParseUnsigned(argv[2], &config.vertex_count) ||
         !ParseUnsigned(argv[3], &config.edge_count)) {
@@ -314,6 +321,47 @@ int main(int argc, char** argv) {
       }
       cache_mode = parsed_cache.ValueOrDie();
     }
+    const auto dataset_or = cedar::GenerateCedarTg(config);
+    if (!dataset_or.ok()) {
+      std::cerr << dataset_or.status().ToString() << "\n";
+      return 1;
+    }
+    dataset = dataset_or.ValueOrDie();
+  }
+  uint64_t configured_workers = default_workers;
+  if (const char* worker_text = std::getenv("CEDAR_BENCH_WORKERS");
+      worker_text != nullptr && *worker_text != '\0') {
+    if (!ParseUnsigned(worker_text, &configured_workers) ||
+        configured_workers == 0 || configured_workers > 1024) {
+      std::cerr << "CEDAR_BENCH_WORKERS must be an integer in [1,1024]\n";
+      return 2;
+    }
+  }
+  const cedar::BenchmarkEnvironment environment =
+      cedar::ProbeBenchmarkEnvironment(results_root);
+  if (named_profile.has_value() &&
+      (named_profile->scale == cedar::BenchmarkScaleProfile::kWorkstation ||
+       named_profile->scale == cedar::BenchmarkScaleProfile::kStress)) {
+    cedar::BenchmarkBinaryProvenance provenance;
+    provenance.source_commit = CEDAR_SOURCE_COMMIT;
+    provenance.source_dirty = CEDAR_SOURCE_DIRTY != 0;
+    provenance.instrumentation_profile_id =
+        cedar::CedarInstrumentationProfileId();
+    provenance.database_format_version = cedar::kCedarDatabaseFormatVersion;
+    const cedar::Status build_preflight =
+        cedar::ValidateProductionBenchmarkBinaryProvenance(provenance);
+    if (!build_preflight.ok()) {
+      std::cerr << build_preflight.ToString() << "\n";
+      return 2;
+    }
+    const cedar::Status preflight = cedar::ValidateProductionBenchmarkPreflight(
+        *named_profile, config, configured_workers, environment);
+    if (!preflight.ok()) {
+      std::cerr << preflight.ToString() << "\n";
+      return 1;
+    }
+  }
+  if (named_profile.has_value()) {
     const auto dataset_or = cedar::GenerateCedarTg(config);
     if (!dataset_or.ok()) {
       std::cerr << dataset_or.status().ToString() << "\n";
@@ -375,15 +423,6 @@ int main(int argc, char** argv) {
             cedar::BenchmarkFaultScenarioName(*fault_scenario)
       : std::string("cedar-public-") +
             cedar::BenchmarkWorkloadFamilyName(workload_family);
-  uint64_t configured_workers = default_workers;
-  if (const char* worker_text = std::getenv("CEDAR_BENCH_WORKERS");
-      worker_text != nullptr && *worker_text != '\0') {
-    if (!ParseUnsigned(worker_text, &configured_workers) || configured_workers == 0 ||
-        configured_workers > 1024) {
-      std::cerr << "CEDAR_BENCH_WORKERS must be an integer in [1,1024]\n";
-      return 2;
-    }
-  }
   manifest.workload_hash = cedar::BlobHashHex(cedar::Blake3Hash(
       manifest.workload_id + ":interval_ns=" +
       std::to_string(default_arrival_interval_ns) + ":workers=" +
@@ -404,10 +443,12 @@ int main(int argc, char** argv) {
   manifest.execution_nonce = std::to_string(static_cast<uint64_t>(::getpid())) + "-" +
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
       "-" + CEDAR_BENCH_VARIANT;
-  const cedar::BenchmarkEnvironment environment = cedar::ProbeBenchmarkEnvironment();
   manifest.os_kernel = environment.os_kernel;
   manifest.cpu_model_and_count = environment.cpu_model_and_count;
   manifest.compiler_and_flags = environment.compiler_and_flags;
+  manifest.memory_limit_bytes = environment.memory_limit_bytes;
+  manifest.storage_device_and_filesystem =
+      environment.storage_device_and_filesystem;
 
   cedar::BenchmarkArtifactSummary summary;
   summary.measurement_mode =
@@ -536,6 +577,8 @@ int main(int argc, char** argv) {
           fault_config.vertex_property_schema_epoch =
               vertex_property.schema_epoch;
           fault_config.valid_time = config.valid_time_span + 1000;
+          fault_config.spill_directory =
+              (std::filesystem::path(run_directory) / "spill-fault").string();
           fault_config.reopen_database = [&] {
             return std::make_unique<cedar::CedarDatabase>(
                 database_path, 2, config.seed, BenchmarkTelemetryConfig());
@@ -640,7 +683,9 @@ int main(int argc, char** argv) {
         summary.metrics_artifact_present = !metrics_json.empty();
         summary.traces_json = traces_json;
         summary.traces_artifact_present = !traces_json.empty();
-        return cedar::Status::OK();
+        return cedar::ValidateProductionMetricArtifact(
+            metrics_json,
+            cedar::ProductionMetricActivityRequirements(workload_family));
     }
     return cedar::Status::InvalidArgument("cedar_bench", "unknown benchmark phase");
   });

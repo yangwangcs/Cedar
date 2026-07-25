@@ -54,7 +54,13 @@ std::string ExportMetricsJson(const MetricRegistry& registry) {
     output << "{\"name\":\"" << EscapeJson(metric.definition.name)
            << "\",\"type\":\"histogram\",\"unit\":\""
            << EscapeJson(metric.definition.unit) << "\",\"schema_version\":"
-           << metric.definition.schema_version << ",\"values\":{";
+           << metric.definition.schema_version << ",\"bounds\":[";
+    for (size_t bound = 0; bound < metric.definition.histogram_bounds.size();
+         ++bound) {
+      if (bound != 0) output << ',';
+      output << metric.definition.histogram_bounds[bound];
+    }
+    output << "],\"values\":{";
     size_t value_index = 0;
     for (const auto& value : metric.values) {
       if (value_index++ != 0) output << ',';

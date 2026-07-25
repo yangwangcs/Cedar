@@ -17,6 +17,11 @@
 
 namespace cedar {
 
+enum class QuerySpillFaultPoint : uint8_t {
+  kBeforeHeaderWrite = 1,
+  kBeforeRecordWrite = 2,
+};
+
 // Ephemeral, query-private ResultBatch storage. Spill files are never added to
 // a Manifest and are removed when their query state is destroyed.
 class QuerySpillFile {
@@ -25,7 +30,9 @@ class QuerySpillFile {
                           std::shared_ptr<QueryCancellation> cancellation = nullptr,
                           std::shared_ptr<ResourceGovernorExtension> resources = nullptr,
                           std::shared_ptr<QueryMemoryAccount> memory_account = nullptr,
-                          std::function<void(uint64_t)> write_observer = {});
+                          std::function<void(uint64_t)> write_observer = {},
+                          std::function<Status(QuerySpillFaultPoint)>
+                              fault_injector = {});
   ~QuerySpillFile();
 
   QuerySpillFile(const QuerySpillFile&) = delete;
@@ -52,6 +59,7 @@ class QuerySpillFile {
   std::shared_ptr<ResourceGovernorExtension> resources_;
   std::shared_ptr<QueryMemoryAccount> memory_account_;
   std::function<void(uint64_t)> write_observer_;
+  std::function<Status(QuerySpillFaultPoint)> fault_injector_;
   ResourceLease descriptor_lease_;
   ResourceLease temporary_lease_;
   std::string path_;

@@ -3,6 +3,7 @@
 
 #include "cedar/db/cedar_database.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <utility>
@@ -10,10 +11,54 @@
 #include "cedar/columnar/page_format.h"
 #include "cedar/observability/metric_exporter.h"
 #include "cedar/observability/instrumentation_profile.h"
+#include "cedar/observability/production_metric_schema.h"
 
 namespace cedar {
 
 struct QueryStorageMetricSink {
+  struct QuerySnapshot {
+    std::array<uint64_t, 2> started{};
+    std::array<uint64_t, 2> completed{};
+    std::array<uint64_t, 2> result_rows{};
+    std::array<uint64_t, 2> operator_output_rows{};
+    uint64_t index_candidate_rows = 0;
+  };
+
+  static void Add(std::atomic<uint64_t>* target, uint64_t value) {
+    uint64_t current = target->load(std::memory_order_relaxed);
+    while (true) {
+      const uint64_t next = value > UINT64_MAX - current
+          ? UINT64_MAX
+          : current + value;
+      if (target->compare_exchange_weak(current, next,
+                                        std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+
+  void RecordQueryStart(bool analytical) {
+    Add(&started[analytical ? 1 : 0], 1);
+  }
+
+  void RecordQueryFinish(bool analytical, const TcypherExecutionStats& stats,
+                         uint64_t streamed_rows, const Status& status) {
+    if (!status.ok()) return;
+    const size_t slot = analytical ? 1 : 0;
+    Add(&completed[slot], 1);
+    Add(&result_rows[slot], streamed_rows);
+    uint64_t output_rows = 0;
+    if (stats.operator_runtime) {
+      for (const auto& entry : stats.operator_runtime->Snapshot()) {
+        output_rows = entry.second.output_rows > UINT64_MAX - output_rows
+            ? UINT64_MAX
+            : output_rows + entry.second.output_rows;
+      }
+    }
+    Add(&operator_output_rows[slot], std::max(output_rows, streamed_rows));
+    Add(&index_candidate_rows, stats.index_candidate_entity_count);
+  }
+
   void Record(const TcypherExecutionStats& stats) {
     page_bytes_decoded.fetch_add(stats.page_bytes_decoded,
                                  std::memory_order_relaxed);
@@ -42,11 +87,32 @@ struct QueryStorageMetricSink {
     return stats;
   }
 
+  QuerySnapshot QueryMetrics() const {
+    QuerySnapshot snapshot;
+    for (size_t slot = 0; slot < snapshot.started.size(); ++slot) {
+      snapshot.started[slot] = started[slot].load(std::memory_order_relaxed);
+      snapshot.completed[slot] =
+          completed[slot].load(std::memory_order_relaxed);
+      snapshot.result_rows[slot] =
+          result_rows[slot].load(std::memory_order_relaxed);
+      snapshot.operator_output_rows[slot] =
+          operator_output_rows[slot].load(std::memory_order_relaxed);
+    }
+    snapshot.index_candidate_rows =
+        index_candidate_rows.load(std::memory_order_relaxed);
+    return snapshot;
+  }
+
   std::atomic<uint64_t> page_bytes_decoded{0};
   std::atomic<uint64_t> page_bytes_skipped{0};
   std::atomic<uint64_t> sst_physical_bytes_read{0};
   std::atomic<uint64_t> page_decode_count{0};
   std::atomic<uint64_t> page_decode_latency_ns{0};
+  std::array<std::atomic<uint64_t>, 2> started{};
+  std::array<std::atomic<uint64_t>, 2> completed{};
+  std::array<std::atomic<uint64_t>, 2> result_rows{};
+  std::array<std::atomic<uint64_t>, 2> operator_output_rows{};
+  std::atomic<uint64_t> index_candidate_rows{0};
 };
 
 namespace {
@@ -111,6 +177,7 @@ uint64_t LogicalResultBytes(const ResultBatch& result) {
 }
 
 void RegisterDatabaseMetrics(MetricRegistry* metrics) {
+  RegisterProductionMetricSchema(metrics).IgnoreError();
   const auto counter = [metrics](const char* name) {
     metrics->Register(MetricDefinition{name, MetricType::kCounter, "count", 1}).IgnoreError();
   };
@@ -333,12 +400,13 @@ class TracedResultStream final : public QueryResultStream {
       std::string name, uint64_t start_time_ns,
       std::shared_ptr<RuntimeFeedbackStore> runtime_feedback,
       std::shared_ptr<TcypherExecutionStats> execution_stats,
-      std::shared_ptr<QueryStorageMetricSink> storage_metrics)
+      std::shared_ptr<QueryStorageMetricSink> storage_metrics,
+      bool analytical)
       : input_(std::move(input)), telemetry_(std::move(telemetry)),
         trace_(trace), name_(std::move(name)), start_time_ns_(start_time_ns),
         runtime_feedback_(std::move(runtime_feedback)),
         execution_stats_(std::move(execution_stats)),
-        storage_metrics_(std::move(storage_metrics)) {}
+        storage_metrics_(std::move(storage_metrics)), analytical_(analytical) {}
 
   ~TracedResultStream() override {
     if (!finished_ && telemetry_) {
@@ -358,6 +426,9 @@ class TracedResultStream final : public QueryResultStream {
     const Status next = input_->Next(batch);
     if (!kCedarMinimalInstrumentation && next.ok() && batch != nullptr &&
         execution_stats_) {
+      result_rows_ = batch->batch().row_count() > UINT64_MAX - result_rows_
+          ? UINT64_MAX
+          : result_rows_ + batch->batch().row_count();
       const uint64_t logical_bytes = LogicalResultBytes(*batch);
       execution_stats_->logical_result_bytes =
           logical_bytes > UINT64_MAX - execution_stats_->logical_result_bytes
@@ -383,6 +454,8 @@ class TracedResultStream final : public QueryResultStream {
     finished_ = true;
     if (!kCedarMinimalInstrumentation && storage_metrics_ && execution_stats_) {
       storage_metrics_->Record(*execution_stats_);
+      storage_metrics_->RecordQueryFinish(analytical_, *execution_stats_,
+                                          result_rows_, status);
     }
     if (status.ok() && runtime_feedback_ && execution_stats_ &&
         execution_stats_->runtime_feedback_key.has_value() &&
@@ -425,6 +498,8 @@ class TracedResultStream final : public QueryResultStream {
   std::shared_ptr<RuntimeFeedbackStore> runtime_feedback_;
   std::shared_ptr<TcypherExecutionStats> execution_stats_;
   std::shared_ptr<QueryStorageMetricSink> storage_metrics_;
+  bool analytical_ = false;
+  uint64_t result_rows_ = 0;
   bool finished_ = false;
 };
 
@@ -713,6 +788,11 @@ StatusOr<std::unique_ptr<QueryResultStream>> CedarDatabase::ExecuteTcypherWithSe
     const TcypherQueryOptions& options) {
   auto entered = lifecycle_->TryEnter(DatabaseOperationClass::kQuery);
   if (!entered.ok()) return entered.status();
+  const bool analytical =
+      options.workload_class == TcypherWorkloadClass::kAnalytical;
+  if (!kCedarMinimalInstrumentation) {
+    query_storage_metrics_->RecordQueryStart(analytical);
+  }
   const uint64_t trace_start = MonotonicTimeNs();
   TraceContext trace = telemetry_->NewTrace(TracePriority::kNormal);
   const std::string trace_name =
@@ -728,7 +808,6 @@ StatusOr<std::unique_ptr<QueryResultStream>> CedarDatabase::ExecuteTcypherWithSe
     return fail(Status::QueryCancelled(
         "query admission", "query was cancelled before admission"));
   }
-  const bool analytical = options.workload_class == TcypherWorkloadClass::kAnalytical;
   const Status pressure_admission = coordinator_.AdmitQuery(analytical);
   if (!pressure_admission.ok()) return fail(pressure_admission);
 
@@ -749,7 +828,7 @@ StatusOr<std::unique_ptr<QueryResultStream>> CedarDatabase::ExecuteTcypherWithSe
         hard_limit / 2, hard_limit);
   }
   const ResourceProfile query_reservation{
-      admitted_options.memory_account->hard_limit_bytes(), 0, 0, 0, 1};
+      admitted_options.memory_account->hard_limit_bytes()};
   auto acquired = resource_governor_.Acquire(query_reservation);
   if (!acquired.ok()) return fail(acquired.status());
   admitted_options.spill_resource_extensions =
@@ -773,7 +852,7 @@ StatusOr<std::unique_ptr<QueryResultStream>> CedarDatabase::ExecuteTcypherWithSe
           std::move(acquired).ConsumeValueOrDie());
   std::unique_ptr<QueryResultStream> traced = std::make_unique<TracedResultStream>(
       std::move(accounted), telemetry_, trace, trace_name, trace_start,
-      runtime_feedback_, execution_stats, query_storage_metrics_);
+      runtime_feedback_, execution_stats, query_storage_metrics_, analytical);
   return std::unique_ptr<QueryResultStream>(
       std::make_unique<LifecycleTrackedResultStream>(
           std::move(traced), registration.ConsumeValueOrDie()));
@@ -958,6 +1037,8 @@ void CedarDatabase::RefreshTelemetry() const {
 void CedarDatabase::PublishStorageSnapshot() const {
   const StorageRuntimeStats current = coordinator_.storage_stats();
   const StorageRuntimeStats query_current = query_storage_metrics_->Snapshot();
+  const QueryStorageMetricSink::QuerySnapshot query_metrics =
+      query_storage_metrics_->QueryMetrics();
   std::lock_guard<std::mutex> lock(storage_metrics_mutex_);
   const auto publish = [this](const char* metric, const char* label,
                               uint64_t current_value,
@@ -1012,6 +1093,30 @@ void CedarDatabase::PublishStorageSnapshot() const {
   publish("cedar_storage_bytes", "blob_gc_rewritten",
           current.blob_gc_rewritten_bytes,
           &published_storage_stats_.blob_gc_rewritten_bytes);
+  publish("cedar_pages_decoded_total", "all",
+          current.page_decode_count,
+          &published_production_storage_stats_.page_decode_count);
+  publish("cedar_page_decode_bytes_total", "all",
+          current.page_bytes_decoded,
+          &published_production_storage_stats_.page_bytes_decoded);
+  publish("cedar_blob_payload_reads_total", "all",
+          current.blob_lookup_count,
+          &published_production_storage_stats_.blob_lookup_count);
+  publish("cedar_blob_payload_bytes_total", "all",
+          current.blob_payload_bytes_read,
+          &published_production_storage_stats_.blob_payload_bytes_read);
+  publish("cedar_blob_hash_lookup_total", "all",
+          current.blob_lookup_count,
+          &published_production_blob_hash_lookups_);
+  publish("cedar_compaction_input_bytes_total", "all",
+          current.compaction_input_bytes,
+          &published_production_storage_stats_.compaction_input_bytes);
+  publish("cedar_compaction_output_bytes_total", "all",
+          current.compaction_output_bytes,
+          &published_production_storage_stats_.compaction_output_bytes);
+  publish("cedar_blob_gc_relocated_bytes_total", "all",
+          current.blob_gc_rewritten_bytes,
+          &published_production_storage_stats_.blob_gc_rewritten_bytes);
   static constexpr const char* kPageTypeLabels[kPageTypeMetricSlots] = {
       "unused", "entity_id", "target_id", "valid_from", "commit_seq",
       "operation", "value_class", "typed_value", "blob_ref", "edge_id",
@@ -1025,6 +1130,12 @@ void CedarDatabase::PublishStorageSnapshot() const {
             &published_storage_stats_.page_stored_bytes_written[slot]);
   }
   const CacheStats cache = cache_manager_.stats();
+  metrics_.SetGauge("cedar_cache_resident_peak_bytes", "all",
+                    cache.peak_resident_bytes).IgnoreError();
+  metrics_.SetGauge("cedar_compaction_buffer_peak_bytes", "all",
+                    current.compaction_peak_buffered_bytes).IgnoreError();
+  metrics_.SetGauge("cedar_compaction_buffer_peak_events", "all",
+                    current.compaction_peak_buffered_events).IgnoreError();
   static constexpr const char* kCacheKindLabels[kCacheKindCount] = {
       "metadata", "page", "blob_location", "blob_value"};
   for (size_t kind = 0; kind < kCacheKindCount; ++kind) {
@@ -1050,5 +1161,22 @@ void CedarDatabase::PublishStorageSnapshot() const {
   publish("cedar_storage_latency_ns", "page_decode",
           query_current.page_decode_latency_ns,
           &published_query_storage_stats_.page_decode_latency_ns);
+  static constexpr std::array<const char*, 2> kQueryClassLabels = {
+      "interactive", "analytical"};
+  for (size_t slot = 0; slot < kQueryClassLabels.size(); ++slot) {
+    publish("cedar_query_started_total", kQueryClassLabels[slot],
+            query_metrics.started[slot], &published_query_started_[slot]);
+    publish("cedar_query_completed_total", kQueryClassLabels[slot],
+            query_metrics.completed[slot], &published_query_completed_[slot]);
+    publish("cedar_query_result_rows_total", kQueryClassLabels[slot],
+            query_metrics.result_rows[slot],
+            &published_query_result_rows_[slot]);
+    publish("cedar_operator_output_rows_total", "all",
+            query_metrics.operator_output_rows[slot],
+            &published_operator_output_rows_[slot]);
+  }
+  publish("cedar_index_candidate_rows_total", "all",
+          query_metrics.index_candidate_rows,
+          &published_index_candidate_rows_);
 }
 }  // namespace cedar

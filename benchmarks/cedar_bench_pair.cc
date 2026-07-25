@@ -15,11 +15,16 @@
 #include <vector>
 
 #include "cedar/benchmark/artifact_reader.h"
+#include "cedar/benchmark/environment_probe.h"
+#include "cedar/benchmark/profile.h"
 #include "cedar/benchmark/regression_compare.h"
 #include "cedar/benchmark/regression_gate.h"
+#include "cedar/benchmark/workload_driver.h"
 #include "cedar/blob/blob_store.h"
 #include "cedar/core/status.h"
 #include "cedar/observability/instrumentation_profile.h"
+
+extern char** environ;
 
 namespace {
 
@@ -31,20 +36,11 @@ using cedar::Status;
 using cedar::StatusOr;
 
 bool ParseUnsigned(const char* text, uint64_t* value) {
-  if (text == nullptr || value == nullptr || *text == '\0') return false;
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(text, &end, 10);
-  if (end == nullptr || *end != '\0') return false;
-  *value = static_cast<uint64_t>(parsed);
+  if (text == nullptr || value == nullptr) return false;
+  const auto parsed = cedar::ParseBenchmarkUnsigned(text);
+  if (!parsed.ok()) return false;
+  *value = parsed.ValueOrDie();
   return true;
-}
-
-std::string ReadBinaryHash(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) return {};
-  const std::string bytes((std::istreambuf_iterator<char>(input)),
-                          std::istreambuf_iterator<char>());
-  return cedar::BlobHashHex(cedar::Blake3Hash(bytes));
 }
 
 std::string JsonEscape(const std::string& value) {
@@ -106,17 +102,36 @@ Status WriteAtomically(const std::string& path, const std::string& content) {
   return Status::OK();
 }
 
-Status RunChild(const std::string& binary, uint64_t seed, uint64_t vertices,
+Status RunChild(const cedar::BenchmarkExecutableSnapshot& snapshot,
+                uint64_t seed, uint64_t vertices,
                 uint64_t edges, const std::string& results_root,
                 const std::string& workload) {
+  Status verified = cedar::VerifyBenchmarkExecutableSnapshot(snapshot);
+  if (!verified.ok()) return verified;
   const pid_t child = ::fork();
   if (child < 0) return Status::IOError("cedar_bench_pair", std::strerror(errno));
   if (child == 0) {
     const std::string seed_text = std::to_string(seed);
     const std::string vertices_text = std::to_string(vertices);
     const std::string edges_text = std::to_string(edges);
-    ::execl(binary.c_str(), binary.c_str(), seed_text.c_str(), vertices_text.c_str(),
-            edges_text.c_str(), results_root.c_str(), workload.c_str(), nullptr);
+#if defined(__linux__)
+    const int executable_fd = ::dup(snapshot.fd());
+    if (executable_fd < 0) _exit(127);
+    const std::string executable =
+        "/proc/self/fd/" + std::to_string(executable_fd);
+    char* const arguments[] = {
+        const_cast<char*>(executable.c_str()),
+        const_cast<char*>(seed_text.c_str()),
+        const_cast<char*>(vertices_text.c_str()),
+        const_cast<char*>(edges_text.c_str()),
+        const_cast<char*>(results_root.c_str()),
+        const_cast<char*>(workload.c_str()), nullptr};
+    ::fexecve(executable_fd, arguments, environ);
+#else
+    ::execl(snapshot.path.c_str(), snapshot.path.c_str(), seed_text.c_str(),
+            vertices_text.c_str(), edges_text.c_str(), results_root.c_str(),
+            workload.c_str(), nullptr);
+#endif
     _exit(127);
   }
   int status = 0;
@@ -124,9 +139,111 @@ Status RunChild(const std::string& binary, uint64_t seed, uint64_t vertices,
     if (errno != EINTR) return Status::IOError("cedar_bench_pair", std::strerror(errno));
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    return Status::IOError(binary, "benchmark child exited unsuccessfully");
+    return Status::IOError(snapshot.path,
+                           "benchmark child exited unsuccessfully");
   }
-  return Status::OK();
+  return cedar::VerifyBenchmarkExecutableSnapshot(snapshot);
+}
+
+Status RunProfileChild(const cedar::BenchmarkExecutableSnapshot& snapshot,
+                       const std::string& profile, uint64_t seed,
+                       const std::string& results_root,
+                       const std::string& workload,
+                       const std::string& cache_mode) {
+  Status verified = cedar::VerifyBenchmarkExecutableSnapshot(snapshot);
+  if (!verified.ok()) return verified;
+  const pid_t child = ::fork();
+  if (child < 0) {
+    return Status::IOError("cedar_bench_pair", std::strerror(errno));
+  }
+  if (child == 0) {
+    const std::string seed_text = std::to_string(seed);
+#if defined(__linux__)
+    const int executable_fd = ::dup(snapshot.fd());
+    if (executable_fd < 0) _exit(127);
+    const std::string executable =
+        "/proc/self/fd/" + std::to_string(executable_fd);
+    char* const arguments[] = {
+        const_cast<char*>(executable.c_str()),
+        const_cast<char*>("--profile"),
+        const_cast<char*>(profile.c_str()),
+        const_cast<char*>(seed_text.c_str()),
+        const_cast<char*>(results_root.c_str()),
+        const_cast<char*>(workload.c_str()),
+        const_cast<char*>(cache_mode.c_str()), nullptr};
+    ::fexecve(executable_fd, arguments, environ);
+#else
+    ::execl(snapshot.path.c_str(), snapshot.path.c_str(), "--profile",
+            profile.c_str(), seed_text.c_str(), results_root.c_str(),
+            workload.c_str(), cache_mode.c_str(), nullptr);
+#endif
+    _exit(127);
+  }
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR) {
+      return Status::IOError("cedar_bench_pair", std::strerror(errno));
+    }
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    return Status::IOError(snapshot.path,
+                           "benchmark child exited unsuccessfully");
+  }
+  return cedar::VerifyBenchmarkExecutableSnapshot(snapshot);
+}
+
+cedar::BenchmarkBaselineApproval ReadBaselineApprovalFromEnvironment() {
+  cedar::BenchmarkBaselineApproval approval;
+  const auto value = [](const char* name) -> std::string {
+    const char* text = std::getenv(name);
+    return text == nullptr ? std::string() : std::string(text);
+  };
+  approval.approved_production_baseline =
+      value("CEDAR_APPROVED_PRODUCTION_BASELINE") == "true";
+  approval.approval_id = value("CEDAR_APPROVED_BASELINE_ID");
+  approval.binary_sha256 = value("CEDAR_APPROVED_BASELINE_SHA256");
+  approval.source_commit = value("CEDAR_APPROVED_BASELINE_SOURCE_COMMIT");
+  approval.approved_by = value("CEDAR_APPROVED_BASELINE_AUTHORITY");
+  return approval;
+}
+
+std::string SerializeProductionPreflight(
+    const cedar::BenchmarkBaselineApproval& approval,
+    const cedar::BenchmarkProfile& profile,
+    const cedar::BenchmarkEnvironment& environment,
+    const std::string& baseline_hash, const std::string& candidate_hash,
+    const std::string& cache_mode, const std::string& workload) {
+  std::ostringstream output;
+  output << "{\"production_preflight_schema_version\":1"
+         << ",\"status\":\"PASS\""
+         << ",\"approved_production_baseline\":true"
+         << ",\"approval_id\":\"" << JsonEscape(approval.approval_id)
+         << "\",\"approved_by\":\"" << JsonEscape(approval.approved_by)
+         << "\",\"baseline_source_commit\":\""
+         << JsonEscape(approval.source_commit)
+         << "\",\"baseline_sha256\":\"" << baseline_hash
+         << "\",\"candidate_sha256\":\"" << candidate_hash
+         << "\",\"profile\":\"" << JsonEscape(profile.name)
+         << "\",\"dataset_vertex_count\":" << profile.dataset.vertex_count
+         << ",\"dataset_edge_count\":" << profile.dataset.edge_count
+         << ",\"dataset_property_events_per_vertex\":"
+         << profile.dataset.property_events_per_vertex
+         << ",\"worker_count\":" << profile.worker_count
+         << ",\"minimum_logical_cpu_count\":"
+         << profile.minimum_logical_cpu_count
+         << ",\"actual_logical_cpu_count\":"
+         << environment.logical_cpu_count
+         << ",\"minimum_memory_bytes\":" << profile.minimum_memory_bytes
+         << ",\"actual_memory_bytes\":" << environment.memory_limit_bytes
+         << ",\"minimum_free_storage_bytes\":"
+         << profile.minimum_free_storage_bytes
+         << ",\"actual_free_storage_bytes\":"
+         << environment.storage_free_bytes
+         << ",\"storage_device_and_filesystem\":\""
+         << JsonEscape(environment.storage_device_and_filesystem)
+         << "\",\"cache_mode\":\"" << JsonEscape(cache_mode)
+         << "\",\"workload\":\"" << JsonEscape(workload) << "\"}";
+  return output.str();
 }
 
 StatusOr<std::string> FindOnlyArtifact(const std::string& root) {
@@ -193,9 +310,13 @@ std::string ArmName(BenchmarkRunArm arm) {
   return arm == BenchmarkRunArm::kBaseline ? "baseline" : "candidate";
 }
 
-std::string SerializeRecords(const std::vector<PairRecord>& records) {
+std::string SerializeRecords(const std::vector<PairRecord>& records,
+                             uint64_t generator_seed,
+                             uint64_t order_seed) {
   std::ostringstream output;
-  output << "{\"paired_schema_version\":1,\"records\":[";
+  output << "{\"paired_schema_version\":2,\"generator_seed\":"
+         << generator_seed << ",\"order_seed\":" << order_seed
+         << ",\"records\":[";
   for (size_t index = 0; index < records.size(); ++index) {
     if (index != 0) output << ',';
     const PairRecord& record = records[index];
@@ -217,13 +338,19 @@ std::string SerializeRecords(const std::vector<PairRecord>& records) {
 int main(int argc, char** argv) {
   const bool instrumentation_overhead =
       argc >= 2 && std::string(argv[1]) == "--instrumentation-overhead";
-  const int first_argument = instrumentation_overhead ? 2 : 1;
+  const bool production_release =
+      argc >= 2 && std::string(argv[1]) == "--production-release";
+  const int first_argument =
+      (instrumentation_overhead || production_release) ? 2 : 1;
   if (argc < first_argument + 7 || argc > first_argument + 9) {
     std::cerr << "usage: cedar_bench_pair <baseline> <candidate> <seed> <vertices> "
                  "<edges> <results-root> <workload> [pair-count] [order-seed]\n";
     std::cerr << "   or: cedar_bench_pair --instrumentation-overhead <minimal-baseline> "
                  "<tier01-candidate> <seed> <vertices> <edges> <results-root> "
                  "<workload> [pair-count] [order-seed]\n";
+    std::cerr << "   or: cedar_bench_pair --production-release <approved-baseline> "
+                 "<candidate> <workstation|stress> <seed> <results-root> "
+                 "<workload> <cache-mode> [pair-count] [order-seed]\n";
     return 2;
   }
   const std::filesystem::path baseline_path =
@@ -234,20 +361,70 @@ int main(int argc, char** argv) {
     std::cerr << "baseline and candidate binaries must differ\n";
     return 2;
   }
-  const std::string baseline_hash = ReadBinaryHash(baseline_path.string());
-  const std::string candidate_hash = ReadBinaryHash(candidate_path.string());
-  if (baseline_hash.empty() || candidate_hash.empty() || baseline_hash == candidate_hash) {
+  const auto baseline_snapshot =
+      cedar::CreateBenchmarkExecutableSnapshot(baseline_path.string());
+  const auto candidate_snapshot =
+      cedar::CreateBenchmarkExecutableSnapshot(candidate_path.string());
+  if (!baseline_snapshot.ok() || !candidate_snapshot.ok()) {
+    std::cerr << (!baseline_snapshot.ok()
+                      ? baseline_snapshot.status().ToString()
+                      : candidate_snapshot.status().ToString())
+              << "\n";
+    return 2;
+  }
+  const std::string& baseline_hash = baseline_snapshot.ValueOrDie().blake3;
+  const std::string& candidate_hash = candidate_snapshot.ValueOrDie().blake3;
+  if (baseline_hash == candidate_hash) {
     std::cerr << "baseline and candidate must be readable and have distinct hashes\n";
     return 2;
   }
   uint64_t seed = 0;
   uint64_t vertices = 0;
   uint64_t edges = 0;
-  if (!ParseUnsigned(argv[first_argument + 2], &seed) ||
-      !ParseUnsigned(argv[first_argument + 3], &vertices) ||
-      !ParseUnsigned(argv[first_argument + 4], &edges)) {
-    std::cerr << "seed, vertices, and edges must be unsigned integers\n";
-    return 2;
+  std::optional<cedar::BenchmarkProfile> production_profile;
+  std::optional<cedar::BenchmarkWorkloadFamily> production_workload;
+  std::string workload;
+  std::string cache_mode;
+  std::filesystem::path root;
+  if (production_release) {
+    const auto parsed_profile = cedar::ParseBenchmarkScaleProfile(
+        argv[first_argument + 2]);
+    if (!parsed_profile.ok()) {
+      std::cerr << parsed_profile.status().ToString() << "\n";
+      return 2;
+    }
+    if (!ParseUnsigned(argv[first_argument + 3], &seed)) {
+      std::cerr << "production seed must be an unsigned integer\n";
+      return 2;
+    }
+    production_profile = cedar::ResolveBenchmarkProfile(
+        parsed_profile.ValueOrDie(), seed);
+    vertices = production_profile->dataset.vertex_count;
+    edges = production_profile->dataset.edge_count;
+    root = std::filesystem::absolute(argv[first_argument + 4]);
+    workload = argv[first_argument + 5];
+    cache_mode = argv[first_argument + 6];
+    const auto parsed_workload = cedar::ParseBenchmarkWorkloadFamily(workload);
+    if (!parsed_workload.ok()) {
+      std::cerr << parsed_workload.status().ToString() << "\n";
+      return 2;
+    }
+    production_workload = parsed_workload.ValueOrDie();
+    const auto parsed_cache = cedar::ParseBenchmarkCacheMode(cache_mode);
+    if (!parsed_cache.ok()) {
+      std::cerr << parsed_cache.status().ToString() << "\n";
+      return 2;
+    }
+    cache_mode = cedar::BenchmarkCacheModeName(parsed_cache.ValueOrDie());
+  } else {
+    if (!ParseUnsigned(argv[first_argument + 2], &seed) ||
+        !ParseUnsigned(argv[first_argument + 3], &vertices) ||
+        !ParseUnsigned(argv[first_argument + 4], &edges)) {
+      std::cerr << "seed, vertices, and edges must be unsigned integers\n";
+      return 2;
+    }
+    root = std::filesystem::absolute(argv[first_argument + 5]);
+    workload = argv[first_argument + 6];
   }
   uint64_t pair_count = 5;
   uint64_t order_seed = 1;
@@ -262,13 +439,68 @@ int main(int argc, char** argv) {
     std::cerr << "order-seed must be unsigned\n";
     return 2;
   }
-  const std::filesystem::path root =
-      std::filesystem::absolute(argv[first_argument + 5]);
+  cedar::BenchmarkBaselineApproval approval;
+  cedar::BenchmarkEnvironment production_environment;
+  std::string baseline_sha256;
+  std::string candidate_sha256;
+  if (production_release) {
+    baseline_sha256 = baseline_snapshot.ValueOrDie().sha256;
+    candidate_sha256 = candidate_snapshot.ValueOrDie().sha256;
+    approval = ReadBaselineApprovalFromEnvironment();
+    const Status approval_status = cedar::ValidateApprovedProductionBaseline(
+        approval, baseline_sha256, candidate_sha256);
+    if (!approval_status.ok()) {
+      std::cerr << approval_status.ToString() << "\n";
+      return 2;
+    }
+    const auto baseline_provenance =
+        cedar::ReadBenchmarkBinaryProvenance(baseline_snapshot.ValueOrDie());
+    const auto candidate_provenance =
+        cedar::ReadBenchmarkBinaryProvenance(candidate_snapshot.ValueOrDie());
+    if (!baseline_provenance.ok() || !candidate_provenance.ok()) {
+      std::cerr << (!baseline_provenance.ok()
+                        ? baseline_provenance.status().ToString()
+                        : candidate_provenance.status().ToString())
+                << "\n";
+      return 2;
+    }
+    const Status baseline_build =
+        cedar::ValidateProductionBenchmarkBinaryProvenance(
+            baseline_provenance.ValueOrDie(), approval.source_commit);
+    const Status candidate_build =
+        cedar::ValidateProductionBenchmarkBinaryProvenance(
+            candidate_provenance.ValueOrDie());
+    if (!baseline_build.ok() || !candidate_build.ok()) {
+      std::cerr << (!baseline_build.ok() ? baseline_build.ToString()
+                                         : candidate_build.ToString())
+                << "\n";
+      return 2;
+    }
+    production_environment = cedar::ProbeBenchmarkEnvironment(root.string());
+    const Status preflight = cedar::ValidateProductionBenchmarkPreflight(
+        *production_profile, production_profile->dataset,
+        production_profile->worker_count, production_environment);
+    if (!preflight.ok()) {
+      std::cerr << preflight.ToString() << "\n";
+      return 1;
+    }
+  }
   std::error_code error;
   std::filesystem::create_directories(root, error);
   if (error) {
     std::cerr << "unable to create results root: " << error.message() << "\n";
     return 1;
+  }
+  if (production_release) {
+    const Status preflight_artifact = WriteAtomically(
+        (root / "production-preflight.json").string(),
+        SerializeProductionPreflight(
+            approval, *production_profile, production_environment,
+            baseline_sha256, candidate_sha256, cache_mode, workload));
+    if (!preflight_artifact.ok()) {
+      std::cerr << preflight_artifact.ToString() << "\n";
+      return 1;
+    }
   }
 
   std::vector<BenchmarkRegressionSample> baseline_samples(pair_count);
@@ -293,12 +525,16 @@ int main(int argc, char** argv) {
       std::cerr << "unable to create pair directory: " << error.message() << "\n";
       return 1;
     }
-    const std::string& binary = arm == BenchmarkRunArm::kBaseline
-        ? baseline_path.string() : candidate_path.string();
+    const cedar::BenchmarkExecutableSnapshot& binary =
+        arm == BenchmarkRunArm::kBaseline
+            ? baseline_snapshot.ValueOrDie()
+            : candidate_snapshot.ValueOrDie();
     PairRecord record{pair, arm, "child-failed", arm == BenchmarkRunArm::kBaseline
                                       ? baseline_hash : candidate_hash, {}, {}, {}};
-    const Status child = RunChild(binary, seed, vertices, edges, arm_root,
-                                  argv[first_argument + 6]);
+    const Status child = production_release
+        ? RunProfileChild(binary, production_profile->name, seed, arm_root,
+                          workload, cache_mode)
+        : RunChild(binary, seed, vertices, edges, arm_root, workload);
     const auto artifact = FindOnlyArtifact(arm_root);
     if (artifact.ok()) {
       record.artifact = artifact.ValueOrDie();
@@ -313,6 +549,54 @@ int main(int argc, char** argv) {
             ? baseline_hash : candidate_hash;
         if (parsed.ValueOrDie().manifest.binary_hash != expected_hash) {
           record.status = "BINARY_PROVENANCE_MISMATCH";
+        } else if (production_release &&
+                   (parsed.ValueOrDie().manifest.dataset_profile_id !=
+                        production_profile->name ||
+                    parsed.ValueOrDie().manifest.dataset_vertex_count !=
+                        production_profile->dataset.vertex_count ||
+                    parsed.ValueOrDie().manifest.dataset_edge_count !=
+                        production_profile->dataset.edge_count ||
+                    parsed.ValueOrDie().manifest
+                            .dataset_property_events_per_vertex !=
+                        production_profile->dataset
+                            .property_events_per_vertex ||
+                    parsed.ValueOrDie().manifest.dataset_valid_time_span !=
+                        production_profile->dataset.valid_time_span ||
+                    parsed.ValueOrDie().manifest.worker_limit !=
+                        production_profile->worker_count)) {
+          record.status = "PRODUCTION_PROFILE_MISMATCH";
+        } else if (production_release &&
+                   parsed.ValueOrDie().manifest.cache_mode != cache_mode) {
+          record.status = "PRODUCTION_CACHE_MODE_MISMATCH";
+        } else if (production_release &&
+                   parsed.ValueOrDie().manifest.durability_mode != "durable") {
+          record.status = "PRODUCTION_DURABILITY_MISMATCH";
+        } else if (production_release &&
+                   parsed.ValueOrDie().manifest.source_dirty) {
+          record.status = "DIRTY_SOURCE_NOT_RELEASE_ELIGIBLE";
+        } else if (production_release &&
+                   !cedar::ValidateProductionArtifactSourceProvenance(
+                        parsed.ValueOrDie().manifest.source_commit,
+                        parsed.ValueOrDie().manifest.source_dirty).ok()) {
+          record.status = "PRODUCTION_SOURCE_COMMIT_INVALID";
+        } else if (production_release &&
+                   parsed.ValueOrDie().manifest.instrumentation_profile_id !=
+                       cedar::kInstrumentationProfileTier0Tier1) {
+          record.status = "PRODUCTION_INSTRUMENTATION_MISMATCH";
+        } else if (production_release &&
+                   arm == BenchmarkRunArm::kBaseline &&
+                   parsed.ValueOrDie().manifest.source_commit !=
+                       approval.source_commit) {
+          record.status = "BASELINE_SOURCE_COMMIT_MISMATCH";
+        } else if (production_release) {
+          const Status metric_status =
+              cedar::ValidateBenchmarkArtifactProductionMetrics(
+                  record.artifact,
+                  cedar::ProductionMetricActivityRequirements(
+                      *production_workload));
+          if (!metric_status.ok()) {
+            record.status = "PRODUCTION_METRIC_ACTIVITY_MISMATCH";
+          }
         } else if (arm == BenchmarkRunArm::kBaseline) {
           if (!have_baseline_key) { baseline_key = key; have_baseline_key = true; }
           if (baseline_profile_id.empty()) {
@@ -346,6 +630,40 @@ int main(int argc, char** argv) {
           }
           if (!child.ok()) candidate_samples[pair].verification_passed = false;
         }
+        if (production_release && arm == BenchmarkRunArm::kBaseline) {
+          if (have_baseline_key &&
+              cedar::BenchmarkBaselineKeyId(key) !=
+                  cedar::BenchmarkBaselineKeyId(baseline_key)) {
+            record.status = "BASELINE_KEY_MISMATCH";
+          } else if (!have_baseline_key) {
+            baseline_key = key;
+            have_baseline_key = true;
+          }
+          if (baseline_profile_id.empty()) {
+            baseline_profile_id = record.instrumentation_profile_id;
+          }
+          baseline_samples[pair] = SampleFor(parsed.ValueOrDie());
+        } else if (production_release) {
+          if (have_candidate_key &&
+              cedar::BenchmarkBaselineKeyId(key) !=
+                  cedar::BenchmarkBaselineKeyId(candidate_key)) {
+            record.status = "CANDIDATE_KEY_MISMATCH";
+          } else if (!have_candidate_key) {
+            candidate_key = key;
+            have_candidate_key = true;
+          }
+          if (candidate_profile_id.empty()) {
+            candidate_profile_id = record.instrumentation_profile_id;
+          }
+          candidate_samples[pair] = SampleFor(parsed.ValueOrDie());
+        }
+        if (record.status != "PASS") {
+          if (arm == BenchmarkRunArm::kBaseline) {
+            baseline_samples[pair].verification_passed = false;
+          } else {
+            candidate_samples[pair].verification_passed = false;
+          }
+        }
       } else {
         record.status = "ARTIFACT_INVALID";
       }
@@ -370,7 +688,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   const Status provenance = WriteAtomically(
-      (root / "paired-runs.json").string(), SerializeRecords(records));
+      (root / "paired-runs.json").string(),
+      SerializeRecords(records, seed, order_seed));
   if (!provenance.ok()) {
     std::cerr << provenance.ToString() << "\n";
     return 1;

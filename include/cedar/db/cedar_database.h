@@ -4,6 +4,7 @@
 #ifndef CEDAR_DB_CEDAR_DATABASE_H_
 #define CEDAR_DB_CEDAR_DATABASE_H_
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -33,6 +34,7 @@ enum class ClosePolicy : uint8_t {
 
 struct QueryStorageMetricSink;
 class BenchmarkFaultCampaignAccess;
+class BenchmarkSchedulerCampaignAccess;
 class CedarDatabaseTestAccess;
 
 // Public clean-break API. All values are typed and every write carries an
@@ -79,6 +81,7 @@ class CedarDatabase {
 
  private:
   friend class BenchmarkFaultCampaignAccess;
+  friend class BenchmarkSchedulerCampaignAccess;
   friend class CedarDatabaseTestAccess;
   void RefreshTelemetry() const;
   void PublishStorageSnapshot() const;
@@ -99,7 +102,14 @@ class CedarDatabase {
   TransactionCoordinator coordinator_;
   mutable std::mutex storage_metrics_mutex_;
   mutable StorageRuntimeStats published_storage_stats_;
+  mutable StorageRuntimeStats published_production_storage_stats_;
+  mutable uint64_t published_production_blob_hash_lookups_ = 0;
   mutable StorageRuntimeStats published_query_storage_stats_;
+  mutable std::array<uint64_t, 2> published_query_started_{};
+  mutable std::array<uint64_t, 2> published_query_completed_{};
+  mutable std::array<uint64_t, 2> published_query_result_rows_{};
+  mutable std::array<uint64_t, 2> published_operator_output_rows_{};
+  mutable uint64_t published_index_candidate_rows_ = 0;
   mutable CacheStats published_cache_stats_;
   std::function<void()> shutdown_execution_hook_;
 };

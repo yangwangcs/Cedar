@@ -11,6 +11,7 @@
 #include "cedar/benchmark/artifact_writer.h"
 #include "cedar/benchmark/cedar_tg.h"
 #include "cedar/core/status.h"
+#include "cedar/observability/metric_registry.h"
 
 namespace cedar {
 
@@ -25,6 +26,8 @@ enum class BenchmarkWorkloadFamily : uint8_t {
   kBlobProjection,
   kDurableIngestion,
   kIndexEquality,
+  kIndexPathMatrix,
+  kSchedulerSaturation,
   kMaintenanceCycle,
   kHtapBalanced,
   kRecovery,
@@ -33,6 +36,8 @@ enum class BenchmarkWorkloadFamily : uint8_t {
 const char* BenchmarkWorkloadFamilyName(BenchmarkWorkloadFamily family);
 StatusOr<BenchmarkWorkloadFamily> ParseBenchmarkWorkloadFamily(
     const std::string& name);
+std::vector<MetricActivityRequirement> ProductionMetricActivityRequirements(
+    BenchmarkWorkloadFamily family);
 std::string BenchmarkDurableIngestionValue(
     const CedarTgDataset& dataset, uint64_t vertex_id);
 std::string BenchmarkHtapIngestionValue(

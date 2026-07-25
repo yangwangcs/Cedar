@@ -139,6 +139,7 @@ StatusOr<CompactionResult> CompactSstPartition(
   }
   return CompactionResult{output_file_number + 1, output, inputs,
                             streaming_stats.peak_buffered_events,
+                            streaming_stats.peak_buffered_bytes,
                             streaming_stats.input_bytes_read,
                             streaming_stats.output_bytes_written,
                             streaming_stats.blob_payload_bytes_read,

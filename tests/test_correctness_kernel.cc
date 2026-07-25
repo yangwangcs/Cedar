@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -82,6 +83,7 @@
 #include "cedar/observability/histogram.h"
 #include "cedar/observability/instrumentation_profile.h"
 #include "cedar/observability/metric_registry.h"
+#include "cedar/observability/production_metric_schema.h"
 #include "cedar/observability/event_ring.h"
 #include "cedar/observability/metric_exporter.h"
 #include "cedar/observability/telemetry_aggregator.h"
@@ -100,6 +102,7 @@
 #include "cedar/benchmark/fault_campaign.h"
 #include "cedar/benchmark/phase_runner.h"
 #include "cedar/benchmark/profile.h"
+#include "cedar/benchmark/production_campaign.h"
 #include "cedar/benchmark/run_manifest.h"
 #include "cedar/benchmark/report_builder.h"
 #include "cedar/benchmark/regression_gate.h"
@@ -149,9 +152,18 @@ class CedarDatabaseTestAccess {
     database->coordinator_.SetMaintenanceCancellationObserverForTesting(
         std::move(observer));
   }
+  static void SetFlushExecutionHook(CedarDatabase* database,
+                                    std::function<void()> hook) {
+    database->coordinator_.SetFlushExecutionHookForTesting(std::move(hook));
+  }
   static void UseSingleWorkerExecutionService(CedarDatabase* database) {
     database->work_execution_service_ =
         std::make_shared<WorkExecutionService>(database->work_scheduler_, 1);
+  }
+  static size_t LiveSstCount(CedarDatabase* database) {
+    if (database == nullptr) return 0;
+    const auto snapshot = database->coordinator_.version_snapshot();
+    return snapshot == nullptr ? 0 : snapshot->files.size();
   }
 };
 
@@ -575,6 +587,203 @@ TEST(BenchmarkArtifactTest, ReleaseEvidenceManifestRejectsOldFormatAndNaming) {
                      std::string("release-closure-columnar").size(),
                      "cedar-v2-columnar");
   EXPECT_TRUE(ValidateReleaseEvidenceManifest(old_naming).IsNotSupportedError());
+}
+
+TEST(BenchmarkArtifactTest,
+     ReleaseEvidenceDirectoryValidatesLedgerAndManifestBindings) {
+  char pattern[] = "/tmp/cedar_release_evidence_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::filesystem::path root(pattern);
+  const std::string manifest =
+      R"json({"schema_version":1,"artifact_id":"release-evidence-test","release_gate_eligible":false,"paper_gate_eligible":false,"database_format_version":1,"clean_break_naming":true,"source":{"commit":"a0260680848483b0bd7898f7973014cc0a90761c"},"execution":{"parallelism":1,"command":"ctest -j1","passed":1,"failed":0,"binary":{"path":"binary.bin","sha256":"336c56285446586144f38937f26bfe23690950a38c47d0d334806913e37667c1"},"log":{"path":"run.log","sha256":"20042cc411f5f6adcbb425f85333dfa6e99f151520db593258403c36f39a4ab8"}},"audit":{"format_version":1,"sha256_verified":true,"provenance_bound_to_current_binary":true}})json";
+  std::ofstream(root / "manifest.json") << manifest;
+  std::ofstream(root / "binary.bin") << "binary payload\n";
+  std::ofstream(root / "run.log") << "run output\n";
+  std::ofstream(root / "SHA256SUMS")
+      << "0be8d1c748ceead4a22b47aa7ad550c9f6f0c5fe15f9e3c6aebff614c2509c39  manifest.json\n"
+      << "336c56285446586144f38937f26bfe23690950a38c47d0d334806913e37667c1  binary.bin\n"
+      << "20042cc411f5f6adcbb425f85333dfa6e99f151520db593258403c36f39a4ab8  run.log\n";
+
+  EXPECT_TRUE(VerifyReleaseEvidenceDirectory(root.string()).ok());
+  const std::filesystem::path external = root.string() + "-external";
+  ASSERT_TRUE(std::filesystem::create_directory(external));
+  std::ofstream(external / "outside.log") << "outside payload\n";
+  std::error_code symlink_error;
+  std::filesystem::create_directory_symlink(external, root / "escape",
+                                            symlink_error);
+  ASSERT_FALSE(symlink_error);
+  std::ofstream(root / "SHA256SUMS", std::ios::app)
+      << "1395b4220597197e06fd534a6d963b2319a8298d257d5dabf2999a3f83ceb862  "
+         "escape/outside.log\n";
+  EXPECT_TRUE(VerifyReleaseEvidenceDirectory(root.string()).IsCorruption());
+  std::filesystem::remove(root / "escape");
+  std::filesystem::remove_all(external);
+  std::ofstream(root / "SHA256SUMS", std::ios::trunc)
+      << "0be8d1c748ceead4a22b47aa7ad550c9f6f0c5fe15f9e3c6aebff614c2509c39  manifest.json\n"
+      << "336c56285446586144f38937f26bfe23690950a38c47d0d334806913e37667c1  binary.bin\n"
+      << "20042cc411f5f6adcbb425f85333dfa6e99f151520db593258403c36f39a4ab8  run.log\n";
+  const std::filesystem::path root_link = root.string() + "-link";
+  std::filesystem::create_directory_symlink(root, root_link, symlink_error);
+  ASSERT_FALSE(symlink_error);
+  EXPECT_TRUE(VerifyReleaseEvidenceDirectory(root_link.string() + "/")
+                  .IsInvalidArgument());
+  std::filesystem::remove(root_link);
+  {
+    std::ofstream ledger(root / "SHA256SUMS",
+                         std::ios::binary | std::ios::app);
+    const std::string nul_path =
+        "336c56285446586144f38937f26bfe23690950a38c47d0d334806913e37667c1  "
+        "binary.bin\0ignored\n";
+    ledger.write(nul_path.data(), nul_path.size());
+  }
+  EXPECT_TRUE(VerifyReleaseEvidenceDirectory(root.string()).IsCorruption());
+  std::ofstream(root / "SHA256SUMS", std::ios::trunc)
+      << "0be8d1c748ceead4a22b47aa7ad550c9f6f0c5fe15f9e3c6aebff614c2509c39  manifest.json\n"
+      << "336c56285446586144f38937f26bfe23690950a38c47d0d334806913e37667c1  binary.bin\n"
+      << "20042cc411f5f6adcbb425f85333dfa6e99f151520db593258403c36f39a4ab8  run.log\n";
+  std::filesystem::rename(root / "SHA256SUMS", root / "SHA256SUMS.real");
+  std::filesystem::create_symlink(root / "SHA256SUMS.real",
+                                  root / "SHA256SUMS", symlink_error);
+  ASSERT_FALSE(symlink_error);
+  EXPECT_TRUE(VerifyReleaseEvidenceDirectory(root.string()).IsCorruption());
+  std::filesystem::remove(root / "SHA256SUMS");
+  std::filesystem::rename(root / "SHA256SUMS.real", root / "SHA256SUMS");
+  std::ofstream(root / "run.log", std::ios::trunc) << "tampered\n";
+  EXPECT_TRUE(VerifyReleaseEvidenceDirectory(root.string()).IsCorruption());
+  std::filesystem::remove_all(root);
+}
+
+TEST(BenchmarkArtifactTest,
+     Sha256LedgerDirectoryRejectsTamperingAndPathSetMismatch) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "cedar_sha256_ledger_directory";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "nested");
+  std::ofstream(root / "a.txt", std::ios::binary) << "alpha";
+  std::ofstream(root / "nested" / "b.txt", std::ios::binary) << "beta";
+  const auto alpha = BenchmarkFileSha256((root / "a.txt").string());
+  const auto beta = BenchmarkFileSha256((root / "nested" / "b.txt").string());
+  ASSERT_TRUE(alpha.ok()) << alpha.status().ToString();
+  ASSERT_TRUE(beta.ok()) << beta.status().ToString();
+  std::ofstream(root / "SHA256SUMS", std::ios::binary)
+      << alpha.ValueOrDie() << "  a.txt\n"
+      << beta.ValueOrDie() << "  nested/b.txt\n";
+  EXPECT_TRUE(VerifySha256LedgerDirectory(
+      root.string(), {"a.txt", "nested/b.txt"}).ok());
+  EXPECT_TRUE(VerifySha256LedgerDirectory(
+      root.string(), {"a.txt"}).IsCorruption());
+  EXPECT_TRUE(VerifySha256LedgerDirectory(
+      root.string(), {"a.txt", "nested/b.txt", "missing"}).IsCorruption());
+
+  std::ofstream(root / "nested" / "b.txt", std::ios::trunc) << "tampered";
+  EXPECT_TRUE(VerifySha256LedgerDirectory(
+      root.string(), {"a.txt", "nested/b.txt"}).IsCorruption());
+  std::filesystem::remove(root / "nested" / "b.txt");
+  std::filesystem::create_symlink(root / "a.txt", root / "nested" / "b.txt");
+  EXPECT_TRUE(VerifySha256LedgerDirectory(
+      root.string(), {"a.txt", "nested/b.txt"}).IsCorruption());
+  std::filesystem::remove_all(root);
+}
+
+TEST(BenchmarkArtifactTest,
+     ExecutableSnapshotRemainsBoundWhenSourcePathIsReplaced) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "cedar_executable_snapshot_path_replacement";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const std::filesystem::path source = root / "benchmark";
+  {
+    std::ofstream output(source, std::ios::binary);
+    output << "original executable bytes";
+  }
+  std::filesystem::permissions(
+      source, std::filesystem::perms::owner_read |
+                  std::filesystem::perms::owner_exec);
+
+  auto snapshot = CreateBenchmarkExecutableSnapshot(source.string());
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const std::string expected_blake3 =
+      BlobHashHex(Blake3Hash("original executable bytes"));
+  ASSERT_EQ(snapshot.ValueOrDie().blake3, expected_blake3);
+
+  std::filesystem::rename(source, root / "original");
+  {
+    std::ofstream output(source, std::ios::binary);
+    output << "replacement executable bytes";
+  }
+  std::ifstream input(snapshot.ValueOrDie().path, std::ios::binary);
+  const std::string executed_bytes((std::istreambuf_iterator<char>(input)),
+                                   std::istreambuf_iterator<char>());
+  EXPECT_EQ(executed_bytes, "original executable bytes");
+  const auto replacement_sha256 = BenchmarkFileSha256(source.string());
+  ASSERT_TRUE(replacement_sha256.ok())
+      << replacement_sha256.status().ToString();
+  EXPECT_NE(snapshot.ValueOrDie().sha256,
+            replacement_sha256.ValueOrDie());
+  std::filesystem::remove_all(root);
+}
+
+TEST(BenchmarkArtifactTest,
+     ExecutableSnapshotDetectsPathReplacementEvenWhenRestored) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "cedar_executable_snapshot_restore_attack";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const std::filesystem::path source = root / "benchmark";
+  {
+    std::ofstream output(source, std::ios::binary);
+    output << "original executable bytes";
+  }
+  std::filesystem::permissions(
+      source, std::filesystem::perms::owner_read |
+                  std::filesystem::perms::owner_exec);
+  auto snapshot = CreateBenchmarkExecutableSnapshot(source.string());
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  const std::filesystem::path original = snapshot.ValueOrDie().path + ".saved";
+  const std::filesystem::path replacement =
+      snapshot.ValueOrDie().path + ".replacement";
+  std::filesystem::rename(snapshot.ValueOrDie().path, original);
+  {
+    std::ofstream output(snapshot.ValueOrDie().path, std::ios::binary);
+    output << "replacement executable bytes";
+  }
+  std::filesystem::rename(snapshot.ValueOrDie().path, replacement);
+  std::filesystem::rename(original, snapshot.ValueOrDie().path);
+
+  EXPECT_TRUE(VerifyBenchmarkExecutableSnapshot(
+                  snapshot.ValueOrDie()).IsCorruption());
+  std::filesystem::remove(replacement);
+  std::filesystem::remove_all(root);
+}
+
+TEST(BenchmarkArtifactTest, ExecutableSnapshotRequiresCloseOnExecDescriptors) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "cedar_executable_snapshot_close_on_exec";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const std::filesystem::path source = root / "benchmark";
+  {
+    std::ofstream output(source, std::ios::binary);
+    output << "executable bytes";
+  }
+  std::filesystem::permissions(
+      source, std::filesystem::perms::owner_read |
+                  std::filesystem::perms::owner_exec);
+  auto snapshot = CreateBenchmarkExecutableSnapshot(source.string());
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  const int flags = ::fcntl(snapshot.ValueOrDie().fd(), F_GETFD);
+  ASSERT_GE(flags, 0);
+  ASSERT_EQ(::fcntl(snapshot.ValueOrDie().fd(), F_SETFD,
+                    flags & ~FD_CLOEXEC),
+            0);
+  EXPECT_TRUE(VerifyBenchmarkExecutableSnapshot(
+                  snapshot.ValueOrDie()).IsCorruption());
+  std::filesystem::remove_all(root);
 }
 
 TEST(BenchmarkArtifactTest,
@@ -4633,6 +4842,48 @@ TEST_F(DurableLogTest, ExecuteTcypherReturnsCommittedVertexBindingsThroughTheNew
   EXPECT_EQ(result.column_names()[0], "n");
   EXPECT_EQ(*result.batch().ValueAt(0, 0), Value::Int64(7));
   EXPECT_TRUE(stream.ValueOrDie()->Next(&result).IsNotFound());
+}
+
+TEST_F(DurableLogTest, ExecuteTcypherAttributesCpuGrantToEveryScheduledMorsel) {
+  CedarDatabase db(path_, 2, 11);
+  ASSERT_TRUE(db.Open().ok());
+  ColumnSchema existence{EntityType::Vertex, 0, 0, "existence",
+                         PhysicalType::kBinary, 4096,
+                         EncodingPolicy::kAdaptive,
+                         CompressionPolicy::kLz4};
+  ColumnSchema registered;
+  ASSERT_TRUE(db.RegisterColumn(existence, &registered).ok());
+  ASSERT_TRUE(db.Put(LogicalKey::VertexExistence(7), 10,
+                     registered.schema_epoch, Value::Binary("")).ok());
+  WorkExecutionService* service =
+      CedarDatabaseTestAccess::work_execution_service(&db);
+  ASSERT_NE(service, nullptr);
+
+  const auto execute = [&](TcypherWorkloadClass workload_class,
+                           size_t work_class_index) {
+    TcypherQueryOptions options;
+    options.statement_start_valid_time = 10;
+    options.workload_class = workload_class;
+    options.execution_stats = std::make_shared<TcypherExecutionStats>();
+    const WorkExecutionStats before = service->stats();
+    auto stream = db.ExecuteTcypher("MATCH (n) RETURN n;", options);
+    ASSERT_TRUE(stream.ok()) << stream.status().ToString();
+    ResultBatch result;
+    ASSERT_TRUE(stream.ValueOrDie()->Next(&result).ok());
+    EXPECT_TRUE(stream.ValueOrDie()->Next(&result).IsNotFound());
+    const WorkExecutionStats after = service->stats();
+    const uint64_t admitted =
+        after.admitted[work_class_index] - before.admitted[work_class_index];
+    const uint64_t granted_cpu =
+        after.admitted_resources[work_class_index].cpu_slots -
+        before.admitted_resources[work_class_index].cpu_slots;
+    EXPECT_GT(admitted, 0U);
+    EXPECT_EQ(admitted, options.execution_stats->morsels_scheduled);
+    EXPECT_EQ(granted_cpu, admitted);
+  };
+
+  execute(TcypherWorkloadClass::kAnalytical, 8);
+  execute(TcypherWorkloadClass::kInteractive, 5);
 }
 
 TEST_F(DurableLogTest, CloseRunsTheRealProtocolAsTypedShutdownWork) {
@@ -18748,6 +18999,93 @@ TEST(WorkSchedulerTest, PrioritizesCommitCriticalAndSkipsCancelledTasks) {
   EXPECT_FALSE(scheduler.NextExecutableWork().has_value());
 }
 
+TEST(WorkSchedulerTest, EssentialMaintenanceSharesItsLaneWithUrgentCompaction) {
+  WorkScheduler scheduler;
+  scheduler.EnqueueExecutable(WorkClass::kFlush, ExecutableTaskId{1});
+  scheduler.EnqueueExecutable(WorkClass::kCompactionUrgent, ExecutableTaskId{2});
+  scheduler.EnqueueExecutable(WorkClass::kFlush, ExecutableTaskId{3});
+  scheduler.EnqueueExecutable(WorkClass::kCompactionUrgent, ExecutableTaskId{4});
+
+  const auto first = scheduler.NextExecutableWork();
+  const auto second = scheduler.NextExecutableWork();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(first->work_class, WorkClass::kFlush);
+  EXPECT_EQ(second->work_class, WorkClass::kCompactionUrgent);
+}
+
+TEST(WorkSchedulerTest, AgingUsesDispatchAgeAfterBatchEnqueue) {
+  WorkScheduler scheduler(2);
+  for (uint64_t id = 1; id <= 8; ++id) {
+    scheduler.EnqueueExecutable(
+        WorkClass::kForegroundWrite, ExecutableTaskId{id});
+    scheduler.CancelExecutable(ExecutableTaskId{id});
+  }
+  scheduler.EnqueueExecutable(
+      WorkClass::kCompactionNormal, ExecutableTaskId{99});
+  for (uint64_t id = 100; id <= 107; ++id) {
+    scheduler.EnqueueExecutable(
+        WorkClass::kForegroundWrite, ExecutableTaskId{id});
+  }
+
+  ASSERT_EQ(scheduler.NextExecutableWork()->work_class,
+            WorkClass::kForegroundWrite);
+  ASSERT_EQ(scheduler.NextExecutableWork()->work_class,
+            WorkClass::kForegroundWrite);
+  EXPECT_EQ(scheduler.NextExecutableWork()->work_class,
+            WorkClass::kCompactionNormal);
+}
+
+TEST(WorkSchedulerTest, SaturatedLanesHonorConfiguredFairnessWeights) {
+  WorkScheduler scheduler(1'000);
+  uint64_t id = 1;
+  for (size_t index = 0; index < 40; ++index) {
+    scheduler.EnqueueExecutable(WorkClass::kForegroundWrite,
+                                ExecutableTaskId{id++});
+  }
+  for (size_t index = 0; index < 20; ++index) {
+    scheduler.EnqueueExecutable(WorkClass::kFlush, ExecutableTaskId{id++});
+    scheduler.EnqueueExecutable(WorkClass::kAnalyticalQuery,
+                                ExecutableTaskId{id++});
+  }
+  for (size_t index = 0; index < 10; ++index) {
+    scheduler.EnqueueExecutable(WorkClass::kCompactionNormal,
+                                ExecutableTaskId{id++});
+  }
+
+  std::array<uint64_t, 4> lane_dispatches{};
+  for (size_t index = 0; index < 90; ++index) {
+    const auto work = scheduler.NextExecutableWork();
+    ASSERT_TRUE(work.has_value());
+    switch (work->work_class) {
+      case WorkClass::kForegroundWrite: ++lane_dispatches[0]; break;
+      case WorkClass::kFlush: ++lane_dispatches[1]; break;
+      case WorkClass::kAnalyticalQuery: ++lane_dispatches[2]; break;
+      case WorkClass::kCompactionNormal: ++lane_dispatches[3]; break;
+      default: FAIL() << "unexpected saturated lane class";
+    }
+  }
+  EXPECT_EQ(lane_dispatches, (std::array<uint64_t, 4>{40, 20, 20, 10}));
+  EXPECT_FALSE(scheduler.NextExecutableWork().has_value());
+}
+
+TEST(WorkSchedulerTest, InteractiveQueueDispatchesEarliestDeadlineFirst) {
+  WorkScheduler scheduler;
+  scheduler.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{1}, 30);
+  scheduler.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{2}, 10);
+  scheduler.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{3}, 20);
+  scheduler.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{4});
+
+  EXPECT_EQ(scheduler.NextExecutableWork()->id, ExecutableTaskId{2});
+  EXPECT_EQ(scheduler.NextExecutableWork()->id, ExecutableTaskId{3});
+  EXPECT_EQ(scheduler.NextExecutableWork()->id, ExecutableTaskId{1});
+  EXPECT_EQ(scheduler.NextExecutableWork()->id, ExecutableTaskId{4});
+}
+
 TEST(WorkExecutionServiceTest, IsolatesOwnerStatusAndRunsCallbacksOnWorker) {
   WorkScheduler scheduler;
   WorkExecutionService service(&scheduler, 1);
@@ -18768,6 +19106,98 @@ TEST(WorkExecutionServiceTest, IsolatesOwnerStatusAndRunsCallbacksOnWorker) {
   EXPECT_TRUE(query.ValueOrDie().Wait().ok());
   EXPECT_TRUE(failing.ValueOrDie().Wait().IsIOError());
   EXPECT_NE(query_worker, caller);
+  EXPECT_TRUE(service.Stop().ok());
+}
+
+TEST(WorkExecutionServiceTest, ExportsQueueDelayAndDeadlineMissDistribution) {
+  WorkScheduler scheduler;
+  WorkExecutionService service(&scheduler, 1);
+  ASSERT_TRUE(service.Start().ok());
+  std::mutex mutex;
+  std::condition_variable ready;
+  bool blocker_started = false;
+  bool release_blocker = false;
+  const auto blocker = service.Submit(
+      WorkClass::kAnalyticalQuery, [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        blocker_started = true;
+        ready.notify_all();
+        ready.wait(lock, [&] { return release_blocker; });
+        return Status::OK();
+      });
+  ASSERT_TRUE(blocker.ok()) << blocker.status().ToString();
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(ready.wait_for(lock, std::chrono::seconds(2),
+                               [&] { return blocker_started; }));
+  }
+  const auto interactive = service.Submit(
+      WorkClass::kInteractiveQuery, [] { return Status::OK(); }, 1);
+  ASSERT_TRUE(interactive.ok()) << interactive.status().ToString();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_blocker = true;
+  }
+  ready.notify_all();
+  ASSERT_TRUE(blocker.ValueOrDie().Wait().ok());
+  ASSERT_TRUE(interactive.ValueOrDie().Wait().ok());
+
+  MetricRegistry metrics(32);
+  ASSERT_TRUE(service.ExportMetrics(&metrics).ok());
+  uint64_t queue_delay_samples = 0;
+  for (const HistogramMetricPoint& point : metrics.HistogramSnapshot()) {
+    if (point.definition.name != "cedar_scheduler_queue_delay_ns") continue;
+    const auto value = point.values.find("interactive_query");
+    if (value != point.values.end()) queue_delay_samples = value->second.count();
+  }
+  EXPECT_EQ(queue_delay_samples, 1U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_deadline_misses_total",
+                            "interactive_query"), 1U);
+  EXPECT_TRUE(service.Stop().ok());
+}
+
+TEST(WorkExecutionServiceTest, ExportsServiceAndGrantDistribution) {
+  WorkScheduler scheduler;
+  WorkExecutionService service(&scheduler, 1);
+  ResourceGovernor governor(ResourceProfile{16, 16, 16, 16, 16, 16, 16, 16,
+                                            16});
+  ASSERT_TRUE(service.ConfigureResourceGovernor(&governor).ok());
+  ASSERT_TRUE(service.Start().ok());
+  const ResourceProfile grant{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const auto task = service.Submit(
+      WorkTaskRequest{WorkClass::kStatsMerge, grant, false, 0},
+      [] { return Status::OK(); });
+  ASSERT_TRUE(task.ok()) << task.status().ToString();
+  ASSERT_TRUE(task.ValueOrDie().Wait().ok());
+
+  MetricRegistry metrics(32);
+  ASSERT_TRUE(service.ExportMetrics(&metrics).ok());
+  uint64_t service_samples = 0;
+  for (const HistogramMetricPoint& point : metrics.HistogramSnapshot()) {
+    if (point.definition.name != "cedar_scheduler_service_ns") continue;
+    const auto value = point.values.find("stats_merge");
+    if (value != point.values.end()) service_samples = value->second.count();
+  }
+  EXPECT_EQ(service_samples, 1U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_memory_bytes_total",
+                            "stats_merge"), 1U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_io_tokens_total",
+                            "stats_merge"), 2U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_descriptors_total",
+                            "stats_merge"), 3U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_temporary_bytes_total",
+                            "stats_merge"), 4U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_cpu_slots_total",
+                            "stats_merge"), 5U);
+  EXPECT_EQ(metrics.Counter(
+                "cedar_scheduler_grant_sequential_read_bytes_total",
+                "stats_merge"), 6U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_random_read_ops_total",
+                            "stats_merge"), 7U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_write_bytes_total",
+                            "stats_merge"), 8U);
+  EXPECT_EQ(metrics.Counter("cedar_scheduler_grant_metadata_ops_total",
+                            "stats_merge"), 9U);
   EXPECT_TRUE(service.Stop().ok());
 }
 
@@ -20538,18 +20968,32 @@ TEST_F(DurableLogTest,
   ASSERT_TRUE(cached_value.ok()) << cached_value.status().ToString();
   EXPECT_EQ(cached_value.ValueOrDie(), value.ValueOrDie());
 
-  auto query = database.ExecuteTcypher("MATCH (n) RETURN n;");
+  auto query = database.ExecuteTcypher(
+      "FOR VALID_TIME AS OF 20 MATCH (n) RETURN n;");
   ASSERT_TRUE(query.ok()) << query.status().ToString();
+  uint64_t query_rows = 0;
   for (;;) {
     ResultBatch batch;
     const Status next = query.ValueOrDie()->Next(&batch);
     if (next.IsNotFound()) break;
     ASSERT_TRUE(next.ok()) << next.ToString();
+    query_rows += batch.batch().row_count();
   }
+  EXPECT_GT(query_rows, 0U);
 
   ASSERT_TRUE(database.Compact().ok());
   ASSERT_TRUE(database.RotateBlobSegments().ok());
   ASSERT_TRUE(database.CollectBlobGarbage().ok());
+
+  const auto cache_stats = database.cache_stats();
+  ASSERT_TRUE(cache_stats.ok()) << cache_stats.status().ToString();
+  EXPECT_GT(cache_stats.ValueOrDie().peak_resident_bytes, 0U);
+  EXPECT_GE(cache_stats.ValueOrDie().peak_resident_bytes,
+            cache_stats.ValueOrDie().resident_bytes);
+  const auto storage_stats = database.storage_stats();
+  ASSERT_TRUE(storage_stats.ok()) << storage_stats.status().ToString();
+  EXPECT_GT(storage_stats.ValueOrDie().compaction_peak_buffered_events, 0U);
+  EXPECT_GT(storage_stats.ValueOrDie().compaction_peak_buffered_bytes, 0U);
 
   const auto metric = [&](const std::string& name,
                           const std::string& label) -> uint64_t {
@@ -20576,6 +21020,21 @@ TEST_F(DurableLogTest,
   EXPECT_GT(metric("cedar_cache_miss_total", "metadata"), 0U);
   EXPECT_GT(metric("cedar_cache_hit_total", "blob_value"), 0U);
   EXPECT_GT(metric("cedar_cache_miss_total", "blob_value"), 0U);
+  EXPECT_GT(metric("cedar_pages_decoded_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_page_decode_bytes_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_blob_payload_reads_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_blob_payload_bytes_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_blob_hash_lookup_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_compaction_input_bytes_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_compaction_output_bytes_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_blob_gc_relocated_bytes_total", "all"), 0U);
+  EXPECT_EQ(metric("cedar_query_started_total", "interactive"), 1U);
+  EXPECT_EQ(metric("cedar_query_completed_total", "interactive"), 1U);
+  EXPECT_GT(metric("cedar_query_result_rows_total", "interactive"), 0U);
+  EXPECT_GT(metric("cedar_operator_output_rows_total", "all"), 0U);
+  EXPECT_GT(metric("cedar_cache_resident_peak_bytes", "all"), 0U);
+  EXPECT_GT(metric("cedar_compaction_buffer_peak_bytes", "all"), 0U);
+  EXPECT_GT(metric("cedar_compaction_buffer_peak_events", "all"), 0U);
   for (const std::string& page_type :
        {"entity_id", "operation", "typed_value"}) {
     EXPECT_GT(metric("cedar_page_uncompressed_bytes_total", page_type), 0U)
@@ -20594,6 +21053,17 @@ TEST_F(DurableLogTest,
             std::string::npos);
   EXPECT_NE(exported.find("cedar_cache_hit_total"), std::string::npos);
   EXPECT_NE(exported.find("cedar_cache_miss_total"), std::string::npos);
+  const Status metric_gate = ValidateProductionMetricArtifact(
+      exported,
+      {
+          MetricActivityRequirement{"cedar_pages_decoded_total", "all", 1},
+          MetricActivityRequirement{"cedar_blob_payload_reads_total", "all", 1},
+          MetricActivityRequirement{"cedar_compaction_input_bytes_total", "all", 1},
+          MetricActivityRequirement{"cedar_cache_resident_peak_bytes", "all", 1},
+          MetricActivityRequirement{"cedar_compaction_buffer_peak_bytes", "all", 1},
+          MetricActivityRequirement{"cedar_query_result_rows_total", "interactive", 1},
+      });
+  EXPECT_TRUE(metric_gate.ok()) << metric_gate.ToString();
 }
 
 TEST_F(DurableLogTest, DatabaseExportsSampledOperationAndCompletedQueryTraces) {
@@ -21044,6 +21514,87 @@ TEST(MetricRegistryTest, BoundsLabelCardinalityAndMergesCounters) {
   EXPECT_EQ(registry.Counter("cedar_query_rows", "scan").value(), 7U);
 }
 
+TEST(MetricRegistryTest, AuditsRequiredDefinitionsForReleaseCoverage) {
+  MetricRegistry registry(4);
+  ASSERT_TRUE(registry.Register(MetricDefinition{
+      "cedar_txn_committed_total", MetricType::kCounter, "count", 1}).ok());
+  ASSERT_TRUE(registry.Register(MetricDefinition{
+      "cedar_query_latency_ns", MetricType::kCounter, "count", 1}).ok());
+
+  const MetricDefinitionAudit audit = registry.AuditDefinitions({
+      MetricDefinition{"cedar_txn_committed_total", MetricType::kCounter,
+                       "count", 1},
+      MetricDefinition{"cedar_query_latency_ns", MetricType::kHistogram,
+                       "ns", 1, {100, 1000}},
+      MetricDefinition{"cedar_page_corruption_total", MetricType::kCounter,
+                       "count", 1},
+  });
+
+  EXPECT_FALSE(audit.complete());
+  EXPECT_EQ(audit.required_count, 3U);
+  EXPECT_EQ(audit.matched_count, 1U);
+  ASSERT_EQ(audit.issues.size(), 2U);
+  EXPECT_EQ(audit.issues[0].name, "cedar_page_corruption_total");
+  EXPECT_EQ(audit.issues[0].kind, MetricDefinitionIssueKind::kMissing);
+  EXPECT_EQ(audit.issues[1].name, "cedar_query_latency_ns");
+  EXPECT_EQ(audit.issues[1].kind, MetricDefinitionIssueKind::kSchemaConflict);
+}
+
+TEST(MetricRegistryTest, AuditsTargetWorkloadMetricActivity) {
+  MetricRegistry registry(4);
+  ASSERT_TRUE(registry.Register(MetricDefinition{
+      "cedar_query_result_rows_total", MetricType::kCounter, "rows", 1}).ok());
+  ASSERT_TRUE(registry.Register(MetricDefinition{
+      "cedar_query_latency_ns", MetricType::kHistogram, "ns", 1,
+      {100, 1000}}).ok());
+  ASSERT_TRUE(registry.AddCounter(
+      "cedar_query_result_rows_total", "interactive", 7).ok());
+  ASSERT_TRUE(registry.ObserveHistogram(
+      "cedar_query_latency_ns", "interactive", 250).ok());
+
+  const MetricActivityAudit audit = registry.AuditActivity({
+      MetricActivityRequirement{
+          "cedar_query_result_rows_total", "interactive", 5},
+      MetricActivityRequirement{
+          "cedar_query_latency_ns", "interactive", 2},
+      MetricActivityRequirement{
+          "cedar_page_corruption_total", "detected", 1},
+  });
+
+  EXPECT_FALSE(audit.complete());
+  EXPECT_EQ(audit.required_count, 3U);
+  EXPECT_EQ(audit.matched_count, 1U);
+  ASSERT_EQ(audit.issues.size(), 2U);
+  EXPECT_EQ(audit.issues[0].name, "cedar_page_corruption_total");
+  EXPECT_EQ(audit.issues[0].kind, MetricActivityIssueKind::kMetricMissing);
+  EXPECT_EQ(audit.issues[1].name, "cedar_query_latency_ns");
+  EXPECT_EQ(audit.issues[1].kind, MetricActivityIssueKind::kBelowMinimum);
+  EXPECT_EQ(audit.issues[1].observed, 1U);
+}
+
+TEST(MetricRegistryTest, ProductionMetricArtifactRejectsIncompleteSchema) {
+  MetricRegistry registry(4);
+  ASSERT_TRUE(registry.Register(MetricDefinition{
+      "cedar_txn_committed_total", MetricType::kCounter, "count", 1}).ok());
+  const Status status = ValidateProductionMetricArtifact(
+      ExportMetricsJson(registry), {});
+  EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+}
+
+TEST_F(DurableLogTest, DatabaseRegistersCompleteProductionMetricSchema) {
+  CedarDatabase database(path_, 1, 11);
+  ASSERT_TRUE(database.Open().ok());
+
+  const std::vector<MetricDefinition>& required =
+      ProductionMetricDefinitions();
+  EXPECT_GE(required.size(), 60U);
+  const MetricDefinitionAudit audit =
+      database.metrics().AuditDefinitions(required);
+  EXPECT_TRUE(audit.complete());
+  EXPECT_EQ(audit.matched_count, required.size());
+  EXPECT_TRUE(audit.issues.empty());
+}
+
 TEST(EventRingTest, ReservesCapacityForCorrectnessEventsAndDropsSpansUnderPressure) {
   EventRing ring(3, 1);
   EXPECT_TRUE(ring.Push(TelemetryEvent{TelemetryEventKind::kSpan, {}, 1, "query", 1}));
@@ -21238,6 +21789,388 @@ TEST(BenchmarkProfileTest, ResolvesAllNamedScaleProfilesWithoutSilentShrink) {
   EXPECT_TRUE(ParseBenchmarkScaleProfile("unknown").status().IsInvalidArgument());
 }
 
+TEST(BenchmarkProfileTest,
+     ProductionProfilePreflightRejectsSilentShrinkAndUndersizedHost) {
+  const BenchmarkProfile workstation = ResolveBenchmarkProfile(
+      BenchmarkScaleProfile::kWorkstation, 73);
+  EXPECT_EQ(workstation.minimum_logical_cpu_count, workstation.worker_count);
+  EXPECT_GE(workstation.minimum_memory_bytes, 32ULL * 1024ULL * 1024ULL * 1024ULL);
+  EXPECT_GE(workstation.minimum_free_storage_bytes,
+            256ULL * 1024ULL * 1024ULL * 1024ULL);
+
+  BenchmarkEnvironment sufficient;
+  sufficient.logical_cpu_count = workstation.minimum_logical_cpu_count;
+  sufficient.memory_limit_bytes = workstation.minimum_memory_bytes;
+  sufficient.storage_free_bytes = workstation.minimum_free_storage_bytes;
+  sufficient.storage_device_and_filesystem = "test-device:test-filesystem";
+  sufficient.resource_limit_provenance_complete = true;
+  sufficient.storage_provenance_complete = true;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count,
+      sufficient).ok());
+
+  CedarTgConfig shrunk_dataset = workstation.dataset;
+  --shrunk_dataset.vertex_count;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, shrunk_dataset, workstation.worker_count,
+      sufficient).IsInvalidArgument());
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count - 1,
+      sufficient).IsInvalidArgument());
+
+  BenchmarkEnvironment undersized = sufficient;
+  --undersized.logical_cpu_count;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count,
+      undersized).IsResourceExhausted());
+  undersized = sufficient;
+  --undersized.memory_limit_bytes;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count,
+      undersized).IsResourceExhausted());
+  undersized = sufficient;
+  --undersized.storage_free_bytes;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count,
+      undersized).IsResourceExhausted());
+  undersized = sufficient;
+  undersized.resource_limit_provenance_complete = false;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count,
+      undersized).IsInvalidArgument());
+  undersized = sufficient;
+  undersized.storage_provenance_complete = false;
+  EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+      workstation, workstation.dataset, workstation.worker_count,
+      undersized).IsInvalidArgument());
+}
+
+TEST(BenchmarkProfileTest,
+     ProductionProfilePreflightRejectsCiAndPaperProfiles) {
+  for (const BenchmarkScaleProfile scale : {
+           BenchmarkScaleProfile::kCi,
+           BenchmarkScaleProfile::kPaper}) {
+    const BenchmarkProfile profile = ResolveBenchmarkProfile(scale, 17);
+    BenchmarkEnvironment environment;
+    environment.logical_cpu_count = 1024;
+    environment.memory_limit_bytes = std::numeric_limits<uint64_t>::max();
+    environment.storage_free_bytes = std::numeric_limits<uint64_t>::max();
+    environment.storage_device_and_filesystem = "test-device:test-filesystem";
+    environment.resource_limit_provenance_complete = true;
+    environment.storage_provenance_complete = true;
+    EXPECT_TRUE(ValidateProductionBenchmarkPreflight(
+        profile, profile.dataset, profile.worker_count,
+        environment).IsNotSupportedError());
+  }
+}
+
+TEST(BenchmarkProfileTest,
+     ProductionBaselineApprovalBindsDistinctBinaryAndAuthority) {
+  BenchmarkBaselineApproval approval;
+  approval.approved_production_baseline = true;
+  approval.approval_id = "release-baseline-2026-07";
+  approval.binary_sha256 = std::string(64, 'a');
+  approval.source_commit = std::string(40, 'b');
+  approval.approved_by = "release-engineering";
+  EXPECT_TRUE(ValidateApprovedProductionBaseline(
+      approval, std::string(64, 'a'), std::string(64, 'c')).ok());
+
+  approval.approved_production_baseline = false;
+  EXPECT_TRUE(ValidateApprovedProductionBaseline(
+      approval, std::string(64, 'a'), std::string(64, 'c'))
+                  .IsInvalidArgument());
+  approval.approved_production_baseline = true;
+  EXPECT_TRUE(ValidateApprovedProductionBaseline(
+      approval, std::string(64, 'd'), std::string(64, 'c'))
+                  .IsInvalidArgument());
+  EXPECT_TRUE(ValidateApprovedProductionBaseline(
+      approval, std::string(64, 'a'), std::string(64, 'a'))
+                  .IsInvalidArgument());
+  approval.approved_by.clear();
+  EXPECT_TRUE(ValidateApprovedProductionBaseline(
+      approval, std::string(64, 'a'), std::string(64, 'c'))
+                  .IsInvalidArgument());
+}
+
+TEST(BenchmarkProfileTest,
+     ProductionArtifactSourceProvenanceRequiresCleanFullCommit) {
+  EXPECT_TRUE(ValidateProductionArtifactSourceProvenance(
+      std::string(40, 'a'), false).ok());
+  EXPECT_TRUE(ValidateProductionArtifactSourceProvenance(
+      std::string(39, 'a'), false).IsInvalidArgument());
+  EXPECT_TRUE(ValidateProductionArtifactSourceProvenance(
+      std::string(40, 'z'), false).IsInvalidArgument());
+  EXPECT_TRUE(ValidateProductionArtifactSourceProvenance(
+      std::string(40, 'a'), true).IsInvalidArgument());
+}
+
+TEST(BenchmarkProfileTest,
+     ProductionBinaryProvenanceRequiresCleanCompatibleApprovedBuilds) {
+  BenchmarkBinaryProvenance provenance;
+  provenance.source_commit = std::string(40, 'a');
+  provenance.source_dirty = false;
+  provenance.instrumentation_profile_id = kInstrumentationProfileTier0Tier1;
+  provenance.database_format_version = 1;
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      provenance, std::string(40, 'a')).ok());
+
+  BenchmarkBinaryProvenance invalid = provenance;
+  invalid.source_dirty = true;
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      invalid, std::string(40, 'a')).IsInvalidArgument());
+  invalid = provenance;
+  invalid.source_commit = std::string(39, 'a');
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      invalid, std::string(40, 'a')).IsInvalidArgument());
+  invalid = provenance;
+  invalid.instrumentation_profile_id = "tier0-minimal";
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      invalid, std::string(40, 'a')).IsInvalidArgument());
+  invalid = provenance;
+  invalid.database_format_version = 2;
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      invalid, std::string(40, 'a')).IsInvalidArgument());
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      provenance, std::string(40, 'b')).IsInvalidArgument());
+  EXPECT_TRUE(ValidateProductionBenchmarkBinaryProvenance(
+      provenance, "").ok());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     PlanCoversEveryWorkloadCacheAndFaultExactlyOnce) {
+  ProductionCampaignConfig config;
+  config.baseline_path = "/opt/cedar/baseline";
+  config.candidate_path = "/opt/cedar/candidate";
+  config.profile = BenchmarkScaleProfile::kWorkstation;
+  config.seed = 73;
+  config.results_root = "/var/lib/cedar/campaign";
+  config.pair_count = 5;
+  config.order_seed = 11;
+  const auto plan = BuildProductionCampaignPlan(config);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(plan.ValueOrDie().size(), 75U);
+
+  std::set<std::string> ids;
+  std::set<std::string> paired_dimensions;
+  std::set<std::string> faults;
+  for (const ProductionCampaignCommand& command : plan.ValueOrDie()) {
+    EXPECT_TRUE(ids.insert(command.id).second) << command.id;
+    EXPECT_FALSE(command.argv.empty());
+    EXPECT_EQ(command.profile, "workstation");
+    EXPECT_EQ(command.seed, 73U);
+    EXPECT_EQ(command.order_seed, 11U);
+    if (command.kind == ProductionCampaignCommandKind::kPairedBenchmark) {
+      paired_dimensions.insert(command.workload + "\n" + command.cache_mode);
+      EXPECT_EQ(command.pair_count, 5U);
+    } else {
+      EXPECT_EQ(command.kind, ProductionCampaignCommandKind::kFaultReopen);
+      faults.insert(command.fault_scenario);
+    }
+  }
+  EXPECT_EQ(paired_dimensions.size(), 65U);
+  EXPECT_EQ(faults.size(), 10U);
+
+  config.profile = BenchmarkScaleProfile::kCi;
+  EXPECT_TRUE(BuildProductionCampaignPlan(config).status().IsNotSupportedError());
+  config.profile = BenchmarkScaleProfile::kWorkstation;
+  config.pair_count = 4;
+  EXPECT_TRUE(BuildProductionCampaignPlan(config).status().IsInvalidArgument());
+  config.pair_count = 5;
+  config.candidate_path = config.baseline_path;
+  EXPECT_TRUE(BuildProductionCampaignPlan(config).status().IsInvalidArgument());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     CommandOutputVerificationRejectsMissingOrIncompleteRoots) {
+  ProductionCampaignCommand paired;
+  paired.id = "paired-point-read-cold_process_and_database";
+  paired.kind = ProductionCampaignCommandKind::kPairedBenchmark;
+  paired.output_root = (std::filesystem::temp_directory_path() /
+                        "cedar_missing_paired_campaign_output").string();
+  std::filesystem::remove_all(paired.output_root);
+  paired.pair_count = 5;
+  EXPECT_FALSE(VerifyProductionCampaignCommandOutput(paired).ok());
+
+  const std::string incomplete =
+      (std::filesystem::temp_directory_path() /
+       "cedar_incomplete_paired_campaign_output").string();
+  std::filesystem::create_directories(incomplete);
+  paired.output_root = incomplete;
+  EXPECT_FALSE(VerifyProductionCampaignCommandOutput(paired).ok());
+  std::filesystem::remove_all(incomplete);
+
+  ProductionCampaignCommand fault;
+  fault.id = "fault-commit_after_prepare_durable";
+  fault.kind = ProductionCampaignCommandKind::kFaultReopen;
+  fault.output_root = (std::filesystem::temp_directory_path() /
+                       "cedar_missing_fault_campaign_output").string();
+  std::filesystem::remove_all(fault.output_root);
+  EXPECT_FALSE(VerifyProductionCampaignCommandOutput(fault).ok());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     FinalizationRequiresEveryPlannedCommandExactlyOnce) {
+  std::vector<ProductionCampaignCommand> plan(3);
+  plan[0].id = "paired-a";
+  plan[1].id = "paired-b";
+  plan[2].id = "fault-c";
+  EXPECT_TRUE(ValidateProductionCampaignCompletionSet(
+      plan, {"paired-a", "paired-b", "fault-c"}).ok());
+  EXPECT_TRUE(ValidateProductionCampaignCompletionSet(
+      plan, {"paired-a", "paired-b"}).IsCorruption());
+  EXPECT_TRUE(ValidateProductionCampaignCompletionSet(
+      plan, {"paired-a", "paired-b", "paired-b"}).IsCorruption());
+  EXPECT_TRUE(ValidateProductionCampaignCompletionSet(
+      plan, {"paired-a", "paired-b", "unknown"}).IsCorruption());
+  plan[2].id = "paired-b";
+  EXPECT_TRUE(ValidateProductionCampaignCompletionSet(
+      plan, {"paired-a", "paired-b", "fault-c"}).IsInvalidArgument());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     FinalizationRevalidatesEveryCompletedCommandOutput) {
+  ProductionCampaignCommand command;
+  command.id = "paired-point-read-cold_process_and_database";
+  command.kind = ProductionCampaignCommandKind::kPairedBenchmark;
+  command.output_root =
+      (std::filesystem::temp_directory_path() /
+       "cedar_finalization_missing_command_output").string();
+  command.profile = "workstation";
+  command.workload = "point-read";
+  command.cache_mode = "cold_process_and_database";
+  command.seed = 73;
+  command.order_seed = 11;
+  command.pair_count = 5;
+  std::filesystem::remove_all(command.output_root);
+  EXPECT_FALSE(ValidateProductionCampaignFinalization(
+      {command}, {command.id}).ok());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     CommandIndexJsonPreservesArgvBoundariesAndChildEvidenceHashes) {
+  ProductionCampaignCommand command;
+  command.id = "paired-point-read-cold_process_and_database";
+  command.kind = ProductionCampaignCommandKind::kPairedBenchmark;
+  command.output_root = "/var/lib/cedar/campaign with spaces/command";
+  command.seed = 73;
+  command.order_seed = 11;
+  command.argv = {"/opt/cedar runner", "argument with spaces"};
+  const std::vector<ProductionCampaignEvidenceBinding> evidence = {
+      {"pair-0-baseline/run/manifest.json", "child-manifest",
+       std::string(64, 'a')},
+      {"pair-0-baseline/run/verification.json", "child-verification",
+       std::string(64, 'b')}};
+  const auto serialized =
+      SerializeProductionCampaignCommandIndexJson(command, evidence);
+  ASSERT_TRUE(serialized.ok()) << serialized.status().ToString();
+  EXPECT_NE(serialized.ValueOrDie().find(
+                "\"argv\":[\"/opt/cedar runner\",\"argument with spaces\"]"),
+            std::string::npos);
+  EXPECT_NE(serialized.ValueOrDie().find(
+                "\"path\":\"pair-0-baseline/run/manifest.json\""),
+            std::string::npos);
+  EXPECT_NE(serialized.ValueOrDie().find(
+                "\"sha256\":\"" + std::string(64, 'a') + "\""),
+            std::string::npos);
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     PairedSeedIdentityRejectsRelocatedCampaignOutput) {
+  EXPECT_TRUE(ValidatePairedCampaignSeedIdentity(
+      2, 73, 11, 73, 73, 11).ok());
+  EXPECT_TRUE(ValidatePairedCampaignSeedIdentity(
+      1, 73, 11, 73, 73, 11).IsCorruption());
+  EXPECT_TRUE(ValidatePairedCampaignSeedIdentity(
+      2, 74, 11, 74, 73, 11).IsCorruption());
+  EXPECT_TRUE(ValidatePairedCampaignSeedIdentity(
+      2, 73, 12, 73, 73, 11).IsCorruption());
+  EXPECT_TRUE(ValidatePairedCampaignSeedIdentity(
+      2, 73, 11, 74, 73, 11).IsCorruption());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     EvidenceTraversalPrunesDatabaseDirectories) {
+  EXPECT_TRUE(ProductionCampaignEvidencePathMayDescend("pair-0/run"));
+  EXPECT_FALSE(ProductionCampaignEvidencePathMayDescend(
+      "pair-0/run/database"));
+  EXPECT_FALSE(ProductionCampaignEvidencePathMayDescend(
+      "pair-0/run/database/shard-0"));
+  EXPECT_TRUE(ProductionCampaignEvidencePathMayDescend(
+      "pair-0/run/database-metrics"));
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     IndexEvidenceMustMatchFinalLedgerEntries) {
+  const std::vector<ProductionCampaignEvidenceBinding> index = {
+      {"commands/pair/run/manifest.json", "child-manifest",
+       std::string(64, 'a')},
+      {"commands/pair/run/verification.json", "child-verification",
+       std::string(64, 'b')}};
+  EXPECT_TRUE(ValidateProductionCampaignEvidenceLedgerBindings(
+      index, index).ok());
+  auto mismatch = index;
+  mismatch[1].sha256 = std::string(64, 'c');
+  EXPECT_TRUE(ValidateProductionCampaignEvidenceLedgerBindings(
+      index, mismatch).IsCorruption());
+  mismatch = index;
+  mismatch.pop_back();
+  EXPECT_TRUE(ValidateProductionCampaignEvidenceLedgerBindings(
+      index, mismatch).IsCorruption());
+}
+
+TEST(BenchmarkProductionCampaignTest,
+     ResealRequiresEveryLedgerDigestToRemainUnchanged) {
+  const std::vector<ProductionCampaignEvidenceBinding> snapshot = {
+      {"commands/pair/run/metrics.json", "ledger", std::string(64, 'a')},
+      {"commands/pair/run/report.md", "ledger", std::string(64, 'b')}};
+  EXPECT_TRUE(ValidateProductionCampaignLedgerSnapshot(
+      snapshot, snapshot).ok());
+  auto changed = snapshot;
+  changed[1].sha256 = std::string(64, 'c');
+  EXPECT_TRUE(ValidateProductionCampaignLedgerSnapshot(
+      snapshot, changed).IsCorruption());
+  changed = snapshot;
+  changed.pop_back();
+  EXPECT_TRUE(ValidateProductionCampaignLedgerSnapshot(
+      snapshot, changed).IsCorruption());
+  changed = snapshot;
+  changed.push_back(
+      {"commands/pair/run/traces.json", "ledger", std::string(64, 'd')});
+  EXPECT_TRUE(ValidateProductionCampaignLedgerSnapshot(
+      snapshot, changed).IsCorruption());
+}
+
+TEST(BenchmarkProfileTest, UnsignedCliValuesRejectSignsWhitespaceAndOverflow) {
+  ASSERT_TRUE(ParseBenchmarkUnsigned("0").ok());
+  EXPECT_EQ(ParseBenchmarkUnsigned("18446744073709551615").ValueOrDie(),
+            std::numeric_limits<uint64_t>::max());
+  for (const std::string& invalid : {
+           "", "-1", "+1", " 1", "1 ", "18446744073709551616"}) {
+    EXPECT_TRUE(ParseBenchmarkUnsigned(invalid).status().IsInvalidArgument())
+        << invalid;
+  }
+}
+
+TEST(BenchmarkEnvironmentTest, ProbeReportsReleasePreflightResources) {
+  const BenchmarkEnvironment environment = ProbeBenchmarkEnvironment(".");
+  EXPECT_GT(environment.logical_cpu_count, 0U);
+  EXPECT_GT(environment.memory_limit_bytes, 0U);
+  EXPECT_GT(environment.storage_free_bytes, 0U);
+  EXPECT_FALSE(environment.storage_device_and_filesystem.empty());
+  EXPECT_TRUE(environment.resource_limit_provenance_complete);
+  EXPECT_TRUE(environment.storage_provenance_complete);
+}
+
+TEST(BenchmarkEnvironmentTest,
+     LinuxCgroupAncestryRequiresHierarchyRootAndInitialNamespace) {
+  EXPECT_TRUE(LinuxCgroupAncestryProvenanceCompleteForTesting(
+      "/", 0xEFFFFFFBULL));
+  EXPECT_FALSE(LinuxCgroupAncestryProvenanceCompleteForTesting(
+      "/docker/hidden-parent", 0xEFFFFFFBULL));
+  EXPECT_FALSE(LinuxCgroupAncestryProvenanceCompleteForTesting(
+      "/", 4026532569ULL));
+}
+
 TEST(BenchmarkProfileTest, NamesEveryCacheModeAndRejectsUnsupportedDurability) {
   const std::vector<std::string> names = {
       "cold_process_and_database",
@@ -21307,7 +22240,9 @@ TEST(BenchmarkFaultCampaignTest, ParsesPublicationFaultScenarioNames) {
            std::string("sst_after_rename"),
            std::string("sidecar_after_rename"),
            std::string("blob_gc_after_manifest_rename"),
-           std::string("accepted_work_shutdown")}) {
+           std::string("accepted_work_shutdown"),
+           std::string("tcypher_spill_disk_full"),
+           std::string("tcypher_spill_corruption")}) {
     const auto parsed = ParseBenchmarkFaultScenario(name);
     ASSERT_TRUE(parsed.ok()) << name << ": " << parsed.status().ToString();
     EXPECT_EQ(BenchmarkFaultScenarioName(parsed.ValueOrDie()), name);
@@ -21333,6 +22268,8 @@ TEST_F(DurableLogTest,
       BenchmarkFaultScenario::kSidecarAfterRename,
       BenchmarkFaultScenario::kBlobGcAfterManifestRename,
       BenchmarkFaultScenario::kAcceptedWorkShutdown,
+      BenchmarkFaultScenario::kTcypherSpillDiskFull,
+      BenchmarkFaultScenario::kTcypherSpillCorruption,
   };
   for (const BenchmarkFaultScenario scenario : scenarios) {
     EXPECT_NE(BenchmarkFaultVerificationDetail(scenario).find(
@@ -21365,6 +22302,7 @@ TEST_F(DurableLogTest,
     config.scenario = scenario;
     config.vertex_property_schema_epoch = registered.schema_epoch;
     config.valid_time = dataset_config.valid_time_span + 10;
+    config.spill_directory = case_path + "/spill";
     config.reopen_database = [case_path, dataset_config] {
       return std::make_unique<CedarDatabase>(
           case_path, 1, dataset_config.seed);
@@ -21378,6 +22316,11 @@ TEST_F(DurableLogTest,
     EXPECT_EQ(result.ValueOrDie().logical_work_units, 1U);
     EXPECT_EQ(result.ValueOrDie().measurement_mode, "fault_recovery");
     ASSERT_NE(database, nullptr);
+    if (scenario == BenchmarkFaultScenario::kTcypherSpillDiskFull ||
+        scenario == BenchmarkFaultScenario::kTcypherSpillCorruption) {
+      EXPECT_TRUE(!std::filesystem::exists(config.spill_directory) ||
+                  std::filesystem::is_empty(config.spill_directory));
+    }
 
     const auto recovered = database->Get(
         LogicalKey::VertexProperty(dataset_config.vertex_count, 1),
@@ -21464,7 +22407,7 @@ TEST_F(DurableLogTest, BenchmarkWorkloadDriverRunsVerifiedPublicApiFamilies) {
       {BenchmarkWorkloadFamily::kIndexEquality, 1},
       {BenchmarkWorkloadFamily::kMaintenanceCycle, 5},
       {BenchmarkWorkloadFamily::kHtapBalanced,
-       2 * dataset_config.vertex_count + 3},
+       2 * dataset_config.vertex_count + 4},
       {BenchmarkWorkloadFamily::kRecovery, 2},
   };
   for (const auto& item : cases) {
@@ -21513,6 +22456,16 @@ TEST_F(DurableLogTest, BenchmarkWorkloadDriverRunsVerifiedPublicApiFamilies) {
                 dataset_config.vertex_count);
       EXPECT_EQ(run.ValueOrDie().transaction_measurements.commit_latency.sample_count,
                 dataset_config.vertex_count);
+    }
+    if (item.first == BenchmarkWorkloadFamily::kHtapBalanced) {
+      EXPECT_GT(run.ValueOrDie().transaction_measurements.conflicts, 0U);
+      EXPECT_TRUE(
+          run.ValueOrDie().transaction_measurements.conflict_abort_rate.defined);
+      EXPECT_GT(
+          run.ValueOrDie().transaction_measurements.visible_prefix_nonzero_stalls,
+          0U);
+      EXPECT_TRUE(run.ValueOrDie()
+                      .transaction_measurements.visible_prefix_max_lag_defined);
     }
     if (item.first == BenchmarkWorkloadFamily::kAnalyticalVertexCount ||
         item.first == BenchmarkWorkloadFamily::kGraphOneHop) {
@@ -21568,6 +22521,273 @@ TEST_F(DurableLogTest, BenchmarkWorkloadDriverRunsVerifiedPublicApiFamilies) {
     EXPECT_GT(run.ValueOrDie().derived_metrics.space_amplification.denominator,
               0U);
   }
+}
+
+TEST_F(DurableLogTest,
+       BenchmarkIndexPathMatrixExecutesEveryRequiredPhysicalChoice) {
+  CedarTgConfig dataset_config;
+  dataset_config.seed = 93;
+  dataset_config.vertex_count = 100;
+  dataset_config.edge_count = 2;
+  dataset_config.valid_time_span = 100;
+  const auto generated = GenerateCedarTg(dataset_config);
+  ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+
+  CedarDatabase database(path_ + "/index-path-matrix", 2,
+                         dataset_config.seed);
+  ASSERT_TRUE(database.Open().ok());
+  ColumnSchema vertex_existence;
+  ColumnSchema vertex_property;
+  ColumnSchema edge_existence;
+  ASSERT_TRUE(database.RegisterColumn(
+      ColumnSchema{EntityType::Vertex, 0, 0, "existence",
+                   PhysicalType::kBinary, 4096, EncodingPolicy::kAdaptive,
+                   CompressionPolicy::kLz4},
+      &vertex_existence).ok());
+  ASSERT_TRUE(database.RegisterColumn(
+      ColumnSchema{EntityType::Vertex, 1, 0, "value",
+                   PhysicalType::kString, 4096, EncodingPolicy::kAdaptive,
+                   CompressionPolicy::kLz4},
+      &vertex_property).ok());
+  ASSERT_TRUE(database.RegisterColumn(
+      ColumnSchema{EntityType::EdgeOut, 1, 0, "existence",
+                   PhysicalType::kBinary, 4096, EncodingPolicy::kAdaptive,
+                   CompressionPolicy::kLz4},
+      &edge_existence).ok());
+  for (const TemporalEvent& event : generated.ValueOrDie().events) {
+    const ColumnSchema* schema =
+        event.logical_key().entity_type() == EntityType::EdgeOut
+            ? &edge_existence
+            : (event.logical_key().IsExistence() ? &vertex_existence
+                                                 : &vertex_property);
+    ASSERT_TRUE(database.Put(event.logical_key(), event.valid_from(),
+                             schema->schema_epoch, event.value()).ok());
+  }
+
+  BenchmarkWorkloadConfig workload;
+  workload.family = BenchmarkWorkloadFamily::kIndexPathMatrix;
+  workload.vertex_property_schema_epoch = vertex_existence.schema_epoch;
+  ASSERT_TRUE(PrepareBenchmarkWorkload(
+      &database, generated.ValueOrDie(), workload).ok());
+  const auto run = RunBenchmarkWorkload(
+      &database, generated.ValueOrDie(), workload);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  ASSERT_TRUE(run.ValueOrDie().terminal_status.ok())
+      << run.ValueOrDie().terminal_status.ToString();
+  EXPECT_TRUE(run.ValueOrDie().verified);
+  EXPECT_EQ(run.ValueOrDie().logical_work_units, 6U);
+  EXPECT_EQ(run.ValueOrDie().samples.size(), 6U);
+  EXPECT_FALSE(run.ValueOrDie().result_checksum.empty());
+  EXPECT_GT(run.ValueOrDie().derived_metrics.index_survival.numerator, 0U);
+  EXPECT_GT(run.ValueOrDie().derived_metrics.index_survival.denominator, 0U);
+  EXPECT_GT(database.metrics().Counter(
+                "cedar_index_candidate_rows_total", "all").value_or(0),
+            0U);
+}
+
+TEST_F(DurableLogTest,
+       BenchmarkSchedulerSaturationPublishesAllClassDistributions) {
+  CedarTgConfig dataset_config;
+  dataset_config.seed = 94;
+  dataset_config.vertex_count = 4;
+  dataset_config.edge_count = 2;
+  dataset_config.valid_time_span = 100;
+  const auto generated = GenerateCedarTg(dataset_config);
+  ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+
+  CedarDatabase database(path_ + "/scheduler-saturation", 1,
+                         dataset_config.seed);
+  ASSERT_TRUE(database.Open().ok());
+  BenchmarkWorkloadConfig workload;
+  workload.family = BenchmarkWorkloadFamily::kSchedulerSaturation;
+  const auto run = RunBenchmarkWorkload(
+      &database, generated.ValueOrDie(), workload);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  ASSERT_TRUE(run.ValueOrDie().terminal_status.ok())
+      << run.ValueOrDie().terminal_status.ToString();
+  EXPECT_TRUE(run.ValueOrDie().verified);
+  EXPECT_EQ(run.ValueOrDie().logical_work_units, 5U);
+  EXPECT_EQ(run.ValueOrDie().samples.size(), 5U);
+
+  database.ExportMetricsJson();
+  for (const std::string& work_class : {
+           std::string("commit_critical"), std::string("recovery"),
+           std::string("shutdown"), std::string("foreground_write"),
+           std::string("point_read"), std::string("interactive_query"),
+           std::string("flush"), std::string("compaction_urgent"),
+           std::string("analytical_query"),
+           std::string("compaction_normal"), std::string("index_build"),
+           std::string("stats_merge"), std::string("blob_gc")}) {
+    EXPECT_GT(database.metrics().Counter(
+                  "cedar_scheduler_grant_cpu_slots_total", work_class)
+                  .value_or(0),
+              0U) << work_class;
+  }
+  EXPECT_GT(database.metrics().Counter(
+                "cedar_scheduler_deadline_misses_total",
+                "interactive_query").value_or(0),
+            0U);
+}
+
+TEST_F(DurableLogTest,
+       BenchmarkMaintenanceCycleExecutesRealCompactionAndPublishesPeaks) {
+  CedarTgConfig dataset_config;
+  dataset_config.seed = 92;
+  dataset_config.vertex_count = 4;
+  dataset_config.edge_count = 2;
+  dataset_config.valid_time_span = 100;
+  const auto generated = GenerateCedarTg(dataset_config);
+  ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+
+  CedarDatabase database(path_ + "/maintenance-workload", 1,
+                         dataset_config.seed);
+  ASSERT_TRUE(database.Open().ok());
+  ColumnSchema vertex_existence;
+  ColumnSchema vertex_property;
+  ColumnSchema edge_existence;
+  ASSERT_TRUE(database.RegisterColumn(
+      ColumnSchema{EntityType::Vertex, 0, 0, "existence",
+                   PhysicalType::kBinary, 4096, EncodingPolicy::kAdaptive,
+                   CompressionPolicy::kLz4},
+      &vertex_existence).ok());
+  ASSERT_TRUE(database.RegisterColumn(
+      ColumnSchema{EntityType::Vertex, 1, 0, "value",
+                   PhysicalType::kString, 4096, EncodingPolicy::kAdaptive,
+                   CompressionPolicy::kLz4},
+      &vertex_property).ok());
+  ASSERT_TRUE(database.RegisterColumn(
+      ColumnSchema{EntityType::EdgeOut, 1, 0, "existence",
+                   PhysicalType::kBinary, 4096, EncodingPolicy::kAdaptive,
+                   CompressionPolicy::kLz4},
+      &edge_existence).ok());
+  for (const TemporalEvent& event : generated.ValueOrDie().events) {
+    const ColumnSchema* schema =
+        event.logical_key().entity_type() == EntityType::EdgeOut
+            ? &edge_existence
+            : (event.logical_key().IsExistence() ? &vertex_existence
+                                                 : &vertex_property);
+    ASSERT_TRUE(database.Put(event.logical_key(), event.valid_from(),
+                             schema->schema_epoch, event.value()).ok());
+  }
+
+  BenchmarkWorkloadConfig workload;
+  workload.family = BenchmarkWorkloadFamily::kMaintenanceCycle;
+  workload.vertex_property_schema_epoch = vertex_property.schema_epoch;
+  ASSERT_TRUE(PrepareBenchmarkWorkload(
+      &database, generated.ValueOrDie(), workload).ok());
+  const auto run = RunBenchmarkWorkload(
+      &database, generated.ValueOrDie(), workload);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  ASSERT_TRUE(run.ValueOrDie().terminal_status.ok())
+      << run.ValueOrDie().terminal_status.ToString();
+  EXPECT_TRUE(run.ValueOrDie().verified);
+  EXPECT_GT(database.metrics().Counter(
+                "cedar_compaction_input_bytes_total", "all").value_or(0),
+            0U);
+  EXPECT_GT(database.metrics().Counter(
+                "cedar_compaction_output_bytes_total", "all").value_or(0),
+            0U);
+  EXPECT_GT(database.metrics().Counter(
+                "cedar_compaction_buffer_peak_bytes", "all").value_or(0),
+            0U);
+  EXPECT_GT(database.metrics().Counter(
+                "cedar_compaction_buffer_peak_events", "all").value_or(0),
+            0U);
+}
+
+TEST(BenchmarkWorkloadDriverTest, DeclaresFailClosedProductionMetricActivity) {
+  const auto htap = ProductionMetricActivityRequirements(
+      BenchmarkWorkloadFamily::kHtapBalanced);
+  const auto index = ProductionMetricActivityRequirements(
+      BenchmarkWorkloadFamily::kIndexEquality);
+  const auto index_path_matrix = ProductionMetricActivityRequirements(
+      BenchmarkWorkloadFamily::kIndexPathMatrix);
+  const auto scheduler_saturation = ProductionMetricActivityRequirements(
+      BenchmarkWorkloadFamily::kSchedulerSaturation);
+  const auto maintenance = ProductionMetricActivityRequirements(
+      BenchmarkWorkloadFamily::kMaintenanceCycle);
+  const auto point = ProductionMetricActivityRequirements(
+      BenchmarkWorkloadFamily::kPointRead);
+  const auto contains = [](const auto& requirements, const std::string& name,
+                           const std::string& label) {
+    return std::any_of(
+        requirements.begin(), requirements.end(), [&](const auto& item) {
+          return item.name == name && item.label == label && item.minimum == 1;
+        });
+  };
+  EXPECT_TRUE(contains(htap, "cedar_txn_conflict_total", "strict"));
+  EXPECT_TRUE(contains(htap, "cedar_txn_visible_prefix_stall_ns",
+                       "snapshot:succeeded"));
+  EXPECT_TRUE(contains(htap, "cedar_scheduler_queue_delay_ns",
+                       "analytical_query"));
+  EXPECT_TRUE(contains(htap, "cedar_scheduler_service_ns",
+                       "analytical_query"));
+  EXPECT_TRUE(contains(htap, "cedar_scheduler_grant_cpu_slots_total",
+                       "analytical_query"));
+  EXPECT_TRUE(contains(index, "cedar_index_candidate_rows_total", "all"));
+  EXPECT_TRUE(contains(index, "cedar_scheduler_service_ns",
+                       "interactive_query"));
+  EXPECT_TRUE(contains(index_path_matrix,
+                       "cedar_index_candidate_rows_total", "all"));
+  EXPECT_TRUE(contains(index_path_matrix, "cedar_scheduler_service_ns",
+                       "interactive_query"));
+  EXPECT_TRUE(contains(index_path_matrix,
+                       "cedar_scheduler_grant_cpu_slots_total",
+                       "interactive_query"));
+  for (const std::string& work_class : {
+           std::string("commit_critical"), std::string("recovery"),
+           std::string("shutdown"), std::string("foreground_write"),
+           std::string("point_read"), std::string("interactive_query"),
+           std::string("flush"), std::string("compaction_urgent"),
+           std::string("analytical_query"),
+           std::string("compaction_normal"), std::string("index_build"),
+           std::string("stats_merge"), std::string("blob_gc")}) {
+    EXPECT_TRUE(contains(scheduler_saturation,
+                         "cedar_scheduler_queue_delay_ns", work_class))
+        << work_class;
+    EXPECT_TRUE(contains(scheduler_saturation,
+                         "cedar_scheduler_service_ns", work_class))
+        << work_class;
+    EXPECT_TRUE(contains(scheduler_saturation,
+                         "cedar_scheduler_grant_cpu_slots_total", work_class))
+        << work_class;
+  }
+  EXPECT_TRUE(contains(scheduler_saturation,
+                       "cedar_scheduler_deadline_misses_total",
+                       "interactive_query"));
+  for (const std::string& work_class : {
+           std::string("flush"), std::string("compaction"),
+           std::string("blob_rotation"), std::string("blob_gc"),
+           std::string("checkpoint")}) {
+    EXPECT_TRUE(contains(maintenance, "cedar_maintenance_completed_total",
+                         work_class)) << work_class;
+  }
+  for (const std::string& metric : {
+           std::string("cedar_compaction_input_bytes_total"),
+           std::string("cedar_compaction_output_bytes_total"),
+           std::string("cedar_compaction_buffer_peak_bytes"),
+           std::string("cedar_compaction_buffer_peak_events"),
+           std::string("cedar_cache_resident_peak_bytes")}) {
+    EXPECT_TRUE(contains(maintenance, metric, "all")) << metric;
+  }
+  EXPECT_TRUE(point.empty());
+}
+
+TEST(BenchmarkWorkloadDriverTest, ParsesIndexPathMatrixFamily) {
+  const auto parsed = ParseBenchmarkWorkloadFamily("index-path-matrix");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  EXPECT_EQ(parsed.ValueOrDie(), BenchmarkWorkloadFamily::kIndexPathMatrix);
+  EXPECT_STREQ(BenchmarkWorkloadFamilyName(parsed.ValueOrDie()),
+               "index-path-matrix");
+}
+
+TEST(BenchmarkWorkloadDriverTest, ParsesSchedulerSaturationFamily) {
+  const auto parsed = ParseBenchmarkWorkloadFamily("scheduler-saturation");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  EXPECT_EQ(parsed.ValueOrDie(),
+            BenchmarkWorkloadFamily::kSchedulerSaturation);
+  EXPECT_STREQ(BenchmarkWorkloadFamilyName(parsed.ValueOrDie()),
+               "scheduler-saturation");
 }
 
 TEST(BenchmarkRegressionGateTest, PersistsFailingPairedReleaseGate) {
@@ -21881,7 +23101,8 @@ TEST(BenchmarkArtifactTest, PersistsOptionalTelemetryPayloadsAndRecordsTheirPres
   verification.load_passed = true;
   verification.result_passed = true;
   verification.reopen_passed = true;
-  const auto written = WriteBenchmarkArtifacts(root, manifest, ProbeBenchmarkEnvironment(),
+  const BenchmarkEnvironment environment = ProbeBenchmarkEnvironment(root);
+  const auto written = WriteBenchmarkArtifacts(root, manifest, environment,
                                                 summary, verification);
   ASSERT_TRUE(written.ok()) << written.status().ToString();
   const BenchmarkArtifactPaths& paths = written.ValueOrDie();
@@ -21893,6 +23114,32 @@ TEST(BenchmarkArtifactTest, PersistsOptionalTelemetryPayloadsAndRecordsTheirPres
           (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>()); }();
   EXPECT_NE(serialized.find("\"histograms_artifact_present\":true"), std::string::npos);
   EXPECT_NE(serialized.find("\"explain_artifact_present\":true"), std::string::npos);
+  const std::string environment_text = [&] {
+    std::ifstream input(paths.environment_path);
+    return std::string((std::istreambuf_iterator<char>(input)),
+                       std::istreambuf_iterator<char>());
+  }();
+  EXPECT_NE(environment_text.find(
+                "logical_cpu_count=" +
+                std::to_string(environment.logical_cpu_count)),
+            std::string::npos);
+  EXPECT_NE(environment_text.find(
+                "memory_limit_bytes=" +
+                std::to_string(environment.memory_limit_bytes)),
+            std::string::npos);
+  EXPECT_NE(environment_text.find(
+                "storage_free_bytes=" +
+                std::to_string(environment.storage_free_bytes)),
+            std::string::npos);
+  EXPECT_NE(environment_text.find(
+                "resource_limit_provenance_complete=true"),
+            std::string::npos);
+  EXPECT_NE(environment_text.find("storage_provenance_complete=true"),
+            std::string::npos);
+  EXPECT_NE(environment_text.find("storage_device_and_filesystem="),
+            std::string::npos);
+  EXPECT_FALSE(ValidateBenchmarkArtifactProductionMetrics(
+                   paths.run_directory, {}).ok());
   std::filesystem::remove_all(root);
 }
 
@@ -22311,6 +23558,279 @@ TEST_F(DurableLogTest, DatabasePointReadsMatchIndependentOracleAcrossFlushAndReo
   database = std::make_unique<CedarDatabase>(path_, 2, 17);
   ASSERT_TRUE(database->Open().ok());
   check();
+}
+
+TEST_F(DurableLogTest,
+       TcypherCorpusMatchesAcrossMemtableFrozenSstCompactionBlobRelocationAndReopen) {
+  auto database = std::make_unique<CedarDatabase>(path_, 1, 73);
+  ASSERT_TRUE(database->Open().ok());
+  ColumnSchema existence{EntityType::Vertex, 0, 0, "Person",
+                         PhysicalType::kBinary, 4096,
+                         EncodingPolicy::kAdaptive,
+                         CompressionPolicy::kLz4};
+  ColumnSchema payload{EntityType::Vertex, 17, 0, "payload",
+                       PhysicalType::kString, 8,
+                       EncodingPolicy::kAdaptive,
+                       CompressionPolicy::kLz4};
+  ColumnSchema registered_existence;
+  ColumnSchema registered_payload;
+  ASSERT_TRUE(database->RegisterColumn(existence, &registered_existence).ok());
+  ASSERT_TRUE(database->RegisterColumn(payload, &registered_payload).ok());
+  const std::array<std::string, 4> payloads = {
+      std::string(8192, 'a'), std::string(8192, 'b'),
+      std::string(8192, 'c'), std::string(8192, 'd')};
+  for (uint64_t vertex = 1; vertex <= 4; ++vertex) {
+    ASSERT_TRUE(database->Put(LogicalKey::VertexExistence(vertex), 10,
+                              registered_existence.schema_epoch,
+                              Value::Binary(""))
+                    .ok());
+    ASSERT_TRUE(database->Put(
+        LogicalKey::VertexProperty(vertex, registered_payload.column_id), 10,
+        registered_payload.schema_epoch,
+        Value::String(payloads[vertex - 1]))
+                    .ok());
+  }
+
+  const auto open_corpus = [&] {
+    TcypherQueryOptions options;
+    options.statement_start_valid_time = 10;
+    return database->ExecuteTcypher(
+        "MATCH (n) RETURN n, n.payload, valid_from(n), valid_to(n);",
+        options);
+  };
+  const auto check_stream = [&](const std::string& stage,
+                                StatusOr<std::unique_ptr<QueryResultStream>> stream) {
+    SCOPED_TRACE(stage);
+    ASSERT_TRUE(stream.ok()) << stream.status().ToString();
+    std::vector<std::tuple<int64_t, std::string, uint64_t, uint64_t>> rows;
+    for (;;) {
+      ResultBatch batch;
+      const Status next = stream.ValueOrDie()->Next(&batch);
+      if (next.IsNotFound()) break;
+      ASSERT_TRUE(next.ok()) << next.ToString();
+      for (uint32_t row = 0; row < batch.batch().row_count(); ++row) {
+        rows.emplace_back(
+            std::get<int64_t>(batch.batch().ValueAt(0, row)->data()),
+            std::get<std::string>(batch.batch().ValueAt(1, row)->data()),
+            std::get<uint64_t>(batch.batch().ValueAt(2, row)->data()),
+            std::get<uint64_t>(batch.batch().ValueAt(3, row)->data()));
+      }
+    }
+    std::sort(rows.begin(), rows.end());
+    EXPECT_EQ(rows,
+              (std::vector<std::tuple<int64_t, std::string, uint64_t,
+                                      uint64_t>>{
+                  {1, payloads[0], 10, std::numeric_limits<uint64_t>::max()},
+                  {2, payloads[1], 10, std::numeric_limits<uint64_t>::max()},
+                  {3, payloads[2], 10, std::numeric_limits<uint64_t>::max()},
+                  {4, payloads[3], 10, std::numeric_limits<uint64_t>::max()}}));
+  };
+  const auto check_corpus = [&](const std::string& stage) {
+    check_stream(stage, open_corpus());
+  };
+
+  check_corpus("active-memtable");
+  auto pinned_before_freeze = open_corpus();
+  ASSERT_TRUE(pinned_before_freeze.ok())
+      << pinned_before_freeze.status().ToString();
+  std::mutex hook_mutex;
+  std::condition_variable hook_changed;
+  bool frozen = false;
+  bool release = false;
+  CedarDatabaseTestAccess::SetFlushExecutionHook(database.get(), [&] {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    frozen = true;
+    hook_changed.notify_one();
+    hook_changed.wait(lock, [&] { return release; });
+  });
+  Status flush_status = Status::InvalidArgument("test", "flush not run");
+  std::thread flush_thread([&] { flush_status = database->Flush(); });
+  bool observed_frozen = false;
+  {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    observed_frozen = hook_changed.wait_for(lock, std::chrono::seconds(2),
+                                            [&] { return frozen; });
+  }
+  if (observed_frozen) {
+    check_stream("pinned-snapshot-during-frozen-handoff",
+                 std::move(pinned_before_freeze));
+  }
+  {
+    std::lock_guard<std::mutex> lock(hook_mutex);
+    release = true;
+  }
+  hook_changed.notify_one();
+  flush_thread.join();
+  ASSERT_TRUE(observed_frozen);
+  ASSERT_TRUE(flush_status.ok()) << flush_status.ToString();
+  CedarDatabaseTestAccess::SetFlushExecutionHook(database.get(), {});
+  check_corpus("one-sst");
+
+  for (uint32_t flush = 0; flush < 2; ++flush) {
+    for (uint64_t vertex = 1; vertex <= 4; ++vertex) {
+      ASSERT_TRUE(database->Put(LogicalKey::VertexExistence(vertex), 10,
+                                registered_existence.schema_epoch,
+                                Value::Binary(""))
+                      .ok());
+      ASSERT_TRUE(database->Put(
+          LogicalKey::VertexProperty(vertex, registered_payload.column_id),
+          10, registered_payload.schema_epoch,
+          Value::String(payloads[vertex - 1]))
+                      .ok());
+    }
+    check_corpus("sst-plus-active-" + std::to_string(flush));
+    ASSERT_TRUE(database->Flush().ok());
+    check_corpus("post-flush-" + std::to_string(flush));
+  }
+  const size_t live_sst_before =
+      CedarDatabaseTestAccess::LiveSstCount(database.get());
+  ASSERT_GT(live_sst_before, 1U);
+  const auto stats_before_compaction = database->storage_stats();
+  ASSERT_TRUE(stats_before_compaction.ok())
+      << stats_before_compaction.status().ToString();
+  check_corpus("many-sst");
+  ASSERT_TRUE(database->Compact().ok());
+  const auto stats_after_compaction = database->storage_stats();
+  ASSERT_TRUE(stats_after_compaction.ok())
+      << stats_after_compaction.status().ToString();
+  EXPECT_GT(stats_after_compaction.ValueOrDie().compaction_input_bytes,
+            stats_before_compaction.ValueOrDie().compaction_input_bytes);
+  EXPECT_GT(stats_after_compaction.ValueOrDie().compaction_output_bytes,
+            stats_before_compaction.ValueOrDie().compaction_output_bytes);
+  EXPECT_LT(CedarDatabaseTestAccess::LiveSstCount(database.get()),
+            live_sst_before);
+  check_corpus("post-compaction");
+
+  database.reset();
+  database = std::make_unique<CedarDatabase>(path_, 1, 73);
+  ASSERT_TRUE(database->Open().ok());
+  check_corpus("reopen");
+  ASSERT_TRUE(database->RotateBlobSegments().ok());
+  ASSERT_TRUE(database->CollectBlobGarbage().ok());
+  const auto relocated = database->storage_stats();
+  ASSERT_TRUE(relocated.ok()) << relocated.status().ToString();
+  EXPECT_GT(relocated.ValueOrDie().blob_gc_rewritten_bytes, 0U);
+  check_corpus("post-blob-relocation");
+
+  database.reset();
+  database = std::make_unique<CedarDatabase>(path_, 1, 73);
+  ASSERT_TRUE(database->Open().ok());
+  check_corpus("reopen-after-blob-relocation");
+}
+
+TEST_F(DurableLogTest,
+       IndexLifecycleCompactsRepairsDropsAndReopensWithoutIdReuse) {
+  auto database = std::make_unique<CedarDatabase>(path_, 1, 79);
+  ASSERT_TRUE(database->Open().ok());
+  ColumnSchema existence{EntityType::Vertex, 0, 0, "Person",
+                         PhysicalType::kBinary, 4096,
+                         EncodingPolicy::kAdaptive,
+                         CompressionPolicy::kLz4};
+  ColumnSchema name{EntityType::Vertex, 7, 0, "name",
+                    PhysicalType::kString, 4096,
+                    EncodingPolicy::kAdaptive,
+                    CompressionPolicy::kLz4};
+  ColumnSchema registered_existence;
+  ColumnSchema registered_name;
+  ASSERT_TRUE(database->RegisterColumn(existence, &registered_existence).ok());
+  ASSERT_TRUE(database->RegisterColumn(name, &registered_name).ok());
+  for (uint32_t flush = 0; flush < 2; ++flush) {
+    for (uint64_t vertex = 1 + flush * 16; vertex <= 16 + flush * 16;
+         ++vertex) {
+      ASSERT_TRUE(database->Put(LogicalKey::VertexExistence(vertex), 10,
+                                registered_existence.schema_epoch,
+                                Value::Binary(""))
+                      .ok());
+      ASSERT_TRUE(database->Put(
+          LogicalKey::VertexProperty(vertex, registered_name.column_id), 10,
+          registered_name.schema_epoch,
+          Value::String(vertex == 7 ? "target" : "other"))
+                      .ok());
+    }
+    ASSERT_TRUE(database->Flush().ok());
+  }
+  const size_t live_sst_before =
+      CedarDatabaseTestAccess::LiveSstCount(database.get());
+  ASSERT_GT(live_sst_before, 1U);
+  const auto stats_before_compaction = database->storage_stats();
+  ASSERT_TRUE(stats_before_compaction.ok())
+      << stats_before_compaction.status().ToString();
+  ASSERT_TRUE(database->Compact().ok());
+  const auto stats_after_compaction = database->storage_stats();
+  ASSERT_TRUE(stats_after_compaction.ok())
+      << stats_after_compaction.status().ToString();
+  EXPECT_GT(stats_after_compaction.ValueOrDie().compaction_input_bytes,
+            stats_before_compaction.ValueOrDie().compaction_input_bytes);
+  EXPECT_GT(stats_after_compaction.ValueOrDie().compaction_output_bytes,
+            stats_before_compaction.ValueOrDie().compaction_output_bytes);
+  EXPECT_LT(CedarDatabaseTestAccess::LiveSstCount(database.get()),
+            live_sst_before);
+
+  IndexDefinition definition;
+  definition.entity_type = EntityType::Vertex;
+  definition.column_id = registered_name.column_id;
+  definition.schema_epoch = registered_name.schema_epoch;
+  definition.capabilities = kIndexEquality;
+  definition.canonical_encoding_id = kIndexCanonicalEncodingBitmap;
+  uint64_t dropped_index_id = 0;
+  ASSERT_TRUE(database->RegisterIndex(definition, &dropped_index_id).ok());
+  ASSERT_TRUE(database->SetIndexState(dropped_index_id,
+                                      IndexState::kBuilding).ok());
+  ASSERT_TRUE(database->SetIndexState(dropped_index_id,
+                                      IndexState::kActive).ok());
+
+  std::filesystem::path old_sidecar;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(
+           std::filesystem::path(path_) / "indexes")) {
+    if (entry.is_regular_file() && entry.path().extension() == ".idx") {
+      old_sidecar = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(old_sidecar.empty());
+  std::ofstream(old_sidecar, std::ios::binary | std::ios::trunc) << "corrupt";
+  ASSERT_TRUE(database->RepairIndexes().ok());
+
+  const auto run_target_query = [&](bool expect_index) {
+    auto stats = std::make_shared<TcypherExecutionStats>();
+    TcypherQueryOptions options;
+    options.statement_start_valid_time = 10;
+    options.execution_stats = stats;
+    auto stream = database->ExecuteTcypher(
+        "MATCH (n) WHERE n.name = 'target' RETURN n;", options);
+    ASSERT_TRUE(stream.ok()) << stream.status().ToString();
+    uint64_t rows = 0;
+    for (;;) {
+      ResultBatch batch;
+      const Status next = stream.ValueOrDie()->Next(&batch);
+      if (next.IsNotFound()) break;
+      ASSERT_TRUE(next.ok()) << next.ToString();
+      rows += batch.batch().row_count();
+    }
+    EXPECT_EQ(rows, 1U);
+    if (expect_index) {
+      EXPECT_GT(stats->index_candidate_items_processed, 0U);
+    } else {
+      EXPECT_EQ(stats->index_candidate_items_processed, 0U);
+    }
+  };
+  run_target_query(true);
+  ASSERT_TRUE(database->DropIndex(dropped_index_id).ok());
+  run_target_query(false);
+
+  database.reset();
+  EXPECT_FALSE(std::filesystem::exists(old_sidecar));
+  database = std::make_unique<CedarDatabase>(path_, 1, 79);
+  ASSERT_TRUE(database->Open().ok());
+  run_target_query(false);
+  uint64_t replacement_index_id = 0;
+  ASSERT_TRUE(database->RegisterIndex(definition, &replacement_index_id).ok());
+  EXPECT_GT(replacement_index_id, dropped_index_id);
+  ASSERT_TRUE(database->SetIndexState(replacement_index_id,
+                                      IndexState::kBuilding).ok());
+  ASSERT_TRUE(database->SetIndexState(replacement_index_id,
+                                      IndexState::kActive).ok());
+  run_target_query(true);
 }
 
 TEST_F(DurableLogTest, DatabaseRangesAndChangesMatchIndependentOracleAcrossReopen) {
@@ -24893,6 +26413,9 @@ TEST_F(DurableLogTest, TcypherValidTimeRangeUsesActiveSstIndexCandidates) {
   EXPECT_GT(stats->index_sst_sources_materialized, 0U);
   EXPECT_EQ(stats->index_candidate_entity_count, 2U);
   EXPECT_EQ(stats->base_history_materialized_events, 0U);
+  db.ExportMetricsJson();
+  EXPECT_EQ(db.metrics().Counter("cedar_index_candidate_rows_total", "all"),
+            2U);
 }
 
 TEST(TcypherExecutorTest,

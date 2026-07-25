@@ -115,6 +115,7 @@ set(CEDAR_SOURCES
     src/benchmark/environment_probe.cc
     src/benchmark/phase_runner.cc
     src/benchmark/profile.cc
+    src/benchmark/production_campaign.cc
     src/benchmark/artifact_writer.cc
     src/benchmark/artifact_reader.cc
     src/benchmark/arrival_scheduler.cc
@@ -128,6 +129,7 @@ set(CEDAR_SOURCES
     src/observability/explain_analyze_profile.cc
     src/observability/metric_exporter.cc
     src/observability/operator_runtime_stats.cc
+    src/observability/production_metric_schema.cc
     src/observability/telemetry_aggregator.cc
     src/runtime/io_governor.cc
     src/runtime/work_execution_service.cc
@@ -194,42 +196,51 @@ add_executable(cedar_evidence_verify benchmarks/cedar_evidence_verify.cc)
 target_link_libraries(cedar_evidence_verify PRIVATE cedar)
 add_executable(cedar_bench_pair benchmarks/cedar_bench_pair.cc)
 target_link_libraries(cedar_bench_pair PRIVATE cedar)
-execute_process(
-    COMMAND git rev-parse HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE CEDAR_SOURCE_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT CEDAR_SOURCE_COMMIT)
-    set(CEDAR_SOURCE_COMMIT "unknown")
-endif()
-execute_process(
-    COMMAND git diff --quiet
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    RESULT_VARIABLE CEDAR_SOURCE_DIRTY
-    ERROR_QUIET
-)
-if(CEDAR_SOURCE_DIRTY EQUAL 0)
-    set(CEDAR_SOURCE_DIRTY_VALUE 0)
-else()
-    set(CEDAR_SOURCE_DIRTY_VALUE 1)
-endif()
-target_compile_definitions(cedar_bench PRIVATE
-    CEDAR_SOURCE_COMMIT="${CEDAR_SOURCE_COMMIT}"
-    CEDAR_SOURCE_DIRTY=${CEDAR_SOURCE_DIRTY_VALUE}
-)
+add_executable(cedar_production_campaign
+    benchmarks/cedar_production_campaign.cc)
+target_link_libraries(cedar_production_campaign PRIVATE cedar)
 add_executable(cedar_bench_alt benchmarks/cedar_bench.cc)
 target_link_libraries(cedar_bench_alt PRIVATE cedar)
-target_compile_definitions(cedar_bench_alt PRIVATE
-    CEDAR_SOURCE_COMMIT="${CEDAR_SOURCE_COMMIT}"
-    CEDAR_SOURCE_DIRTY=${CEDAR_SOURCE_DIRTY_VALUE}
-    CEDAR_BENCH_VARIANT="alt"
-)
+target_compile_definitions(cedar_bench_alt PRIVATE CEDAR_BENCH_VARIANT="alt")
+
+find_program(CEDAR_GIT_EXECUTABLE git)
+if(NOT CEDAR_GIT_EXECUTABLE)
+    set(CEDAR_GIT_EXECUTABLE git)
+endif()
+set(CEDAR_BENCHMARK_PROVENANCE_HEADER
+    "${CMAKE_BINARY_DIR}/generated/cedar/benchmark/build_provenance.h")
+add_custom_target(cedar_benchmark_provenance
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DOUTPUT_FILE=${CEDAR_BENCHMARK_PROVENANCE_HEADER}
+        -DGIT_EXECUTABLE=${CEDAR_GIT_EXECUTABLE}
+        -P ${CMAKE_SOURCE_DIR}/cmake/GenerateBenchmarkProvenance.cmake
+    BYPRODUCTS ${CEDAR_BENCHMARK_PROVENANCE_HEADER}
+    VERBATIM)
+foreach(CEDAR_BENCHMARK_TARGET cedar_bench cedar_bench_alt)
+    add_dependencies(${CEDAR_BENCHMARK_TARGET} cedar_benchmark_provenance)
+    target_include_directories(${CEDAR_BENCHMARK_TARGET} PRIVATE
+        "${CMAKE_BINARY_DIR}/generated")
+endforeach()
 
 option(BUILD_TESTS "Build Cedar test programs" OFF)
 if(BUILD_TESTS)
     enable_testing()
+    add_test(NAME release_source_contract
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${CMAKE_SOURCE_DIR}
+            -DOUTPUT_ROOT=${CMAKE_BINARY_DIR}/release-source-contract
+            -P ${CMAKE_SOURCE_DIR}/cmake/VerifyReleaseSourceContract.cmake)
+    add_test(NAME release_source_contract_negative
+        COMMAND ${CMAKE_COMMAND}
+            -DSCANNER=${CMAKE_SOURCE_DIR}/cmake/VerifyReleaseSourceContract.cmake
+            -DTEST_ROOT=${CMAKE_BINARY_DIR}/release-source-contract-negative
+            -P ${CMAKE_SOURCE_DIR}/tests/test_release_source_contract.cmake)
+    add_test(NAME benchmark_provenance_generation
+        COMMAND ${CMAKE_COMMAND}
+            -DGENERATOR=${CMAKE_SOURCE_DIR}/cmake/GenerateBenchmarkProvenance.cmake
+            -DTEST_ROOT=${CMAKE_BINARY_DIR}/benchmark-provenance-test-repo
+            -P ${CMAKE_SOURCE_DIR}/tests/test_benchmark_provenance.cmake)
     find_package(GTest CONFIG QUIET)
     if(NOT GTest_FOUND)
         include(FetchContent)

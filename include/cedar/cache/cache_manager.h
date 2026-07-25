@@ -31,6 +31,7 @@ struct CacheKey {
 };
 struct CacheStats {
   uint64_t resident_bytes = 0;
+  uint64_t peak_resident_bytes = 0;
   uint64_t entries = 0;
   uint64_t hits = 0;
   uint64_t misses = 0;

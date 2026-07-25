@@ -2767,9 +2767,16 @@ StatusOr<SstMetadata> MergeSstFilesStreaming(
 
   const auto update_peak = [&]() {
     uint64_t buffered = output_block.size() + chain.size();
-    for (const auto& cursor : cursors) buffered += cursor->buffered_events();
+    uint64_t buffered_bytes = output_bytes + chain_bytes;
+    for (const auto& cursor : cursors) {
+      buffered += cursor->buffered_events();
+      buffered_bytes = SaturatingAdd(buffered_bytes,
+                                     cursor->buffered_bytes());
+    }
     local_stats.peak_buffered_events = std::max(
         local_stats.peak_buffered_events, buffered);
+    local_stats.peak_buffered_bytes = std::max(
+        local_stats.peak_buffered_bytes, buffered_bytes);
   };
   const auto flush_output = [&](bool continuation_after) -> Status {
     if (output_block.empty()) return Status::OK();

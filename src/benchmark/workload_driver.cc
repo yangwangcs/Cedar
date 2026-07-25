@@ -4,6 +4,7 @@
 #include "cedar/benchmark/workload_driver.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -20,6 +21,15 @@
 #include "cedar/db/cedar_database.h"
 
 namespace cedar {
+
+class BenchmarkSchedulerCampaignAccess {
+ public:
+  static WorkExecutionService* ExecutionService(CedarDatabase* database) {
+    return database == nullptr ? nullptr
+                               : database->work_execution_service_.get();
+  }
+};
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -211,7 +221,7 @@ BenchmarkWorkloadResult RunHtapBalanced(
   BenchmarkWorkloadResult result;
   result.measurement_mode = "mixed";
   const uint64_t vertex_count = dataset.config.vertex_count;
-  result.samples.resize(static_cast<size_t>(2 * vertex_count + 3));
+  result.samples.resize(static_cast<size_t>(2 * vertex_count + 4));
   const Clock::time_point origin = Clock::now();
   std::mutex start_mutex;
   std::condition_variable start_ready;
@@ -293,6 +303,49 @@ BenchmarkWorkloadResult RunHtapBalanced(
   point_reader.join();
   analytical.join();
   maintenance.join();
+  execute(static_cast<size_t>(2 * vertex_count + 3), [&] {
+    auto first = database->CreateTcypherSession();
+    if (!first.ok()) return first.status();
+    auto second = database->CreateTcypherSession();
+    if (!second.ok()) return second.status();
+    Status status = first.ValueOrDie()->Begin(TcypherSessionMode::kStrict);
+    if (!status.ok()) return status;
+    status = second.ValueOrDie()->Begin(TcypherSessionMode::kStrict);
+    if (!status.ok()) return status;
+    const uint64_t conflict_time = dataset.config.valid_time_span + 10'000;
+    const LogicalKey first_key = LogicalKey::VertexProperty(1, 1);
+    const LogicalKey second_key = LogicalKey::VertexProperty(
+        vertex_count > 1 ? 2 : 1, 1);
+    status = first.ValueOrDie()->RecordRead(
+        TransactionCoordinator::StrictReadPoint(second_key, conflict_time));
+    if (!status.ok()) return status;
+    status = second.ValueOrDie()->RecordRead(
+        TransactionCoordinator::StrictReadPoint(first_key, conflict_time));
+    if (!status.ok()) return status;
+    status = first.ValueOrDie()->Stage({PendingEvent::Put(
+        first_key, conflict_time, config.vertex_property_schema_epoch,
+        Value::String("bench-htap-strict-first"))});
+    if (!status.ok()) return status;
+    status = second.ValueOrDie()->Stage({PendingEvent::Put(
+        second_key, conflict_time, config.vertex_property_schema_epoch,
+        Value::String("bench-htap-strict-second"))});
+    if (!status.ok()) return status;
+    uint64_t first_commit_seq = 0;
+    status = first.ValueOrDie()->Commit(&first_commit_seq);
+    if (!status.ok()) return status;
+    uint64_t second_commit_seq = 0;
+    const Status rejected = second.ValueOrDie()->Commit(&second_commit_seq);
+    if (!rejected.IsConflict()) {
+      return rejected.ok()
+          ? Status::Corruption(
+                "benchmark HTAP", "strict conflict was not rejected")
+          : rejected;
+    }
+    return first_commit_seq != 0 && second_commit_seq == 0
+        ? Status::OK()
+        : Status::Corruption(
+              "benchmark HTAP", "strict conflict commit sequence mismatch");
+  });
   result.elapsed_ns = ElapsedNs(origin);
   result.logical_work_units = static_cast<uint64_t>(std::count_if(
       result.samples.begin(), result.samples.end(),
@@ -311,11 +364,13 @@ BenchmarkWorkloadResult RunHtapBalanced(
   }
   const uint64_t snapshot_seq = visible.ValueOrDie();
   for (uint64_t vertex_id = 1; vertex_id <= vertex_count; ++vertex_id) {
+    const Value expected = vertex_id == 1
+        ? Value::String("bench-htap-strict-first")
+        : Value::String(BenchmarkHtapIngestionValue(dataset, vertex_id));
     const auto value = database->Get(
         LogicalKey::VertexProperty(vertex_id, 1),
         std::numeric_limits<uint64_t>::max(), snapshot_seq);
-    if (!value.ok() || value.ValueOrDie() != std::optional<Value>(
-            Value::String(BenchmarkHtapIngestionValue(dataset, vertex_id)))) {
+    if (!value.ok() || value.ValueOrDie() != std::optional<Value>(expected)) {
       result.terminal_status = value.ok()
           ? Status::Corruption("benchmark HTAP", "writer verification failed")
           : value.status();
@@ -325,6 +380,431 @@ BenchmarkWorkloadResult RunHtapBalanced(
   result.verified = true;
   result.result_checksum =
       ResultChecksum(dataset, config.family, result.logical_work_units);
+  return result;
+}
+
+enum class RequiredAccessPath : uint8_t {
+  kBase,
+  kIndex,
+  kHybrid,
+  kIntersection,
+};
+
+CandidateSource CandidateSourceFor(RequiredAccessPath path) {
+  switch (path) {
+    case RequiredAccessPath::kBase: return CandidateSource::kBase;
+    case RequiredAccessPath::kIndex: return CandidateSource::kIndex;
+    case RequiredAccessPath::kHybrid: return CandidateSource::kHybrid;
+    case RequiredAccessPath::kIntersection:
+      return CandidateSource::kIntersection;
+  }
+  return CandidateSource::kBase;
+}
+
+Status VerifyExecutedAccessPath(
+    const TcypherExecutionStats& stats, RequiredAccessPath required) {
+  const CandidateSource expected = CandidateSourceFor(required);
+  if (!stats.has_selected_access_path ||
+      stats.selected_access_path != expected ||
+      !stats.has_executed_access_path ||
+      stats.executed_access_path != expected) {
+    return Status::Corruption(
+        "benchmark index path matrix",
+        "required=" + std::to_string(static_cast<uint8_t>(expected)) +
+            " selected_present=" +
+            std::to_string(stats.has_selected_access_path) +
+            " selected=" + std::to_string(static_cast<uint8_t>(
+                stats.selected_access_path)) +
+            " executed_present=" +
+            std::to_string(stats.has_executed_access_path) +
+            " executed=" + std::to_string(static_cast<uint8_t>(
+                stats.executed_access_path)) +
+            " candidates=" +
+            std::to_string(stats.index_candidate_entity_count));
+  }
+  return Status::OK();
+}
+
+Status VerifyExecutedGraphOrder(
+    const TcypherExecutionStats& stats, GraphOrder required) {
+  if (!stats.has_selected_graph_order ||
+      stats.selected_graph_order != required ||
+      !stats.has_executed_graph_order ||
+      stats.executed_graph_order != required) {
+    return Status::Corruption(
+        "benchmark index path matrix",
+        "required=" + std::to_string(static_cast<uint8_t>(required)) +
+            " selected_present=" +
+            std::to_string(stats.has_selected_graph_order) +
+            " selected=" + std::to_string(static_cast<uint8_t>(
+                stats.selected_graph_order)) +
+            " executed_present=" +
+            std::to_string(stats.has_executed_graph_order) +
+            " executed=" + std::to_string(static_cast<uint8_t>(
+                stats.executed_graph_order)));
+  }
+  return Status::OK();
+}
+
+BenchmarkWorkloadResult RunIndexPathMatrix(
+    CedarDatabase* database, const CedarTgDataset& dataset) {
+  BenchmarkWorkloadResult result;
+  result.measurement_mode = "closed_loop";
+  const Clock::time_point origin = Clock::now();
+  uint64_t indexed_output_rows = 0;
+  uint64_t indexed_candidate_rows = 0;
+  const auto run_query = [&](
+      const std::string& query, uint64_t expected_rows,
+      std::optional<RequiredAccessPath> access_path,
+      std::optional<GraphOrder> graph_order,
+      TcypherSession* session = nullptr) {
+    BenchmarkOperationSample sample;
+    sample.requested_arrival_ns = ElapsedNs(origin);
+    sample.admitted_ns = sample.requested_arrival_ns;
+    sample.started_ns = sample.requested_arrival_ns;
+    auto stats = std::make_shared<TcypherExecutionStats>();
+    TcypherQueryOptions options;
+    options.statement_start_valid_time = 0;
+    options.execution_stats = stats;
+    Status status = Status::OK();
+    StatusOr<uint64_t> rows = session == nullptr
+        ? ExecuteRowCountQuery(database, query, options)
+        : [&]() -> StatusOr<uint64_t> {
+            auto opened = database->ExecuteTcypher(*session, query, options);
+            if (!opened.ok()) return opened.status();
+            std::unique_ptr<QueryResultStream> stream =
+                std::move(opened).ConsumeValueOrDie();
+            uint64_t row_count = 0;
+            for (;;) {
+              ResultBatch batch;
+              const Status next = stream->Next(&batch);
+              if (next.IsNotFound()) break;
+              if (!next.ok()) return next;
+              row_count = SaturatingAdd(
+                  row_count, batch.batch().row_count());
+            }
+            const Status terminal = stream->terminal_status();
+            return terminal.ok() ? StatusOr<uint64_t>(row_count)
+                                 : StatusOr<uint64_t>(terminal);
+          }();
+    if (!rows.ok()) {
+      status = rows.status();
+    } else if (rows.ValueOrDie() != expected_rows) {
+      status = Status::Corruption(
+          "benchmark index path matrix",
+          "query result count expected=" + std::to_string(expected_rows) +
+              " actual=" + std::to_string(rows.ValueOrDie()));
+    } else if (access_path.has_value()) {
+      status = VerifyExecutedAccessPath(*stats, *access_path);
+    }
+    if (status.ok() && graph_order.has_value()) {
+      status = VerifyExecutedGraphOrder(*stats, *graph_order);
+    }
+    sample.completed_ns = ElapsedNs(origin);
+    sample.terminal_status = status.ok() ? "PASS" : status.ToString();
+    result.samples.push_back(std::move(sample));
+    if (!status.ok()) {
+      if (result.terminal_status.ok()) result.terminal_status = status;
+      return;
+    }
+    ++result.logical_work_units;
+    if (access_path.has_value() &&
+        *access_path != RequiredAccessPath::kBase) {
+      indexed_output_rows = SaturatingAdd(indexed_output_rows, expected_rows);
+    }
+    indexed_candidate_rows = SaturatingAdd(
+        indexed_candidate_rows, stats->index_candidate_entity_count);
+  };
+
+  const uint64_t matrix_vertex_count =
+      std::max<uint64_t>(dataset.config.vertex_count, 256);
+  run_query("MATCH (n) WHERE n.indexed_name = 'Other' RETURN n;",
+            matrix_vertex_count - 1,
+            RequiredAccessPath::kBase, std::nullopt);
+  run_query("MATCH (n) WHERE n.indexed_name = 'target' RETURN n;", 1,
+            RequiredAccessPath::kIndex, std::nullopt);
+  auto session = database->CreateTcypherSession();
+  if (!session.ok()) {
+    result.terminal_status = session.status();
+  } else {
+    Status status = session.ValueOrDie()->Begin(TcypherSessionMode::kSnapshot);
+    if (status.ok()) {
+      auto staged = database->ExecuteTcypher(
+          *session.ValueOrDie(),
+          "MATCH (n {id: 2}) SET n.hybrid_name = 'target' VALID FROM 0;");
+      status = staged.ok() ? Status::OK() : staged.status();
+    }
+    if (status.ok()) {
+      run_query("MATCH (n) WHERE n.hybrid_name = 'target' RETURN n;", 2,
+                RequiredAccessPath::kHybrid, std::nullopt,
+                session.ValueOrDie().get());
+    } else if (result.terminal_status.ok()) {
+      result.terminal_status = status;
+    }
+    const Status rollback = session.ValueOrDie()->Rollback();
+    if (!rollback.ok() && result.terminal_status.ok()) {
+      result.terminal_status = rollback;
+    }
+  }
+  run_query(
+      "MATCH (n) WHERE n.left_key = 'Ada' AND "
+      "n.right_key = 'Paris' RETURN n;",
+      2, RequiredAccessPath::kIntersection, std::nullopt);
+  run_query(
+      "MATCH (a) MATCH (b) WHERE a.graph_name = 'target' AND "
+      "a.graph_city = b.graph_code RETURN a, b;",
+      1, std::nullopt, GraphOrder::kIndexFirst);
+  run_query(
+      "MATCH (a) MATCH (b) MATCH (c) WHERE "
+      "a.graph_city = b.graph_code AND "
+      "b.graph_city = c.graph_code RETURN a, b, c;",
+      1, std::nullopt, GraphOrder::kAdjacencyFirst);
+
+  result.elapsed_ns = ElapsedNs(origin);
+  result.verified = result.terminal_status.ok() &&
+      result.logical_work_units == 6 && indexed_candidate_rows != 0;
+  if (result.verified) {
+    result.derived_metrics.index_survival =
+        BenchmarkRatio{indexed_output_rows, indexed_candidate_rows};
+    result.result_checksum =
+        ResultChecksum(dataset, BenchmarkWorkloadFamily::kIndexPathMatrix,
+                       result.logical_work_units);
+  } else if (result.terminal_status.ok()) {
+    result.terminal_status = Status::Corruption(
+        "benchmark index path matrix", "path matrix verification incomplete");
+  }
+  return result;
+}
+
+size_t BenchmarkWorkClassIndex(WorkClass work_class) {
+  switch (work_class) {
+    case WorkClass::kCommitCritical: return 0;
+    case WorkClass::kRecovery: return 1;
+    case WorkClass::kShutdown: return 2;
+    case WorkClass::kForegroundWrite: return 3;
+    case WorkClass::kPointRead: return 4;
+    case WorkClass::kInteractiveQuery: return 5;
+    case WorkClass::kFlush: return 6;
+    case WorkClass::kCompactionUrgent: return 7;
+    case WorkClass::kAnalyticalQuery: return 8;
+    case WorkClass::kCompactionNormal: return 9;
+    case WorkClass::kIndexBuild: return 10;
+    case WorkClass::kStatsMerge: return 11;
+    case WorkClass::kBlobGc: return 12;
+  }
+  return 12;
+}
+
+BenchmarkWorkloadResult RunSchedulerSaturation(
+    CedarDatabase* database, const CedarTgDataset& dataset) {
+  BenchmarkWorkloadResult result;
+  result.measurement_mode = "closed_loop";
+  const Clock::time_point origin = Clock::now();
+  const auto record = [&](const Status& status) {
+    BenchmarkOperationSample sample;
+    sample.requested_arrival_ns = ElapsedNs(origin);
+    sample.admitted_ns = sample.requested_arrival_ns;
+    sample.started_ns = sample.requested_arrival_ns;
+    sample.completed_ns = ElapsedNs(origin);
+    sample.terminal_status = status.ok() ? "PASS" : status.ToString();
+    result.samples.push_back(std::move(sample));
+    if (status.ok()) {
+      ++result.logical_work_units;
+    } else if (result.terminal_status.ok()) {
+      result.terminal_status = status;
+    }
+  };
+
+  WorkScheduler fairness(1'000);
+  uint64_t id = 1;
+  for (size_t cycle = 0; cycle < 10; ++cycle) {
+    for (size_t count = 0; count < 4; ++count) {
+      fairness.EnqueueExecutable(WorkClass::kForegroundWrite,
+                                 ExecutableTaskId{id++});
+    }
+    for (size_t count = 0; count < 2; ++count) {
+      fairness.EnqueueExecutable(WorkClass::kFlush, ExecutableTaskId{id++});
+      fairness.EnqueueExecutable(WorkClass::kAnalyticalQuery,
+                                 ExecutableTaskId{id++});
+    }
+    fairness.EnqueueExecutable(WorkClass::kCompactionNormal,
+                               ExecutableTaskId{id++});
+  }
+  Status fairness_status = Status::OK();
+  for (size_t window = 0; window < 10 && fairness_status.ok(); ++window) {
+    std::array<uint64_t, 4> counts{};
+    for (size_t dispatch = 0; dispatch < 9; ++dispatch) {
+      const auto work = fairness.NextExecutableWork();
+      if (!work.has_value()) {
+        fairness_status = Status::Corruption(
+            "benchmark scheduler", "fairness queue drained early");
+        break;
+      }
+      switch (work->work_class) {
+        case WorkClass::kForegroundWrite: ++counts[0]; break;
+        case WorkClass::kFlush: ++counts[1]; break;
+        case WorkClass::kAnalyticalQuery: ++counts[2]; break;
+        case WorkClass::kCompactionNormal: ++counts[3]; break;
+        default:
+          fairness_status = Status::Corruption(
+              "benchmark scheduler", "unexpected fairness lane class");
+          break;
+      }
+    }
+    if (fairness_status.ok() &&
+        counts != std::array<uint64_t, 4>{4, 2, 2, 1}) {
+      fairness_status = Status::Corruption(
+          "benchmark scheduler", "fairness window differs from 4:2:2:1");
+    }
+  }
+  record(fairness_status);
+
+  WorkScheduler deadlines;
+  deadlines.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{1}, 30);
+  deadlines.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{2}, 10);
+  deadlines.EnqueueExecutable(WorkClass::kInteractiveQuery,
+                              ExecutableTaskId{3}, 20);
+  const std::array<uint64_t, 3> expected_deadlines = {2, 3, 1};
+  Status deadline_order = Status::OK();
+  for (const uint64_t expected : expected_deadlines) {
+    const auto work = deadlines.NextExecutableWork();
+    if (!work.has_value() || work->id.value != expected) {
+      deadline_order = Status::Corruption(
+          "benchmark scheduler", "interactive EDF order differs");
+      break;
+    }
+  }
+  record(deadline_order);
+
+  WorkExecutionService* service =
+      BenchmarkSchedulerCampaignAccess::ExecutionService(database);
+  if (service == nullptr) {
+    const Status missing = Status::InvalidArgument(
+        "benchmark scheduler", "database execution service is unavailable");
+    record(missing);
+    record(missing);
+    record(missing);
+    result.elapsed_ns = ElapsedNs(origin);
+    return result;
+  }
+  std::mutex blocker_mutex;
+  std::condition_variable blocker_changed;
+  uint32_t blockers_started = 0;
+  bool release_blockers = false;
+  std::vector<WorkTaskHandle> blocker_handles;
+  for (size_t blocker = 0; blocker < 4; ++blocker) {
+    auto submitted = service->Submit(
+        WorkClass::kAnalyticalQuery, [&] {
+          std::unique_lock<std::mutex> lock(blocker_mutex);
+          ++blockers_started;
+          blocker_changed.notify_all();
+          blocker_changed.wait(lock, [&] { return release_blockers; });
+          return Status::OK();
+        });
+    if (!submitted.ok()) {
+      record(submitted.status());
+      result.elapsed_ns = ElapsedNs(origin);
+      return result;
+    }
+    blocker_handles.push_back(submitted.ValueOrDie());
+  }
+  {
+    std::unique_lock<std::mutex> lock(blocker_mutex);
+    if (!blocker_changed.wait_for(
+            lock, std::chrono::seconds(5),
+            [&] { return blockers_started == 4; })) {
+      release_blockers = true;
+      blocker_changed.notify_all();
+      const Status timed_out = Status::ResourceExhausted(
+          "benchmark scheduler", "workers did not saturate");
+      record(timed_out);
+      result.elapsed_ns = ElapsedNs(origin);
+      return result;
+    }
+  }
+  std::vector<WorkTaskHandle> saturated_handles;
+  const auto submit_many = [&](WorkClass work_class, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+      auto submitted = service->Submit(work_class, [] { return Status::OK(); });
+      if (!submitted.ok()) return submitted.status();
+      saturated_handles.push_back(submitted.ValueOrDie());
+    }
+    return Status::OK();
+  };
+  Status saturation_status = submit_many(WorkClass::kForegroundWrite, 40);
+  if (saturation_status.ok()) {
+    saturation_status = submit_many(WorkClass::kFlush, 20);
+  }
+  if (saturation_status.ok()) {
+    saturation_status = submit_many(WorkClass::kAnalyticalQuery, 20);
+  }
+  if (saturation_status.ok()) {
+    saturation_status = submit_many(WorkClass::kCompactionNormal, 10);
+  }
+  StatusOr<WorkTaskHandle> deadline_task = service->Submit(
+      WorkClass::kInteractiveQuery, [] { return Status::OK(); }, 1);
+  if (!deadline_task.ok() && saturation_status.ok()) {
+    saturation_status = deadline_task.status();
+  }
+  {
+    std::lock_guard<std::mutex> lock(blocker_mutex);
+    release_blockers = true;
+  }
+  blocker_changed.notify_all();
+  for (const WorkTaskHandle& handle : blocker_handles) {
+    const Status waited = handle.Wait();
+    if (!waited.ok() && saturation_status.ok()) saturation_status = waited;
+  }
+  for (const WorkTaskHandle& handle : saturated_handles) {
+    const Status waited = handle.Wait();
+    if (!waited.ok() && saturation_status.ok()) saturation_status = waited;
+  }
+  if (deadline_task.ok()) {
+    const Status waited = deadline_task.ValueOrDie().Wait();
+    if (!waited.ok() && saturation_status.ok()) saturation_status = waited;
+  }
+  record(saturation_status);
+
+  const WorkExecutionStats after_saturation = service->stats();
+  record(after_saturation.deadline_misses[
+             BenchmarkWorkClassIndex(WorkClass::kInteractiveQuery)] > 0
+      ? Status::OK()
+      : Status::Corruption(
+            "benchmark scheduler", "interactive deadline miss was absent"));
+
+  const std::array<WorkClass, 13> work_classes = {
+      WorkClass::kCommitCritical, WorkClass::kRecovery, WorkClass::kShutdown,
+      WorkClass::kForegroundWrite, WorkClass::kPointRead,
+      WorkClass::kInteractiveQuery, WorkClass::kFlush,
+      WorkClass::kCompactionUrgent, WorkClass::kAnalyticalQuery,
+      WorkClass::kCompactionNormal, WorkClass::kIndexBuild,
+      WorkClass::kStatsMerge, WorkClass::kBlobGc};
+  Status grants = Status::OK();
+  for (const WorkClass work_class : work_classes) {
+    WorkTaskRequest request;
+    request.work_class = work_class;
+    request.resources = ResourceProfile{1, 1, 1, 1, 1, 1, 1, 1, 1};
+    request.commit_critical = work_class == WorkClass::kCommitCritical;
+    auto submitted = service->Submit(request, [] { return Status::OK(); });
+    if (!submitted.ok()) {
+      grants = submitted.status();
+      break;
+    }
+    grants = submitted.ValueOrDie().Wait();
+    if (!grants.ok()) break;
+  }
+  record(grants);
+
+  result.elapsed_ns = ElapsedNs(origin);
+  result.verified = result.terminal_status.ok() &&
+      result.logical_work_units == 5 && result.samples.size() == 5;
+  if (result.verified) {
+    result.result_checksum = ResultChecksum(
+        dataset, BenchmarkWorkloadFamily::kSchedulerSaturation,
+        result.logical_work_units);
+  }
   return result;
 }
 
@@ -340,11 +820,75 @@ const char* BenchmarkWorkloadFamilyName(BenchmarkWorkloadFamily family) {
     case BenchmarkWorkloadFamily::kBlobProjection: return "blob-projection";
     case BenchmarkWorkloadFamily::kDurableIngestion: return "durable-ingestion";
     case BenchmarkWorkloadFamily::kIndexEquality: return "index-equality";
+    case BenchmarkWorkloadFamily::kIndexPathMatrix: return "index-path-matrix";
+    case BenchmarkWorkloadFamily::kSchedulerSaturation: return "scheduler-saturation";
     case BenchmarkWorkloadFamily::kMaintenanceCycle: return "maintenance-cycle";
     case BenchmarkWorkloadFamily::kHtapBalanced: return "htap-balanced";
     case BenchmarkWorkloadFamily::kRecovery: return "recovery";
   }
   return "unknown";
+}
+
+std::vector<MetricActivityRequirement> ProductionMetricActivityRequirements(
+    BenchmarkWorkloadFamily family) {
+  if (family == BenchmarkWorkloadFamily::kHtapBalanced) {
+    return {
+        {"cedar_txn_conflict_total", "strict", 1},
+        {"cedar_txn_visible_prefix_stall_ns", "snapshot:succeeded", 1},
+        {"cedar_scheduler_queue_delay_ns", "analytical_query", 1},
+        {"cedar_scheduler_service_ns", "analytical_query", 1},
+        {"cedar_scheduler_grant_cpu_slots_total", "analytical_query", 1},
+    };
+  }
+  if (family == BenchmarkWorkloadFamily::kIndexEquality) {
+    return {
+        {"cedar_index_candidate_rows_total", "all", 1},
+        {"cedar_scheduler_service_ns", "interactive_query", 1},
+    };
+  }
+  if (family == BenchmarkWorkloadFamily::kIndexPathMatrix) {
+    return {
+        {"cedar_index_candidate_rows_total", "all", 1},
+        {"cedar_scheduler_service_ns", "interactive_query", 1},
+        {"cedar_scheduler_grant_cpu_slots_total", "interactive_query", 1},
+    };
+  }
+  if (family == BenchmarkWorkloadFamily::kSchedulerSaturation) {
+    std::vector<MetricActivityRequirement> requirements;
+    for (const std::string& label : {
+             std::string("commit_critical"), std::string("recovery"),
+             std::string("shutdown"), std::string("foreground_write"),
+             std::string("point_read"), std::string("interactive_query"),
+             std::string("flush"), std::string("compaction_urgent"),
+             std::string("analytical_query"),
+             std::string("compaction_normal"), std::string("index_build"),
+             std::string("stats_merge"), std::string("blob_gc")}) {
+      requirements.push_back(
+          {"cedar_scheduler_queue_delay_ns", label, 1});
+      requirements.push_back(
+          {"cedar_scheduler_service_ns", label, 1});
+      requirements.push_back(
+          {"cedar_scheduler_grant_cpu_slots_total", label, 1});
+    }
+    requirements.push_back(
+        {"cedar_scheduler_deadline_misses_total", "interactive_query", 1});
+    return requirements;
+  }
+  if (family == BenchmarkWorkloadFamily::kMaintenanceCycle) {
+    return {
+        {"cedar_maintenance_completed_total", "flush", 1},
+        {"cedar_maintenance_completed_total", "compaction", 1},
+        {"cedar_maintenance_completed_total", "blob_rotation", 1},
+        {"cedar_maintenance_completed_total", "blob_gc", 1},
+        {"cedar_maintenance_completed_total", "checkpoint", 1},
+        {"cedar_compaction_input_bytes_total", "all", 1},
+        {"cedar_compaction_output_bytes_total", "all", 1},
+        {"cedar_compaction_buffer_peak_bytes", "all", 1},
+        {"cedar_compaction_buffer_peak_events", "all", 1},
+        {"cedar_cache_resident_peak_bytes", "all", 1},
+    };
+  }
+  return {};
 }
 
 std::string BenchmarkDurableIngestionValue(
@@ -376,6 +920,8 @@ StatusOr<BenchmarkWorkloadFamily> ParseBenchmarkWorkloadFamily(
            BenchmarkWorkloadFamily::kBlobProjection,
            BenchmarkWorkloadFamily::kDurableIngestion,
            BenchmarkWorkloadFamily::kIndexEquality,
+           BenchmarkWorkloadFamily::kIndexPathMatrix,
+           BenchmarkWorkloadFamily::kSchedulerSaturation,
            BenchmarkWorkloadFamily::kMaintenanceCycle,
            BenchmarkWorkloadFamily::kHtapBalanced,
            BenchmarkWorkloadFamily::kRecovery}) {
@@ -419,6 +965,101 @@ Status PrepareBenchmarkWorkload(
       config.family == BenchmarkWorkloadFamily::kValidTimeRange ||
       config.family == BenchmarkWorkloadFamily::kGraphOneHop) {
     return database->Flush();
+  }
+  if (config.family == BenchmarkWorkloadFamily::kMaintenanceCycle) {
+    if (config.vertex_property_schema_epoch == 0) {
+      return Status::InvalidArgument(
+          "benchmark workload",
+          "maintenance workload requires property schema epoch");
+    }
+    Status status = database->Flush();
+    if (!status.ok()) return status;
+    return database->Put(
+        LogicalKey::VertexProperty(1, 1),
+        dataset.config.valid_time_span + 1,
+        config.vertex_property_schema_epoch,
+        Value::String("bench-maintenance-" +
+                      dataset.dataset_hash.substr(0, 16)));
+  }
+  if (config.family == BenchmarkWorkloadFamily::kIndexPathMatrix) {
+    if (config.vertex_property_schema_epoch == 0) {
+      return Status::InvalidArgument(
+          "benchmark workload",
+          "index path matrix requires vertex existence schema epoch");
+    }
+    struct MatrixColumn {
+      uint16_t id;
+      const char* name;
+      bool indexed;
+      ColumnSchema registered;
+    };
+    std::array<MatrixColumn, 7> columns = {{
+        {7, "indexed_name", true, {}},
+        {8, "left_key", true, {}},
+        {9, "right_key", true, {}},
+        {10, "hybrid_name", true, {}},
+        {11, "graph_name", true, {}},
+        {12, "graph_city", false, {}},
+        {13, "graph_code", false, {}},
+    }};
+    Status status = Status::OK();
+    for (MatrixColumn& column : columns) {
+      status = database->RegisterColumn(
+          ColumnSchema{EntityType::Vertex, column.id, 0, column.name,
+                       PhysicalType::kString, 4096,
+                       EncodingPolicy::kAdaptive,
+                       CompressionPolicy::kLz4},
+          &column.registered);
+      if (!status.ok()) return status;
+    }
+    const uint64_t matrix_vertex_count =
+        std::max<uint64_t>(dataset.config.vertex_count, 256);
+    for (uint64_t id = 1; id <= matrix_vertex_count; ++id) {
+      if (id > dataset.config.vertex_count) {
+        status = database->Put(
+            LogicalKey::VertexExistence(id), 0,
+            config.vertex_property_schema_epoch, Value::Binary(""));
+        if (!status.ok()) return status;
+      }
+      const std::array<std::string, 7> values = {
+          id == 1 ? "target" : "Other",
+          id <= 8 ? "Ada" : "OtherLeft",
+          id >= 7 && id <= 14 ? "Paris" : "OtherRight",
+          id == 1 ? "target" : "other",
+          id == 1 ? "target" : "other",
+          id == 1 ? "join-1"
+                  : (id == 2 ? "join-2" : "city-" + std::to_string(id)),
+          id == 2 ? "join-1"
+                  : (id == 3 ? "join-2" : "code-" + std::to_string(id)),
+      };
+      for (size_t column_index = 0;
+           column_index < columns.size(); ++column_index) {
+        status = database->Put(
+            LogicalKey::VertexProperty(id, columns[column_index].id), 0,
+            columns[column_index].registered.schema_epoch,
+            Value::String(values[column_index]));
+        if (!status.ok()) return status;
+      }
+    }
+    status = database->Flush();
+    if (!status.ok()) return status;
+    for (const MatrixColumn& column : columns) {
+      if (!column.indexed) continue;
+      IndexDefinition definition;
+      definition.entity_type = EntityType::Vertex;
+      definition.column_id = column.registered.column_id;
+      definition.schema_epoch = column.registered.schema_epoch;
+      definition.capabilities = kIndexEquality;
+      definition.canonical_encoding_id = kIndexCanonicalEncoding;
+      uint64_t index_id = 0;
+      status = database->RegisterIndex(definition, &index_id);
+      if (!status.ok()) return status;
+      status = database->SetIndexState(index_id, IndexState::kBuilding);
+      if (!status.ok()) return status;
+      status = database->SetIndexState(index_id, IndexState::kActive);
+      if (!status.ok()) return status;
+    }
+    return Status::OK();
   }
   if (config.family != BenchmarkWorkloadFamily::kIndexEquality) {
     return Status::OK();
@@ -555,11 +1196,26 @@ StatusOr<BenchmarkWorkloadResult> RunBenchmarkWorkloadImpl(
         dataset, config.family, expected_rows,
         [&] { return ExecuteRowCountQuery(database, query, options); });
     if (result.verified) {
+      if (stats->index_candidate_entity_count == 0 ||
+          !stats->has_executed_access_path ||
+          stats->executed_access_path == CandidateSource::kBase) {
+        result.verified = false;
+        result.terminal_status = Status::Corruption(
+            "benchmark workload",
+            "index workload did not execute a nonzero indexed candidate path");
+        result.result_checksum.clear();
+      }
       result.derived_metrics.index_survival = BenchmarkRatio{
           result.logical_work_units, stats->index_candidate_entity_count};
     }
     AttachExecutionSamples(stats, &result);
     return result;
+  }
+  if (config.family == BenchmarkWorkloadFamily::kIndexPathMatrix) {
+    return RunIndexPathMatrix(database, dataset);
+  }
+  if (config.family == BenchmarkWorkloadFamily::kSchedulerSaturation) {
+    return RunSchedulerSaturation(database, dataset);
   }
   if (config.family == BenchmarkWorkloadFamily::kMaintenanceCycle) {
     BenchmarkWorkloadResult result;

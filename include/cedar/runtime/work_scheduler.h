@@ -51,7 +51,9 @@ struct ScheduledWork {
   Id id;
   WorkClass work_class = WorkClass::kAnalyticalQuery;
   uint64_t enqueue_sequence = 0;
+  uint64_t enqueue_dispatch_sequence = 0;
   uint64_t deadline_sequence = 0;
+  uint64_t dispatch_sequence = 0;
 };
 
 using ScheduledExecutableWork = ScheduledWork<ExecutableTaskId>;
@@ -115,6 +117,7 @@ class WorkScheduler {
     uint64_t sequence = 0;
     uint64_t dispatch_sequence = 0;
     size_t fair_lane_cursor = 0;
+    std::array<size_t, kFairLaneCount> lane_class_cursors{};
     std::array<uint32_t, kFairLaneCount> deficits{};
   };
 
@@ -177,8 +180,13 @@ class WorkScheduler {
   template <typename Id>
   void EnqueueLocked(QueueState<Id>* state, WorkClass kind, Id id,
                      uint64_t deadline_sequence) {
+    const uint64_t eligible_dispatch =
+        state->dispatch_sequence == std::numeric_limits<uint64_t>::max()
+            ? state->dispatch_sequence
+            : state->dispatch_sequence + 1;
     state->queues[QueueIndex(kind)].push_back(
-        ScheduledWork<Id>{id, kind, ++state->sequence, deadline_sequence});
+        ScheduledWork<Id>{id, kind, ++state->sequence, eligible_dispatch,
+                          deadline_sequence});
   }
 
   template <typename Id>
@@ -237,8 +245,13 @@ class WorkScheduler {
   template <typename Id>
   static std::optional<ScheduledWork<Id>> TakeFromLaneLocked(
       QueueState<Id>* state, FairLane lane) {
-    for (WorkClass kind : ClassesForLane(lane)) {
+    const auto& classes = ClassesForLane(lane);
+    size_t& cursor = state->lane_class_cursors[static_cast<size_t>(lane)];
+    for (size_t attempt = 0; attempt < classes.size(); ++attempt) {
+      const size_t index = (cursor + attempt) % classes.size();
+      const WorkClass kind = classes[index];
       if (const auto work = TakeFromClassLocked(state, kind); work.has_value()) {
+        cursor = (index + 1) % classes.size();
         return work;
       }
     }
@@ -252,17 +265,24 @@ class WorkScheduler {
   std::optional<ScheduledWork<Id>> TakeAgedLocked(QueueState<Id>* state) const {
     WorkClass selected_kind = WorkClass::kBlobGc;
     uint64_t selected_age = 0;
+    uint64_t selected_sequence = 0;
     bool found = false;
     for (size_t index = 0; index < kQueueCount; ++index) {
       auto& queue = state->queues[index];
       DiscardCancelledLocked(state, &queue);
       if (queue.empty()) continue;
-      const uint64_t age = state->dispatch_sequence >= queue.front().enqueue_sequence
-          ? state->dispatch_sequence - queue.front().enqueue_sequence
+      const uint64_t age = state->dispatch_sequence >=
+              queue.front().enqueue_dispatch_sequence
+          ? state->dispatch_sequence -
+                queue.front().enqueue_dispatch_sequence
           : 0;
-      if (age >= aging_dispatches_ && (!found || age > selected_age)) {
+      if (age >= aging_dispatches_ &&
+          (!found || age > selected_age ||
+           (age == selected_age &&
+            queue.front().enqueue_sequence < selected_sequence))) {
         found = true;
         selected_age = age;
+        selected_sequence = queue.front().enqueue_sequence;
         selected_kind = queue.front().work_class;
       }
     }
@@ -274,10 +294,16 @@ class WorkScheduler {
     ++state->dispatch_sequence;
     for (WorkClass kind : CriticalOrder()) {
       if (const auto work = TakeFromClassLocked(state, kind); work.has_value()) {
-        return work;
+        auto dispatched = work;
+        dispatched->dispatch_sequence = state->dispatch_sequence;
+        return dispatched;
       }
     }
-    if (const auto aged = TakeAgedLocked(state); aged.has_value()) return aged;
+    if (const auto aged = TakeAgedLocked(state); aged.has_value()) {
+      auto dispatched = aged;
+      dispatched->dispatch_sequence = state->dispatch_sequence;
+      return dispatched;
+    }
     for (size_t attempts = 0; attempts < kFairLaneCount * 2; ++attempts) {
       const FairLane lane = static_cast<FairLane>(state->fair_lane_cursor);
       if (!LaneHasWorkLocked(state, lane)) {
@@ -301,7 +327,9 @@ class WorkScheduler {
         state->fair_lane_cursor =
             (state->fair_lane_cursor + 1) % kFairLaneCount;
       }
-      return work;
+      auto dispatched = work;
+      dispatched->dispatch_sequence = state->dispatch_sequence;
+      return dispatched;
     }
     return std::nullopt;
   }

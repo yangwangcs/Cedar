@@ -4,6 +4,7 @@
 #ifndef CEDAR_OBSERVABILITY_METRIC_REGISTRY_H_
 #define CEDAR_OBSERVABILITY_METRIC_REGISTRY_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -34,6 +35,56 @@ struct MetricPoint {
 struct HistogramMetricPoint {
   MetricDefinition definition;
   std::map<std::string, Histogram> values;
+};
+
+enum class MetricDefinitionIssueKind : uint8_t {
+  kMissing,
+  kSchemaConflict,
+};
+
+struct MetricDefinitionIssue {
+  std::string name;
+  MetricDefinitionIssueKind kind = MetricDefinitionIssueKind::kMissing;
+};
+
+struct MetricDefinitionAudit {
+  size_t required_count = 0;
+  size_t matched_count = 0;
+  std::vector<MetricDefinitionIssue> issues;
+
+  bool complete() const {
+    return matched_count == required_count && issues.empty();
+  }
+};
+
+struct MetricActivityRequirement {
+  std::string name;
+  std::string label;
+  uint64_t minimum = 1;
+};
+
+enum class MetricActivityIssueKind : uint8_t {
+  kMetricMissing,
+  kLabelMissing,
+  kBelowMinimum,
+};
+
+struct MetricActivityIssue {
+  std::string name;
+  std::string label;
+  MetricActivityIssueKind kind = MetricActivityIssueKind::kMetricMissing;
+  uint64_t observed = 0;
+  uint64_t minimum = 0;
+};
+
+struct MetricActivityAudit {
+  size_t required_count = 0;
+  size_t matched_count = 0;
+  std::vector<MetricActivityIssue> issues;
+
+  bool complete() const {
+    return matched_count == required_count && issues.empty();
+  }
 };
 
 // Stable-name metric registry. Labels are already normalized bounded buckets
@@ -88,6 +139,34 @@ class MetricRegistry {
     return Status::OK();
   }
 
+  Status MergeHistogram(const std::string& name, const std::string& label,
+                        const Histogram& value) {
+    if (name.empty()) {
+      return Status::InvalidArgument("metrics", "empty metric name");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto definition = definitions_.find(name);
+    if (definition == definitions_.end()) {
+      return Status::NotFound("metrics", "metric is not registered");
+    }
+    if (definition->second.type != MetricType::kHistogram) {
+      return Status::InvalidArgument(
+          "metrics", "metric update type mismatches schema");
+    }
+    auto& labels = histograms_[name];
+    auto found = labels.find(label);
+    if (found == labels.end()) {
+      if (labels.size() >= max_labels_) {
+        return Status::InvalidArgument("metrics", "label cardinality limit");
+      }
+      found = labels
+                  .emplace(label,
+                           Histogram(definition->second.histogram_bounds))
+                  .first;
+    }
+    return found->second.Merge(value);
+  }
+
   std::optional<uint64_t> Counter(const std::string& name, const std::string& label) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto metric = metrics_.find(name);
@@ -124,6 +203,95 @@ class MetricRegistry {
               ? std::map<std::string, Histogram>{} : metric->second});
     }
     return snapshot;
+  }
+
+  MetricDefinitionAudit AuditDefinitions(
+      const std::vector<MetricDefinition>& required) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    MetricDefinitionAudit audit;
+    audit.required_count = required.size();
+    for (const MetricDefinition& expected : required) {
+      const auto existing = definitions_.find(expected.name);
+      if (existing == definitions_.end()) {
+        audit.issues.push_back(
+            MetricDefinitionIssue{expected.name,
+                                  MetricDefinitionIssueKind::kMissing});
+        continue;
+      }
+      const MetricDefinition& actual = existing->second;
+      if (actual.type != expected.type || actual.unit != expected.unit ||
+          actual.schema_version != expected.schema_version ||
+          actual.histogram_bounds != expected.histogram_bounds) {
+        audit.issues.push_back(MetricDefinitionIssue{
+            expected.name, MetricDefinitionIssueKind::kSchemaConflict});
+        continue;
+      }
+      ++audit.matched_count;
+    }
+    std::sort(audit.issues.begin(), audit.issues.end(),
+              [](const MetricDefinitionIssue& left,
+                 const MetricDefinitionIssue& right) {
+                if (left.name != right.name) return left.name < right.name;
+                return left.kind < right.kind;
+              });
+    return audit;
+  }
+
+  MetricActivityAudit AuditActivity(
+      const std::vector<MetricActivityRequirement>& required) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    MetricActivityAudit audit;
+    audit.required_count = required.size();
+    for (const MetricActivityRequirement& expected : required) {
+      const auto definition = definitions_.find(expected.name);
+      if (definition == definitions_.end()) {
+        audit.issues.push_back(MetricActivityIssue{
+            expected.name, expected.label,
+            MetricActivityIssueKind::kMetricMissing, 0, expected.minimum});
+        continue;
+      }
+      uint64_t observed = 0;
+      bool has_label = false;
+      if (definition->second.type == MetricType::kHistogram) {
+        const auto metric = histograms_.find(expected.name);
+        if (metric != histograms_.end()) {
+          const auto label = metric->second.find(expected.label);
+          if (label != metric->second.end()) {
+            has_label = true;
+            observed = label->second.count();
+          }
+        }
+      } else {
+        const auto metric = metrics_.find(expected.name);
+        if (metric != metrics_.end()) {
+          const auto label = metric->second.find(expected.label);
+          if (label != metric->second.end()) {
+            has_label = true;
+            observed = label->second;
+          }
+        }
+      }
+      if (!has_label) {
+        audit.issues.push_back(MetricActivityIssue{
+            expected.name, expected.label,
+            MetricActivityIssueKind::kLabelMissing, 0, expected.minimum});
+      } else if (observed < expected.minimum) {
+        audit.issues.push_back(MetricActivityIssue{
+            expected.name, expected.label,
+            MetricActivityIssueKind::kBelowMinimum, observed,
+            expected.minimum});
+      } else {
+        ++audit.matched_count;
+      }
+    }
+    std::sort(audit.issues.begin(), audit.issues.end(),
+              [](const MetricActivityIssue& left,
+                 const MetricActivityIssue& right) {
+                if (left.name != right.name) return left.name < right.name;
+                if (left.label != right.label) return left.label < right.label;
+                return left.kind < right.kind;
+              });
+    return audit;
   }
 
  private:

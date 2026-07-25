@@ -140,6 +140,15 @@ void AtomicSaturatingAdd(std::atomic<uint64_t>* value, uint64_t delta) {
   }
 }
 
+void AtomicMax(std::atomic<uint64_t>* value, uint64_t candidate) {
+  uint64_t current = value->load(std::memory_order_relaxed);
+  while (current < candidate &&
+         !value->compare_exchange_weak(current, candidate,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
 uint64_t EstimateFlushWriteBytes(const std::vector<TemporalEvent>& events) {
   uint64_t bytes = 0;
   for (const TemporalEvent& event : events) {
@@ -1282,6 +1291,10 @@ Status TransactionCoordinator::CompactInternal(
                         compacted.ValueOrDie().output_bytes_written);
     AtomicSaturatingAdd(&compaction_blob_payload_bytes_read_,
                         compacted.ValueOrDie().blob_payload_bytes_read);
+    AtomicMax(&compaction_peak_buffered_events_,
+              compacted.ValueOrDie().peak_buffered_events);
+    AtomicMax(&compaction_peak_buffered_bytes_,
+              compacted.ValueOrDie().peak_buffered_bytes);
     for (size_t slot = 0; slot < kPageTypeMetricSlots; ++slot) {
       AtomicSaturatingAdd(
           &page_uncompressed_bytes_written_[slot],
@@ -3185,6 +3198,10 @@ StorageRuntimeStats TransactionCoordinator::storage_stats() const {
       compaction_output_bytes_.load(std::memory_order_relaxed);
   stats.compaction_blob_payload_bytes_read =
       compaction_blob_payload_bytes_read_.load(std::memory_order_relaxed);
+  stats.compaction_peak_buffered_events =
+      compaction_peak_buffered_events_.load(std::memory_order_relaxed);
+  stats.compaction_peak_buffered_bytes =
+      compaction_peak_buffered_bytes_.load(std::memory_order_relaxed);
   stats.blob_gc_live_bytes = blob.gc_live_bytes;
   stats.blob_gc_rewritten_bytes = blob.gc_rewritten_bytes;
   for (size_t slot = 0; slot < kPageTypeMetricSlots; ++slot) {

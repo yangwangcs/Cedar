@@ -25,6 +25,8 @@ enum class BenchmarkFaultScenario : uint8_t {
   kSidecarAfterRename = 6,
   kBlobGcAfterManifestRename = 7,
   kAcceptedWorkShutdown = 8,
+  kTcypherSpillDiskFull = 9,
+  kTcypherSpillCorruption = 10,
 };
 
 const char* BenchmarkFaultScenarioName(BenchmarkFaultScenario scenario);
@@ -41,6 +43,7 @@ struct BenchmarkFaultCampaignConfig {
       BenchmarkFaultScenario::kCommitAfterPrepareDurable;
   uint32_t vertex_property_schema_epoch = 0;
   uint64_t valid_time = 0;
+  std::string spill_directory;
   std::function<std::unique_ptr<CedarDatabase>()> reopen_database;
 };
 

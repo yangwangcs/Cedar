@@ -344,7 +344,18 @@ StatusOr<BenchmarkArtifactPaths> WriteBenchmarkArtifacts(
   std::ostringstream environment_text;
   environment_text << "os_kernel=" << environment.os_kernel << '\n'
                    << "cpu_model_and_count=" << environment.cpu_model_and_count << '\n'
-                   << "compiler_and_flags=" << environment.compiler_and_flags << '\n';
+                   << "compiler_and_flags=" << environment.compiler_and_flags << '\n'
+                   << "logical_cpu_count=" << environment.logical_cpu_count << '\n'
+                   << "memory_limit_bytes=" << environment.memory_limit_bytes << '\n'
+                   << "storage_free_bytes=" << environment.storage_free_bytes << '\n'
+                   << "resource_limit_provenance_complete="
+                   << (environment.resource_limit_provenance_complete
+                           ? "true" : "false") << '\n'
+                   << "storage_provenance_complete="
+                   << (environment.storage_provenance_complete
+                           ? "true" : "false") << '\n'
+                   << "storage_device_and_filesystem="
+                   << environment.storage_device_and_filesystem << '\n';
   status = WriteAtomically(paths.environment_path, environment_text.str());
   if (!status.ok()) return status;
   if (!summary.metrics_json.empty()) {

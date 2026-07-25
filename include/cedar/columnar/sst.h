@@ -134,6 +134,7 @@ struct SstStreamingWriteStats {
   uint64_t input_blocks_read = 0;
   uint64_t output_blocks_written = 0;
   uint64_t peak_buffered_events = 0;
+  uint64_t peak_buffered_bytes = 0;
   uint64_t input_bytes_read = 0;
   uint64_t output_bytes_written = 0;
   uint64_t blob_payload_bytes_read = 0;

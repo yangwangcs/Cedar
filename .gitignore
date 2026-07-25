@@ -33,6 +33,7 @@ out/
 
 # Test data and databases
 test_data/
+results/
 *.db/
 *.sst
 *.log

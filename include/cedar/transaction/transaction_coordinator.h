@@ -87,6 +87,8 @@ struct StorageRuntimeStats {
   uint64_t compaction_input_bytes = 0;
   uint64_t compaction_output_bytes = 0;
   uint64_t compaction_blob_payload_bytes_read = 0;
+  uint64_t compaction_peak_buffered_events = 0;
+  uint64_t compaction_peak_buffered_bytes = 0;
   uint64_t blob_gc_live_bytes = 0;
   uint64_t blob_gc_rewritten_bytes = 0;
   std::array<uint64_t, kPageTypeMetricSlots> page_uncompressed_bytes_written{};
@@ -466,6 +468,8 @@ class TransactionCoordinator {
   std::atomic<uint64_t> compaction_input_bytes_{0};
   std::atomic<uint64_t> compaction_output_bytes_{0};
   std::atomic<uint64_t> compaction_blob_payload_bytes_read_{0};
+  std::atomic<uint64_t> compaction_peak_buffered_events_{0};
+  std::atomic<uint64_t> compaction_peak_buffered_bytes_{0};
   std::array<std::atomic<uint64_t>, kPageTypeMetricSlots>
       page_uncompressed_bytes_written_{};
   std::array<std::atomic<uint64_t>, kPageTypeMetricSlots>

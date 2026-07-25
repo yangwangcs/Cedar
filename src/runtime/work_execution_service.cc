@@ -3,6 +3,7 @@
 
 #include "cedar/runtime/work_execution_service.h"
 
+#include <array>
 #include <exception>
 #include <new>
 #include <utility>
@@ -11,6 +12,53 @@ namespace cedar {
 namespace {
 
 thread_local WorkExecutionService* current_execution_service = nullptr;
+
+std::vector<uint64_t> QueueDelayBounds() {
+  static constexpr std::array<uint64_t, 12> kBounds = {
+      1'000,       5'000,       10'000,      50'000,
+      100'000,     500'000,     1'000'000,   5'000'000,
+      10'000'000,  50'000'000,  100'000'000, 1'000'000'000};
+  return std::vector<uint64_t>(kBounds.begin(), kBounds.end());
+}
+
+uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
+  return right > UINT64_MAX - left ? UINT64_MAX : left + right;
+}
+
+void AccumulateResources(ResourceProfile* total,
+                         const ResourceProfile& addition) {
+  total->memory_bytes =
+      SaturatingAdd(total->memory_bytes, addition.memory_bytes);
+  total->io_tokens = SaturatingAdd(total->io_tokens, addition.io_tokens);
+  total->descriptors =
+      SaturatingAdd(total->descriptors, addition.descriptors);
+  total->temporary_bytes =
+      SaturatingAdd(total->temporary_bytes, addition.temporary_bytes);
+  total->cpu_slots = SaturatingAdd(total->cpu_slots, addition.cpu_slots);
+  total->sequential_read_bytes = SaturatingAdd(
+      total->sequential_read_bytes, addition.sequential_read_bytes);
+  total->random_read_ops =
+      SaturatingAdd(total->random_read_ops, addition.random_read_ops);
+  total->write_bytes =
+      SaturatingAdd(total->write_bytes, addition.write_bytes);
+  total->metadata_ops =
+      SaturatingAdd(total->metadata_ops, addition.metadata_ops);
+}
+
+uint64_t ResourceDimension(const ResourceProfile& resources, size_t index) {
+  switch (index) {
+    case 0: return resources.memory_bytes;
+    case 1: return resources.io_tokens;
+    case 2: return resources.descriptors;
+    case 3: return resources.temporary_bytes;
+    case 4: return resources.cpu_slots;
+    case 5: return resources.sequential_read_bytes;
+    case 6: return resources.random_read_ops;
+    case 7: return resources.write_bytes;
+    case 8: return resources.metadata_ops;
+  }
+  return 0;
+}
 
 Status InvokeWorkCallback(const std::function<Status()>& callback) {
   try {
@@ -135,6 +183,7 @@ Status WorkExecutionService::WaitForTask(const WorkTaskHandle& handle) {
       if (selected.has_value()) {
         const auto registered = tasks_.find(selected->id.value);
         if (registered != tasks_.end()) {
+          RecordDispatchLocked(*selected, registered->second);
           task = std::move(registered->second);
           tasks_.erase(registered);
           running_tasks_.emplace(
@@ -213,7 +262,9 @@ StatusOr<WorkTaskHandle> WorkExecutionService::Submit(
         id.value, RegisteredTask{id, request.work_class, std::move(callback),
                                  completion, std::move(grant),
                                  request.preemptible,
-                                 std::move(cancellation)});
+                                 std::move(cancellation),
+                                 request.resources,
+                                 std::chrono::steady_clock::now()});
     if (!inserted.second) {
       ++stats_.rejected[work_class_index];
       return Status::ResourceExhausted("work execution", "duplicate task identifier");
@@ -227,6 +278,8 @@ StatusOr<WorkTaskHandle> WorkExecutionService::Submit(
       return Status::ResourceExhausted("work execution", "failed to enqueue task");
     }
     ++stats_.admitted[work_class_index];
+    AccumulateResources(&stats_.admitted_resources[work_class_index],
+                        request.resources);
     ++outstanding_tasks_;
     lock.unlock();
     work_available_.notify_one();
@@ -346,18 +399,48 @@ void WorkExecutionService::Complete(
 }
 
 void WorkExecutionService::ExecuteTask(RegisteredTask task) {
+  const auto service_started = std::chrono::steady_clock::now();
   Status status = InvokeWorkCallback(task.callback);
+  const auto service_elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - service_started);
   task.grant.reset();
   std::lock_guard<std::mutex> lock(mutex_);
   Complete(task.completion, status);
   running_tasks_.erase(task.id.value);
   --outstanding_tasks_;
-  ++stats_.completed[WorkClassIndex(task.work_class)];
+  const size_t class_index = WorkClassIndex(task.work_class);
+  ++stats_.completed[class_index];
+  service_histograms_[class_index].Observe(
+      static_cast<uint64_t>(service_elapsed.count()));
 }
 
 WorkExecutionStats WorkExecutionService::stats() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return stats_;
+}
+
+void WorkExecutionService::InitializeQueueDelayHistograms() {
+  const std::vector<uint64_t> bounds = QueueDelayBounds();
+  for (size_t index = 0; index < queue_delay_histograms_.size(); ++index) {
+    queue_delay_histograms_[index] = Histogram(bounds);
+    exported_queue_delay_histograms_[index] = Histogram(bounds);
+    service_histograms_[index] = Histogram(bounds);
+    exported_service_histograms_[index] = Histogram(bounds);
+  }
+}
+
+void WorkExecutionService::RecordDispatchLocked(
+    const ScheduledExecutableWork& work, const RegisteredTask& task) {
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - task.enqueued_at);
+  const size_t class_index = WorkClassIndex(task.work_class);
+  queue_delay_histograms_[class_index].Observe(
+      static_cast<uint64_t>(elapsed.count()));
+  if (work.deadline_sequence != 0 &&
+      work.dispatch_sequence > work.deadline_sequence) {
+    ++stats_.deadline_misses[class_index];
+  }
 }
 
 Status WorkExecutionService::ExportMetrics(MetricRegistry* metrics) {
@@ -375,6 +458,24 @@ Status WorkExecutionService::ExportMetrics(MetricRegistry* metrics) {
       "cedar_scheduler_tasks_rejected_total",
       "cedar_scheduler_tasks_cancelled_total",
       "cedar_scheduler_tasks_completed_total"};
+  static constexpr const char* kQueueDelayMetric =
+      "cedar_scheduler_queue_delay_ns";
+  static constexpr const char* kDeadlineMissMetric =
+      "cedar_scheduler_deadline_misses_total";
+  static constexpr const char* kServiceMetric = "cedar_scheduler_service_ns";
+  static constexpr std::array<const char*, 9> kGrantMetricNames = {
+      "cedar_scheduler_grant_memory_bytes_total",
+      "cedar_scheduler_grant_io_tokens_total",
+      "cedar_scheduler_grant_descriptors_total",
+      "cedar_scheduler_grant_temporary_bytes_total",
+      "cedar_scheduler_grant_cpu_slots_total",
+      "cedar_scheduler_grant_sequential_read_bytes_total",
+      "cedar_scheduler_grant_random_read_ops_total",
+      "cedar_scheduler_grant_write_bytes_total",
+      "cedar_scheduler_grant_metadata_ops_total"};
+  static constexpr std::array<const char*, 9> kGrantMetricUnits = {
+      "bytes", "tokens", "descriptors", "bytes", "slots",
+      "bytes", "operations", "bytes", "operations"};
 
   for (const char* metric_name : kMetricNames) {
     const Status registered = metrics->Register(
@@ -382,6 +483,38 @@ Status WorkExecutionService::ExportMetrics(MetricRegistry* metrics) {
     if (!registered.ok()) return registered;
     for (const char* label : kWorkClassLabels) {
       const Status seeded = metrics->AddCounter(metric_name, label, 0);
+      if (!seeded.ok()) return seeded;
+    }
+  }
+  const std::vector<uint64_t> queue_delay_bounds = QueueDelayBounds();
+  Status registered = metrics->Register(MetricDefinition{
+      kQueueDelayMetric, MetricType::kHistogram, "ns", 1,
+      queue_delay_bounds});
+  if (!registered.ok()) return registered;
+  registered = metrics->Register(MetricDefinition{
+      kDeadlineMissMetric, MetricType::kCounter, "count", 1});
+  if (!registered.ok()) return registered;
+  registered = metrics->Register(MetricDefinition{
+      kServiceMetric, MetricType::kHistogram, "ns", 1,
+      queue_delay_bounds});
+  if (!registered.ok()) return registered;
+  for (size_t index = 0; index < kGrantMetricNames.size(); ++index) {
+    registered = metrics->Register(MetricDefinition{
+        kGrantMetricNames[index], MetricType::kCounter,
+        kGrantMetricUnits[index], 1});
+    if (!registered.ok()) return registered;
+  }
+  const Histogram empty_queue_delay(queue_delay_bounds);
+  for (const char* label : kWorkClassLabels) {
+    Status seeded =
+        metrics->MergeHistogram(kQueueDelayMetric, label, empty_queue_delay);
+    if (!seeded.ok()) return seeded;
+    seeded = metrics->AddCounter(kDeadlineMissMetric, label, 0);
+    if (!seeded.ok()) return seeded;
+    seeded = metrics->MergeHistogram(kServiceMetric, label, empty_queue_delay);
+    if (!seeded.ok()) return seeded;
+    for (const char* metric_name : kGrantMetricNames) {
+      seeded = metrics->AddCounter(metric_name, label, 0);
       if (!seeded.ok()) return seeded;
     }
   }
@@ -407,6 +540,49 @@ Status WorkExecutionService::ExportMetrics(MetricRegistry* metrics) {
       (*exported[metric_index])[class_index] = value;
     }
   }
+  for (size_t class_index = 0; class_index < kWorkClassLabels.size();
+       ++class_index) {
+    auto queue_delay_delta = queue_delay_histograms_[class_index].DifferenceFrom(
+        exported_queue_delay_histograms_[class_index]);
+    if (!queue_delay_delta.ok()) return queue_delay_delta.status();
+    Status updated = metrics->MergeHistogram(
+        kQueueDelayMetric, kWorkClassLabels[class_index],
+        queue_delay_delta.ValueOrDie());
+    if (!updated.ok()) return updated;
+    const uint64_t deadline_misses = stats_.deadline_misses[class_index];
+    const uint64_t previous_deadline_misses =
+        exported_stats_.deadline_misses[class_index];
+    updated = metrics->AddCounter(
+        kDeadlineMissMetric, kWorkClassLabels[class_index],
+        deadline_misses - previous_deadline_misses);
+    if (!updated.ok()) return updated;
+    exported_queue_delay_histograms_[class_index] =
+        queue_delay_histograms_[class_index];
+    exported_stats_.deadline_misses[class_index] = deadline_misses;
+
+    auto service_delta = service_histograms_[class_index].DifferenceFrom(
+        exported_service_histograms_[class_index]);
+    if (!service_delta.ok()) return service_delta.status();
+    updated = metrics->MergeHistogram(
+        kServiceMetric, kWorkClassLabels[class_index],
+        service_delta.ValueOrDie());
+    if (!updated.ok()) return updated;
+    exported_service_histograms_[class_index] = service_histograms_[class_index];
+
+    for (size_t resource_index = 0;
+         resource_index < kGrantMetricNames.size(); ++resource_index) {
+      const uint64_t value = ResourceDimension(
+          stats_.admitted_resources[class_index], resource_index);
+      const uint64_t previous = ResourceDimension(
+          exported_stats_.admitted_resources[class_index], resource_index);
+      updated = metrics->AddCounter(
+          kGrantMetricNames[resource_index], kWorkClassLabels[class_index],
+          value - previous);
+      if (!updated.ok()) return updated;
+    }
+    exported_stats_.admitted_resources[class_index] =
+        stats_.admitted_resources[class_index];
+  }
   return Status::OK();
 }
 
@@ -429,6 +605,7 @@ void WorkExecutionService::WorkerLoop() {
       }
       const auto registered = tasks_.find(selected->id.value);
       if (registered == tasks_.end()) continue;
+      RecordDispatchLocked(*selected, registered->second);
       task = std::move(registered->second);
       tasks_.erase(registered);
       running_tasks_.emplace(

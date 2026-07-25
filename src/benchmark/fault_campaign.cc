@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -14,6 +16,7 @@
 
 #include "cedar/blob/blob_store.h"
 #include "cedar/db/cedar_database.h"
+#include "cedar/tcypher/runtime/query_spill.h"
 
 namespace cedar {
 
@@ -195,8 +198,12 @@ bool ExpectedInjectedStatus(BenchmarkFaultScenario scenario,
     return status.ok();
   }
   if (scenario == BenchmarkFaultScenario::kCommitAfterPrepareDurable ||
-      scenario == BenchmarkFaultScenario::kBlobIndexPartialWrite) {
+      scenario == BenchmarkFaultScenario::kBlobIndexPartialWrite ||
+      scenario == BenchmarkFaultScenario::kTcypherSpillDiskFull) {
     return status.IsIOError();
+  }
+  if (scenario == BenchmarkFaultScenario::kTcypherSpillCorruption) {
+    return status.IsCorruption();
   }
   return status.IsIndeterminate();
 }
@@ -221,6 +228,10 @@ const char* BenchmarkFaultScenarioName(BenchmarkFaultScenario scenario) {
       return "blob_gc_after_manifest_rename";
     case BenchmarkFaultScenario::kAcceptedWorkShutdown:
       return "accepted_work_shutdown";
+    case BenchmarkFaultScenario::kTcypherSpillDiskFull:
+      return "tcypher_spill_disk_full";
+    case BenchmarkFaultScenario::kTcypherSpillCorruption:
+      return "tcypher_spill_corruption";
   }
   return "unknown";
 }
@@ -241,7 +252,9 @@ StatusOr<BenchmarkFaultScenario> ParseBenchmarkFaultScenario(
            BenchmarkFaultScenario::kSstAfterRename,
            BenchmarkFaultScenario::kSidecarAfterRename,
            BenchmarkFaultScenario::kBlobGcAfterManifestRename,
-           BenchmarkFaultScenario::kAcceptedWorkShutdown}) {
+           BenchmarkFaultScenario::kAcceptedWorkShutdown,
+           BenchmarkFaultScenario::kTcypherSpillDiskFull,
+           BenchmarkFaultScenario::kTcypherSpillCorruption}) {
     if (name == BenchmarkFaultScenarioName(scenario)) return scenario;
   }
   return Status::InvalidArgument("benchmark fault campaign",
@@ -285,7 +298,64 @@ StatusOr<BenchmarkWorkloadResult> RunBenchmarkFaultCampaign(
   sample.admitted_ns = 0;
   sample.started_ns = ElapsedNs(origin);
   Status injected;
-  if (config.scenario == BenchmarkFaultScenario::kManifestAfterRename ||
+  if (config.scenario == BenchmarkFaultScenario::kTcypherSpillDiskFull) {
+    if (config.spill_directory.empty()) {
+      return Status::InvalidArgument(
+          "benchmark fault campaign", "spill directory is required");
+    }
+    QuerySpillFile spill(
+        config.spill_directory, nullptr, nullptr, nullptr, {},
+        [](QuerySpillFaultPoint point) {
+          return point == QuerySpillFaultPoint::kBeforeRecordWrite
+              ? Status::IOError(
+                    "query spill", "No space left on device")
+              : Status::OK();
+        });
+    const Status opened = spill.Open();
+    if (!opened.ok()) return opened;
+    injected = spill.AppendRecord("benchmark-spill-record");
+    spill.Close().IgnoreError();
+  } else if (config.scenario ==
+             BenchmarkFaultScenario::kTcypherSpillCorruption) {
+    if (config.spill_directory.empty()) {
+      return Status::InvalidArgument(
+          "benchmark fault campaign", "spill directory is required");
+    }
+    QuerySpillFile spill(config.spill_directory);
+    Status status = spill.Open();
+    if (!status.ok()) return status;
+    status = spill.AppendRecord("benchmark-spill-record");
+    if (!status.ok()) return status;
+    status = spill.Seal();
+    if (!status.ok()) return status;
+    std::fstream file(spill.path(),
+                      std::ios::binary | std::ios::in | std::ios::out);
+    if (!file.good()) {
+      return Status::IOError(
+          spill.path(), "failed to open spill file for corruption");
+    }
+    file.seekg(-1, std::ios::end);
+    char byte = 0;
+    file.read(&byte, 1);
+    if (!file.good()) {
+      return Status::IOError(
+          spill.path(), "failed to read spill corruption byte");
+    }
+    byte ^= 0x5a;
+    file.seekp(-1, std::ios::end);
+    file.write(&byte, 1);
+    file.flush();
+    if (!file.good()) {
+      return Status::IOError(
+          spill.path(), "failed to write spill corruption byte");
+    }
+    file.close();
+    status = spill.Rewind();
+    if (!status.ok()) return status;
+    std::string record;
+    injected = spill.NextRecord(&record);
+    spill.Close().IgnoreError();
+  } else if (config.scenario == BenchmarkFaultScenario::kManifestAfterRename ||
       config.scenario == BenchmarkFaultScenario::kSstAfterRename) {
     const Status put = (*database)->Put(
         key, config.valid_time, config.vertex_property_schema_epoch, value);

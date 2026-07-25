@@ -14,6 +14,8 @@
 
 #include "cedar/core/status.h"
 
+#include <cstdint>
+
 namespace cedar {
 
 const char* Status::CopyState(const char* state) {

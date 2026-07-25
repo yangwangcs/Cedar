@@ -20,8 +20,8 @@ void IoGovernor::ReplenishBucket(Bucket* bucket, uint64_t elapsed_ns) {
   const uint64_t rate = bucket->budget.replenish_per_second;
   const uint64_t refill = elapsed_ns > std::numeric_limits<uint64_t>::max() / rate
       ? bucket->budget.capacity
-      : std::min(bucket->budget.capacity,
-                 (elapsed_ns * rate) / 1000000000ULL);
+      : std::min<uint64_t>(bucket->budget.capacity,
+                           (elapsed_ns * rate) / 1000000000ULL);
   bucket->tokens = std::min(bucket->budget.capacity,
                             bucket->tokens > std::numeric_limits<uint64_t>::max() - refill
                                 ? bucket->budget.capacity : bucket->tokens + refill);

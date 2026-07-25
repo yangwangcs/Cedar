@@ -295,6 +295,16 @@ bool ProbeLinuxResourceLimits(const std::vector<MountInfo>& mounts,
   const uint64_t physical_memory =
       static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
 
+  // Keep usable resource values even when cgroup provenance cannot be
+  // resolved on a hosted runner. The caller still receives a false return
+  // value, so resource_limit_provenance_complete remains conservative.
+  environment->logical_cpu_count = static_cast<uint32_t>(affinity_count);
+  environment->memory_limit_bytes = physical_memory;
+  environment->cpu_model_and_count =
+      "logical_cpus=" + std::to_string(environment->logical_cpu_count) +
+      ";affinity_cpus=" + std::to_string(affinity_count) +
+      ";cgroup_v2=unresolved";
+
   std::filesystem::path mount_point;
   std::filesystem::path cgroup_directory;
   std::string cgroup_name;

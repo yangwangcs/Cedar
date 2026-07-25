@@ -3,6 +3,7 @@
 
 #include "cedar/columnar/granule_block.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 

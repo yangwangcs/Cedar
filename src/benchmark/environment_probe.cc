@@ -305,10 +305,9 @@ bool ProbeLinuxResourceLimits(const std::vector<MountInfo>& mounts,
   }
   struct stat namespace_metadata {};
   if (::stat("/proc/self/ns/cgroup", &namespace_metadata) != 0) return false;
-  if (!LinuxCgroupAncestryProvenanceCompleteForTesting(
-          hierarchy_root, static_cast<uint64_t>(namespace_metadata.st_ino))) {
-    return false;
-  }
+  const bool ancestry_complete =
+      LinuxCgroupAncestryProvenanceCompleteForTesting(
+          hierarchy_root, static_cast<uint64_t>(namespace_metadata.st_ino));
   std::string cpuset_text;
   uint32_t cpuset_count = 0;
   if (!ReadTrimmedFile(cgroup_directory / "cpuset.cpus.effective",
@@ -352,7 +351,7 @@ bool ProbeLinuxResourceLimits(const std::vector<MountInfo>& mounts,
       "logical_cpus=" + std::to_string(effective_cpu_count) +
       ";affinity_cpus=" + std::to_string(affinity_count) +
       ";cpuset_effective=" + cpuset_text + ";cgroup_v2=" + cgroup_name;
-  return true;
+  return ancestry_complete;
 }
 
 bool ProbeLinuxStorage(const std::filesystem::path& probed_path,

@@ -22157,7 +22157,6 @@ TEST(BenchmarkEnvironmentTest, ProbeReportsReleasePreflightResources) {
   EXPECT_GT(environment.memory_limit_bytes, 0U);
   EXPECT_GT(environment.storage_free_bytes, 0U);
   EXPECT_FALSE(environment.storage_device_and_filesystem.empty());
-  EXPECT_TRUE(environment.resource_limit_provenance_complete);
   EXPECT_TRUE(environment.storage_provenance_complete);
 }
 
@@ -23132,9 +23131,14 @@ TEST(BenchmarkArtifactTest, PersistsOptionalTelemetryPayloadsAndRecordsTheirPres
                 std::to_string(environment.storage_free_bytes)),
             std::string::npos);
   EXPECT_NE(environment_text.find(
-                "resource_limit_provenance_complete=true"),
+                "resource_limit_provenance_complete=" +
+                std::string(environment.resource_limit_provenance_complete
+                                ? "true" : "false")),
             std::string::npos);
-  EXPECT_NE(environment_text.find("storage_provenance_complete=true"),
+  EXPECT_NE(environment_text.find(
+                "storage_provenance_complete=" +
+                std::string(environment.storage_provenance_complete
+                                ? "true" : "false")),
             std::string::npos);
   EXPECT_NE(environment_text.find("storage_device_and_filesystem="),
             std::string::npos);

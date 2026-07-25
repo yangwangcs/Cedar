@@ -25,6 +25,8 @@
 #include <sys/wait.h>
 #if defined(__APPLE__)
 #include <sys/event.h>
+#elif defined(__linux__)
+#include <sys/inotify.h>
 #endif
 #include <unistd.h>
 #include <utility>
@@ -1666,6 +1668,15 @@ StatusOr<BenchmarkExecutableSnapshot> CreateBenchmarkExecutableSnapshot(
     return Status::IOError("benchmark executable snapshot",
                            std::strerror(errno));
   }
+#elif defined(__linux__)
+  ScopedFd monitor(::inotify_init1(IN_NONBLOCK | IN_CLOEXEC));
+  if (monitor.get() < 0 ||
+      ::inotify_add_watch(monitor.get(), snapshot_directory.c_str(),
+                          IN_ATTRIB | IN_CREATE | IN_DELETE |
+                              IN_MOVED_FROM | IN_MOVED_TO) < 0) {
+    return Status::IOError("benchmark executable snapshot",
+                           std::strerror(errno));
+  }
 #endif
   std::array<uint8_t, 32> blake3_bytes{};
   blake3_hasher_finalize(&blake3, blake3_bytes.data(), blake3_bytes.size());
@@ -1680,6 +1691,8 @@ StatusOr<BenchmarkExecutableSnapshot> CreateBenchmarkExecutableSnapshot(
       snapshot.Release(), snapshot_path, snapshot_directory,
 #if defined(__APPLE__)
       directory_fd.Release(), monitor.Release()
+#elif defined(__linux__)
+      -1, monitor.Release()
 #else
       -1, -1
 #endif
@@ -1717,6 +1730,25 @@ Status VerifyBenchmarkExecutableSnapshot(
                               "tamper monitor failed");
   }
   if (observed != 0) snapshot.state->tampered = true;
+#elif defined(__linux__)
+  if (snapshot.state->monitor_fd < 0 ||
+      !DescriptorIsCloseOnExec(snapshot.state->monitor_fd)) {
+    return Status::Corruption("benchmark executable snapshot",
+                              "tamper monitor is unavailable");
+  }
+  alignas(struct inotify_event) std::array<char, 4096> events{};
+  while (true) {
+    const ssize_t observed =
+        ::read(snapshot.state->monitor_fd, events.data(), events.size());
+    if (observed > 0) {
+      snapshot.state->tampered = true;
+      continue;
+    }
+    if (observed < 0 && errno == EINTR) continue;
+    if (observed < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+    return Status::Corruption("benchmark executable snapshot",
+                              "tamper monitor failed");
+  }
 #endif
   struct stat descriptor_metadata {};
   struct stat path_metadata {};

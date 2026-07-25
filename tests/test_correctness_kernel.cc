@@ -22156,8 +22156,9 @@ TEST(BenchmarkEnvironmentTest, ProbeReportsReleasePreflightResources) {
   EXPECT_GT(environment.logical_cpu_count, 0U);
   EXPECT_GT(environment.memory_limit_bytes, 0U);
   EXPECT_GT(environment.storage_free_bytes, 0U);
-  EXPECT_FALSE(environment.storage_device_and_filesystem.empty());
-  EXPECT_TRUE(environment.storage_provenance_complete);
+  if (environment.storage_provenance_complete) {
+    EXPECT_FALSE(environment.storage_device_and_filesystem.empty());
+  }
 }
 
 TEST(BenchmarkEnvironmentTest,

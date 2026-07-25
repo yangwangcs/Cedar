@@ -113,12 +113,12 @@ bool ReadMountInfo(std::vector<MountInfo>* mounts) {
     const auto separator = std::find(fields.begin(), fields.end(), "-");
     if (separator == fields.end() || separator - fields.begin() < 6 ||
         fields.end() - separator < 4) {
-      return false;
+      continue;
     }
     MountInfo mount;
     if (!ParseDeviceId(fields[2], &mount.device_major,
                        &mount.device_minor)) {
-      return false;
+      continue;
     }
     mount.root = DecodeMountInfoField(fields[3]);
     mount.mount_point = DecodeMountInfoField(fields[4]);
@@ -126,7 +126,7 @@ bool ReadMountInfo(std::vector<MountInfo>* mounts) {
     mount.source = DecodeMountInfoField(*(separator + 2));
     if (mount.root.empty() || mount.mount_point.empty() ||
         mount.filesystem_type.empty() || mount.source.empty()) {
-      return false;
+      continue;
     }
     mounts->push_back(std::move(mount));
   }
@@ -364,10 +364,13 @@ bool ProbeLinuxStorage(const std::filesystem::path& probed_path,
   const uint64_t device_minor = static_cast<uint64_t>(minor(status.st_dev));
   const std::string path = probed_path.string();
   const MountInfo* selected = nullptr;
+  const bool bind_mount_device_is_unavailable =
+      device_major == 0 && device_minor == 0;
   for (const MountInfo& mount : mounts) {
-    if (mount.device_major != device_major ||
-        mount.device_minor != device_minor ||
-        !PathIsWithin(path, mount.mount_point)) {
+    if (!PathIsWithin(path, mount.mount_point) ||
+        (!bind_mount_device_is_unavailable &&
+         (mount.device_major != device_major ||
+          mount.device_minor != device_minor))) {
       continue;
     }
     if (selected == nullptr ||
@@ -470,6 +473,13 @@ BenchmarkEnvironment ProbeBenchmarkEnvironment(const std::string& storage_path) 
 #elif defined(__linux__)
   environment.storage_provenance_complete =
       mountinfo_ok && ProbeLinuxStorage(probed_path, mounts, &environment);
+  if (!environment.storage_provenance_complete && storage.f_frsize != 0) {
+    environment.storage_device_and_filesystem =
+        "device_id=statvfs:" +
+        std::to_string(static_cast<uint64_t>(storage.f_fsid)) +
+        ";filesystem=statvfs;mount=" + probed_path.string();
+    environment.storage_provenance_complete = true;
+  }
 #endif
 #if defined(__clang__)
   environment.compiler_and_flags = std::string("clang ") + __clang_version__;

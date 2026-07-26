@@ -6,6 +6,7 @@ out/
 
 # Agent workflow state
 .superpowers/
+.worktrees/
 
 # Local design notes are not part of the public source tree
 docs/

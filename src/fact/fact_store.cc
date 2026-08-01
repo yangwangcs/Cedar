@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -24,6 +25,7 @@ namespace {
 
 constexpr uint32_t kCedarFactStoreFormatVersion = 1;
 constexpr size_t kFactIdentityPrefixBytes = 12;
+constexpr char kSequenceMetaPrefix[] = "sequence/";
 
 Status FromRocksDb(const rocksdb::Status& status, const char* context) {
   if (status.ok()) return Status::OK();
@@ -33,6 +35,13 @@ Status FromRocksDb(const rocksdb::Status& status, const char* context) {
   if (status.IsInvalidArgument()) return Status::InvalidArgument(context, message);
   if (status.IsNotSupported()) return Status::NotSupported(context, message);
   return Status::IOError(context, message);
+}
+
+Status FromCommitWriteFailure(const rocksdb::Status& status) {
+  if (status.IsInvalidArgument() || status.IsNotSupported()) {
+    return FromRocksDb(status, "commit fact store batch");
+  }
+  return Status::Indeterminate("commit fact store batch", status.ToString());
 }
 
 void AppendU16(std::string* out, uint16_t value) {
@@ -107,7 +116,87 @@ class FactStoreImpl {
   CommitSeq visible_seq;
   CommitSeq oldest_readable_seq;
   size_t active_snapshots = 0;
+  bool recovery_required = false;
 };
+
+Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq) {
+  const auto sequence_key = EncodeSequenceMetaKey(commit_seq);
+  if (!sequence_key.ok()) return sequence_key.status();
+  std::string encoded_sequence;
+  const rocksdb::Status got_sequence = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, sequence_key.ValueOrDie(),
+      &encoded_sequence);
+  if (!got_sequence.ok()) {
+    return Status::Corruption("fact store", "missing durable sequence record");
+  }
+  const auto sequence = DecodeSequenceRecord(encoded_sequence);
+  if (!sequence.ok()) return sequence.status();
+  if (sequence.ValueOrDie().commit_seq != commit_seq) {
+    return Status::Corruption("fact store", "sequence record has wrong commit sequence");
+  }
+  const auto transaction_key = EncodeTransactionMetaKey(sequence.ValueOrDie().txn_id);
+  if (!transaction_key.ok()) return transaction_key.status();
+  std::string encoded_outcome;
+  const rocksdb::Status got_outcome = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, transaction_key.ValueOrDie(),
+      &encoded_outcome);
+  if (!got_outcome.ok()) {
+    return Status::Corruption("fact store", "sequence record is missing outcome");
+  }
+  const auto outcome = DecodeTransactionOutcome(encoded_outcome);
+  if (!outcome.ok()) return outcome.status();
+  if (outcome.ValueOrDie().txn_id != sequence.ValueOrDie().txn_id ||
+      outcome.ValueOrDie().commit_seq != commit_seq) {
+    return Status::Corruption("fact store", "outcome and sequence disagree");
+  }
+  for (const std::string& fact_key : sequence.ValueOrDie().fact_keys) {
+    const auto decoded_key = DecodeFactKey(fact_key);
+    if (!decoded_key.ok() || decoded_key.ValueOrDie().commit_seq != commit_seq) {
+      return Status::Corruption("fact store", "sequence contains invalid fact key");
+    }
+    std::string encoded_fact;
+    const rocksdb::Status got_fact = store->db->Get(
+        rocksdb::ReadOptions(), store->facts_cf, fact_key, &encoded_fact);
+    if (!got_fact.ok()) {
+      return Status::Corruption("fact store", "sequence record is missing fact");
+    }
+    const auto fact = DecodeFactValue(decoded_key.ValueOrDie().ref,
+                                      decoded_key.ValueOrDie().valid_from,
+                                      commit_seq, encoded_fact);
+    if (!fact.ok()) return fact.status();
+  }
+  return Status::OK();
+}
+
+Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq) {
+  if (visible_seq.value == 0) return Status::OK();
+  rocksdb::ReadOptions options;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->meta_cf));
+  uint64_t expected = 1;
+  for (iterator->Seek(kSequenceMetaPrefix);
+       iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix);
+       iterator->Next()) {
+    const Status valid = ValidateCommittedSequence(store, CommitSeq{expected});
+    if (!valid.ok()) return valid;
+    if (expected == visible_seq.value) {
+      ++expected;
+      iterator->Next();
+      break;
+    }
+    ++expected;
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "iterate durable sequence records");
+  }
+  if (expected != visible_seq.value + 1) {
+    return Status::Corruption("fact store", "visible watermark lacks contiguous sequences");
+  }
+  if (iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix)) {
+    return Status::Corruption("fact store", "sequence exceeds visible watermark");
+  }
+  return Status::OK();
+}
 
 class StoreSnapshot::State {
  public:
@@ -135,6 +224,47 @@ class StoreSnapshot::State {
 
 FactPrefix FactPrefix::Exact(FactRef ref) {
   return FactPrefix(ref.family(), ref.property_id(), ref.entity_id());
+}
+
+Status StoreCommitBatch::Validate() const {
+  if (!txn_id.valid() || system_hlc == 0 || mutations.empty()) {
+    return Status::InvalidArgument("commit batch", "missing transaction, time, or facts");
+  }
+  std::set<std::string> facts;
+  for (const PendingFactMutation& mutation : mutations) {
+    const Status valid = mutation.Validate();
+    if (!valid.ok()) return valid;
+    const std::string key = EncodeFactKey(mutation.ref, mutation.valid_from,
+                                          CommitSeq{1});
+    if (key.empty() || !facts.emplace(key).second) {
+      return Status::InvalidArgument("commit batch", "duplicate fact mutation");
+    }
+  }
+  std::set<uint64_t> edge_ids;
+  for (const EdgeIdentity& identity : edge_identities) {
+    const Status valid = identity.Validate();
+    if (!valid.ok()) return valid;
+    if (!edge_ids.emplace(identity.edge_id.value).second) {
+      return Status::InvalidArgument("commit batch", "duplicate edge identity");
+    }
+  }
+  if (!edge_ids.empty()) {
+    for (uint64_t edge_id : edge_ids) {
+      bool has_state_assertion = false;
+      for (const PendingFactMutation& mutation : mutations) {
+        if (mutation.ref.family() == FactFamily::kEdgeState &&
+            mutation.ref.entity_id() == edge_id &&
+            mutation.operation == FactOperation::kPut) {
+          has_state_assertion = true;
+          break;
+        }
+      }
+      if (!has_state_assertion) {
+        return Status::InvalidArgument("commit batch", "edge identity lacks state assertion");
+      }
+    }
+  }
+  return Status::OK();
 }
 
 FactPrefix FactPrefix::Family(FactFamily family, PropertyId property_id) {
@@ -287,6 +417,9 @@ Status FactStore::Open() {
     }
     store->visible_seq = visible.ValueOrDie();
     store->oldest_readable_seq = oldest.ValueOrDie();
+    const Status sequences_valid =
+        ValidateCommittedSequences(store.get(), store->visible_seq);
+    if (!sequences_valid.ok()) return sequences_valid;
   }
   impl_ = std::move(store);
   return Status::OK();
@@ -399,6 +532,255 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
   }
   return iterator->status().ok() ? Status::OK()
                                  : FromRocksDb(iterator->status(), "iterate fact scan");
+}
+
+StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
+  const Status valid = batch.Validate();
+  if (!valid.ok()) return valid;
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("commit", "store is not open");
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  if (store->recovery_required) {
+    return Status::RecoveryRequired("commit", "reopen required after indeterminate write");
+  }
+
+  const auto transaction_key = EncodeTransactionMetaKey(batch.txn_id);
+  if (!transaction_key.ok()) return transaction_key.status();
+  std::string encoded_outcome;
+  const rocksdb::Status got_outcome = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, transaction_key.ValueOrDie(),
+      &encoded_outcome);
+  if (got_outcome.ok()) {
+    const auto outcome = DecodeTransactionOutcome(encoded_outcome);
+    if (!outcome.ok()) return outcome.status();
+    const auto sequence_key = EncodeSequenceMetaKey(outcome.ValueOrDie().commit_seq);
+    if (!sequence_key.ok()) return sequence_key.status();
+    std::string encoded_sequence;
+    const rocksdb::Status got_sequence = store->db->Get(
+        rocksdb::ReadOptions(), store->meta_cf, sequence_key.ValueOrDie(),
+        &encoded_sequence);
+    if (!got_sequence.ok()) {
+      return Status::Corruption("commit", "outcome is missing sequence record");
+    }
+    const auto sequence = DecodeSequenceRecord(encoded_sequence);
+    if (!sequence.ok()) return sequence.status();
+    if (sequence.ValueOrDie().txn_id != batch.txn_id ||
+        sequence.ValueOrDie().system_hlc != batch.system_hlc ||
+        sequence.ValueOrDie().fact_keys.size() != batch.mutations.size()) {
+      return Status::Conflict("commit", "transaction ID belongs to a different batch");
+    }
+    std::set<uint64_t> committed_edge_ids;
+    for (const std::string& fact_key : sequence.ValueOrDie().fact_keys) {
+      const auto decoded_key = DecodeFactKey(fact_key);
+      if (!decoded_key.ok()) return decoded_key.status();
+      if (decoded_key.ValueOrDie().ref.family() == FactFamily::kEdgeState ||
+          decoded_key.ValueOrDie().ref.family() == FactFamily::kEdgeProperty) {
+        committed_edge_ids.emplace(decoded_key.ValueOrDie().ref.entity_id());
+      }
+    }
+    if (committed_edge_ids.size() != batch.edge_identities.size()) {
+      return Status::Conflict("commit", "transaction ID belongs to a different batch");
+    }
+    for (const EdgeIdentity& identity : batch.edge_identities) {
+      if (!committed_edge_ids.contains(identity.edge_id.value)) {
+        return Status::Conflict("commit", "transaction ID belongs to a different batch");
+      }
+      const auto identity_key = EncodeEdgeIdentityMetaKey(identity.edge_id);
+      if (!identity_key.ok()) return identity_key.status();
+      std::string encoded_identity;
+      const rocksdb::Status got_identity = store->db->Get(
+          rocksdb::ReadOptions(), store->meta_cf, identity_key.ValueOrDie(),
+          &encoded_identity);
+      if (!got_identity.ok()) {
+        return Status::Corruption("commit", "committed edge is missing identity");
+      }
+      const auto committed_identity = DecodeEdgeIdentity(encoded_identity);
+      if (!committed_identity.ok()) return committed_identity.status();
+      if (committed_identity.ValueOrDie() != identity) {
+        return Status::Conflict("commit", "transaction ID belongs to a different batch");
+      }
+    }
+    for (size_t index = 0; index < batch.mutations.size(); ++index) {
+      const PendingFactMutation& mutation = batch.mutations[index];
+      const std::string expected_key = EncodeFactKey(
+          mutation.ref, mutation.valid_from, outcome.ValueOrDie().commit_seq);
+      if (expected_key != sequence.ValueOrDie().fact_keys[index]) {
+        return Status::Conflict("commit", "transaction ID belongs to a different batch");
+      }
+      std::string encoded_fact;
+      const rocksdb::Status got_fact = store->db->Get(
+          rocksdb::ReadOptions(), store->facts_cf, expected_key, &encoded_fact);
+      if (!got_fact.ok()) return FromRocksDb(got_fact, "read committed fact");
+      const auto actual = DecodeFactValue(mutation.ref, mutation.valid_from,
+                                          outcome.ValueOrDie().commit_seq,
+                                          encoded_fact);
+      if (!actual.ok()) return actual.status();
+      const FactEvent expected{mutation.ref, mutation.valid_from,
+                               outcome.ValueOrDie().commit_seq,
+                               mutation.operation, mutation.schema_epoch,
+                               mutation.value};
+      if (actual.ValueOrDie().operation != expected.operation ||
+          actual.ValueOrDie().schema_epoch != expected.schema_epoch ||
+          actual.ValueOrDie().value != expected.value) {
+        return Status::Conflict("commit", "transaction ID belongs to a different batch");
+      }
+    }
+    return StoreCommitResult{outcome.ValueOrDie().commit_seq,
+                             sequence.ValueOrDie().system_hlc};
+  }
+  if (!got_outcome.IsNotFound()) return FromRocksDb(got_outcome, "read transaction outcome");
+
+  for (const PendingFactMutation& mutation : batch.mutations) {
+    if (mutation.ref.family() != FactFamily::kEdgeState ||
+        mutation.operation != FactOperation::kPut) {
+      continue;
+    }
+    const auto identity_key = EncodeEdgeIdentityMetaKey(EdgeId{mutation.ref.entity_id()});
+    if (!identity_key.ok()) return identity_key.status();
+    std::string encoded_identity;
+    const rocksdb::Status got_identity = store->db->Get(
+        rocksdb::ReadOptions(), store->meta_cf, identity_key.ValueOrDie(),
+        &encoded_identity);
+    if (got_identity.IsNotFound()) {
+      bool supplied_identity = false;
+      for (const EdgeIdentity& identity : batch.edge_identities) {
+        if (identity.edge_id.value == mutation.ref.entity_id()) {
+          supplied_identity = true;
+          break;
+        }
+      }
+      if (!supplied_identity) {
+        return Status::InvalidArgument("commit", "first edge assertion requires identity");
+      }
+    } else if (!got_identity.ok()) {
+      return FromRocksDb(got_identity, "read edge identity");
+    }
+  }
+
+  for (const EdgeIdentity& identity : batch.edge_identities) {
+    const auto identity_key = EncodeEdgeIdentityMetaKey(identity.edge_id);
+    if (!identity_key.ok()) return identity_key.status();
+    std::string encoded_identity;
+    const rocksdb::Status got_identity = store->db->Get(
+        rocksdb::ReadOptions(), store->meta_cf, identity_key.ValueOrDie(),
+        &encoded_identity);
+    if (got_identity.IsNotFound()) continue;
+    if (!got_identity.ok()) {
+      return FromRocksDb(got_identity, "read edge identity");
+    }
+    const auto existing_identity = DecodeEdgeIdentity(encoded_identity);
+    if (!existing_identity.ok()) return existing_identity.status();
+    if (existing_identity.ValueOrDie() != identity) {
+      return Status::IdentityConflict("commit", "edge ID has a different identity");
+    }
+  }
+
+  if (store->visible_seq.value == std::numeric_limits<uint64_t>::max()) {
+    return Status::ResourceExhausted("commit", "commit sequence exhausted");
+  }
+  const CommitSeq commit_seq{store->visible_seq.value + 1};
+  std::vector<std::string> fact_keys;
+  fact_keys.reserve(batch.mutations.size());
+  rocksdb::WriteBatch write_batch;
+  for (const PendingFactMutation& mutation : batch.mutations) {
+    FactEvent event{mutation.ref, mutation.valid_from, commit_seq,
+                    mutation.operation, mutation.schema_epoch, mutation.value};
+    const auto encoded_value = EncodeFactValue(event);
+    if (!encoded_value.ok()) return encoded_value.status();
+    std::string key = EncodeFactKey(mutation.ref, mutation.valid_from, commit_seq);
+    if (key.empty()) return Status::InvalidArgument("commit", "invalid fact key");
+    write_batch.Put(store->facts_cf, key, encoded_value.ValueOrDie());
+    fact_keys.push_back(std::move(key));
+  }
+  for (const EdgeIdentity& identity : batch.edge_identities) {
+    const auto key = EncodeEdgeIdentityMetaKey(identity.edge_id);
+    const auto value = EncodeEdgeIdentity(identity);
+    if (!key.ok()) return key.status();
+    if (!value.ok()) return value.status();
+    write_batch.Put(store->meta_cf, key.ValueOrDie(), value.ValueOrDie());
+  }
+  const TransactionOutcomeRecord outcome{batch.txn_id, commit_seq,
+                                         TransactionOutcome::kCommitted};
+  const SequenceRecord sequence{commit_seq, batch.txn_id, batch.system_hlc,
+                                fact_keys};
+  const auto encoded_new_outcome = EncodeTransactionOutcome(outcome);
+  const auto encoded_new_sequence = EncodeSequenceRecord(sequence);
+  const auto encoded_watermark = EncodeWatermark(commit_seq);
+  const auto sequence_key = EncodeSequenceMetaKey(commit_seq);
+  if (!encoded_new_outcome.ok()) return encoded_new_outcome.status();
+  if (!encoded_new_sequence.ok()) return encoded_new_sequence.status();
+  if (!encoded_watermark.ok()) return encoded_watermark.status();
+  if (!sequence_key.ok()) return sequence_key.status();
+  write_batch.Put(store->meta_cf, transaction_key.ValueOrDie(),
+                  encoded_new_outcome.ValueOrDie());
+  write_batch.Put(store->meta_cf, sequence_key.ValueOrDie(),
+                  encoded_new_sequence.ValueOrDie());
+  write_batch.Put(store->meta_cf, EncodeVisibleWatermarkKey(),
+                  encoded_watermark.ValueOrDie());
+  rocksdb::WriteOptions options;
+  options.sync = true;
+  const rocksdb::Status written = store->db->Write(options, &write_batch);
+  if (!written.ok()) {
+    const Status status = FromCommitWriteFailure(written);
+    if (status.IsIndeterminate()) store->recovery_required = true;
+    return status;
+  }
+  store->visible_seq = commit_seq;
+  return StoreCommitResult{commit_seq, batch.system_hlc};
+}
+
+CommitSeq FactStore::visible_seq() const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+  }
+  if (!store) return CommitSeq{};
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  return store->visible_seq;
+}
+
+StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(
+    TxnId txn_id) const {
+  if (!txn_id.valid()) return Status::InvalidArgument("transaction", "zero transaction ID");
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("transaction", "store is not open");
+  }
+  const auto transaction_key = EncodeTransactionMetaKey(txn_id);
+  if (!transaction_key.ok()) return transaction_key.status();
+  std::string encoded_outcome;
+  const rocksdb::Status got_outcome = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, transaction_key.ValueOrDie(),
+      &encoded_outcome);
+  if (got_outcome.IsNotFound()) return std::optional<StoreCommitResult>{};
+  if (!got_outcome.ok()) return FromRocksDb(got_outcome, "read transaction outcome");
+  const auto outcome = DecodeTransactionOutcome(encoded_outcome);
+  if (!outcome.ok()) return outcome.status();
+  const auto sequence_key = EncodeSequenceMetaKey(outcome.ValueOrDie().commit_seq);
+  if (!sequence_key.ok()) return sequence_key.status();
+  std::string encoded_sequence;
+  const rocksdb::Status got_sequence = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, sequence_key.ValueOrDie(),
+      &encoded_sequence);
+  if (!got_sequence.ok()) {
+    return Status::Corruption("transaction", "outcome is missing sequence record");
+  }
+  const auto sequence = DecodeSequenceRecord(encoded_sequence);
+  if (!sequence.ok()) return sequence.status();
+  if (sequence.ValueOrDie().txn_id != txn_id ||
+      sequence.ValueOrDie().commit_seq != outcome.ValueOrDie().commit_seq) {
+    return Status::Corruption("transaction", "outcome and sequence disagree");
+  }
+  return std::optional<StoreCommitResult>{
+      StoreCommitResult{outcome.ValueOrDie().commit_seq,
+                        sequence.ValueOrDie().system_hlc}};
 }
 
 }  // namespace cedar

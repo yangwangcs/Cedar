@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
@@ -26,6 +27,22 @@ struct FactStoreOptions {
 
 struct SnapshotOptions {
   std::optional<CommitSeq> as_of;
+};
+
+struct StoreCommitBatch {
+  TxnId txn_id;
+  uint64_t system_hlc = 0;
+  std::vector<PendingFactMutation> mutations;
+  std::vector<EdgeIdentity> edge_identities;
+
+  Status Validate() const;
+};
+
+struct StoreCommitResult {
+  CommitSeq commit_seq;
+  uint64_t system_hlc = 0;
+
+  constexpr bool operator==(const StoreCommitResult&) const = default;
 };
 
 class FactPrefix {
@@ -87,6 +104,10 @@ class FactStore {
                                           ValidTime valid_time) const;
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactVisitor& visitor) const;
+  StatusOr<StoreCommitResult> Commit(const StoreCommitBatch& batch);
+  CommitSeq visible_seq() const;
+  StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(
+      TxnId txn_id) const;
 
  private:
   FactStoreOptions options_;

@@ -34,3 +34,8 @@ add_executable(test_fact_store test_fact_store.cc)
 target_link_libraries(test_fact_store
     PRIVATE cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_fact_store)
+
+add_executable(test_fact_store_commit test_fact_store_commit.cc)
+target_link_libraries(test_fact_store_commit
+    PRIVATE cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_fact_store_commit)

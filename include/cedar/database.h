@@ -4,6 +4,7 @@
 #ifndef CEDAR_DATABASE_H_
 #define CEDAR_DATABASE_H_
 
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -21,6 +22,8 @@ struct DatabaseOptions {
   uint64_t write_buffer_bytes = 64ULL * 1024ULL * 1024ULL;
   uint64_t block_cache_bytes = 256ULL * 1024ULL * 1024ULL;
   uint64_t blob_threshold_bytes = 4096;
+  std::function<Status()> commit_prewrite_fault_injector_for_testing;
+  std::function<Status()> commit_fault_injector_for_testing;
 };
 
 class Database {

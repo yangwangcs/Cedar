@@ -72,3 +72,9 @@ target_include_directories(test_strict_transactions PRIVATE ${CMAKE_SOURCE_DIR}/
 target_link_libraries(test_strict_transactions
     PRIVATE cedar_kernel cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_strict_transactions)
+
+add_executable(test_kernel_commit test_kernel_commit.cc)
+target_include_directories(test_kernel_commit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_kernel_commit
+    PRIVATE cedar_kernel cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_kernel_commit)

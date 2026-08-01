@@ -25,6 +25,8 @@ struct FactStoreOptions {
   uint64_t write_buffer_bytes = 64ULL * 1024ULL * 1024ULL;
   uint64_t block_cache_bytes = 256ULL * 1024ULL * 1024ULL;
   uint64_t blob_threshold_bytes = 4096;
+  std::function<Status()> commit_prewrite_fault_injector_for_testing;
+  std::function<Status()> commit_fault_injector_for_testing;
 };
 
 struct SnapshotWriteDependency {
@@ -134,6 +136,7 @@ class FactStore {
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactVisitor& visitor) const;
   StatusOr<StoreCommitResult> Commit(const StoreCommitBatch& batch);
+  StatusOr<TxnId> AllocateTransactionId();
   StatusOr<IdLease> LeaseIds(IdKind kind, uint64_t count);
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);
   StatusOr<std::optional<PropertyDefinition>> LookupProperty(

@@ -19,15 +19,18 @@ namespace cedar {
 class Transaction::State {
  public:
   explicit State(std::shared_ptr<Database::Impl> database,
-                 TransactionOptions options, StoreSnapshot snapshot)
+                 TransactionOptions options, StoreSnapshot snapshot, TxnId txn_id)
       : database(std::move(database)),
         options(options),
-        snapshot(std::move(snapshot)) {}
+        snapshot(std::move(snapshot)),
+        txn_id(txn_id) {}
 
   std::shared_ptr<Database::Impl> database;
   TransactionOptions options;
   std::optional<StoreSnapshot> snapshot;
+  TxnId txn_id;
   std::vector<PendingFactMutation> mutations;
+  std::vector<EdgeIdentity> edge_identities;
   std::vector<SnapshotWriteDependency> snapshot_write_dependencies;
   std::vector<StrictReadDependency> strict_read_dependencies;
   std::vector<std::tuple<uint8_t, uint16_t, uint64_t, uint64_t>> mutation_keys;
@@ -117,6 +120,25 @@ class Transaction::State {
     return Status::OK();
   }
 
+  Status StageEdge(EdgeIdentity identity, ValidTime valid_time) {
+    const Status valid = identity.Validate();
+    if (!valid.ok()) return valid;
+    const auto existing = std::find_if(
+        edge_identities.begin(), edge_identities.end(),
+        [&identity](const EdgeIdentity& candidate) {
+          return candidate.edge_id == identity.edge_id;
+        });
+    if (existing != edge_identities.end() && *existing != identity) {
+      return Status::IdentityConflict("transaction", "edge ID has a different identity");
+    }
+    const Status staged = Stage(PendingFactMutation{
+        EntityFact::Edge(identity.edge_id).ref(), valid_time, FactOperation::kPut,
+        0, std::nullopt});
+    if (!staged.ok()) return staged;
+    if (existing == edge_identities.end()) edge_identities.push_back(identity);
+    return Status::OK();
+  }
+
   void Finish() {
     terminal = true;
     snapshot.reset();
@@ -190,6 +212,14 @@ Status Transaction::Assert(EntityFact entity, ValidTime valid_time) {
                                             std::nullopt});
 }
 
+Status Transaction::Assert(EdgeIdentity identity, ValidTime valid_time) {
+  if (!state_) return Status::InvalidArgument("transaction", "moved-from transaction");
+  if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
+  const Status database_open = state_->CheckDatabaseOpen();
+  if (!database_open.ok()) return database_open;
+  return state_->StageEdge(std::move(identity), valid_time);
+}
+
 Status Transaction::Retract(EntityFact entity, ValidTime valid_time) {
   if (!state_) return Status::InvalidArgument("transaction", "moved-from transaction");
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
@@ -234,7 +264,22 @@ StatusOr<CommitResult> Transaction::Commit() {
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
   const Status database_open = state_->CheckDatabaseOpen();
   if (!database_open.ok()) return database_open;
-  return Status::NotSupported("transaction", "commits are not implemented yet");
+  StoreCommitBatch batch{state_->txn_id,
+                         state_->txn_id.value,
+                         std::move(state_->mutations),
+                         std::move(state_->edge_identities),
+                         std::move(state_->snapshot_write_dependencies),
+                         std::move(state_->strict_read_dependencies)};
+  const auto committed = state_->database->store.Commit(batch);
+  state_->Finish();
+  if (!committed.ok()) {
+    const Status status = committed.status();
+    return CommitResult{status.IsIndeterminate() ? CommitOutcome::kIndeterminate
+                                                  : CommitOutcome::kAborted,
+                        CommitSeq{}, batch.txn_id, status};
+  }
+  return CommitResult{CommitOutcome::kCommitted, committed.ValueOrDie().commit_seq,
+                      batch.txn_id, Status::OK()};
 }
 
 Status Transaction::Rollback() {
@@ -249,11 +294,14 @@ StatusOr<std::unique_ptr<Transaction>> Database::BeginTransaction(
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  auto txn_id = impl_->store.AllocateTransactionId();
+  if (!txn_id.ok()) return txn_id.status();
   auto snapshot = impl_->store.BeginSnapshot();
   if (!snapshot.ok()) return snapshot.status();
   return std::unique_ptr<Transaction>(
       new Transaction(std::make_unique<Transaction::State>(
-          impl_, options, snapshot.ConsumeValueOrDie())));
+          impl_, options, snapshot.ConsumeValueOrDie(),
+          txn_id.ConsumeValueOrDie())));
 }
 
 }  // namespace cedar

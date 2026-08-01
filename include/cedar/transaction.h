@@ -50,6 +50,7 @@ class Transaction {
   Status Scan(FactFamily family, PropertyId property_id,
               const TransactionFactVisitor& visitor);
   Status Assert(EntityFact entity, ValidTime valid_time);
+  Status Assert(EdgeIdentity identity, ValidTime valid_time);
   Status Retract(EntityFact entity, ValidTime valid_time);
   Status Set(PropertyFact property, ValidTime valid_time, Value value);
   Status Unset(PropertyFact property, ValidTime valid_time);

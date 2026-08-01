@@ -117,10 +117,12 @@ TEST_F(FactStoreCommitTest,
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   std::unique_ptr<rocksdb::DB> database;
   ASSERT_TRUE(rocksdb::DB::Open(raw_options, path_, descriptors, &handles, &database).ok());
-  std::unique_ptr<rocksdb::Iterator> default_iterator(
-      database->NewIterator(rocksdb::ReadOptions(), handles[0]));
-  default_iterator->SeekToFirst();
-  EXPECT_FALSE(default_iterator->Valid());
+  {
+    std::unique_ptr<rocksdb::Iterator> default_iterator(
+        database->NewIterator(rocksdb::ReadOptions(), handles[0]));
+    default_iterator->SeekToFirst();
+    EXPECT_FALSE(default_iterator->Valid());
+  }
   for (rocksdb::ColumnFamilyHandle* handle : handles) {
     database->DestroyColumnFamilyHandle(handle);
   }

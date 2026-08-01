@@ -131,7 +131,8 @@ Status PropertyDefinition::Validate() const {
 }
 
 Status IdAllocatorState::Validate() const {
-  if (next_id == 0 || (kind != IdKind::kVertex && kind != IdKind::kEdge)) {
+  if (next_id == 0 || (kind != IdKind::kVertex && kind != IdKind::kEdge &&
+                       kind != IdKind::kTransaction)) {
     return Status::InvalidArgument("ID allocator", "invalid allocator state");
   }
   return Status::OK();
@@ -180,8 +181,15 @@ StatusOr<std::string> EncodeEdgeIdentityMetaKey(EdgeId edge_id) {
 }
 
 std::string EncodeAllocatorMetaKey(IdKind kind) {
-  return kind == IdKind::kVertex ? "allocator/vertex_next" :
-                                  "allocator/edge_next";
+  switch (kind) {
+    case IdKind::kVertex:
+      return "allocator/vertex_next";
+    case IdKind::kEdge:
+      return "allocator/edge_next";
+    case IdKind::kTransaction:
+      return "allocator/transaction_next";
+  }
+  return "allocator/invalid";
 }
 
 StatusOr<std::string> EncodeTransactionMetaKey(TxnId txn_id) {

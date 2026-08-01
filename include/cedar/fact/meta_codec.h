@@ -14,7 +14,7 @@
 
 namespace cedar {
 
-enum class IdKind : uint8_t { kVertex = 1, kEdge = 2 };
+enum class IdKind : uint8_t { kVertex = 1, kEdge = 2, kTransaction = 3 };
 
 struct IdAllocatorState {
   IdKind kind = IdKind::kVertex;

@@ -17,7 +17,9 @@ class Database::Impl {
       : store(FactStoreOptions{std::move(options.path),
                                options.write_buffer_bytes,
                                options.block_cache_bytes,
-                               options.blob_threshold_bytes}) {}
+                               options.blob_threshold_bytes,
+                               std::move(options.commit_prewrite_fault_injector_for_testing),
+                               std::move(options.commit_fault_injector_for_testing)}) {}
 
   mutable std::mutex mutex;
   FactStore store;

@@ -165,6 +165,9 @@ class FactStoreImpl {
   CommitSeq oldest_readable_seq;
   IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
   IdAllocatorState edge_allocator{IdKind::kEdge, 1};
+  IdAllocatorState transaction_allocator{IdKind::kTransaction, 1};
+  uint64_t next_transaction_id = 1;
+  uint64_t transaction_lease_limit = 1;
   std::shared_ptr<const PropertySchemas> property_schemas =
       std::make_shared<const PropertySchemas>();
   size_t active_snapshots = 0;
@@ -354,6 +357,43 @@ Status LoadAllocatorState(FactStoreImpl* store, IdKind kind,
     return Status::Corruption("fact store", "allocator record has wrong ID kind");
   }
   *state = decoded.ValueOrDie();
+  return Status::OK();
+}
+
+Status LoadTransactionAllocatorState(FactStoreImpl* store,
+                                     IdAllocatorState* state) {
+  std::string encoded;
+  const rocksdb::Status got = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf,
+      EncodeAllocatorMetaKey(IdKind::kTransaction), &encoded);
+  if (got.ok()) {
+    const auto decoded = DecodeIdAllocatorState(encoded);
+    if (!decoded.ok()) return decoded.status();
+    if (decoded.ValueOrDie().kind != IdKind::kTransaction) {
+      return Status::Corruption("fact store", "transaction allocator has wrong ID kind");
+    }
+    *state = decoded.ValueOrDie();
+    return Status::OK();
+  }
+  if (!got.IsNotFound()) return FromRocksDb(got, "read transaction ID allocator");
+
+  uint64_t highest = 0;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(rocksdb::ReadOptions(), store->meta_cf));
+  for (iterator->Seek(kSequenceMetaPrefix);
+       iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix);
+       iterator->Next()) {
+    const auto sequence = DecodeSequenceRecord(iterator->value().ToString());
+    if (!sequence.ok()) return sequence.status();
+    highest = std::max(highest, sequence.ValueOrDie().txn_id.value);
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "iterate transaction IDs");
+  }
+  if (highest == std::numeric_limits<uint64_t>::max()) {
+    return Status::ResourceExhausted("transaction", "transaction ID space exhausted");
+  }
+  *state = IdAllocatorState{IdKind::kTransaction, highest + 1};
   return Status::OK();
 }
 
@@ -779,6 +819,11 @@ Status FactStore::Open() {
   const Status edge_allocator =
       LoadAllocatorState(store.get(), IdKind::kEdge, &store->edge_allocator);
   if (!edge_allocator.ok()) return edge_allocator;
+  const Status transaction_allocator = LoadTransactionAllocatorState(
+      store.get(), &store->transaction_allocator);
+  if (!transaction_allocator.ok()) return transaction_allocator;
+  store->next_transaction_id = store->transaction_allocator.next_id;
+  store->transaction_lease_limit = store->transaction_allocator.next_id;
   const Status schemas = LoadPropertySchemas(store.get());
   if (!schemas.ok()) return schemas;
   impl_ = std::move(store);
@@ -1091,14 +1136,70 @@ StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
                   encoded_watermark.ValueOrDie());
   rocksdb::WriteOptions options;
   options.sync = true;
+  if (options_.commit_prewrite_fault_injector_for_testing) {
+    const Status injected = options_.commit_prewrite_fault_injector_for_testing();
+    if (!injected.ok()) {
+      if (injected.IsIndeterminate()) store->recovery_required = true;
+      return injected;
+    }
+  }
   const rocksdb::Status written = store->db->Write(options, &write_batch);
   if (!written.ok()) {
     const Status status = FromCommitWriteFailure(written);
     if (status.IsIndeterminate()) store->recovery_required = true;
     return status;
   }
+  if (options_.commit_fault_injector_for_testing) {
+    const Status injected = options_.commit_fault_injector_for_testing();
+    if (!injected.ok()) {
+      store->recovery_required = true;
+      return injected.IsIndeterminate()
+                 ? injected
+                 : Status::Indeterminate("commit", injected.ToString());
+    }
+  }
   store->visible_seq = commit_seq;
   return StoreCommitResult{commit_seq, batch.system_hlc};
+}
+
+StatusOr<TxnId> FactStore::AllocateTransactionId() {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("transaction", "store is not open");
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  if (store->recovery_required) {
+    return Status::RecoveryRequired("transaction",
+                                    "reopen required after indeterminate write");
+  }
+  if (store->next_transaction_id == store->transaction_lease_limit) {
+    if (kDefaultIdLeaseSize >
+        std::numeric_limits<uint64_t>::max() - store->transaction_allocator.next_id) {
+      return Status::ResourceExhausted("transaction", "transaction ID space exhausted");
+    }
+    const uint64_t lease_start = store->transaction_allocator.next_id;
+    const IdAllocatorState updated{IdKind::kTransaction,
+                                   lease_start + kDefaultIdLeaseSize};
+    const auto encoded = EncodeIdAllocatorState(updated);
+    if (!encoded.ok()) return encoded.status();
+    rocksdb::WriteBatch batch;
+    batch.Put(store->meta_cf, EncodeAllocatorMetaKey(IdKind::kTransaction),
+              encoded.ValueOrDie());
+    rocksdb::WriteOptions options;
+    options.sync = true;
+    const rocksdb::Status written = store->db->Write(options, &batch);
+    if (!written.ok()) {
+      const Status status = FromMetadataWriteFailure(written);
+      if (status.IsIndeterminate()) store->recovery_required = true;
+      return status;
+    }
+    store->transaction_allocator = updated;
+    store->next_transaction_id = lease_start;
+    store->transaction_lease_limit = updated.next_id;
+  }
+  return TxnId{store->next_transaction_id++};
 }
 
 StatusOr<IdLease> FactStore::LeaseIds(IdKind kind, uint64_t count) {

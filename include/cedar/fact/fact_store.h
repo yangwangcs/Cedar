@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -89,6 +90,7 @@ class FactStore {
 
  private:
   FactStoreOptions options_;
+  mutable std::mutex lifecycle_mutex_;
   std::shared_ptr<FactStoreImpl> impl_;
 };
 

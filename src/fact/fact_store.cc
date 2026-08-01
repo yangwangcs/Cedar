@@ -10,8 +10,10 @@
 #include <utility>
 #include <vector>
 
+#include <rocksdb/comparator.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <rocksdb/slice_transform.h>
 #include <rocksdb/write_batch.h>
 
 #include "cedar/fact/fact_codec.h"
@@ -60,6 +62,32 @@ std::string EncodeFactIdentityPrefix(FactFamily family, PropertyId property_id,
   return prefix;
 }
 
+rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
+                                    bool is_new_database) {
+  rocksdb::Options result;
+  result.create_if_missing = true;
+  result.create_missing_column_families = is_new_database;
+  result.write_buffer_size = options.write_buffer_bytes;
+  result.atomic_flush = true;
+  result.comparator = rocksdb::BytewiseComparator();
+  result.enable_blob_files = true;
+  result.min_blob_size = options.blob_threshold_bytes;
+  return result;
+}
+
+std::vector<rocksdb::ColumnFamilyDescriptor> MakeColumnFamilyDescriptors(
+    const rocksdb::Options& options) {
+  rocksdb::ColumnFamilyOptions default_options(options);
+  rocksdb::ColumnFamilyOptions facts_options(options);
+  facts_options.prefix_extractor =
+      std::shared_ptr<const rocksdb::SliceTransform>(
+          rocksdb::NewFixedPrefixTransform(kFactIdentityPrefixBytes));
+  rocksdb::ColumnFamilyOptions meta_options(options);
+  return {{rocksdb::kDefaultColumnFamilyName, std::move(default_options)},
+          {"facts", std::move(facts_options)},
+          {"meta", std::move(meta_options)}};
+}
+
 }  // namespace
 
 class FactStoreImpl {
@@ -78,6 +106,7 @@ class FactStoreImpl {
   rocksdb::ColumnFamilyHandle* meta_cf = nullptr;
   CommitSeq visible_seq;
   CommitSeq oldest_readable_seq;
+  size_t active_snapshots = 0;
 };
 
 class StoreSnapshot::State {
@@ -90,9 +119,12 @@ class StoreSnapshot::State {
         oldest_readable_seq(oldest_readable_seq) {}
 
   ~State() {
-    if (store && snapshot != nullptr && store->db) {
+    if (!store) return;
+    std::lock_guard<std::mutex> lock(store->publisher_mutex);
+    if (snapshot != nullptr && store->db) {
       store->db->ReleaseSnapshot(snapshot);
     }
+    --store->active_snapshots;
   }
 
   std::shared_ptr<FactStoreImpl> store;
@@ -137,6 +169,7 @@ FactStore::FactStore(FactStoreOptions options) : options_(std::move(options)) {}
 FactStore::~FactStore() { Close().IgnoreError(); }
 
 Status FactStore::Open() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   if (impl_) return Status::InvalidArgument("fact store", "store is already open");
   if (options_.path.empty()) {
     return Status::InvalidArgument("fact store", "missing database path");
@@ -162,12 +195,7 @@ Status FactStore::Open() {
     return Status::IOError("fact store", filesystem_error.message());
   }
 
-  rocksdb::Options options;
-  options.create_if_missing = true;
-  options.create_missing_column_families = is_new_database;
-  options.write_buffer_size = options_.write_buffer_bytes;
-  options.enable_blob_files = true;
-  options.min_blob_size = options_.blob_threshold_bytes;
+  rocksdb::Options options = MakeRocksDbOptions(options_, is_new_database);
 
   std::vector<std::string> existing_column_families;
   if (!is_new_database) {
@@ -187,11 +215,8 @@ Status FactStore::Open() {
     }
   }
 
-  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
-  descriptors.emplace_back(rocksdb::kDefaultColumnFamilyName,
-                           rocksdb::ColumnFamilyOptions(options));
-  descriptors.emplace_back("facts", rocksdb::ColumnFamilyOptions(options));
-  descriptors.emplace_back("meta", rocksdb::ColumnFamilyOptions(options));
+  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
+      MakeColumnFamilyDescriptors(options);
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   std::unique_ptr<rocksdb::DB> db;
   const rocksdb::Status opened =
@@ -268,11 +293,18 @@ Status FactStore::Open() {
 }
 
 Status FactStore::Close() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (!impl_) return Status::OK();
+  std::lock_guard<std::mutex> publisher_lock(impl_->publisher_mutex);
+  if (impl_->active_snapshots != 0) {
+    return Status::SnapshotPinned("fact store", "active snapshots prevent close");
+  }
   impl_.reset();
   return Status::OK();
 }
 
 StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   if (!impl_) return Status::InvalidArgument("fact store", "store is not open");
   std::lock_guard<std::mutex> lock(impl_->publisher_mutex);
   const CommitSeq selected = options.as_of.value_or(impl_->visible_seq);
@@ -284,15 +316,22 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
   }
   const rocksdb::Snapshot* snapshot = impl_->db->GetSnapshot();
   if (snapshot == nullptr) return Status::IOError("snapshot", "RocksDB refused snapshot");
-  return StoreSnapshot(std::make_unique<StoreSnapshot::State>(
-      impl_, snapshot, selected, impl_->oldest_readable_seq));
+  auto state = std::make_unique<StoreSnapshot::State>(
+      impl_, snapshot, selected, impl_->oldest_readable_seq);
+  ++impl_->active_snapshots;
+  return StoreSnapshot(std::move(state));
 }
 
 StatusOr<std::optional<FactEvent>> FactStore::Read(
     const StoreSnapshot& snapshot, const FactRef& ref,
     ValidTime valid_time) const {
-  if (!impl_ || snapshot.state_ == nullptr || snapshot.state_->store != impl_) {
-    return Status::InvalidArgument("fact read", "snapshot belongs to another store");
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("fact read", "snapshot belongs to another store");
+    }
   }
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
@@ -303,7 +342,7 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
-      impl_->db->NewIterator(options, impl_->facts_cf));
+      store->db->NewIterator(options, store->facts_cf));
   for (iterator->Seek(seek); iterator->Valid() && StartsWith(iterator->key(), prefix);
        iterator->Next()) {
     const auto decoded_key = DecodeFactKey(iterator->key().ToString());
@@ -326,8 +365,13 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
 
 Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                        const FactVisitor& visitor) const {
-  if (!impl_ || snapshot.state_ == nullptr || snapshot.state_->store != impl_) {
-    return Status::InvalidArgument("fact scan", "snapshot belongs to another store");
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("fact scan", "snapshot belongs to another store");
+    }
   }
   const Status valid = prefix.Validate();
   if (!valid.ok()) return valid;
@@ -337,7 +381,7 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
-      impl_->db->NewIterator(options, impl_->facts_cf));
+      store->db->NewIterator(options, store->facts_cf));
   for (iterator->Seek(encoded_prefix);
        iterator->Valid() && StartsWith(iterator->key(), encoded_prefix);
        iterator->Next()) {

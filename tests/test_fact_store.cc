@@ -33,24 +33,26 @@ TEST_F(FactStoreTest, OpensTwoColumnFamiliesAndReturnsEmptySnapshot) {
   const Status opened = store.Open();
   ASSERT_TRUE(opened.ok()) << opened.ToString();
 
-  auto snapshot = store.BeginSnapshot({});
-  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-  EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{0});
-  EXPECT_EQ(snapshot.ValueOrDie().oldest_readable_seq(), CommitSeq{0});
+  {
+    auto snapshot = store.BeginSnapshot({});
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{0});
+    EXPECT_EQ(snapshot.ValueOrDie().oldest_readable_seq(), CommitSeq{0});
 
-  const FactRef ref = EntityFact::Vertex(VertexId{7}).ref();
-  const auto read = store.Read(snapshot.ValueOrDie(), ref, ValidTime{10});
-  ASSERT_TRUE(read.ok()) << read.status().ToString();
-  EXPECT_FALSE(read.ValueOrDie().has_value());
+    const FactRef ref = EntityFact::Vertex(VertexId{7}).ref();
+    const auto read = store.Read(snapshot.ValueOrDie(), ref, ValidTime{10});
+    ASSERT_TRUE(read.ok()) << read.status().ToString();
+    EXPECT_FALSE(read.ValueOrDie().has_value());
 
-  size_t scanned = 0;
-  ASSERT_TRUE(store.Scan(snapshot.ValueOrDie(), FactPrefix::Exact(ref),
-                         [&](const FactEvent&) {
-                           ++scanned;
-                           return Status::OK();
-                         })
-                  .ok());
-  EXPECT_EQ(scanned, 0U);
+    size_t scanned = 0;
+    ASSERT_TRUE(store.Scan(snapshot.ValueOrDie(), FactPrefix::Exact(ref),
+                           [&](const FactEvent&) {
+                             ++scanned;
+                             return Status::OK();
+                           })
+                    .ok());
+    EXPECT_EQ(scanned, 0U);
+  }
   EXPECT_TRUE(store.Close().ok());
 
   rocksdb::Options options;
@@ -69,6 +71,36 @@ TEST_F(FactStoreTest, RejectsSnapshotsOutsideDurableWindow) {
   EXPECT_TRUE(store.BeginSnapshot(SnapshotOptions{CommitSeq{1}})
                   .status()
                   .IsInvalidArgument());
+  EXPECT_TRUE(store.Close().ok());
+}
+
+TEST_F(FactStoreTest, CloseRejectsLiveSnapshotThenSucceedsAfterRelease) {
+  FactStore store(FactStoreOptions{path_});
+  ASSERT_TRUE(store.Open().ok());
+
+  {
+    auto snapshot = store.BeginSnapshot({});
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+    const Status closed = store.Close();
+    EXPECT_TRUE(closed.IsSnapshotPinned()) << closed.ToString();
+
+    const auto still_open = store.BeginSnapshot({});
+    EXPECT_TRUE(still_open.ok()) << still_open.status().ToString();
+  }
+
+  EXPECT_TRUE(store.Close().ok());
+}
+
+TEST_F(FactStoreTest, ReopensAfterSnapshotIsReleasedBeforeClose) {
+  FactStore store(FactStoreOptions{path_});
+  ASSERT_TRUE(store.Open().ok());
+  {
+    auto snapshot = store.BeginSnapshot({});
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  }
+  ASSERT_TRUE(store.Close().ok());
+  ASSERT_TRUE(store.Open().ok());
   EXPECT_TRUE(store.Close().ok());
 }
 

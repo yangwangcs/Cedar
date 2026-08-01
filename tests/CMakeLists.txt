@@ -29,3 +29,8 @@ gtest_discover_tests(test_fact_model)
 add_executable(test_fact_codec test_fact_codec.cc)
 target_link_libraries(test_fact_codec ${CEDAR_TEST_LIBS})
 gtest_discover_tests(test_fact_codec)
+
+add_executable(test_fact_store test_fact_store.cc)
+target_link_libraries(test_fact_store
+    PRIVATE cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_fact_store)

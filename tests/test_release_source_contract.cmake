@@ -22,6 +22,7 @@ set(MUTATION_FILES
     src/benchmark/run_manifest.cc
     src/blob/blob_store.cc
     src/columnar/sst.cc
+    src/fact/fact_store.cc
     src/index/index_sidecar.cc
     src/statistics/stats_snapshot.cc
     src/storage/sst_compaction.cc
@@ -59,12 +60,8 @@ set(PUBLICATION_FILES
     src/transaction/transaction_coordinator.cc)
 set(CLAIM_FILES
     README.md
-    docs/superpowers/specs/2026-07-17-cedar-columnar-design.md
-    docs/superpowers/specs/2026-07-17-cedar-htap-design.md
-    docs/superpowers/specs/2026-07-17-cedar-htap-resource-scheduling-design.md
-    docs/superpowers/specs/2026-07-17-cedar-tcypher-vectorized-execution-design.md
-    docs/superpowers/specs/2026-07-17-cedar-temporal-index-cbo-design.md
-    docs/superpowers/specs/2026-07-17-cedar-observability-benchmark-design.md)
+    docs/superpowers/specs/2026-07-27-cedar-atomic-commit-design.md
+    docs/superpowers/specs/2026-08-01-cedar-rocksdb-kernel-design.md)
 
 function(WRITE_FIXTURE_FILE RELATIVE_PATH CONTENT)
   get_filename_component(PARENT "${FIXTURE_SOURCE}/${RELATIVE_PATH}" DIRECTORY)
@@ -161,9 +158,9 @@ if(NOT EXISTS "${FIXTURE_OUTPUT}/source-input-files.txt")
 endif()
 file(STRINGS "${FIXTURE_OUTPUT}/source-input-files.txt" BOUND_INPUT_LINES)
 list(LENGTH BOUND_INPUT_LINES BOUND_INPUT_COUNT)
-if(NOT BOUND_INPUT_COUNT EQUAL 31)
+if(NOT BOUND_INPUT_COUNT EQUAL 28)
   message(FATAL_ERROR
-          "baseline output binds ${BOUND_INPUT_COUNT} inputs instead of 31")
+          "baseline output binds ${BOUND_INPUT_COUNT} inputs instead of 28")
 endif()
 
 PREPARE_FIXTURE()

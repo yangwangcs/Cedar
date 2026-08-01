@@ -31,12 +31,8 @@ if(NOT EXISTS "${OUTPUT_ROOT_ABSOLUTE}" AND STRANDED_BACKUPS)
 endif()
 
 set(AUTHORITATIVE_SPECIFICATIONS
-    docs/superpowers/specs/2026-07-17-cedar-columnar-design.md
-    docs/superpowers/specs/2026-07-17-cedar-htap-design.md
-    docs/superpowers/specs/2026-07-17-cedar-htap-resource-scheduling-design.md
-    docs/superpowers/specs/2026-07-17-cedar-tcypher-vectorized-execution-design.md
-    docs/superpowers/specs/2026-07-17-cedar-temporal-index-cbo-design.md
-    docs/superpowers/specs/2026-07-17-cedar-observability-benchmark-design.md)
+    docs/superpowers/specs/2026-07-27-cedar-atomic-commit-design.md
+    docs/superpowers/specs/2026-08-01-cedar-rocksdb-kernel-design.md)
 
 file(GLOB_RECURSE SOURCE_SCOPE_FILES
      LIST_DIRECTORIES false RELATIVE "${SOURCE_ROOT_REAL}"
@@ -90,6 +86,7 @@ set(EXPECTED_ALL_MUTATION_FILES
     src/benchmark/run_manifest.cc
     src/blob/blob_store.cc
     src/columnar/sst.cc
+    src/fact/fact_store.cc
     src/index/index_sidecar.cc
     src/statistics/stats_snapshot.cc
     src/storage/sst_compaction.cc
@@ -104,6 +101,7 @@ set(EXPECTED_ALL_MUTATION_FILES
 set(EXPECTED_DATABASE_DURABLE_WRITERS
     src/blob/blob_store.cc
     src/columnar/sst.cc
+    src/fact/fact_store.cc
     src/index/index_sidecar.cc
     src/statistics/stats_snapshot.cc
     src/storage/sst_compaction.cc

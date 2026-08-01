@@ -25,3 +25,7 @@ gtest_discover_tests(test_rocksdb_dependency)
 add_executable(test_fact_model test_fact_model.cc)
 target_link_libraries(test_fact_model ${CEDAR_TEST_LIBS})
 gtest_discover_tests(test_fact_model)
+
+add_executable(test_fact_codec test_fact_codec.cc)
+target_link_libraries(test_fact_codec ${CEDAR_TEST_LIBS})
+gtest_discover_tests(test_fact_codec)

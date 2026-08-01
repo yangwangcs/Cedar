@@ -15,8 +15,11 @@
 #ifndef FERN_CORE_STATUS_H_
 #define FERN_CORE_STATUS_H_
 
+#include <cassert>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include "cedar/core/slice.h"
 
@@ -223,9 +226,9 @@ inline Status& Status::operator=(Status&& rhs) noexcept {
 template <typename T>
 class StatusOr {
  public:
-  StatusOr() = default;
+  StatusOr() : status_(Status::InvalidArgument("StatusOr", "missing value")) {}
 
-  StatusOr(const Status& status) : status_(status), value_() {}
+  StatusOr(const Status& status) : status_(status) { assert(!status.ok()); }
   StatusOr(const T& value) : status_(), value_(value) {}
   StatusOr(T&& value) : status_(), value_(std::move(value)) {}
 
@@ -234,37 +237,37 @@ class StatusOr {
   StatusOr(StatusOr&&) = default;
   StatusOr& operator=(StatusOr&&) = default;
 
-  bool ok() const { return status_.ok(); }
+  bool ok() const { return status_.ok() && value_.has_value(); }
   const Status& status() const { return status_; }
 
   const T& ValueOrDie() const {
     assert(ok());
-    return value_;
+    return *value_;
   }
 
   T& ValueOrDie() {
     assert(ok());
-    return value_;
+    return *value_;
   }
 
   T ConsumeValueOrDie() {
     assert(ok());
-    return std::move(value_);
+    return std::move(*value_);
   }
 
   const T& value() const {
     assert(ok());
-    return value_;
+    return *value_;
   }
 
   T& value() {
     assert(ok());
-    return value_;
+    return *value_;
   }
 
  private:
   Status status_;
-  T value_;
+  std::optional<T> value_;
 };
 
 }  // namespace cedar

@@ -6,6 +6,20 @@
 namespace cedar {
 namespace {
 
+struct NonDefaultConstructible {
+  explicit NonDefaultConstructible(uint64_t value) : value(value) {}
+
+  uint64_t value;
+};
+
+TEST(StatusOrTest, CarriesErrorWithoutConstructingValue) {
+  StatusOr<NonDefaultConstructible> result(
+      Status::InvalidArgument("test", "expected failure"));
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsInvalidArgument());
+}
+
 TEST(FactModelTest, SeparatesEntityStateFromProperties) {
   const EntityFact vertex = EntityFact::Vertex(VertexId{7});
   const PropertyFact property =

@@ -57,6 +57,8 @@ set(CEDAR_SOURCES
     src/core/crc32c.cc
     src/types/value.cc
     src/fact/fact.cc
+    src/fact/fact_codec.cc
+    src/fact/meta_codec.cc
     src/index/canonical_value.cc
     src/index/index_sidecar.cc
     src/index/hybrid_scan.cc

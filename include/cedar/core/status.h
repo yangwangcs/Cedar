@@ -94,6 +94,22 @@ class Status {
                                    const Slice& msg2 = Slice()) {
     return Status(kMaintenanceBackoff, msg, msg2);
   }
+  static Status IdentityConflict(const Slice& msg,
+                                 const Slice& msg2 = Slice()) {
+    return Status(kIdentityConflict, msg, msg2);
+  }
+  static Status SnapshotExpired(const Slice& msg,
+                                const Slice& msg2 = Slice()) {
+    return Status(kSnapshotExpired, msg, msg2);
+  }
+  static Status SnapshotPinned(const Slice& msg,
+                               const Slice& msg2 = Slice()) {
+    return Status(kSnapshotPinned, msg, msg2);
+  }
+  static Status UnsupportedSerializablePredicate(
+      const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kUnsupportedSerializablePredicate, msg, msg2);
+  }
 
   // Returns true iff the status indicates success.
   bool ok() const { return (state_ == nullptr); }
@@ -127,6 +143,12 @@ class Status {
   bool IsRecoveryRequired() const { return code() == kRecoveryRequired; }
   bool IsShutdownInProgress() const { return code() == kShutdownInProgress; }
   bool IsMaintenanceBackoff() const { return code() == kMaintenanceBackoff; }
+  bool IsIdentityConflict() const { return code() == kIdentityConflict; }
+  bool IsSnapshotExpired() const { return code() == kSnapshotExpired; }
+  bool IsSnapshotPinned() const { return code() == kSnapshotPinned; }
+  bool IsUnsupportedSerializablePredicate() const {
+    return code() == kUnsupportedSerializablePredicate;
+  }
 
   // Return a string representation of this status suitable for printing.
   // Returns the string "OK" for success.
@@ -155,7 +177,11 @@ class Status {
     kIndeterminate = 15,
     kRecoveryRequired = 16,
     kShutdownInProgress = 17,
-    kMaintenanceBackoff = 18
+    kMaintenanceBackoff = 18,
+    kIdentityConflict = 19,
+    kSnapshotExpired = 20,
+    kSnapshotPinned = 21,
+    kUnsupportedSerializablePredicate = 22
   };
 
   Code code() const {

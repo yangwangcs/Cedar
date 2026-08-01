@@ -107,6 +107,18 @@ std::string Status::ToString() const {
       case kMaintenanceBackoff:
         type = "MaintenanceBackoff: ";
         break;
+      case kIdentityConflict:
+        type = "IdentityConflict: ";
+        break;
+      case kSnapshotExpired:
+        type = "SnapshotExpired: ";
+        break;
+      case kSnapshotPinned:
+        type = "SnapshotPinned: ";
+        break;
+      case kUnsupportedSerializablePredicate:
+        type = "UnsupportedSerializablePredicate: ";
+        break;
       default:
         snprintf(tmp, sizeof(tmp), "Unknown code(%d): ",
                  static_cast<int>(code()));

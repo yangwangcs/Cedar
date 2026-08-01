@@ -139,9 +139,15 @@ TEST_F(FactStoreMetadataTest, RegistersPropertiesIdempotentlyAndPreservesEpochs)
   EXPECT_EQ(reopened_old.ValueOrDie()->name, "name");
 }
 
-TEST_F(FactStoreMetadataTest, RejectsPropertyTypeChangeForExistingName) {
+TEST_F(FactStoreMetadataTest,
+       RejectsTypeChangeForPropertyNameAcrossNonAdjacentEpochs) {
   ASSERT_TRUE(store_->RegisterProperty(
                         Property(PropertyId{9}, "name", PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{9}, "display_name",
+                                 PropertyEntityKind::kVertex,
                                  PhysicalType::kString))
                   .ok());
 

@@ -88,6 +88,19 @@ Status ValidatePropertyRequest(const PropertyDefinition& definition) {
   return persisted.Validate();
 }
 
+bool HasIncompatiblePropertyName(
+    const std::vector<PropertyDefinition>& definitions,
+    const PropertyDefinition& candidate) {
+  for (const PropertyDefinition& definition : definitions) {
+    if (definition.name == candidate.name &&
+        (definition.entity_kind != candidate.entity_kind ||
+         definition.physical_type != candidate.physical_type)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::string EncodeFactIdentityPrefix(FactFamily family, PropertyId property_id,
                                      std::optional<uint64_t> entity_id) {
   std::string prefix;
@@ -192,13 +205,8 @@ Status LoadPropertySchemas(FactStoreImpl* store) {
     if (definition.ValueOrDie().schema_epoch != epochs.size() + 1) {
       return Status::Corruption("fact store", "schema epochs are not contiguous");
     }
-    if (!epochs.empty()) {
-      const PropertyDefinition& previous = epochs.back();
-      if (previous.name == definition.ValueOrDie().name &&
-          (previous.entity_kind != definition.ValueOrDie().entity_kind ||
-           previous.physical_type != definition.ValueOrDie().physical_type)) {
-        return Status::Corruption("fact store", "schema type changes for a property name");
-      }
+    if (HasIncompatiblePropertyName(epochs, definition.ValueOrDie())) {
+      return Status::Corruption("fact store", "schema type changes for a property name");
     }
     epochs.push_back(definition.ConsumeValueOrDie());
   }
@@ -891,9 +899,7 @@ StatusOr<PropertyDefinition> FactStore::RegisterProperty(
   if (found != store->property_schemas->end() && !found->second.empty()) {
     const PropertyDefinition& latest = found->second.back();
     if (SamePropertyDefinition(latest, definition)) return latest;
-    if (latest.name == definition.name &&
-        (latest.entity_kind != definition.entity_kind ||
-         latest.physical_type != definition.physical_type)) {
+    if (HasIncompatiblePropertyName(found->second, definition)) {
       return Status::SchemaMismatch("property definition",
                                     "property name has an incompatible type");
     }

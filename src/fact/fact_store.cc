@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -24,7 +25,9 @@ namespace cedar {
 namespace {
 
 constexpr uint32_t kCedarFactStoreFormatVersion = 1;
+constexpr uint64_t kDefaultIdLeaseSize = 4096;
 constexpr size_t kFactIdentityPrefixBytes = 12;
+constexpr char kSchemaMetaPrefix[] = "schema/";
 constexpr char kSequenceMetaPrefix[] = "sequence/";
 
 Status FromRocksDb(const rocksdb::Status& status, const char* context) {
@@ -44,6 +47,13 @@ Status FromCommitWriteFailure(const rocksdb::Status& status) {
   return Status::Indeterminate("commit fact store batch", status.ToString());
 }
 
+Status FromMetadataWriteFailure(const rocksdb::Status& status) {
+  if (status.IsInvalidArgument() || status.IsNotSupported()) {
+    return FromRocksDb(status, "persist fact store metadata");
+  }
+  return Status::Indeterminate("persist fact store metadata", status.ToString());
+}
+
 void AppendU16(std::string* out, uint16_t value) {
   out->push_back(static_cast<char>(value >> 8));
   out->push_back(static_cast<char>(value));
@@ -58,6 +68,24 @@ void AppendU64(std::string* out, uint64_t value) {
 bool StartsWith(const rocksdb::Slice& value, const std::string& prefix) {
   return value.size() >= prefix.size() &&
          std::equal(prefix.begin(), prefix.end(), value.data());
+}
+
+bool SamePropertyDefinition(const PropertyDefinition& left,
+                            const PropertyDefinition& right) {
+  return left.property_id == right.property_id && left.name == right.name &&
+         left.entity_kind == right.entity_kind &&
+         left.physical_type == right.physical_type &&
+         left.blob_threshold_bytes == right.blob_threshold_bytes;
+}
+
+Status ValidatePropertyRequest(const PropertyDefinition& definition) {
+  if (definition.schema_epoch != 0) {
+    return Status::InvalidArgument("property definition",
+                                   "registration request has a schema epoch");
+  }
+  PropertyDefinition persisted = definition;
+  persisted.schema_epoch = 1;
+  return persisted.Validate();
 }
 
 std::string EncodeFactIdentityPrefix(FactFamily family, PropertyId property_id,
@@ -101,6 +129,8 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeColumnFamilyDescriptors(
 
 class FactStoreImpl {
  public:
+  using PropertySchemas = std::map<uint16_t, std::vector<PropertyDefinition>>;
+
   ~FactStoreImpl() {
     if (!db) return;
     if (default_cf != nullptr) db->DestroyColumnFamilyHandle(default_cf);
@@ -115,9 +145,69 @@ class FactStoreImpl {
   rocksdb::ColumnFamilyHandle* meta_cf = nullptr;
   CommitSeq visible_seq;
   CommitSeq oldest_readable_seq;
+  IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
+  IdAllocatorState edge_allocator{IdKind::kEdge, 1};
+  std::shared_ptr<const PropertySchemas> property_schemas =
+      std::make_shared<const PropertySchemas>();
   size_t active_snapshots = 0;
   bool recovery_required = false;
 };
+
+Status LoadAllocatorState(FactStoreImpl* store, IdKind kind,
+                          IdAllocatorState* state) {
+  std::string encoded;
+  const rocksdb::Status got = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, EncodeAllocatorMetaKey(kind), &encoded);
+  if (got.IsNotFound()) {
+    *state = IdAllocatorState{kind, 1};
+    return Status::OK();
+  }
+  if (!got.ok()) return FromRocksDb(got, "read ID allocator metadata");
+  const auto decoded = DecodeIdAllocatorState(encoded);
+  if (!decoded.ok()) return decoded.status();
+  if (decoded.ValueOrDie().kind != kind) {
+    return Status::Corruption("fact store", "allocator record has wrong ID kind");
+  }
+  *state = decoded.ValueOrDie();
+  return Status::OK();
+}
+
+Status LoadPropertySchemas(FactStoreImpl* store) {
+  auto schemas = std::make_shared<FactStoreImpl::PropertySchemas>();
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(rocksdb::ReadOptions(), store->meta_cf));
+  for (iterator->Seek(kSchemaMetaPrefix);
+       iterator->Valid() && StartsWith(iterator->key(), kSchemaMetaPrefix);
+       iterator->Next()) {
+    const std::string key = iterator->key().ToString();
+    auto definition = DecodePropertyDefinition(iterator->value().ToString());
+    if (!definition.ok()) return definition.status();
+    const auto expected_key = EncodeSchemaMetaKey(definition.ValueOrDie().property_id,
+                                                  definition.ValueOrDie().schema_epoch);
+    if (!expected_key.ok()) return expected_key.status();
+    if (key != expected_key.ValueOrDie()) {
+      return Status::Corruption("fact store", "schema record key disagrees with value");
+    }
+    auto& epochs = (*schemas)[definition.ValueOrDie().property_id.value];
+    if (definition.ValueOrDie().schema_epoch != epochs.size() + 1) {
+      return Status::Corruption("fact store", "schema epochs are not contiguous");
+    }
+    if (!epochs.empty()) {
+      const PropertyDefinition& previous = epochs.back();
+      if (previous.name == definition.ValueOrDie().name &&
+          (previous.entity_kind != definition.ValueOrDie().entity_kind ||
+           previous.physical_type != definition.ValueOrDie().physical_type)) {
+        return Status::Corruption("fact store", "schema type changes for a property name");
+      }
+    }
+    epochs.push_back(definition.ConsumeValueOrDie());
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "iterate property schemas");
+  }
+  store->property_schemas = std::move(schemas);
+  return Status::OK();
+}
 
 Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq) {
   const auto sequence_key = EncodeSequenceMetaKey(commit_seq);
@@ -421,6 +511,14 @@ Status FactStore::Open() {
         ValidateCommittedSequences(store.get(), store->visible_seq);
     if (!sequences_valid.ok()) return sequences_valid;
   }
+  const Status vertex_allocator =
+      LoadAllocatorState(store.get(), IdKind::kVertex, &store->vertex_allocator);
+  if (!vertex_allocator.ok()) return vertex_allocator;
+  const Status edge_allocator =
+      LoadAllocatorState(store.get(), IdKind::kEdge, &store->edge_allocator);
+  if (!edge_allocator.ok()) return edge_allocator;
+  const Status schemas = LoadPropertySchemas(store.get());
+  if (!schemas.ok()) return schemas;
   impl_ = std::move(store);
   return Status::OK();
 }
@@ -731,6 +829,121 @@ StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
   }
   store->visible_seq = commit_seq;
   return StoreCommitResult{commit_seq, batch.system_hlc};
+}
+
+StatusOr<IdLease> FactStore::LeaseIds(IdKind kind, uint64_t count) {
+  if (kind != IdKind::kVertex && kind != IdKind::kEdge) {
+    return Status::InvalidArgument("ID lease", "unknown ID kind");
+  }
+  if (count == 0) count = kDefaultIdLeaseSize;
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("ID lease", "store is not open");
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  if (store->recovery_required) {
+    return Status::RecoveryRequired("ID lease",
+                                    "reopen required after indeterminate write");
+  }
+  IdAllocatorState* allocator = kind == IdKind::kVertex
+      ? &store->vertex_allocator
+      : &store->edge_allocator;
+  if (count > std::numeric_limits<uint64_t>::max() - allocator->next_id) {
+    return Status::ResourceExhausted("ID lease", "ID space exhausted");
+  }
+  const uint64_t next_id = allocator->next_id + count;
+  const IdAllocatorState updated{kind, next_id};
+  const auto encoded = EncodeIdAllocatorState(updated);
+  if (!encoded.ok()) return encoded.status();
+  rocksdb::WriteBatch batch;
+  batch.Put(store->meta_cf, EncodeAllocatorMetaKey(kind), encoded.ValueOrDie());
+  rocksdb::WriteOptions options;
+  options.sync = true;
+  const rocksdb::Status written = store->db->Write(options, &batch);
+  if (!written.ok()) {
+    const Status status = FromMetadataWriteFailure(written);
+    if (status.IsIndeterminate()) store->recovery_required = true;
+    return status;
+  }
+  const IdLease lease{kind, allocator->next_id, count};
+  *allocator = updated;
+  return lease;
+}
+
+StatusOr<PropertyDefinition> FactStore::RegisterProperty(
+    PropertyDefinition definition) {
+  const Status valid = ValidatePropertyRequest(definition);
+  if (!valid.ok()) return valid;
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("property definition", "store is not open");
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  if (store->recovery_required) {
+    return Status::RecoveryRequired("property definition",
+                                    "reopen required after indeterminate write");
+  }
+  const auto found = store->property_schemas->find(definition.property_id.value);
+  if (found != store->property_schemas->end() && !found->second.empty()) {
+    const PropertyDefinition& latest = found->second.back();
+    if (SamePropertyDefinition(latest, definition)) return latest;
+    if (latest.name == definition.name &&
+        (latest.entity_kind != definition.entity_kind ||
+         latest.physical_type != definition.physical_type)) {
+      return Status::SchemaMismatch("property definition",
+                                    "property name has an incompatible type");
+    }
+    if (latest.schema_epoch == std::numeric_limits<uint32_t>::max()) {
+      return Status::ResourceExhausted("property definition", "schema epochs exhausted");
+    }
+    definition.schema_epoch = latest.schema_epoch + 1;
+  } else {
+    definition.schema_epoch = 1;
+  }
+  const auto key = EncodeSchemaMetaKey(definition.property_id, definition.schema_epoch);
+  const auto encoded = EncodePropertyDefinition(definition);
+  if (!key.ok()) return key.status();
+  if (!encoded.ok()) return encoded.status();
+  rocksdb::WriteBatch batch;
+  batch.Put(store->meta_cf, key.ValueOrDie(), encoded.ValueOrDie());
+  rocksdb::WriteOptions options;
+  options.sync = true;
+  const rocksdb::Status written = store->db->Write(options, &batch);
+  if (!written.ok()) {
+    const Status status = FromMetadataWriteFailure(written);
+    if (status.IsIndeterminate()) store->recovery_required = true;
+    return status;
+  }
+  auto schemas = std::make_shared<FactStoreImpl::PropertySchemas>(
+      *store->property_schemas);
+  (*schemas)[definition.property_id.value].push_back(definition);
+  store->property_schemas = std::move(schemas);
+  return definition;
+}
+
+StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
+    PropertyId property_id, uint32_t schema_epoch) const {
+  if (!property_id.valid()) {
+    return Status::InvalidArgument("property definition", "zero property ID");
+  }
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("property definition", "store is not open");
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  const auto found = store->property_schemas->find(property_id.value);
+  if (found == store->property_schemas->end() || found->second.empty() ||
+      schema_epoch > found->second.size()) {
+    return std::optional<PropertyDefinition>{};
+  }
+  if (schema_epoch == 0) return std::optional<PropertyDefinition>{found->second.back()};
+  return std::optional<PropertyDefinition>{found->second[schema_epoch - 1]};
 }
 
 CommitSeq FactStore::visible_seq() const {

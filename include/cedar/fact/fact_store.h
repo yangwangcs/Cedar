@@ -14,6 +14,7 @@
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
+#include "cedar/fact/meta_codec.h"
 
 namespace cedar {
 
@@ -43,6 +44,14 @@ struct StoreCommitResult {
   uint64_t system_hlc = 0;
 
   constexpr bool operator==(const StoreCommitResult&) const = default;
+};
+
+struct IdLease {
+  IdKind kind = IdKind::kVertex;
+  uint64_t first_id = 0;
+  uint64_t count = 0;
+
+  constexpr bool operator==(const IdLease&) const = default;
 };
 
 class FactPrefix {
@@ -105,6 +114,10 @@ class FactStore {
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactVisitor& visitor) const;
   StatusOr<StoreCommitResult> Commit(const StoreCommitBatch& batch);
+  StatusOr<IdLease> LeaseIds(IdKind kind, uint64_t count);
+  StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);
+  StatusOr<std::optional<PropertyDefinition>> LookupProperty(
+      PropertyId property_id, uint32_t schema_epoch = 0) const;
   CommitSeq visible_seq() const;
   StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(
       TxnId txn_id) const;

@@ -27,11 +27,22 @@ struct FactStoreOptions {
   uint64_t blob_threshold_bytes = 4096;
 };
 
+struct SnapshotWriteDependency {
+  FactRef ref;
+  ValidTime valid_from;
+  std::optional<ValidTime> predecessor;
+  std::optional<ValidTime> successor;
+  CommitSeq snapshot_seq;
+
+  Status Validate() const;
+};
+
 struct StoreCommitBatch {
   TxnId txn_id;
   uint64_t system_hlc = 0;
   std::vector<PendingFactMutation> mutations;
   std::vector<EdgeIdentity> edge_identities;
+  std::vector<SnapshotWriteDependency> snapshot_write_dependencies;
 
   Status Validate() const;
 };

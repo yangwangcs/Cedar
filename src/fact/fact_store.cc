@@ -171,6 +171,76 @@ class FactStoreImpl {
   bool recovery_required = false;
 };
 
+namespace {
+
+struct CurrentFactInterval {
+  ValidTime valid_from;
+  std::optional<ValidTime> valid_to;
+  CommitSeq commit_seq;
+};
+
+bool IntervalsOverlap(ValidTime left_from, std::optional<ValidTime> left_to,
+                      ValidTime right_from, std::optional<ValidTime> right_to) {
+  const bool left_before_right_end =
+      !right_to.has_value() || left_from.value < right_to->value;
+  const bool right_before_left_end =
+      !left_to.has_value() || right_from.value < left_to->value;
+  return left_before_right_end && right_before_left_end;
+}
+
+StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
+    FactStoreImpl* store, const FactRef& ref) {
+  const std::string prefix = EncodeFactIdentityPrefix(
+      ref.family(), ref.property_id(), ref.entity_id());
+  rocksdb::ReadOptions options;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  std::vector<CurrentFactInterval> intervals;
+  std::optional<ValidTime> previous_boundary;
+  for (iterator->Seek(prefix);
+       iterator->Valid() && StartsWith(iterator->key(), prefix);
+       iterator->Next()) {
+    const auto decoded = DecodeFactKey(iterator->key().ToString());
+    if (!decoded.ok()) return decoded.status();
+    if (previous_boundary.has_value() &&
+        decoded.ValueOrDie().valid_from == *previous_boundary) {
+      continue;
+    }
+    intervals.push_back(CurrentFactInterval{decoded.ValueOrDie().valid_from,
+                                             previous_boundary,
+                                             decoded.ValueOrDie().commit_seq});
+    previous_boundary = decoded.ValueOrDie().valid_from;
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "iterate current fact intervals");
+  }
+  return intervals;
+}
+
+Status ValidateSnapshotWriteDependencies(
+    FactStoreImpl* store,
+    const std::vector<SnapshotWriteDependency>& dependencies) {
+  for (const SnapshotWriteDependency& dependency : dependencies) {
+    if (dependency.snapshot_seq.value > store->visible_seq.value) {
+      return Status::InvalidArgument("commit",
+                                     "snapshot dependency exceeds visible watermark");
+    }
+    const auto intervals = CurrentFactIntervals(store, dependency.ref);
+    if (!intervals.ok()) return intervals.status();
+    for (const CurrentFactInterval& interval : intervals.ValueOrDie()) {
+      if (interval.commit_seq.value <= dependency.snapshot_seq.value) continue;
+      if (IntervalsOverlap(dependency.valid_from, dependency.successor,
+                           interval.valid_from, interval.valid_to)) {
+        return Status::Conflict(
+            "commit", "snapshot write conflicts with a later overlapping event");
+      }
+    }
+  }
+  return Status::OK();
+}
+
+}  // namespace
+
 Status LoadAllocatorState(FactStoreImpl* store, IdKind kind,
                           IdAllocatorState* state) {
   std::string encoded;
@@ -347,6 +417,20 @@ FactPrefix FactPrefix::Exact(FactRef ref) {
   return FactPrefix(ref.family(), ref.property_id(), ref.entity_id());
 }
 
+Status SnapshotWriteDependency::Validate() const {
+  const Status valid = ref.Validate();
+  if (!valid.ok()) return valid;
+  if (predecessor.has_value() && predecessor->value >= valid_from.value) {
+    return Status::InvalidArgument("snapshot write dependency",
+                                   "predecessor is not before mutation");
+  }
+  if (successor.has_value() && successor->value <= valid_from.value) {
+    return Status::InvalidArgument("snapshot write dependency",
+                                   "successor is not after mutation");
+  }
+  return Status::OK();
+}
+
 Status StoreCommitBatch::Validate() const {
   if (!txn_id.valid() || system_hlc == 0 || mutations.empty()) {
     return Status::InvalidArgument("commit batch", "missing transaction, time, or facts");
@@ -359,6 +443,17 @@ Status StoreCommitBatch::Validate() const {
                                           CommitSeq{1});
     if (key.empty() || !facts.emplace(key).second) {
       return Status::InvalidArgument("commit batch", "duplicate fact mutation");
+    }
+  }
+  std::set<std::string> dependencies;
+  for (const SnapshotWriteDependency& dependency : snapshot_write_dependencies) {
+    const Status dependency_valid = dependency.Validate();
+    if (!dependency_valid.ok()) return dependency_valid;
+    const std::string key = EncodeFactKey(dependency.ref, dependency.valid_from,
+                                          CommitSeq{1});
+    if (!facts.contains(key) || !dependencies.emplace(key).second) {
+      return Status::InvalidArgument("commit batch",
+                                     "invalid snapshot write dependency");
     }
   }
   std::set<uint64_t> edge_ids;
@@ -763,6 +858,10 @@ StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
                              sequence.ValueOrDie().system_hlc};
   }
   if (!got_outcome.IsNotFound()) return FromRocksDb(got_outcome, "read transaction outcome");
+
+  const Status snapshot_dependencies = ValidateSnapshotWriteDependencies(
+      store.get(), batch.snapshot_write_dependencies);
+  if (!snapshot_dependencies.ok()) return snapshot_dependencies;
 
   for (const PendingFactMutation& mutation : batch.mutations) {
     if (mutation.ref.family() != FactFamily::kEdgeState ||

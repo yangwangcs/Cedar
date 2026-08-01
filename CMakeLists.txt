@@ -169,6 +169,7 @@ target_link_libraries(cedar_fact_store PRIVATE cedar cedar_rocksdb)
 add_library(cedar_kernel STATIC
     src/kernel/database.cc
     src/kernel/snapshot.cc
+    src/kernel/temporal_validation.cc
     src/kernel/transaction.cc)
 target_include_directories(cedar_kernel PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(cedar_kernel PRIVATE ${CMAKE_SOURCE_DIR}/src)

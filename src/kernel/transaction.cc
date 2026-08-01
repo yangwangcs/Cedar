@@ -11,6 +11,7 @@
 
 #include "cedar/database.h"
 #include "kernel/database_impl.h"
+#include "kernel/temporal_validation.h"
 #include "kernel/transaction_mutation.h"
 
 namespace cedar {
@@ -27,6 +28,7 @@ class Transaction::State {
   TransactionOptions options;
   std::optional<StoreSnapshot> snapshot;
   std::vector<PendingFactMutation> mutations;
+  std::vector<SnapshotWriteDependency> snapshot_write_dependencies;
   std::vector<std::tuple<uint8_t, uint16_t, uint64_t, uint64_t>> mutation_keys;
   bool terminal = false;
 
@@ -65,8 +67,13 @@ class Transaction::State {
         mutation_keys.end()) {
       return Status::InvalidArgument("transaction", "duplicate fact mutation");
     }
+    auto dependencies = DeriveSnapshotWriteDependencies(
+        database->store, *snapshot, std::vector<PendingFactMutation>{mutation});
+    if (!dependencies.ok()) return dependencies.status();
     mutation_keys.push_back(key);
     mutations.push_back(std::move(mutation));
+    snapshot_write_dependencies.push_back(
+        dependencies.ConsumeValueOrDie().front());
     std::sort(mutations.begin(), mutations.end(), CanonicalMutationLess);
     return Status::OK();
   }

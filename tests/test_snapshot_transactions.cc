@@ -95,6 +95,22 @@ TEST_F(SnapshotTransactionTest, ConflictsWithLaterCorrectionInsideCapturedInterv
   EXPECT_TRUE(conflicted.status().IsConflict()) << conflicted.status().ToString();
 }
 
+TEST_F(SnapshotTransactionTest, CorrectsAnExistingBoundaryWithStrictPredecessor) {
+  ASSERT_TRUE(store_->Commit(StoreCommitBatch{
+                         TxnId{1}, 1, {VertexPut(1, 10), VertexPut(1, 30)}, {}, {}})
+                  .ok());
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  StoreCommitBatch correction =
+      BatchFromSnapshot(TxnId{2}, snapshot.ValueOrDie(), {VertexPut(1, 10)});
+  ASSERT_EQ(correction.snapshot_write_dependencies.size(), 1U);
+  EXPECT_FALSE(correction.snapshot_write_dependencies[0].predecessor.has_value());
+  EXPECT_EQ(correction.snapshot_write_dependencies[0].successor,
+            std::optional<ValidTime>{ValidTime{30}});
+  EXPECT_TRUE(store_->Commit(correction).ok());
+}
+
 TEST_F(SnapshotTransactionTest, AllowsDisjointValidTimeIntervalsForOneFact) {
   ASSERT_TRUE(store_->Commit(StoreCommitBatch{
                          TxnId{1}, 1, {VertexPut(1, 10), VertexPut(1, 30)}, {}, {}})

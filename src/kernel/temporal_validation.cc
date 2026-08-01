@@ -25,11 +25,13 @@ StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
         });
     if (!scanned.ok()) return scanned;
 
-    const auto successor = boundaries.upper_bound(mutation.valid_from.value);
+    const auto predecessor_boundary =
+        boundaries.lower_bound(mutation.valid_from.value);
     std::optional<ValidTime> predecessor;
-    if (successor != boundaries.begin()) {
-      predecessor = ValidTime{*std::prev(successor)};
+    if (predecessor_boundary != boundaries.begin()) {
+      predecessor = ValidTime{*std::prev(predecessor_boundary)};
     }
+    const auto successor = boundaries.upper_bound(mutation.valid_from.value);
     std::optional<ValidTime> successor_time;
     if (successor != boundaries.end()) {
       successor_time = ValidTime{*successor};

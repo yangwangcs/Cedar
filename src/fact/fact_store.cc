@@ -999,6 +999,20 @@ StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
       return Status::InvalidArgument("edge identity", "snapshot belongs to another store");
     }
   }
+
+  // Identity is bound atomically with the first EdgeState PUT. Requiring that
+  // state in the logical snapshot prevents a future immutable identity from
+  // leaking into an older as-of view.
+  bool has_visible_edge_state = false;
+  const Status scanned = Scan(
+      snapshot, FactPrefix::Exact(EntityFact::Edge(edge_id).ref()),
+      [&has_visible_edge_state](const FactEvent&) {
+        has_visible_edge_state = true;
+        return Status::OK();
+      });
+  if (!scanned.ok()) return scanned;
+  if (!has_visible_edge_state) return std::optional<EdgeIdentity>{};
+
   std::string encoded;
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;

@@ -159,6 +159,33 @@ TEST_F(FactStoreMetadataTest, SnapshotCapturesPropertySchemaView) {
   EXPECT_EQ(captured.ValueOrDie()->schema_epoch, 1U);
 }
 
+TEST_F(FactStoreMetadataTest, HidesEdgeIdentityCreatedAfterLogicalSnapshot) {
+  const EdgeIdentity identity{EdgeId{9}, VertexId{1}, VertexId{2}, 7};
+  const StoreCommitBatch batch{
+      TxnId{1},
+      1,
+      {{EntityFact::Edge(identity.edge_id).ref(), ValidTime{10},
+        FactOperation::kPut, 0, std::nullopt}},
+      {identity}};
+  ASSERT_TRUE(store_->Commit(batch).ok());
+
+  const auto before_creation =
+      store_->BeginSnapshot(SnapshotOptions{CommitSeq{0}});
+  ASSERT_TRUE(before_creation.ok()) << before_creation.status().ToString();
+  const auto hidden = store_->LookupEdgeIdentity(before_creation.ValueOrDie(),
+                                                 identity.edge_id);
+  ASSERT_TRUE(hidden.ok()) << hidden.status().ToString();
+  EXPECT_FALSE(hidden.ValueOrDie().has_value());
+
+  const auto after_creation =
+      store_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(after_creation.ok()) << after_creation.status().ToString();
+  const auto visible = store_->LookupEdgeIdentity(after_creation.ValueOrDie(),
+                                                  identity.edge_id);
+  ASSERT_TRUE(visible.ok()) << visible.status().ToString();
+  EXPECT_EQ(visible.ValueOrDie(), std::optional<EdgeIdentity>{identity});
+}
+
 TEST_F(FactStoreMetadataTest,
        RejectsTypeChangeForPropertyNameAcrossNonAdjacentEpochs) {
   ASSERT_TRUE(store_->RegisterProperty(

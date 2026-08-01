@@ -16,3 +16,8 @@ set(CEDAR_TEST_LIBS
 add_executable(test_correctness_kernel test_correctness_kernel.cc)
 target_link_libraries(test_correctness_kernel ${CEDAR_TEST_LIBS})
 gtest_discover_tests(test_correctness_kernel)
+
+add_executable(test_rocksdb_dependency test_rocksdb_dependency.cc)
+target_link_libraries(test_rocksdb_dependency
+    PRIVATE cedar_rocksdb ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_rocksdb_dependency)

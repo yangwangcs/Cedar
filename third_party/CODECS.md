@@ -6,11 +6,13 @@ or download codec packages at database startup.
 | Codec | Upstream version | Release archive SHA-256 | License |
 |---|---:|---|---|
 | LZ4 | 1.10.0 | `537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b` | BSD 2-Clause (`third_party/lz4/LICENSE`) |
+| RocksDB | 11.1.2 | `3aba946031d27734eeea68ced7dd6f46629ba23a7b49945eb29aea68d1595311` | Apache 2.0 / GPLv2 dual license; Cedar uses Apache 2.0 (`third_party/rocksdb/LICENSE.Apache`) |
 | Zstd | 1.5.7 | `37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3` | BSD 3-Clause / GPLv2 dual license; Cedar uses the BSD terms (`third_party/zstd/LICENSE`) |
 
 Source archives:
 
 - `https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz`
+- `https://github.com/facebook/rocksdb/archive/refs/tags/v11.1.2.tar.gz`
 - `https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz`
 
 The LZ4 snapshot retains the upstream `lib/` directory. The Zstd snapshot
@@ -18,3 +20,8 @@ retains the public headers and the `common/`, `compress/`, and `decompress/`
 library directories required by Cedar's page codec. Cedar does not compile the
 upstream command-line programs, tests, legacy decoders, deprecated API, or
 dictionary-builder tools.
+
+RocksDB is retained as a gitlink pinned to tag `v11.1.2` commit
+`3b446089141659fad25328c5ea3e7ed283df46e4`. Cedar builds its static library
+without RocksDB tests, tools, examples, JNI, optional compression libraries,
+or system-RocksDB discovery.

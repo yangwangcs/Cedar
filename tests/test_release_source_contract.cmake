@@ -60,7 +60,6 @@ set(PUBLICATION_FILES
     src/transaction/transaction_coordinator.cc)
 set(CLAIM_FILES
     README.md
-    docs/superpowers/specs/2026-07-27-cedar-atomic-commit-design.md
     docs/superpowers/specs/2026-08-01-cedar-rocksdb-kernel-design.md)
 
 function(WRITE_FIXTURE_FILE RELATIVE_PATH CONTENT)
@@ -158,9 +157,9 @@ if(NOT EXISTS "${FIXTURE_OUTPUT}/source-input-files.txt")
 endif()
 file(STRINGS "${FIXTURE_OUTPUT}/source-input-files.txt" BOUND_INPUT_LINES)
 list(LENGTH BOUND_INPUT_LINES BOUND_INPUT_COUNT)
-if(NOT BOUND_INPUT_COUNT EQUAL 28)
+if(NOT BOUND_INPUT_COUNT EQUAL 27)
   message(FATAL_ERROR
-          "baseline output binds ${BOUND_INPUT_COUNT} inputs instead of 28")
+          "baseline output binds ${BOUND_INPUT_COUNT} inputs instead of 27")
 endif()
 
 PREPARE_FIXTURE()

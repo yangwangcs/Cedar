@@ -31,7 +31,6 @@ if(NOT EXISTS "${OUTPUT_ROOT_ABSOLUTE}" AND STRANDED_BACKUPS)
 endif()
 
 set(AUTHORITATIVE_SPECIFICATIONS
-    docs/superpowers/specs/2026-07-27-cedar-atomic-commit-design.md
     docs/superpowers/specs/2026-08-01-cedar-rocksdb-kernel-design.md)
 
 file(GLOB_RECURSE SOURCE_SCOPE_FILES

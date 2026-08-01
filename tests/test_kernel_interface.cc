@@ -92,9 +92,9 @@ TEST_F(KernelInterfaceTest, RejectsOperationsAfterCloseAndOnMovedFromHandles) {
       std::move(transaction).ConsumeValueOrDie();
   Transaction moved = std::move(*transaction_handle);
   EXPECT_TRUE(transaction_handle->Rollback().IsInvalidArgument());
+  EXPECT_TRUE(database.ValueOrDie()->Close().IsSnapshotPinned());
   EXPECT_TRUE(moved.Rollback().ok());
   EXPECT_TRUE(moved.Rollback().IsInvalidArgument());
-
   EXPECT_TRUE(database.ValueOrDie()->Close().ok());
   EXPECT_TRUE(database.ValueOrDie()->BeginTransaction().status().IsInvalidArgument());
   EXPECT_TRUE(database.ValueOrDie()->BeginSnapshot().status().IsInvalidArgument());
@@ -107,26 +107,17 @@ TEST_F(KernelInterfaceTest, ExposesVacuumAsAnExplicitKernelOperation) {
   EXPECT_TRUE(database.ValueOrDie()->Vacuum(CommitSeq{1}).IsNotSupportedError());
 }
 
-TEST_F(KernelInterfaceTest, RejectsLiveTransactionOperationsAfterClose) {
+TEST_F(KernelInterfaceTest, TransactionPinsDatabaseUntilRollback) {
   const auto database = Database::Open(DatabaseOptions{.path = path_});
   ASSERT_TRUE(database.ok()) << database.status().ToString();
   const auto transaction = database.ValueOrDie()->BeginTransaction(
       TransactionOptions{.isolation = IsolationLevel::kStrict});
   ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
 
-  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
   Transaction* const handle = transaction.ValueOrDie().get();
-  const EntityFact entity = EntityFact::Vertex(VertexId{1});
-  const PropertyFact property = PropertyFact::Vertex(VertexId{1}, PropertyId{1});
-
-  EXPECT_TRUE(handle->Exists(entity, ValidTime{1}).status().IsInvalidArgument());
-  EXPECT_TRUE(handle->Get(property, ValidTime{1}).status().IsInvalidArgument());
-  EXPECT_TRUE(handle->Assert(entity, ValidTime{1}).IsInvalidArgument());
-  EXPECT_TRUE(handle->Retract(entity, ValidTime{1}).IsInvalidArgument());
-  EXPECT_TRUE(handle->Set(property, ValidTime{1}, Value::Int64(1)).IsInvalidArgument());
-  EXPECT_TRUE(handle->Unset(property, ValidTime{1}).IsInvalidArgument());
-  EXPECT_TRUE(handle->Commit().status().IsInvalidArgument());
+  EXPECT_TRUE(database.ValueOrDie()->Close().IsSnapshotPinned());
   EXPECT_TRUE(handle->Rollback().ok());
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
 }
 
 TEST_F(KernelInterfaceTest, ResolvesNoCommittedTransactionAsAbsent) {

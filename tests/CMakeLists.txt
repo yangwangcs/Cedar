@@ -54,3 +54,9 @@ add_executable(test_kernel_snapshot test_kernel_snapshot.cc)
 target_link_libraries(test_kernel_snapshot
     PRIVATE cedar_kernel cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_snapshot)
+
+add_executable(test_kernel_mutations test_kernel_mutations.cc)
+target_include_directories(test_kernel_mutations PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_kernel_mutations
+    PRIVATE cedar_kernel ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_kernel_mutations)

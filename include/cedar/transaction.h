@@ -4,6 +4,7 @@
 #ifndef CEDAR_TRANSACTION_H_
 #define CEDAR_TRANSACTION_H_
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -13,6 +14,8 @@
 namespace cedar {
 
 class Database;
+
+using TransactionFactVisitor = std::function<Status(const FactEvent&)>;
 
 enum class IsolationLevel : uint8_t { kSnapshot = 1, kStrict = 2 };
 
@@ -44,6 +47,8 @@ class Transaction {
 
   StatusOr<bool> Exists(EntityFact entity, ValidTime valid_time);
   StatusOr<std::optional<Value>> Get(PropertyFact property, ValidTime valid_time);
+  Status Scan(FactFamily family, PropertyId property_id,
+              const TransactionFactVisitor& visitor);
   Status Assert(EntityFact entity, ValidTime valid_time);
   Status Retract(EntityFact entity, ValidTime valid_time);
   Status Set(PropertyFact property, ValidTime valid_time, Value value);

@@ -3,6 +3,7 @@
 
 #include "kernel/temporal_validation.h"
 
+#include <map>
 #include <set>
 
 namespace cedar {
@@ -41,6 +42,37 @@ StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
         snapshot.commit_seq()});
   }
   return dependencies;
+}
+
+StatusOr<StrictReadDependency> CaptureStrictReadDependency(
+    const FactStore& store, const StoreSnapshot& snapshot, const FactRef& ref,
+    ValidTime valid_time) {
+  const Status valid = ref.Validate();
+  if (!valid.ok()) return valid;
+
+  std::map<uint64_t, FactEvent> boundaries;
+  const Status scanned = store.Scan(
+      snapshot, FactPrefix::Exact(ref), [&boundaries](const FactEvent& event) {
+        const auto found = boundaries.find(event.valid_from.value);
+        if (found == boundaries.end() ||
+            found->second.commit_seq.value < event.commit_seq.value) {
+          boundaries.insert_or_assign(event.valid_from.value, event);
+        }
+        return Status::OK();
+      });
+  if (!scanned.ok()) return scanned;
+
+  StrictReadDependency dependency{ref, valid_time, snapshot.commit_seq()};
+  const auto successor = boundaries.upper_bound(valid_time.value);
+  if (successor != boundaries.end()) {
+    dependency.successor = ValidTime{successor->first};
+  }
+  if (successor != boundaries.begin()) {
+    const auto observed = std::prev(successor);
+    dependency.observed_event = observed->second;
+    dependency.predecessor = ValidTime{observed->first};
+  }
+  return dependency;
 }
 
 }  // namespace cedar

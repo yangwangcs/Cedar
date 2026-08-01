@@ -14,6 +14,10 @@ StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
     const FactStore& store, const StoreSnapshot& snapshot,
     const std::vector<PendingFactMutation>& mutations);
 
+StatusOr<StrictReadDependency> CaptureStrictReadDependency(
+    const FactStore& store, const StoreSnapshot& snapshot, const FactRef& ref,
+    ValidTime valid_time);
+
 }  // namespace cedar
 
 #endif  // CEDAR_KERNEL_TEMPORAL_VALIDATION_H_

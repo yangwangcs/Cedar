@@ -37,12 +37,24 @@ struct SnapshotWriteDependency {
   Status Validate() const;
 };
 
+struct StrictReadDependency {
+  FactRef ref;
+  ValidTime valid_time;
+  CommitSeq snapshot_seq;
+  std::optional<FactEvent> observed_event;
+  std::optional<ValidTime> predecessor;
+  std::optional<ValidTime> successor;
+
+  Status Validate() const;
+};
+
 struct StoreCommitBatch {
   TxnId txn_id;
   uint64_t system_hlc = 0;
   std::vector<PendingFactMutation> mutations;
   std::vector<EdgeIdentity> edge_identities;
   std::vector<SnapshotWriteDependency> snapshot_write_dependencies;
+  std::vector<StrictReadDependency> strict_read_dependencies;
 
   Status Validate() const;
 };

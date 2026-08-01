@@ -66,3 +66,9 @@ target_include_directories(test_snapshot_transactions PRIVATE ${CMAKE_SOURCE_DIR
 target_link_libraries(test_snapshot_transactions
     PRIVATE cedar_kernel cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_snapshot_transactions)
+
+add_executable(test_strict_transactions test_strict_transactions.cc)
+target_include_directories(test_strict_transactions PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_strict_transactions
+    PRIVATE cedar_kernel cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_strict_transactions)

@@ -179,6 +179,37 @@ struct CurrentFactInterval {
   CommitSeq commit_seq;
 };
 
+struct StrictReadIdentity {
+  std::optional<FactEvent> observed_event;
+  std::optional<ValidTime> predecessor;
+  std::optional<ValidTime> successor;
+};
+
+bool SameFactEvent(const FactEvent& left, const FactEvent& right) {
+  return left.ref == right.ref && left.valid_from == right.valid_from &&
+         left.commit_seq == right.commit_seq && left.operation == right.operation &&
+         left.schema_epoch == right.schema_epoch && left.value == right.value;
+}
+
+bool SameFactEvent(const std::optional<FactEvent>& left,
+                   const std::optional<FactEvent>& right) {
+  return left.has_value() == right.has_value() &&
+         (!left.has_value() || SameFactEvent(*left, *right));
+}
+
+bool SameStrictReadIdentity(const StrictReadIdentity& left,
+                            const StrictReadIdentity& right) {
+  return SameFactEvent(left.observed_event, right.observed_event) &&
+         left.predecessor == right.predecessor && left.successor == right.successor;
+}
+
+bool MatchesStrictReadDependency(const StrictReadIdentity& identity,
+                                 const StrictReadDependency& dependency) {
+  return SameFactEvent(identity.observed_event, dependency.observed_event) &&
+         identity.predecessor == dependency.predecessor &&
+         identity.successor == dependency.successor;
+}
+
 bool IntervalsOverlap(ValidTime left_from, std::optional<ValidTime> left_to,
                       ValidTime right_from, std::optional<ValidTime> right_to) {
   const bool left_before_right_end =
@@ -217,6 +248,47 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
   return intervals;
 }
 
+StatusOr<StrictReadIdentity> CurrentStrictReadIdentity(
+    FactStoreImpl* store, const FactRef& ref, ValidTime valid_time,
+    CommitSeq commit_limit) {
+  const std::string prefix = EncodeFactIdentityPrefix(
+      ref.family(), ref.property_id(), ref.entity_id());
+  rocksdb::ReadOptions options;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  std::map<uint64_t, FactEvent> boundaries;
+  for (iterator->Seek(prefix);
+       iterator->Valid() && StartsWith(iterator->key(), prefix);
+       iterator->Next()) {
+    const auto decoded_key = DecodeFactKey(iterator->key().ToString());
+    if (!decoded_key.ok()) return decoded_key.status();
+    if (decoded_key.ValueOrDie().commit_seq.value > commit_limit.value) continue;
+    const uint64_t boundary = decoded_key.ValueOrDie().valid_from.value;
+    if (boundaries.contains(boundary)) continue;
+    auto event = DecodeFactValue(decoded_key.ValueOrDie().ref,
+                                 decoded_key.ValueOrDie().valid_from,
+                                 decoded_key.ValueOrDie().commit_seq,
+                                 iterator->value().ToString());
+    if (!event.ok()) return event.status();
+    boundaries.emplace(boundary, event.ConsumeValueOrDie());
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "iterate strict read identity");
+  }
+
+  StrictReadIdentity identity;
+  const auto successor = boundaries.upper_bound(valid_time.value);
+  if (successor != boundaries.end()) {
+    identity.successor = ValidTime{successor->first};
+  }
+  if (successor != boundaries.begin()) {
+    const auto observed = std::prev(successor);
+    identity.observed_event = observed->second;
+    identity.predecessor = ValidTime{observed->first};
+  }
+  return identity;
+}
+
 Status ValidateSnapshotWriteDependencies(
     FactStoreImpl* store,
     const std::vector<SnapshotWriteDependency>& dependencies) {
@@ -234,6 +306,31 @@ Status ValidateSnapshotWriteDependencies(
         return Status::Conflict(
             "commit", "snapshot write conflicts with a later overlapping event");
       }
+    }
+  }
+  return Status::OK();
+}
+
+Status ValidateStrictReadDependencies(
+    FactStoreImpl* store,
+    const std::vector<StrictReadDependency>& dependencies) {
+  for (const StrictReadDependency& dependency : dependencies) {
+    if (dependency.snapshot_seq.value > store->visible_seq.value) {
+      return Status::InvalidArgument("commit",
+                                     "strict dependency exceeds visible watermark");
+    }
+    const auto at_snapshot = CurrentStrictReadIdentity(
+        store, dependency.ref, dependency.valid_time, dependency.snapshot_seq);
+    if (!at_snapshot.ok()) return at_snapshot.status();
+    if (!MatchesStrictReadDependency(at_snapshot.ValueOrDie(), dependency)) {
+      return Status::Conflict("commit",
+                              "strict read identity does not match its snapshot");
+    }
+    const auto current = CurrentStrictReadIdentity(
+        store, dependency.ref, dependency.valid_time, store->visible_seq);
+    if (!current.ok()) return current.status();
+    if (!SameStrictReadIdentity(at_snapshot.ValueOrDie(), current.ValueOrDie())) {
+      return Status::Conflict("commit", "strict read was changed after its snapshot");
     }
   }
   return Status::OK();
@@ -431,6 +528,34 @@ Status SnapshotWriteDependency::Validate() const {
   return Status::OK();
 }
 
+Status StrictReadDependency::Validate() const {
+  const Status valid = ref.Validate();
+  if (!valid.ok()) return valid;
+  if (predecessor.has_value() && predecessor->value > valid_time.value) {
+    return Status::InvalidArgument("strict read dependency",
+                                   "predecessor is after read time");
+  }
+  if (successor.has_value() && successor->value <= valid_time.value) {
+    return Status::InvalidArgument("strict read dependency",
+                                   "successor is not after read time");
+  }
+  if (observed_event.has_value()) {
+    const Status observed_valid = observed_event->Validate();
+    if (!observed_valid.ok()) return observed_valid;
+    if (observed_event->ref != ref ||
+        observed_event->valid_from.value > valid_time.value ||
+        observed_event->commit_seq.value > snapshot_seq.value ||
+        predecessor != std::optional<ValidTime>{observed_event->valid_from}) {
+      return Status::InvalidArgument("strict read dependency",
+                                     "observed event disagrees with read identity");
+    }
+  } else if (predecessor.has_value()) {
+    return Status::InvalidArgument("strict read dependency",
+                                   "empty read has a predecessor fence");
+  }
+  return Status::OK();
+}
+
 Status StoreCommitBatch::Validate() const {
   if (!txn_id.valid() || system_hlc == 0 || mutations.empty()) {
     return Status::InvalidArgument("commit batch", "missing transaction, time, or facts");
@@ -454,6 +579,17 @@ Status StoreCommitBatch::Validate() const {
     if (!facts.contains(key) || !dependencies.emplace(key).second) {
       return Status::InvalidArgument("commit batch",
                                      "invalid snapshot write dependency");
+    }
+  }
+  std::set<std::pair<std::string, uint64_t>> strict_reads;
+  for (const StrictReadDependency& dependency : strict_read_dependencies) {
+    const Status dependency_valid = dependency.Validate();
+    if (!dependency_valid.ok()) return dependency_valid;
+    const std::string ref_key = EncodeFactKey(dependency.ref, ValidTime{0},
+                                              CommitSeq{1});
+    if (ref_key.empty() ||
+        !strict_reads.emplace(ref_key, dependency.valid_time.value).second) {
+      return Status::InvalidArgument("commit batch", "duplicate strict read dependency");
     }
   }
   std::set<uint64_t> edge_ids;
@@ -862,6 +998,9 @@ StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
   const Status snapshot_dependencies = ValidateSnapshotWriteDependencies(
       store.get(), batch.snapshot_write_dependencies);
   if (!snapshot_dependencies.ok()) return snapshot_dependencies;
+  const Status strict_dependencies = ValidateStrictReadDependencies(
+      store.get(), batch.strict_read_dependencies);
+  if (!strict_dependencies.ok()) return strict_dependencies;
 
   for (const PendingFactMutation& mutation : batch.mutations) {
     if (mutation.ref.family() != FactFamily::kEdgeState ||

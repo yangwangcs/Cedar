@@ -115,6 +115,11 @@ class FactStore {
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);
   StatusOr<std::optional<PropertyDefinition>> LookupProperty(
       PropertyId property_id, uint32_t schema_epoch = 0) const;
+  StatusOr<std::optional<PropertyDefinition>> LookupProperty(
+      const StoreSnapshot& snapshot, PropertyId property_id,
+      uint32_t schema_epoch = 0) const;
+  StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
+      const StoreSnapshot& snapshot, EdgeId edge_id) const;
   CommitSeq visible_seq() const;
   StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(
       TxnId txn_id) const;

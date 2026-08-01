@@ -143,6 +143,10 @@ class FactStore {
   StatusOr<StoreCommitResult> Commit(StoreCommitBatch);
   StatusOr<IdLease> LeaseIds(IdKind, uint64_t count);
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition);
+  StatusOr<std::optional<PropertyDefinition>> LookupProperty(
+      const StoreSnapshot&, PropertyId, uint32_t schema_epoch = 0) const;
+  StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
+      const StoreSnapshot&, EdgeId) const;
   StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(TxnId) const;
   Status Vacuum(CommitSeq oldest_readable);
 };

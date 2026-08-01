@@ -304,11 +304,13 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq) {
 class StoreSnapshot::State {
  public:
   State(std::shared_ptr<FactStoreImpl> store, const rocksdb::Snapshot* snapshot,
-        CommitSeq commit_seq, CommitSeq oldest_readable_seq)
+        CommitSeq commit_seq, CommitSeq oldest_readable_seq,
+        std::shared_ptr<const FactStoreImpl::PropertySchemas> property_schemas)
       : store(std::move(store)),
         snapshot(snapshot),
         commit_seq(commit_seq),
-        oldest_readable_seq(oldest_readable_seq) {}
+        oldest_readable_seq(oldest_readable_seq),
+        property_schemas(std::move(property_schemas)) {}
 
   ~State() {
     if (!store) return;
@@ -323,7 +325,23 @@ class StoreSnapshot::State {
   const rocksdb::Snapshot* snapshot = nullptr;
   CommitSeq commit_seq;
   CommitSeq oldest_readable_seq;
+  std::shared_ptr<const FactStoreImpl::PropertySchemas> property_schemas;
 };
+
+StatusOr<std::optional<PropertyDefinition>> LookupPropertyInSchemas(
+    const FactStoreImpl::PropertySchemas& schemas, PropertyId property_id,
+    uint32_t schema_epoch) {
+  if (!property_id.valid()) {
+    return Status::InvalidArgument("property definition", "zero property ID");
+  }
+  const auto found = schemas.find(property_id.value);
+  if (found == schemas.end() || found->second.empty() ||
+      schema_epoch > found->second.size()) {
+    return std::optional<PropertyDefinition>{};
+  }
+  if (schema_epoch == 0) return std::optional<PropertyDefinition>{found->second.back()};
+  return std::optional<PropertyDefinition>{found->second[schema_epoch - 1]};
+}
 
 FactPrefix FactPrefix::Exact(FactRef ref) {
   return FactPrefix(ref.family(), ref.property_id(), ref.entity_id());
@@ -561,7 +579,8 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
   const rocksdb::Snapshot* snapshot = impl_->db->GetSnapshot();
   if (snapshot == nullptr) return Status::IOError("snapshot", "RocksDB refused snapshot");
   auto state = std::make_unique<StoreSnapshot::State>(
-      impl_, snapshot, selected, impl_->oldest_readable_seq);
+      impl_, snapshot, selected, impl_->oldest_readable_seq,
+      impl_->property_schemas);
   ++impl_->active_snapshots;
   return StoreSnapshot(std::move(state));
 }
@@ -938,9 +957,6 @@ StatusOr<PropertyDefinition> FactStore::RegisterProperty(
 
 StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
     PropertyId property_id, uint32_t schema_epoch) const {
-  if (!property_id.valid()) {
-    return Status::InvalidArgument("property definition", "zero property ID");
-  }
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -948,13 +964,54 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
     if (!store) return Status::InvalidArgument("property definition", "store is not open");
   }
   std::lock_guard<std::mutex> lock(store->publisher_mutex);
-  const auto found = store->property_schemas->find(property_id.value);
-  if (found == store->property_schemas->end() || found->second.empty() ||
-      schema_epoch > found->second.size()) {
-    return std::optional<PropertyDefinition>{};
+  return LookupPropertyInSchemas(*store->property_schemas, property_id,
+                                 schema_epoch);
+}
+
+StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
+    const StoreSnapshot& snapshot, PropertyId property_id,
+    uint32_t schema_epoch) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("property definition",
+                                     "snapshot belongs to another store");
+    }
   }
-  if (schema_epoch == 0) return std::optional<PropertyDefinition>{found->second.back()};
-  return std::optional<PropertyDefinition>{found->second[schema_epoch - 1]};
+  return LookupPropertyInSchemas(*snapshot.state_->property_schemas, property_id,
+                                 schema_epoch);
+}
+
+StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
+    const StoreSnapshot& snapshot, EdgeId edge_id) const {
+  if (!edge_id.valid()) {
+    return Status::InvalidArgument("edge identity", "zero edge ID");
+  }
+  const auto key = EncodeEdgeIdentityMetaKey(edge_id);
+  if (!key.ok()) return key.status();
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("edge identity", "snapshot belongs to another store");
+    }
+  }
+  std::string encoded;
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  const rocksdb::Status got = store->db->Get(options, store->meta_cf,
+                                              key.ValueOrDie(), &encoded);
+  if (got.IsNotFound()) return std::optional<EdgeIdentity>{};
+  if (!got.ok()) return FromRocksDb(got, "read edge identity");
+  auto decoded = DecodeEdgeIdentity(encoded);
+  if (!decoded.ok()) return decoded.status();
+  if (decoded.ValueOrDie().edge_id != edge_id) {
+    return Status::Corruption("edge identity", "edge ID disagrees with metadata key");
+  }
+  return std::optional<EdgeIdentity>{decoded.ConsumeValueOrDie()};
 }
 
 CommitSeq FactStore::visible_seq() const {

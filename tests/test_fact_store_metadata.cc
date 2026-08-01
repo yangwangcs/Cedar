@@ -139,6 +139,26 @@ TEST_F(FactStoreMetadataTest, RegistersPropertiesIdempotentlyAndPreservesEpochs)
   EXPECT_EQ(reopened_old.ValueOrDie()->name, "name");
 }
 
+TEST_F(FactStoreMetadataTest, SnapshotCapturesPropertySchemaView) {
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{9}, "name", PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{9}, "display_name",
+                                 PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+  const auto captured = store_->LookupProperty(snapshot.ValueOrDie(), PropertyId{9});
+  ASSERT_TRUE(captured.ok()) << captured.status().ToString();
+  ASSERT_TRUE(captured.ValueOrDie().has_value());
+  EXPECT_EQ(captured.ValueOrDie()->name, "name");
+  EXPECT_EQ(captured.ValueOrDie()->schema_epoch, 1U);
+}
+
 TEST_F(FactStoreMetadataTest,
        RejectsTypeChangeForPropertyNameAcrossNonAdjacentEpochs) {
   ASSERT_TRUE(store_->RegisterProperty(

@@ -46,6 +46,10 @@ struct ValidTime {
   constexpr bool operator==(const ValidTime&) const = default;
 };
 
+struct SnapshotOptions {
+  std::optional<CommitSeq> as_of;
+};
+
 enum class FactFamily : uint8_t {
   kVertexState = 1,
   kVertexProperty = 2,

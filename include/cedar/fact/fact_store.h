@@ -23,11 +23,8 @@ class FactStoreImpl;
 struct FactStoreOptions {
   std::string path;
   uint64_t write_buffer_bytes = 64ULL * 1024ULL * 1024ULL;
+  uint64_t block_cache_bytes = 256ULL * 1024ULL * 1024ULL;
   uint64_t blob_threshold_bytes = 4096;
-};
-
-struct SnapshotOptions {
-  std::optional<CommitSeq> as_of;
 };
 
 struct StoreCommitBatch {

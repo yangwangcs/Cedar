@@ -13,9 +13,11 @@
 #include <vector>
 
 #include <rocksdb/comparator.h>
+#include <rocksdb/cache.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 #include <rocksdb/slice_transform.h>
+#include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
 
 #include "cedar/fact/fact_codec.h"
@@ -122,6 +124,9 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
   result.comparator = rocksdb::BytewiseComparator();
   result.enable_blob_files = true;
   result.min_blob_size = options.blob_threshold_bytes;
+  rocksdb::BlockBasedTableOptions table_options;
+  table_options.block_cache = rocksdb::NewLRUCache(options.block_cache_bytes);
+  result.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
   return result;
 }
 

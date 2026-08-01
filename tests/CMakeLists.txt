@@ -44,3 +44,8 @@ add_executable(test_fact_store_metadata test_fact_store_metadata.cc)
 target_link_libraries(test_fact_store_metadata
     PRIVATE cedar_fact_store cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_fact_store_metadata)
+
+add_executable(test_kernel_interface test_kernel_interface.cc)
+target_link_libraries(test_kernel_interface
+    PRIVATE cedar_kernel ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_kernel_interface)

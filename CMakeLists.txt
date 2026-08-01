@@ -165,6 +165,14 @@ target_link_libraries(cedar PRIVATE cedar_blake3 cedar_lz4)
 add_library(cedar_fact_store STATIC src/fact/fact_store.cc)
 target_include_directories(cedar_fact_store PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(cedar_fact_store PRIVATE cedar cedar_rocksdb)
+
+add_library(cedar_kernel STATIC
+    src/kernel/database.cc
+    src/kernel/snapshot.cc
+    src/kernel/transaction.cc)
+target_include_directories(cedar_kernel PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(cedar_kernel PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(cedar_kernel PRIVATE cedar_fact_store)
 if(CEDAR_MINIMAL_INSTRUMENTATION)
     target_compile_definitions(cedar PUBLIC CEDAR_MINIMAL_INSTRUMENTATION=1)
 else()

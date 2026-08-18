@@ -268,6 +268,8 @@ struct CedarMaintenanceResult {
   CedarMaintenanceKind kind = CedarMaintenanceKind::kFlush;
   uint64_t input_bytes = 0;
   uint64_t output_bytes = 0;
+  uint64_t remaining_smallest_complete_unit_bytes = 0;
+  uint64_t atomic_overrun_bytes = 0;
   uint64_t elapsed_us = 0;
   CedarMaintenanceYield yield = CedarMaintenanceYield::kNone;
   CedarMaintenanceSnapshot remaining;
@@ -397,8 +399,9 @@ boundary. While set:
 - no normal flush grant starts;
 - an emergency flush may start only to avoid memory, WAL-retention, or write-stop
   failure;
-- already-running compaction checks cancellation/yield only at safe file or
-  table-builder boundaries;
+- an already-running compaction is not interrupted mid-job; it completes its
+  current native input overlap and atomic VersionEdit/MANIFEST installation,
+  then reports elapsed time and any aggregate estimate overrun;
 - no record, page, file install, VersionEdit, or MANIFEST write is interrupted.
 
 ### 9.4 WAL options
@@ -478,11 +481,14 @@ MANIFEST-owned authoritative representation.
 
 - Facts target files remain 128 MiB with independently bounded row groups and
   pages.
-- A compaction grant's `max_output_bytes` is an aggregate job budget, not merely
-  `output_file_size_limit` per output file.
-- One currently open output file or one VersionEdit install may cross the byte
-  or deadline limit only by its documented atomic boundary. The overrun is
-  reported.
+- A compaction grant's `max_output_bytes` is an aggregate admission budget, not
+  merely `output_file_size_limit` per output file. RocksDB estimates the complete
+  picked job before submission; an estimate over budget yields without starting
+  the job and keeps the overlap debt queued.
+- Once submitted, the native job completes its full input overlap and one atomic
+  VersionEdit/MANIFEST installation. Compression variance may cross the budget;
+  Cedar reports the atomic overrun and uses it to size the next grant. Cedar does
+  not publish a partial overlap compaction.
 - Obsolete-file deletion remains RocksDB-owned and is included in ending space
   metrics.
 

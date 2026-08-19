@@ -117,6 +117,7 @@ struct CommitPipelineMetrics {
   uint64_t epochs = 0;
   uint64_t epoch_transactions = 0;
   uint64_t epoch_bytes = 0;
+  uint64_t wal_rotations = 0;
   uint64_t append_fast_path = 0;
   uint64_t general_path = 0;
   uint64_t pending_overlay_peak = 0;

@@ -247,6 +247,11 @@ target_link_libraries(test_kernel_bounded_benchmark
     PRIVATE cedar_kernel_bench_workload ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bounded_benchmark)
 
+add_test(NAME KernelBenchmarkCsvContract
+    COMMAND ${CMAKE_COMMAND}
+        -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
+
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)
 target_include_directories(test_commit_publisher PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_commit_publisher

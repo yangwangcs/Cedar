@@ -839,6 +839,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
             runtime_pressure_state.load(std::memory_order_acquire);
         if (result.ok()) {
           const auto& group_metrics = result.ValueOrDie();
+          append_commit_metrics.wal_rotations += group_metrics.wal_rotations;
           RecordLatency(&append_commit_metrics.latency.validation,
                         group_metrics.validation_us);
           RecordLatency(&append_commit_metrics.latency.assembly,

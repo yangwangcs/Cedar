@@ -27,6 +27,16 @@ TEST(KernelBoundedBenchmarkTest, LeanUsesProductionStorageWithoutKernelMode) {
   EXPECT_FALSE(database_options.production.kernel_mode);
 }
 
+TEST(KernelBoundedBenchmarkTest, BenchmarkSampleCarriesAppendStageMetrics) {
+  KernelBenchmarkSample sample;
+  sample.commit_pipeline.latency.queue.buckets[0] = 11;
+  sample.commit_pipeline.latency.wal_sync.total_us = 29;
+  sample.commit_pipeline.latency.publication.max_us = 47;
+  EXPECT_EQ(sample.commit_pipeline.latency.queue.buckets[0], 11U);
+  EXPECT_EQ(sample.commit_pipeline.latency.wal_sync.total_us, 29U);
+  EXPECT_EQ(sample.commit_pipeline.latency.publication.max_us, 47U);
+}
+
 TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {
   char pattern[] = "/tmp/cedar_bounded_benchmark_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

@@ -15,6 +15,12 @@
 namespace {
 using Clock = std::chrono::steady_clock;
 
+void PrintLatencyPercentiles(const cedar::CommitLatencyHistogram& histogram) {
+  std::cout << histogram.ApproximatePercentile(50) << ','
+            << histogram.ApproximatePercentile(95) << ','
+            << histogram.ApproximatePercentile(99);
+}
+
 cedar::Status WriteVertex(cedar::Database* database, uint64_t id) {
   auto transaction = database->BeginTransaction();
   if (!transaction.ok()) return transaction.status();
@@ -225,6 +231,7 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   sample.writer_failures = bounded_writers.failures;
   sample.write_stopped = runtime.ValueOrDie().write_stopped;
   sample.background_errors = runtime.ValueOrDie().background_error_count;
+  sample.commit_pipeline = metrics;
   if (options.verify_reopen) {
     uint64_t expected_id = options.operations;
     if (workload == cedar::benchmark::KernelWorkload::kPropertyPut) {
@@ -240,13 +247,18 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   } else {
     sample.reopen_verified = true;
   }
-  std::cout << "profile,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
+  std::cout << "schema_version,profile,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
                "live_sst_bytes,retained_wal_bytes,n_plus_one_eligible_epochs,"
                "n_plus_one_promoted_epochs,projected_scan_rows,projected_scan_bytes_read,"
                "canonical_scan_bytes_read,logical_facts_bytes,obsolete_sst_bytes,"
                "temporary_output_bytes,writer_clients,writer_failures,write_stopped,"
-               "background_errors,qualification\n";
-  std::cout << cedar::benchmark::BenchmarkExecutionProfileName(options.execution_profile)
+               "background_errors,commit_epochs,epoch_transactions,epoch_bytes,wal_sync_count,wal_rotations,"
+               "queue_p50_us,queue_p95_us,queue_p99_us,validation_p50_us,validation_p95_us,validation_p99_us,"
+               "assembly_p50_us,assembly_p95_us,assembly_p99_us,wal_append_p50_us,wal_append_p95_us,wal_append_p99_us,"
+               "wal_sync_p50_us,wal_sync_p95_us,wal_sync_p99_us,wal_callback_p50_us,wal_callback_p95_us,wal_callback_p99_us,"
+               "manifest_p50_us,manifest_p95_us,manifest_p99_us,memtable_p50_us,memtable_p95_us,memtable_p99_us,"
+               "publication_p50_us,publication_p95_us,publication_p99_us,end_to_end_p50_us,end_to_end_p95_us,end_to_end_p99_us,qualification\n";
+  std::cout << "1," << cedar::benchmark::BenchmarkExecutionProfileName(options.execution_profile)
             << ',' << cedar::benchmark::KernelWorkloadName(options.workload) << ','
             << sample.operations << ',' << sample.elapsed_seconds << ','
             << sample.operations_per_second << ',' << sample.point_read_operations << ','
@@ -258,7 +270,32 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
             << ',' << sample.obsolete_sst_bytes << ',' << sample.temporary_output_bytes
             << ',' << sample.writer_clients << ',' << sample.writer_failures
             << ',' << sample.write_stopped << ',' << sample.background_errors
-            << ',' << cedar::benchmark::BenchmarkQualificationStatus(options, sample) << '\n';
+            << ',' << sample.commit_pipeline.epochs
+            << ',' << sample.commit_pipeline.epoch_transactions
+            << ',' << sample.commit_pipeline.epoch_bytes
+            << ',' << sample.commit_pipeline.latency.wal_sync.count
+            << ',' << sample.commit_pipeline.wal_rotations << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.queue);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.validation);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.assembly);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.wal_append);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.wal_sync);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.wal_callback);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.manifest);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.memtable_insert);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.publication);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.end_to_end);
+  std::cout << ',' << cedar::benchmark::BenchmarkQualificationStatus(options, sample)
+            << '\n';
   return 0;
 }
 }  // namespace

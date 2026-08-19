@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "cedar/core/status.h"
+#include "cedar/database.h"
 
 namespace cedar::benchmark {
 
@@ -62,6 +63,7 @@ struct KernelBenchmarkSample {
   uint64_t background_errors = 0;
   uint64_t unexplained_autonomous_jobs = 0;
   bool reopen_verified = false;
+  CommitPipelineMetrics commit_pipeline;
 };
 
 StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(

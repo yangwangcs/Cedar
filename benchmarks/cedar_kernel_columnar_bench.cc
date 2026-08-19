@@ -196,11 +196,15 @@ int Run(const Options& options) {
   }
   std::cout << "schema_version,workload,dataset_rows,iterations,live_sst_bytes,"
                "scanned_rows,elapsed_seconds,rows_per_second,projected_scan_bytes_read,"
-               "qualification\n"
+               "projected_scan_pages_skipped,projected_scan_pages_read,"
+               "projected_scan_physical_bytes_read,qualification\n"
             << "1,persisted-columnar-scan," << options.rows << ','
             << options.iterations << ',' << live_sst_bytes << ',' << scanned_rows << ','
             << elapsed << ',' << (elapsed == 0 ? 0 : scanned_rows / elapsed) << ','
             << runtime.ValueOrDie().projected_scan_bytes_read << ','
+            << runtime.ValueOrDie().projected_scan_pages_skipped << ','
+            << runtime.ValueOrDie().projected_scan_pages_read << ','
+            << runtime.ValueOrDie().projected_scan_physical_bytes_read << ','
             << ((live_sst_bytes != 0 && scanned_rows != 0)
                     ? "persisted_sst_and_rows"
                     : "invalid_no_persisted_scan")

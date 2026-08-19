@@ -46,17 +46,30 @@ run_case() {
   local workload="$6"
   local writer_clients="$7"
   local database_path="$output_dir/${name}-db"
+  set +e
   "$bench" \
-    --path "$database_path" \
-    --database-path "$database_path" \
-    "${common[@]}" \
-    --workload "$workload" \
-    --writer-clients "$writer_clients" \
-    --prepare-seed "$prepare" \
-    --profile "$profile" \
-    --campaign "$campaign" \
-    --duration-seconds "$duration" \
-    > "$output_dir/${name}.csv"
+      --path "$database_path" \
+      --database-path "$database_path" \
+      "${common[@]}" \
+      --workload "$workload" \
+      --writer-clients "$writer_clients" \
+      --prepare-seed "$prepare" \
+      --profile "$profile" \
+      --campaign "$campaign" \
+      --duration-seconds "$duration" \
+      > "$output_dir/${name}.csv"
+  local status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    if [[ "$profile" == lean && "$campaign" == sustained ]] && \
+       rg -q ',sustained_(maintenance_error|unexplained_autonomous_maintenance)$' \
+         "$output_dir/${name}.csv"; then
+      printf 'expected_lean_baseline_exit=%s\n' "$status" \
+        > "$output_dir/${name}.expected-baseline.txt"
+      return 0
+    fi
+    return "$status"
+  fi
 }
 
 run_case lean warm 30 lean-30s true mixed-90-write-10-point-read 1

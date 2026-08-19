@@ -687,24 +687,49 @@ Status Database::Impl::StartAppendCommitPipeline() {
           ++append_commit_metrics.n_plus_one_promoted_epochs;
           next_epoch_slot.reset();
         } else {
-          const auto deadline = std::chrono::steady_clock::now() +
-              std::chrono::microseconds(std::min(
-                  append_commit_window_us,
-                  runtime_collection_window_us.load(std::memory_order_acquire)));
-          append_commit_cv.wait_until(lock, deadline, [this] {
-            return append_commit_stopping ||
-                   append_commit_requests.size() >= std::min<uint32_t>(
-                       append_commit_max_batch_size,
-                       runtime_target_count.load(std::memory_order_acquire));
-          });
+          const auto limits_for_queue = [this] {
+            internal::EpochQueueSnapshot snapshot;
+            snapshot.depth = append_commit_requests.size();
+            snapshot.pressure_state =
+                runtime_pressure_state.load(std::memory_order_acquire);
+            if (!append_commit_requests.empty()) {
+              snapshot.oldest_age_us = static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() -
+                      append_commit_requests.front()->enqueued_at)
+                      .count());
+            }
+            return adaptive_epoch_controller.NextLimits(snapshot);
+          };
+          internal::EpochLimits collection_limits = limits_for_queue();
+          const uint32_t runtime_maximum = std::min<uint32_t>(
+              append_commit_max_batch_size,
+              runtime_target_count.load(std::memory_order_acquire));
+          const uint32_t wake_at = std::min<uint32_t>(
+              runtime_maximum, std::max<uint32_t>(2, collection_limits.max_transactions));
+          const uint64_t collection_age_us = std::min<uint64_t>(
+              append_commit_window_us,
+              std::min<uint64_t>(
+                  runtime_collection_window_us.load(std::memory_order_acquire),
+                  collection_limits.max_age_us));
+          if (collection_age_us != 0 && append_commit_requests.size() < wake_at) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(collection_age_us);
+            append_commit_cv.wait_until(lock, deadline, [this, wake_at] {
+              return append_commit_stopping || append_commit_requests.size() >= wake_at;
+            });
+          }
+          collection_limits = limits_for_queue();
           internal::CommitConflictIndex conflict_index;
           const size_t maximum = std::min<size_t>(
               append_commit_requests.size(), std::min<uint32_t>(
-                  append_commit_max_batch_size,
-                  runtime_target_count.load(std::memory_order_acquire)));
+                  std::min<uint32_t>(append_commit_max_batch_size,
+                                     runtime_target_count.load(std::memory_order_acquire)),
+                  collection_limits.max_transactions));
           const uint64_t target_bytes = std::min<uint64_t>(
-              append_commit_max_batch_bytes,
-              runtime_target_bytes.load(std::memory_order_acquire));
+              std::min<uint64_t>(append_commit_max_batch_bytes,
+                                 runtime_target_bytes.load(std::memory_order_acquire)),
+              collection_limits.max_encoded_bytes);
           uint64_t batch_bytes = 0;
           requests.reserve(maximum);
           for (size_t index = 0; index < maximum; ++index) {
@@ -854,6 +879,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
             RecordLatency(&append_commit_metrics.latency.memtable_insert,
                           group_metrics.memtable_insert_us);
           }
+          uint64_t epoch_bytes = 0;
+          for (const auto& request : requests) {
+            epoch_bytes += request->estimated_bytes;
+          }
+          adaptive_epoch_controller.Observe(internal::EpochObservation{
+              group_metrics.wal_sync_us,
+              append_commit_metrics.latency.queue.ApproximatePercentile(99),
+              requests.size(), epoch_bytes});
         }
         if (discarded_stale_predecision) {
           RecordNPlusOneDiscard(&append_commit_metrics,

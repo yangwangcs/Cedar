@@ -188,6 +188,14 @@ target_link_libraries(test_kernel_commit
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_commit)
 
+add_executable(test_adaptive_epoch_controller
+    kernel/test_adaptive_epoch_controller.cc)
+target_include_directories(test_adaptive_epoch_controller PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_adaptive_epoch_controller
+    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_adaptive_epoch_controller)
+
 add_executable(test_async_submission_executor kernel/test_async_submission_executor.cc)
 target_include_directories(test_async_submission_executor PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_async_submission_executor

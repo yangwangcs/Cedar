@@ -69,6 +69,7 @@ add_library(cedar_core STATIC
     src/storage/rocks/rocks_adapter.cc
     src/runtime/pressure_controller.cc
     src/kernel/adaptive_epoch_controller.cc
+    src/kernel/epoch_completion.cc
     src/kernel/database.cc
     src/kernel/async_submission_executor.cc
     src/kernel/maintenance_controller.cc

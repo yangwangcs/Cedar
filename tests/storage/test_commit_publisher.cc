@@ -163,6 +163,23 @@ TEST(DecidedEpochTest, ExposesOneImmutablePrebuiltBatchSubmission) {
   EXPECT_EQ(epoch.ClaimBatchForWrite(), nullptr);
 }
 
+TEST(DecidedEpochTest, TransfersCommittedResultsWithoutRetainingACopy) {
+  auto batch = std::make_unique<rocksdb::WriteBatch>();
+  batch->Put("prebuilt-key", "prebuilt-value");
+  StoreCommittedGroupResult result;
+  result.results.emplace_back(StoreCommitResult{CommitSeq{8}, 17});
+  result.results.emplace_back(StoreCommitResult{CommitSeq{9}, 18});
+
+  DecidedEpoch epoch(CommitSeq{7}, CommitSeq{9}, 2, true, std::move(batch),
+                     std::move(result));
+
+  StoreCommittedGroupResult transferred = epoch.TakeGroupResult();
+  ASSERT_EQ(transferred.results.size(), 2U);
+  EXPECT_EQ(transferred.results[0].ValueOrDie().commit_seq, CommitSeq{8});
+  EXPECT_EQ(transferred.results[1].ValueOrDie().commit_seq, CommitSeq{9});
+  EXPECT_TRUE(epoch.group_result().results.empty());
+}
+
 TEST(DecidedEpochTest, DoesNotRetainABatchForANonDurableDecision) {
   auto batch = std::make_unique<rocksdb::WriteBatch>();
   batch->Put("must-not-be-written", "value");

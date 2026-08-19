@@ -49,7 +49,7 @@ class DecidedEpoch {
 
   const rocksdb::WriteBatch& batch() const;
   std::unique_ptr<rocksdb::WriteBatch> ClaimBatchForWrite();
-  StoreCommittedGroupResult CopyGroupResult() const { return group_result_; }
+  StoreCommittedGroupResult TakeGroupResult();
 
  private:
   CommitSeq base_visible_seq_;

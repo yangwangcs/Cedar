@@ -24,6 +24,7 @@
 #include "storage/facts/pending_version_overlay.h"
 #include "kernel/async_commit.h"
 #include "kernel/adaptive_epoch_controller.h"
+#include "kernel/epoch_completion.h"
 #include "kernel/async_submission_executor.h"
 #include "kernel/maintenance_controller.h"
 #include "kernel/maintenance_policy.h"
@@ -102,7 +103,7 @@ class Database::Impl {
     SlotState state = SlotState::kEmpty;
   };
   struct WalDurabilityContext {
-    std::vector<std::shared_ptr<CommitHandle::State>> handles;
+    std::shared_ptr<internal::EpochCompletion> completion;
     std::vector<std::shared_ptr<AsyncSubmissionExecutor::Ticket>> executor_tickets;
     AsyncSubmissionExecutor* executor = nullptr;
     std::chrono::steady_clock::time_point write_started_at;

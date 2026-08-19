@@ -2560,7 +2560,7 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     return Status::InvalidArgument("commit", "missing decided epoch");
   }
   if (!epoch->requires_durable_write()) {
-    return epoch->CopyGroupResult();
+    return epoch->TakeGroupResult();
   }
   if (store->visible_seq != epoch->base_visible_seq()) {
     return Status::Conflict("commit", "decided epoch base is no longer current");
@@ -2617,7 +2617,7 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     }
     store->PublishVisible(epoch->visible_seq_target());
   }
-  StoreCommittedGroupResult result = epoch->CopyGroupResult();
+  StoreCommittedGroupResult result = epoch->TakeGroupResult();
   result.wal_append_us = kernel_metrics.wal_append_us;
   result.wal_sync_us = kernel_metrics.wal_sync_us;
   result.manifest_us = kernel_metrics.manifest_us;

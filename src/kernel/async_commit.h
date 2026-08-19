@@ -4,11 +4,17 @@
 #ifndef CEDAR_KERNEL_ASYNC_COMMIT_H_
 #define CEDAR_KERNEL_ASYNC_COMMIT_H_
 
+#include <cstddef>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <optional>
 
 #include "cedar/transaction.h"
+
+namespace cedar::internal {
+class EpochCompletion;
+}  // namespace cedar::internal
 
 namespace cedar {
 
@@ -22,8 +28,10 @@ class CommitHandle::State {
   const CommitAcceptance acceptance;
   mutable std::mutex mutex;
   std::condition_variable completed;
-  bool wal_durable = false;
   std::optional<CommitResult> result;
+  std::shared_ptr<internal::EpochCompletion> epoch_completion;
+  size_t epoch_result_ordinal = 0;
+  bool waits_for_epoch_durability = false;
 };
 
 }  // namespace cedar

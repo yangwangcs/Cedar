@@ -91,6 +91,11 @@ void BindCommitHandleToEpoch(
 RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   RuntimeMetrics metrics;
   metrics.retained_wal_bytes = source.retained_wal_bytes;
+  metrics.maintenance_snapshot_age_us = source.maintenance_snapshot_age_us;
+  metrics.background_flush_calls = source.background_flush_calls;
+  metrics.manual_compaction_calls = source.manual_compaction_calls;
+  metrics.periodic_task_registrations = source.periodic_task_registrations;
+  metrics.recovery_flush_exceptions = source.recovery_flush_exceptions;
   metrics.active_fact_bytes = source.total_active_memtable_bytes;
   metrics.immutable_fact_bytes = source.total_immutable_memtable_bytes;
   metrics.immutable_fact_count = source.total_immutable_memtable_count;
@@ -1415,6 +1420,16 @@ Status Database::Close() {
   return Status::OK();
 }
 
+Status Database::CreateCheckpoint(const std::string& checkpoint_path) const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  if (impl_->closing) {
+    return Status::ShutdownInProgress("database", "database close is in progress");
+  }
+  return impl_->store.CreateCheckpoint(checkpoint_path);
+}
+
 StatusOr<VertexId> Database::AllocateVertexId() {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -1543,7 +1558,17 @@ StatusOr<RuntimeMetrics> Database::SampleRuntimeMetrics() const {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   const auto sampled = impl_->store.SampleRuntimeMetrics();
   if (!sampled.ok()) return sampled.status();
-  return ToRuntimeMetrics(sampled.ValueOrDie());
+  RuntimeMetrics metrics = ToRuntimeMetrics(sampled.ValueOrDie());
+  if (impl_->maintenance_controller) {
+    const CedarMaintenanceMetrics maintenance =
+        impl_->maintenance_controller->metrics();
+    metrics.maintenance_flush_grants_accepted =
+        maintenance.flush_grants_accepted;
+    metrics.maintenance_compaction_grants_accepted =
+        maintenance.compaction_grants_accepted;
+    metrics.maintenance_errors = maintenance.maintenance_errors;
+  }
+  return metrics;
 }
 
 }  // namespace cedar

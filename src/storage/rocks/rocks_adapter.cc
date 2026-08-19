@@ -25,6 +25,7 @@
 #include <rocksdb/cedar_maintenance.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/statistics.h>
 #include <rocksdb/table.h>
@@ -1376,6 +1377,38 @@ Status FactStore::Close() {
   impl_->accepting_snapshots = false;
   impl_.reset();
   return Status::OK();
+}
+
+Status FactStore::CreateCheckpoint(const std::string& checkpoint_path) const {
+  if (checkpoint_path.empty() ||
+      !std::filesystem::path(checkpoint_path).is_absolute()) {
+    return Status::InvalidArgument("fact store checkpoint",
+                                   "checkpoint path must be absolute");
+  }
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) {
+      return Status::InvalidArgument("fact store checkpoint", "store is not open");
+    }
+  }
+  std::error_code filesystem_error;
+  if (std::filesystem::exists(checkpoint_path, filesystem_error)) {
+    return Status::InvalidArgument("fact store checkpoint",
+                                   "destination already exists");
+  }
+  if (filesystem_error) {
+    return Status::IOError("fact store checkpoint", filesystem_error.message());
+  }
+  rocksdb::Checkpoint* raw_checkpoint = nullptr;
+  const rocksdb::Status created =
+      rocksdb::Checkpoint::Create(store->db.get(), &raw_checkpoint);
+  if (!created.ok()) return FromRocksDb(created, "create fact store checkpoint");
+  std::unique_ptr<rocksdb::Checkpoint> checkpoint(raw_checkpoint);
+  const rocksdb::Status checkpointed = checkpoint->CreateCheckpoint(
+      checkpoint_path, std::numeric_limits<uint64_t>::max());
+  return FromRocksDb(checkpointed, "create fact store checkpoint");
 }
 
 StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const {
@@ -3453,6 +3486,18 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   const auto wal_started_at = std::chrono::steady_clock::now();
   sample.retained_wal_bytes = maintenance.retained_wal_bytes;
   metrics.retained_wal_bytes = sample.retained_wal_bytes;
+  const uint64_t sampled_now_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  metrics.maintenance_snapshot_age_us =
+      sampled_now_us >= maintenance.sampled_at_us
+          ? sampled_now_us - maintenance.sampled_at_us
+          : 0;
+  metrics.background_flush_calls = maintenance.background_flush_calls;
+  metrics.manual_compaction_calls = maintenance.manual_compaction_calls;
+  metrics.periodic_task_registrations = maintenance.periodic_task_registrations;
+  metrics.recovery_flush_exceptions = maintenance.recovery_flush_exceptions;
   timing.recovery_wal_bytes_us = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - wal_started_at)

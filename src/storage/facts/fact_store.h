@@ -150,6 +150,11 @@ struct RocksDbRuntimeMetrics {
   bool shutting_down = false;
   uint64_t delayed_write_rate_bytes_per_sec = 0;
   uint64_t retained_wal_bytes = 0;
+  uint64_t maintenance_snapshot_age_us = 0;
+  uint64_t background_flush_calls = 0;
+  uint64_t manual_compaction_calls = 0;
+  uint64_t periodic_task_registrations = 0;
+  uint64_t recovery_flush_exceptions = 0;
   uint64_t block_cache_hits = 0;
   uint64_t block_cache_misses = 0;
   uint64_t blocks_compressed = 0;
@@ -350,6 +355,9 @@ class FactStore {
 
   Status Open();
   Status Close();
+  // Creates a RocksDB-owned openable checkpoint without exposing RocksDB
+  // handles or file-format details across the Cedar storage boundary.
+  Status CreateCheckpoint(const std::string& checkpoint_path) const;
   StatusOr<StoreSnapshot> BeginSnapshot(SnapshotOptions options = {}) const;
   StatusOr<std::optional<FactEvent>> Read(const StoreSnapshot& snapshot,
                                           const FactRef& ref,

@@ -83,12 +83,58 @@ TEST(BenchmarkOptionsTest, ValidatesCampaignDurations) {
       {"--path", "/tmp/cedar", "--campaign", "preflight", "--duration-seconds", "300"})
                   .ok());
   EXPECT_TRUE(ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--campaign", "preflight", "--duration-seconds", "60"})
+                  .ok());
+  EXPECT_TRUE(ParseKernelBenchmarkOptions(
       {"--path", "/tmp/cedar", "--campaign", "sustained", "--duration-seconds", "1800"})
                   .ok());
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
                    {"--path", "/tmp/cedar", "--campaign", "sustained",
                     "--duration-seconds", "1799"})
                    .ok());
+}
+
+TEST(BenchmarkQualificationTest, PreflightFailureStopsTheCampaign) {
+  KernelBenchmarkOptions options;
+  options.campaign = CampaignKind::kPreflight;
+  options.duration_seconds = 300;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 300;
+  sample.reopen_verified = true;
+  sample.background_errors = 1;
+  EXPECT_NE(CampaignExitCode(options, sample), 0);
+}
+
+TEST(BenchmarkQualificationTest, WarmSuccessDoesNotClaimSustainedButCanProceed) {
+  KernelBenchmarkOptions options;
+  options.campaign = CampaignKind::kWarm;
+  options.duration_seconds = 30;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 30;
+  sample.reopen_verified = true;
+  EXPECT_EQ(BenchmarkQualificationStatus(options, sample), "warm_not_sustained");
+  EXPECT_EQ(CampaignExitCode(options, sample), 0);
+}
+
+TEST(BenchmarkQualificationTest, ReopenVerificationCanBeDisabled) {
+  KernelBenchmarkOptions options;
+  options.campaign = CampaignKind::kWarm;
+  options.duration_seconds = 30;
+  options.verify_reopen = false;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 30;
+  EXPECT_EQ(CampaignExitCode(options, sample), 0);
+}
+
+TEST(BenchmarkQualificationTest, MaintenanceDebtFailsClosed) {
+  KernelBenchmarkOptions options;
+  options.campaign = CampaignKind::kPreflight;
+  options.duration_seconds = 300;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 300;
+  sample.reopen_verified = true;
+  sample.pending_compaction_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+  EXPECT_NE(CampaignExitCode(options, sample), 0);
 }
 
 TEST(BenchmarkOptionsTest, ParsesBoundedWriterClients) {
@@ -104,6 +150,13 @@ TEST(BenchmarkOptionsTest, RejectsUnboundedWriterClients) {
                    .ok());
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
                    {"--path", "/tmp/cedar", "--writer-clients", "33"})
+                   .ok());
+}
+
+TEST(BenchmarkOptionsTest, RejectsSeedAndDestinationAlias) {
+  EXPECT_FALSE(ParseKernelBenchmarkOptions({
+                   "--seed-db", "/tmp/cedar-seed", "--database-path",
+                   "/tmp/cedar-seed", "--prepare-seed", "true"})
                    .ok());
 }
 

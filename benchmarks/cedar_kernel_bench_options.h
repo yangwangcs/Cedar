@@ -55,6 +55,10 @@ struct KernelBenchmarkSample {
   uint64_t temporary_output_bytes = 0;
   uint64_t live_sst_bytes = 0;
   uint64_t retained_wal_bytes = 0;
+  uint64_t pending_compaction_bytes = 0;
+  uint64_t maintenance_max_snapshot_age_us = 0;
+  uint64_t maintenance_errors = 0;
+  uint64_t maintenance_recovery_exception_jobs = 0;
   uint64_t n_plus_one_eligible_epochs = 0;
   uint64_t n_plus_one_promoted_epochs = 0;
   uint32_t writer_clients = 1;
@@ -72,6 +76,8 @@ const char* BenchmarkExecutionProfileName(BenchmarkExecutionProfile profile);
 const char* KernelWorkloadName(KernelWorkload workload);
 std::string BenchmarkQualificationStatus(const KernelBenchmarkOptions& options,
                                          const KernelBenchmarkSample& sample);
+int CampaignExitCode(const KernelBenchmarkOptions& options,
+                     const KernelBenchmarkSample& sample);
 
 }  // namespace cedar::benchmark
 

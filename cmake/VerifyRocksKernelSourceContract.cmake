@@ -11,7 +11,12 @@ foreach(header IN LISTS cedar_public_headers)
   endif()
 endforeach()
 
-file(GLOB_RECURSE cedar_sources "${CEDAR_SOURCE_DIR}/src/*.cc")
+file(GLOB_RECURSE cedar_sources
+     "${CEDAR_SOURCE_DIR}/src/core/*.cc"
+     "${CEDAR_SOURCE_DIR}/src/kernel/*.cc"
+     "${CEDAR_SOURCE_DIR}/src/runtime/*.cc"
+     "${CEDAR_SOURCE_DIR}/src/storage/*.cc"
+     "${CEDAR_SOURCE_DIR}/src/types/*.cc")
 set(rocksdb_include_sources)
 foreach(source IN LISTS cedar_sources)
   file(REAL_PATH "${source}" source)
@@ -72,6 +77,27 @@ endif()
 
 if(NOT EXISTS "${CEDAR_SOURCE_DIR}/third_party/cedar_codecs/PROVENANCE.md")
   message(FATAL_ERROR "Cedar codec provenance is missing")
+endif()
+
+set(embedded_engine_root "${CEDAR_SOURCE_DIR}/src/engine/rocksdb")
+if(NOT EXISTS "${embedded_engine_root}/CMakeLists.txt" OR
+   NOT EXISTS "${embedded_engine_root}/PROVENANCE.md" OR
+   NOT EXISTS "${embedded_engine_root}/LICENSE.Apache")
+  message(FATAL_ERROR "embedded Cedar engine source or provenance is missing")
+endif()
+if(EXISTS "${embedded_engine_root}/.git")
+  message(FATAL_ERROR "embedded Cedar engine contains nested Git metadata")
+endif()
+if(NOT EXISTS "${CEDAR_SOURCE_DIR}/src/engine/cedar/README.md" OR
+   NOT EXISTS "${CEDAR_SOURCE_DIR}/src/engine/cedar/MAINTENANCE.md")
+  message(FATAL_ERROR "Cedar engine extension ownership record is missing")
+endif()
+if(EXISTS "${CEDAR_SOURCE_DIR}/third_party/rocksdb")
+  message(FATAL_ERROR "retired RocksDB submodule source remains")
+endif()
+file(READ "${CEDAR_SOURCE_DIR}/.gitmodules" cedar_gitmodules)
+if(cedar_gitmodules MATCHES "third_party/rocksdb")
+  message(FATAL_ERROR "RocksDB submodule declaration remains")
 endif()
 
 foreach(forbidden_directory IN ITEMS "${CEDAR_SOURCE_DIR}/src/projection"

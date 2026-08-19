@@ -1,14 +1,15 @@
 # Cedar
 
-Cedar is an embedded C++20 bitemporal graph database kernel. Standard RocksDB
-is its sole canonical WAL, MemTable, manifest, and LSM store. Cedar stores
+Cedar is an embedded C++20 bitemporal graph database kernel. Its Cedar-owned,
+RocksDB-derived engine is the sole canonical WAL, MemTable, manifest, and LSM
+store. Cedar stores
 immutable bitemporal facts there; columnar and adjacency structures are
 rebuildable analytical projections rather than a second source of truth.
 
 Every write occurs in an explicit transaction. Snapshot reads bind a logical
-commit sequence and a RocksDB Snapshot, so a fact is resolved by both the
+commit sequence and an engine snapshot, so a fact is resolved by both the
 requested valid time and the snapshot's system time. New databases use the
-clean-break RocksDB format; legacy Cedar formats are rejected without mutation.
+clean-break engine format; legacy Cedar formats are rejected without mutation.
 
 ## Build
 
@@ -23,15 +24,15 @@ ctest --test-dir build --output-on-failure
 ```
 
 `Cedar::cedar` is the sole installed consumer target. Cedar packages its
-private storage archives beneath `lib/cedar/internal` only to resolve the
-static library; it installs no RocksDB headers or consumer-facing RocksDB
-target. Columnar and adjacency projections are optional derived targets; they
+private engine archives beneath `lib/cedar/internal` only to resolve the
+static library; it installs no engine headers or consumer-facing engine target.
+Columnar and adjacency projections are optional derived targets; they
 are deliberately not installed as part of the embedded kernel.
 
 ## Format and migration
 
 Format version `1` is stored, checksummed, at `meta/format/current` in the
-RocksDB `meta` Column Family. Cedar verifies the exact version, the `facts` and
+engine `meta` Column Family. Cedar verifies the exact version, the `facts` and
 `meta` Column Family layout, watermarks, and contiguous sequence metadata at
 open. It rejects old Cedar directories, missing or corrupt format records, and
 future versions without modifying them.
@@ -43,12 +44,12 @@ the explicit Cedar `Transaction` API into a fresh version-1 directory.
 ## Verification and benchmark
 
 The standard verification profiles are Debug/Release CTest plus ASAN, UBSAN,
-and TSAN. Cedar builds the pinned RocksDB source once into a profile-keyed
+and TSAN. Cedar builds its embedded engine source once into a profile-keyed
 static-library cache, then every Cedar build links that library. The cache key
-includes the RocksDB revision, compiler, target, and sanitizer profile; set
-`CEDAR_ROCKSDB_CACHE_DIR` to relocate it. UBSAN enables the pinned RocksDB
-source's upstream UBSAN mode, which suppresses only its documented intentional
-unaligned checksum loads.
+includes the Cedar engine baseline, engine source digest, compiler, target, and
+sanitizer profile; set `CEDAR_ROCKSDB_CACHE_DIR` to relocate it. UBSAN enables
+the embedded engine's upstream UBSAN mode, which suppresses only its documented
+intentional unaligned checksum loads.
 
 ```bash
 cmake -S . -B build-bench -DBUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release

@@ -5,6 +5,11 @@ add_test(NAME PublicHeaderContract
         -DCEDAR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
         -P ${CMAKE_SOURCE_DIR}/tests/test_public_header_contract.cmake)
 
+add_test(NAME EmbeddedEngineContract
+    COMMAND ${CMAKE_COMMAND}
+        -DCEDAR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/test_embedded_engine_contract.cmake)
+
 if(GTest_FOUND)
     set(GTEST_TARGET GTest::gtest)
     set(GTEST_MAIN_TARGET GTest::gtest_main)
@@ -20,7 +25,7 @@ set(CEDAR_TEST_LIBS
 
 function(configure_cedar_parquet_test target)
     target_include_directories(${target} PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/rocksdb)
+        ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
     target_compile_definitions(${target} PRIVATE
         ROCKSDB_PLATFORM_POSIX
         ROCKSDB_LIB_IO_POSIX
@@ -58,10 +63,10 @@ gtest_discover_tests(test_rocksdb_dependency)
 
 add_executable(test_rocksdb_cedar_kernel
     test_rocksdb_cedar_kernel.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/test_util/sync_point.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/test_util/sync_point_impl.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/test_util/sync_point.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/test_util/sync_point_impl.cc)
 target_include_directories(test_rocksdb_cedar_kernel PRIVATE
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
 target_compile_definitions(test_rocksdb_cedar_kernel PRIVATE
     ROCKSDB_PLATFORM_POSIX
     ROCKSDB_LIB_IO_POSIX
@@ -79,37 +84,37 @@ target_link_libraries(test_rocksdb_cedar_kernel
 gtest_discover_tests(test_rocksdb_cedar_kernel)
 
 add_executable(test_cedar_parquet_kernel
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_kernel_test.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/compact_protocol.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_metadata.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_kernel_test.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/compact_protocol.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_metadata.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
 configure_cedar_parquet_test(test_cedar_parquet_kernel)
 
 add_executable(test_cedar_parquet_format
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_format_test.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_format.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_format_test.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_format.cc)
 configure_cedar_parquet_test(test_cedar_parquet_format)
 
 add_executable(test_cedar_parquet_table_builder
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_table_builder_test.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_table_builder.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_metadata.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_table_builder_test.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_table_builder.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_metadata.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
 configure_cedar_parquet_test(test_cedar_parquet_table_builder)
 
 add_executable(test_cedar_parquet_table_reader
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_table_reader_test.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_table_reader.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_metadata.cc
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_table_reader_test.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_table_reader.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_metadata.cc
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
 configure_cedar_parquet_test(test_cedar_parquet_table_reader)
 
 add_executable(test_cedar_parquet_table_factory
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/table/cedar_parquet/cedar_parquet_table_factory_test.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_table_factory_test.cc)
 configure_cedar_parquet_test(test_cedar_parquet_table_factory)
 
 add_executable(test_partitioned_version_radix_memtable
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb/memtable/partitioned_version_radix_memtable_test.cc)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/memtable/partitioned_version_radix_memtable_test.cc)
 configure_cedar_parquet_test(test_partitioned_version_radix_memtable)
 
 add_executable(test_fact_model storage/test_fact_model.cc)
@@ -154,7 +159,7 @@ gtest_discover_tests(test_kernel_snapshot)
 add_executable(test_columnar_fact_scan storage/test_columnar_fact_scan.cc)
 target_include_directories(test_columnar_fact_scan PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party/rocksdb)
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
 target_link_libraries(test_columnar_fact_scan
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_columnar_fact_scan)

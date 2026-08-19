@@ -79,7 +79,7 @@ target_include_directories(cedar_core
     PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_SOURCE_DIR}/src
-            ${CEDAR_ROCKSDB_SOURCE_DIR})
+            ${CEDAR_ENGINE_SOURCE_DIR})
 target_link_libraries(cedar_core PRIVATE cedar_rocksdb)
 set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
     "$<BUILD_INTERFACE:cedar_rocksdb>")

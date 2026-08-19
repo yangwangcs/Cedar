@@ -1,5 +1,10 @@
 # Cedar Product and RocksDB Boundary Implementation Plan
 
+> **Superseded:** The external `cedar-rocksdb` fork publication route is
+> replaced by the approved embedded-engine design. Continue with
+> `2026-08-19-cedar-embedded-engine.md`; completed product-boundary work in
+> this document remains valid.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reorganize Cedar's source, build, and release boundaries so Cedar is the only public product while a Cedar-controlled RocksDB fork remains an internal storage adapter, without changing the single-WAL architecture, storage format, transaction semantics, or performance policy.

@@ -372,6 +372,128 @@ TEST(CedarParquetTableReaderTest, PrunesNumericCommitRangeBeforeReadingPages) {
 }
 
 TEST(CedarParquetTableReaderTest,
+     ParallelProjectedScanMatchesSerialRowsInDeterministicOrder) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (uint64_t entity = 1; entity <= 8; ++entity) {
+    keys.push_back(InternalKeyFor(entity, 100 - entity));
+    values.push_back(StateFactValue());
+  }
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator,
+      /*row_group_max_rows=*/2, /*page_max_rows=*/1);
+
+  const auto collect = [](CedarParquetTableReader* table,
+                          uint32_t workers,
+                          std::vector<std::string>* observed_keys,
+                          std::vector<uint64_t>* observed_entities) {
+    CedarParquetScanSpec spec;
+    spec.max_parallel_row_groups = workers;
+    spec.batch_row_limit = 3;
+    spec.projection = {CedarParquetColumnId::kEntityId};
+    return table->ScanProjected(
+        spec, [observed_keys, observed_entities](
+                 const CedarParquetColumnarBatch& batch) {
+          const auto& entity = std::get<std::vector<uint64_t>>(
+              batch.columns.front().values);
+          for (size_t row = 0; row < batch.row_count(); ++row) {
+            observed_keys->push_back(batch.internal_keys[row]);
+            observed_entities->push_back(entity[row]);
+          }
+          return Status::OK();
+        });
+  };
+
+  std::vector<std::string> serial_keys;
+  std::vector<uint64_t> serial_entities;
+  ASSERT_TRUE(collect(reader.get(), 1, &serial_keys, &serial_entities).ok());
+  std::vector<std::string> parallel_keys;
+  std::vector<uint64_t> parallel_entities;
+  ASSERT_TRUE(collect(reader.get(), 2, &parallel_keys, &parallel_entities).ok());
+  EXPECT_EQ(parallel_keys, serial_keys);
+  EXPECT_EQ(parallel_entities, serial_entities);
+}
+
+TEST(CedarParquetTableReaderTest, ParallelProjectedScanReportsBoundedWorkers) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (uint64_t entity = 1; entity <= 16; ++entity) {
+    keys.push_back(InternalKeyFor(entity, 100 - entity));
+    values.push_back(StateFactValue());
+  }
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator,
+      /*row_group_max_rows=*/2, /*page_max_rows=*/1);
+  CedarParquetScanStats stats;
+  CedarParquetScanSpec spec;
+  spec.max_parallel_row_groups = 3;
+  spec.batch_row_limit = 2;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.stats = &stats;
+  ASSERT_TRUE(reader->ScanProjected(spec, [](const CedarParquetColumnarBatch&) {
+                       return Status::OK();
+                     })
+                  .ok());
+  EXPECT_GT(stats.max_parallel_row_groups_observed, 0U);
+  EXPECT_LE(stats.max_parallel_row_groups_observed, 3U);
+}
+
+TEST(CedarParquetTableReaderTest, RejectsUnboundedParallelWorkerRequest) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {InternalKeyFor(1, 1)};
+  const std::vector<std::string> values = {StateFactValue()};
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator);
+  CedarParquetScanSpec spec;
+  spec.max_parallel_row_groups = kCedarParquetMaximumParallelRowGroups + 1;
+  Status status = reader->ScanProjected(
+      spec, [](const CedarParquetColumnarBatch&) { return Status::OK(); });
+  EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+}
+
+TEST(CedarParquetTableReaderTest, ParallelProjectedScanJoinsWorkersAfterCancellation) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (uint64_t entity = 1; entity <= 12; ++entity) {
+    keys.push_back(InternalKeyFor(entity, 100 - entity));
+    values.push_back(StateFactValue());
+  }
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator,
+      /*row_group_max_rows=*/2, /*page_max_rows=*/1);
+  CedarParquetScanStats stats;
+  CedarParquetScanSpec spec;
+  spec.max_parallel_row_groups = 3;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.stats = &stats;
+  size_t batches = 0;
+  Status status = reader->ScanProjected(
+      spec, [&batches](const CedarParquetColumnarBatch&) {
+        ++batches;
+        return Status::Incomplete("test", "stop after first batch");
+      });
+  EXPECT_TRUE(status.IsIncomplete()) << status.ToString();
+  EXPECT_EQ(batches, 1U);
+  EXPECT_GT(stats.max_parallel_row_groups_observed, 0U);
+  EXPECT_LE(stats.max_parallel_row_groups_observed, 3U);
+}
+
+TEST(CedarParquetTableReaderTest,
      RetainsNumericValidTimeRangeAcrossLittleEndianByteBoundary) {
   Options options;
   ImmutableOptions immutable_options(options);

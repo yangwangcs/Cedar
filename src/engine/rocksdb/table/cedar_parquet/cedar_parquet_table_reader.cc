@@ -5,11 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <future>
+#include <thread>
 #include <utility>
 
 #include "db/dbformat.h"
@@ -326,6 +330,112 @@ Status AppendProjectedValue(CedarParquetColumnVector* column,
   }
   return Status::OK();
 }
+
+struct CedarParquetRowGroupScanResult {
+  Status status;
+  std::vector<CedarParquetColumnarBatch> batches;
+  CedarParquetScanStats stats;
+};
+
+// A scan-local Cedar-owned pool keeps a fixed number of worker threads and a
+// bounded mailbox. Results are still consumed in row-group order by the
+// caller, so worker completion order cannot affect visible output.
+class CedarParquetRowGroupScanPool {
+ public:
+  using Task = std::function<CedarParquetRowGroupScanResult()>;
+
+  CedarParquetRowGroupScanPool(uint32_t worker_count, size_t queue_capacity)
+      : queue_capacity_(std::max<size_t>(1, queue_capacity)) {
+    workers_.reserve(worker_count);
+    for (uint32_t i = 0; i < worker_count; ++i) {
+      workers_.emplace_back([this] { WorkerMain(); });
+    }
+  }
+
+  ~CedarParquetRowGroupScanPool() {
+    StopAndJoin();
+  }
+
+  void StopAndJoin() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      queue_.clear();
+    }
+    condition_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) worker.join();
+    }
+  }
+
+  CedarParquetRowGroupScanPool(const CedarParquetRowGroupScanPool&) = delete;
+  CedarParquetRowGroupScanPool& operator=(const CedarParquetRowGroupScanPool&) = delete;
+
+  std::future<CedarParquetRowGroupScanResult> Submit(Task task) {
+    auto promise = std::make_shared<std::promise<CedarParquetRowGroupScanResult>>();
+    auto future = promise->get_future();
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      condition_.wait(lock, [this] {
+        return stopping_ || queue_.size() < queue_capacity_;
+      });
+      if (stopping_) {
+        promise->set_value({Status::ShutdownInProgress(
+                                "Cedar Parquet scan", "worker pool stopped"),
+                            {}, {}});
+        return future;
+      }
+      queue_.push_back([promise = std::move(promise), task = std::move(task)]() mutable {
+        try {
+          promise->set_value(task());
+        } catch (...) {
+          promise->set_exception(std::current_exception());
+        }
+      });
+    }
+    condition_.notify_one();
+    return future;
+  }
+
+  uint32_t PeakWorkers() const {
+    return peak_workers_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  void WorkerMain() {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+        if (stopping_) return;
+        if (queue_.empty()) continue;
+        task = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      condition_.notify_all();
+      const uint32_t active = active_workers_.fetch_add(
+                                  1, std::memory_order_relaxed) +
+                              1;
+      uint32_t peak = peak_workers_.load(std::memory_order_relaxed);
+      while (active > peak &&
+             !peak_workers_.compare_exchange_weak(
+                 peak, active, std::memory_order_relaxed)) {
+      }
+      task();
+      active_workers_.fetch_sub(1, std::memory_order_relaxed);
+    }
+  }
+
+  const size_t queue_capacity_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<std::function<void()>> queue_;
+  std::vector<std::thread> workers_;
+  std::atomic<uint32_t> active_workers_{0};
+  std::atomic<uint32_t> peak_workers_{0};
+  bool stopping_ = false;
+};
 
 }  // namespace
 
@@ -1173,6 +1283,14 @@ Status CedarParquetTableReader::ScanProjected(
   if (spec.batch_row_limit == 0) {
     return Status::InvalidArgument("Cedar Parquet scan", "zero batch row limit");
   }
+  if (spec.max_parallel_row_groups == 0) {
+    return Status::InvalidArgument("Cedar Parquet scan",
+                                   "zero row-group worker limit");
+  }
+  if (spec.max_parallel_row_groups > kCedarParquetMaximumParallelRowGroups) {
+    return Status::InvalidArgument("Cedar Parquet scan",
+                                   "row-group worker limit exceeds Cedar bound");
+  }
   if (spec.sort_key_lower.has_value() && spec.sort_key_upper.has_value() &&
       *spec.sort_key_lower > *spec.sort_key_upper) {
     return Status::InvalidArgument("Cedar Parquet scan", "invalid sort-key range");
@@ -1228,20 +1346,9 @@ Status CedarParquetTableReader::ScanProjected(
     columns.push_back(std::move(column));
   }
 
-  CedarParquetColumnarBatch batch;
-  batch.columns = columns;
-  const auto flush = [&]() -> Status {
-    if (batch.internal_keys.empty()) return Status::OK();
-    if (spec.stats != nullptr) {
-      spec.stats->rows_emitted += batch.row_count();
-    }
-    Status status = visitor(batch);
-    if (!status.ok()) return status;
-    batch = CedarParquetColumnarBatch();
-    batch.columns = columns;
-    return Status::OK();
-  };
-
+  // Select candidate groups serially. This preserves the ordered metadata
+  // pruning and early-stop semantics before any decode jobs are launched.
+  std::vector<size_t> candidate_row_groups;
   for (size_t row_group_index = 0; row_group_index < footer_.row_groups.size();
        ++row_group_index) {
     const auto& row_group = footer_.row_groups[row_group_index];
@@ -1284,51 +1391,78 @@ Status CedarParquetTableReader::ScanProjected(
       }
       break;
     }
+    candidate_row_groups.push_back(row_group_index);
+  }
+
+  std::atomic<bool> cancelled{false};
+  const auto scan_row_group = [&](size_t row_group_index) {
+    CedarParquetRowGroupScanResult result{Status::OK(), {}, {}};
+    CedarParquetColumnarBatch batch;
+    batch.columns = columns;
+    const auto flush = [&]() {
+      if (batch.internal_keys.empty()) return;
+      result.stats.rows_emitted += batch.row_count();
+      result.batches.push_back(std::move(batch));
+      batch = CedarParquetColumnarBatch();
+      batch.columns = columns;
+    };
+    const auto& row_group = footer_.row_groups[row_group_index];
+    const auto& sort_column = row_group.columns.front();
+    const auto& valid_column = row_group.columns[7];
+    const auto& commit_column = row_group.columns[8];
     for (size_t page_index = 0; page_index < sort_column.page_locations.size();
          ++page_index) {
+      if (cancelled.load(std::memory_order_acquire)) {
+        result.status = Status::Incomplete("Cedar Parquet scan", "scan cancelled");
+        return result;
+      }
       const auto& page_bounds = sort_column.page_indexes[page_index];
       if ((spec.valid_from_min.has_value() || spec.valid_from_max.has_value()) &&
           !NumericPageIntersects(valid_column.page_indexes[page_index],
                                  spec.valid_from_min, spec.valid_from_max)) {
-        if (spec.stats != nullptr) ++spec.stats->pages_skipped;
+        ++result.stats.pages_skipped;
         continue;
       }
       if ((spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) &&
           !NumericPageIntersects(commit_column.page_indexes[page_index],
                                  spec.cedar_commit_seq_min,
                                  spec.cedar_commit_seq_max)) {
-        if (spec.stats != nullptr) ++spec.stats->pages_skipped;
+        ++result.stats.pages_skipped;
         continue;
       }
       if (spec.sort_key_lower.has_value() && page_bounds.max_value < *spec.sort_key_lower) {
-        if (spec.stats != nullptr) ++spec.stats->pages_skipped;
+        ++result.stats.pages_skipped;
         continue;
       }
       if (spec.sort_key_upper.has_value() && page_bounds.min_value > *spec.sort_key_upper) {
-        if (spec.stats != nullptr) {
-          spec.stats->pages_skipped += sort_column.page_locations.size() - page_index;
-        }
-        return flush();
+        result.stats.pages_skipped += sort_column.page_locations.size() - page_index;
+        break;
       }
 
-      if (spec.stats != nullptr) {
-        ++spec.stats->pages_read;
-        for (const auto& column : row_group.columns) {
-          if (page_index < column.page_locations.size()) {
-            spec.stats->bytes_read += static_cast<uint64_t>(
-                column.page_locations[page_index].compressed_page_size);
-          }
+      ++result.stats.pages_read;
+      for (const auto& column : row_group.columns) {
+        if (page_index < column.page_locations.size()) {
+          result.stats.bytes_read += static_cast<uint64_t>(
+              column.page_locations[page_index].compressed_page_size);
         }
       }
 
       std::vector<std::string> sort_keys;
       std::vector<std::string> internal_keys;
       Status status = DecodeColumnPage(row_group_index, 0, page_index, &sort_keys);
-      if (!status.ok()) return status;
+      if (!status.ok()) {
+        result.status = status;
+        return result;
+      }
       status = DecodeColumnPage(row_group_index, 1, page_index, &internal_keys);
-      if (!status.ok()) return status;
+      if (!status.ok()) {
+        result.status = status;
+        return result;
+      }
       if (sort_keys.size() != internal_keys.size()) {
-        return Status::Corruption("Cedar Parquet scan canonical page length mismatch");
+        result.status = Status::Corruption(
+            "Cedar Parquet scan canonical page length mismatch");
+        return result;
       }
 
       std::vector<std::vector<std::optional<std::string>>> projected_pages;
@@ -1337,9 +1471,14 @@ Status CedarParquetTableReader::ScanProjected(
         std::vector<std::optional<std::string>> values;
         status = DecodePrimitiveColumnPage(
             row_group_index, static_cast<size_t>(column.id), page_index, &values);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+          result.status = status;
+          return result;
+        }
         if (values.size() != internal_keys.size()) {
-          return Status::Corruption("Cedar Parquet scan projected page length mismatch");
+          result.status = Status::Corruption(
+              "Cedar Parquet scan projected page length mismatch");
+          return result;
         }
         projected_pages.push_back(std::move(values));
       }
@@ -1347,20 +1486,30 @@ Status CedarParquetTableReader::ScanProjected(
       std::vector<std::optional<std::string>> commit_sequences;
       if (spec.valid_from_min.has_value() || spec.valid_from_max.has_value()) {
         status = DecodePrimitiveColumnPage(row_group_index, 7, page_index, &valid_times);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+          result.status = status;
+          return result;
+        }
       }
       if (spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) {
         status = DecodePrimitiveColumnPage(row_group_index, 8, page_index,
                                            &commit_sequences);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+          result.status = status;
+          return result;
+        }
       }
       std::vector<std::string> encoded_values;
       if (request_encoded_values) {
         status = DecodeColumnPage(row_group_index, 2, page_index, &encoded_values);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+          result.status = status;
+          return result;
+        }
         if (encoded_values.size() != internal_keys.size()) {
-          return Status::Corruption(
+          result.status = Status::Corruption(
               "Cedar Parquet scan encoded-value page length mismatch");
+          return result;
         }
       }
 
@@ -1369,7 +1518,9 @@ Status CedarParquetTableReader::ScanProjected(
           continue;
         }
         if (spec.sort_key_upper.has_value() && sort_keys[row] > *spec.sort_key_upper) {
-          return flush();
+          flush();
+          result.status = Status::OK();
+          return result;
         }
         if (!valid_times.empty() &&
             (!valid_times[row].has_value() ||
@@ -1392,16 +1543,94 @@ Status CedarParquetTableReader::ScanProjected(
         for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
           status = AppendProjectedValue(&batch.columns[column_index],
                                         projected_pages[column_index][row]);
-          if (!status.ok()) return status;
+          if (!status.ok()) {
+            result.status = status;
+            return result;
+          }
         }
         if (batch.row_count() == spec.batch_row_limit) {
-          status = flush();
-          if (!status.ok()) return status;
+          flush();
         }
       }
     }
+    flush();
+    return result;
+  };
+
+  const size_t worker_limit = std::max<size_t>(1, spec.max_parallel_row_groups);
+  const auto deliver = [&](CedarParquetRowGroupScanResult result) -> Status {
+    if (!result.status.ok()) return result.status;
+    for (const auto& batch : result.batches) {
+      Status status = visitor(batch);
+      if (!status.ok()) {
+        cancelled.store(true, std::memory_order_release);
+        return status;
+      }
+    }
+    if (spec.stats != nullptr) {
+      spec.stats->pages_skipped += result.stats.pages_skipped;
+      spec.stats->pages_read += result.stats.pages_read;
+      spec.stats->bytes_read += result.stats.bytes_read;
+      spec.stats->rows_emitted += result.stats.rows_emitted;
+    }
+    return Status::OK();
+  };
+
+  if (worker_limit == 1) {
+    for (size_t row_group_index : candidate_row_groups) {
+      Status status = deliver(scan_row_group(row_group_index));
+      if (!status.ok()) return status;
+    }
+    if (spec.stats != nullptr && !candidate_row_groups.empty()) {
+      spec.stats->max_parallel_row_groups_observed = std::max<uint32_t>(
+          spec.stats->max_parallel_row_groups_observed, 1);
+    }
+    return Status::OK();
   }
-  return flush();
+
+  CedarParquetRowGroupScanPool pool(static_cast<uint32_t>(worker_limit), worker_limit);
+  const auto finish_parallel = [&](Status status) {
+    pool.StopAndJoin();
+    if (spec.stats != nullptr) {
+      spec.stats->max_parallel_row_groups_observed = std::max(
+          spec.stats->max_parallel_row_groups_observed, pool.PeakWorkers());
+    }
+    return status;
+  };
+  std::deque<std::future<CedarParquetRowGroupScanResult>> pending;
+  for (size_t row_group_index : candidate_row_groups) {
+    pending.push_back(pool.Submit([&, row_group_index] {
+      return scan_row_group(row_group_index);
+    }));
+    if (pending.size() < worker_limit) continue;
+    std::future<CedarParquetRowGroupScanResult> future = std::move(pending.front());
+    pending.pop_front();
+    CedarParquetRowGroupScanResult result;
+    try {
+      result = future.get();
+    } catch (...) {
+      cancelled.store(true, std::memory_order_release);
+      return finish_parallel(
+          Status::Corruption("Cedar Parquet scan worker failed"));
+    }
+    Status status = deliver(std::move(result));
+    if (!status.ok()) return finish_parallel(std::move(status));
+  }
+  while (!pending.empty()) {
+    std::future<CedarParquetRowGroupScanResult> future = std::move(pending.front());
+    pending.pop_front();
+    CedarParquetRowGroupScanResult result;
+    try {
+      result = future.get();
+    } catch (...) {
+      cancelled.store(true, std::memory_order_release);
+      return finish_parallel(
+          Status::Corruption("Cedar Parquet scan worker failed"));
+    }
+    Status status = deliver(std::move(result));
+    if (!status.ok()) return finish_parallel(std::move(status));
+  }
+  return finish_parallel(Status::OK());
 }
 
 Status CedarParquetTableReader::NewProjectedCursor(

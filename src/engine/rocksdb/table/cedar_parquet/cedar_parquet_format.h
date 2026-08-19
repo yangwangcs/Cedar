@@ -64,6 +64,10 @@ inline bool EncodeCedarParquetNumericIndexValueFromLittleEndian(
   return true;
 }
 inline constexpr size_t kCedarParquetV2SortKeyBytes = 40;
+// Scan workers decode whole projected row groups before the caller merges
+// their results. Keep this bound small so a malformed or untrusted scan spec
+// cannot turn a read into unbounded thread or retained-batch allocation.
+inline constexpr uint32_t kCedarParquetMaximumParallelRowGroups = 8;
 
 struct CedarParquetTableOptions {
   uint32_t row_group_max_rows = 16U * 1024U;
@@ -167,6 +171,8 @@ struct CedarParquetScanStats {
   uint64_t pages_read = 0;
   uint64_t bytes_read = 0;
   uint64_t rows_emitted = 0;
+  // Peak active Cedar-owned workers used by this completed ScanProjected call.
+  uint32_t max_parallel_row_groups_observed = 0;
 };
 
 struct CedarParquetScanSpec {
@@ -178,6 +184,11 @@ struct CedarParquetScanSpec {
   std::optional<uint64_t> cedar_commit_seq_max;
   std::vector<CedarParquetColumnId> projection;
   uint32_t batch_row_limit = 1024;
+  // Bounds the number of Cedar-owned row-group scan jobs. A value of one
+  // preserves the serial scan path and is the default for callers that do not
+  // opt into parallel decoding. Values above
+  // kCedarParquetMaximumParallelRowGroups are rejected.
+  uint32_t max_parallel_row_groups = 1;
   CedarParquetScanStats* stats = nullptr;
 };
 

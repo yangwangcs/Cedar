@@ -148,9 +148,8 @@ Release validation.
 - [ ] **Step 4: Remove only the RocksDB submodule declaration and gitlink.**
 
   ```bash
-  git rm --cached third_party/rocksdb
+  git rm -f third_party/rocksdb
   git config -f .gitmodules --remove-section submodule.third_party/rocksdb
-  rmdir third_party/rocksdb
   git add .gitmodules src/engine
   ```
 
@@ -159,7 +158,7 @@ Release validation.
 - [ ] **Step 5: Prove the source has exactly the expected content.**
 
   ```bash
-  test "$(git -C src/engine/rocksdb rev-parse HEAD 2>/dev/null || true)" = ""
+  test ! -e src/engine/rocksdb/.git
   test -f src/engine/rocksdb/PROVENANCE.md
   test -f src/engine/rocksdb/LICENSE.Apache
   git ls-files src/engine/rocksdb | wc -l

@@ -1559,6 +1559,14 @@ Status CedarParquetTableReader::ScanProjected(
 
   const size_t worker_limit = std::max<size_t>(1, spec.max_parallel_row_groups);
   const auto deliver = [&](CedarParquetRowGroupScanResult result) -> Status {
+    // Account for physical work before invoking user code. Cancellation or a
+    // visitor error must not erase work already performed by Cedar workers.
+    if (spec.stats != nullptr) {
+      spec.stats->pages_skipped += result.stats.pages_skipped;
+      spec.stats->pages_read += result.stats.pages_read;
+      spec.stats->bytes_read += result.stats.bytes_read;
+      spec.stats->rows_emitted += result.stats.rows_emitted;
+    }
     if (!result.status.ok()) return result.status;
     for (const auto& batch : result.batches) {
       Status status = visitor(batch);
@@ -1566,12 +1574,6 @@ Status CedarParquetTableReader::ScanProjected(
         cancelled.store(true, std::memory_order_release);
         return status;
       }
-    }
-    if (spec.stats != nullptr) {
-      spec.stats->pages_skipped += result.stats.pages_skipped;
-      spec.stats->pages_read += result.stats.pages_read;
-      spec.stats->bytes_read += result.stats.bytes_read;
-      spec.stats->rows_emitted += result.stats.rows_emitted;
     }
     return Status::OK();
   };

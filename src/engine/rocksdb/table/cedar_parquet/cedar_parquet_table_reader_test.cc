@@ -489,6 +489,9 @@ TEST(CedarParquetTableReaderTest, ParallelProjectedScanJoinsWorkersAfterCancella
       });
   EXPECT_TRUE(status.IsIncomplete()) << status.ToString();
   EXPECT_EQ(batches, 1U);
+  EXPECT_GT(stats.pages_read, 0U);
+  EXPECT_GT(stats.bytes_read, 0U);
+  EXPECT_GT(stats.rows_emitted, 0U);
   EXPECT_GT(stats.max_parallel_row_groups_observed, 0U);
   EXPECT_LE(stats.max_parallel_row_groups_observed, 3U);
 }

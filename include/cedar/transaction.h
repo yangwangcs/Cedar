@@ -5,6 +5,8 @@
 #define CEDAR_TRANSACTION_H_
 
 #include <functional>
+#include <condition_variable>
+#include <mutex>
 #include <memory>
 #include <optional>
 
@@ -21,6 +23,7 @@ enum class IsolationLevel : uint8_t { kSnapshot = 1, kStrict = 2 };
 
 struct TransactionOptions {
   IsolationLevel isolation = IsolationLevel::kSnapshot;
+  uint64_t commit_deadline_us = 0;
 };
 
 enum class CommitOutcome : uint8_t {
@@ -34,6 +37,32 @@ struct CommitResult {
   CommitSeq commit_seq;
   TxnId txn_id;
   Status status = Status::InvalidArgument("commit", "not attempted");
+};
+
+enum class CommitAcceptance : uint8_t {
+  kAccepted = 1,
+  kIndeterminate = 2,
+};
+
+class CommitHandle {
+ public:
+  class State;
+
+  CommitHandle() = default;
+  CommitHandle(const CommitHandle&) = default;
+  CommitHandle& operator=(const CommitHandle&) = default;
+
+  TxnId txn_id() const;
+  CommitAcceptance acceptance() const;
+  StatusOr<CommitResult> Wait() const;
+
+ private:
+  explicit CommitHandle(std::shared_ptr<State> state);
+
+  std::shared_ptr<State> state_;
+
+  friend class Database;
+  friend class Transaction;
 };
 
 class Transaction {
@@ -55,6 +84,7 @@ class Transaction {
   Status Set(PropertyFact property, ValidTime valid_time, Value value);
   Status Unset(PropertyFact property, ValidTime valid_time);
   StatusOr<CommitResult> Commit();
+  StatusOr<CommitHandle> CommitAsync();
   Status Rollback();
 
  private:

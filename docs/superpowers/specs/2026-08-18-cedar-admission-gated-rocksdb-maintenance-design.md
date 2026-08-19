@@ -66,8 +66,9 @@ The implementation must preserve all of the following:
 9. Recovery flushes and recovery-required transitions may not depend on a live
    Cedar policy thread. Reopen must reconstruct all maintenance debt from
    RocksDB state.
-10. Generic and Lean profiles remain rollback paths and can reopen a database
-    last written by Kernel Mode without format conversion.
+10. Kernel Mode is the only Cedar production runtime and reopens only its own
+    database format. Lean is retained as a measurement configuration, not as a
+    compatibility or rollback implementation.
 
 ## 3. Current implementation defects addressed here
 
@@ -149,13 +150,7 @@ durable-sync and I/O-interference limits are isolated.
 
 ## 5. Profile model
 
-### 5.1 Generic profile
-
-The developer/oracle profile keeps upstream-style RocksDB behavior and
-statistics. It exists for differential correctness and emergency diagnosis, not
-for production throughput claims.
-
-### 5.2 Cedar Lean Profile
+### 5.1 Cedar Lean Profile
 
 Lean uses the production memory layout, WAL parameters, explicit RocksDB worker
 counts, disabled periodic statistics/info-log work, cached Cedar sampling, and
@@ -165,7 +160,7 @@ flush and compaction admission.
 Lean is the control profile for determining whether Kernel Mode improves or
 regresses write throughput, read amplification, or space amplification.
 
-### 5.3 Cedar Kernel Mode
+### 5.2 Cedar Kernel Mode
 
 Kernel includes all Lean settings and enables admission-gated maintenance.
 RocksDB may discover and queue debt but may submit no ordinary flush or
@@ -561,8 +556,8 @@ flushes required for opening or error recovery bypass ordinary Cedar admission
 through an explicit RocksDB-owned `kRecovery` path. This exception increments a
 counter and cannot run ordinary policy compaction.
 
-The same database must reopen under Generic, Lean, or Kernel profile. Kernel
-selection does not change durable bytes.
+Kernel-written databases reopen only through Kernel Mode. Lean runs use their
+own fresh benchmark directories and are not a compatibility path.
 
 ### 13.3 Shutdown
 
@@ -630,7 +625,7 @@ jobs in Kernel Mode. Recovery exceptions must be named and countable.
   an emergency flush;
 - no-autonomous-work counters across active writes, flush debt, compaction debt,
   checkpoint, backup, and close;
-- Generic/Lean/Kernel reopen and snapshot equivalence.
+- Kernel reopen and snapshot equivalence, with Lean measured only on fresh data.
 
 ### 15.3 Crash and sanitizer tests
 
@@ -644,7 +639,7 @@ shutdown, and recovery exceptions.
 Campaigns use identical seeds and exact profile/configuration output:
 
 1. 2,048-operation smoke for correctness and immediate rejection behavior.
-2. 30-second warm Generic/Lean/Kernel comparisons.
+2. 30-second warm Lean/Kernel comparisons on independent fresh databases.
 3. 60-second and 300-second bounded preflights. A hang, write stop, rejection,
    background error, debt growth, or reopen failure stops the campaign.
 4. A 30-minute bounded Kernel run only after the 300-second preflight passes.
@@ -661,21 +656,15 @@ passes only when correctness gates pass, maintenance remains bounded, N+1 meets
 its promotion target, no measured read/write regression exceeds the stated
 comparison bounds, and the remaining limit is honestly attributed.
 
-## 16. Rollout and rollback
+## 16. Rollout
 
-1. Implement DB-wide observation while retaining existing Lean automatic
-   maintenance.
-2. Implement the token gate behind `kernel_mode` with Kernel disabled by
-   default.
-3. Differentially verify native jobs with the gate off and on.
-4. Enable Kernel only in tests and explicit benchmarks.
-5. Run correctness, crash, sanitizer, read, write, and space campaigns.
-6. Publish the qualification record.
-7. Make Kernel the production default only after review of the 30-minute and
-   production-device evidence.
-
-Rollback selects Lean or Generic at open. It does not rewrite files or replay a
-Cedar-specific log.
+1. Implement DB-wide observation and the Lean measurement configuration.
+2. Enable the token gate in Kernel Mode for tests and explicit benchmarks.
+3. Run correctness, crash, sanitizer, read, write, and space campaigns.
+4. Publish the qualification record.
+5. Make Kernel the production default after review of the 30-minute and
+   production-device evidence. There is no runtime rollback to an older Cedar
+   write path and no Cedar-specific replay log.
 
 ## 17. Ownership after this adjustment
 

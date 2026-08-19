@@ -12,7 +12,7 @@
 
 namespace cedar {
 
-inline constexpr size_t kEncodedFactKeyBytes = 28;
+inline constexpr size_t kEncodedFactKeyBytes = 32;
 inline constexpr size_t kMaxFactValuePayloadBytes = 16U * 1024U * 1024U;
 
 struct DecodedFactKey {

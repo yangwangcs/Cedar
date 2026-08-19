@@ -1,0 +1,110 @@
+#include <gtest/gtest.h>
+
+#include "benchmarks/cedar_kernel_bench_options.h"
+
+namespace cedar::benchmark {
+
+TEST(BenchmarkQualificationTest, SuccessfulThirtySecondsIsWarmOnly) {
+  KernelBenchmarkOptions options;
+  options.duration_seconds = 30;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 30;
+  sample.reopen_verified = true;
+  EXPECT_EQ(BenchmarkQualificationStatus(options, sample), "warm_not_sustained");
+}
+
+TEST(BenchmarkQualificationTest, SustainedRunDoesNotUseThroughputFloor) {
+  KernelBenchmarkOptions options;
+  options.duration_seconds = 1'800;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 1'800;
+  sample.reopen_verified = true;
+  sample.operations_per_second = 1.0;
+  sample.n_plus_one_eligible_epochs = 1;
+  sample.n_plus_one_promoted_epochs = 1;
+  EXPECT_EQ(BenchmarkQualificationStatus(options, sample), "sustained_local_gates_passed");
+}
+
+TEST(BenchmarkQualificationTest, UnexplainedAutonomousJobFailsClosed) {
+  KernelBenchmarkOptions options;
+  options.duration_seconds = 1'800;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 1'800;
+  sample.reopen_verified = true;
+  sample.n_plus_one_eligible_epochs = 1;
+  sample.n_plus_one_promoted_epochs = 1;
+  sample.unexplained_autonomous_jobs = 1;
+  EXPECT_EQ(BenchmarkQualificationStatus(options, sample),
+            "sustained_unexplained_autonomous_maintenance");
+}
+
+TEST(BenchmarkQualificationTest, WriterFailureFailsClosed) {
+  KernelBenchmarkOptions options;
+  options.duration_seconds = 1'800;
+  KernelBenchmarkSample sample;
+  sample.elapsed_seconds = 1'800;
+  sample.reopen_verified = true;
+  sample.n_plus_one_eligible_epochs = 1;
+  sample.n_plus_one_promoted_epochs = 1;
+  sample.writer_failures = 1;
+  EXPECT_EQ(BenchmarkQualificationStatus(options, sample),
+            "sustained_writer_failure");
+}
+
+TEST(BenchmarkOptionsTest, RequiresAbsolutePath) {
+  EXPECT_FALSE(ParseKernelBenchmarkOptions({"--path", "relative"}).ok());
+  const auto parsed = ParseKernelBenchmarkOptions({"--path", "/tmp/cedar", "--profile", "kernel"});
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  EXPECT_EQ(parsed.ValueOrDie().execution_profile, BenchmarkExecutionProfile::kKernel);
+}
+
+TEST(BenchmarkOptionsTest, ParsesKernelWorkloadNames) {
+  const auto parsed = ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--workload", "projected-event-scan"});
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  EXPECT_EQ(parsed.ValueOrDie().workload, KernelWorkload::kProjectedEventScan);
+  EXPECT_STREQ(KernelWorkloadName(parsed.ValueOrDie().workload), "projected-event-scan");
+}
+
+TEST(BenchmarkOptionsTest, RejectsUnknownKernelWorkload) {
+  EXPECT_FALSE(ParseKernelBenchmarkOptions(
+                   {"--path", "/tmp/cedar", "--workload", "legacy"})
+                   .ok());
+}
+
+TEST(BenchmarkOptionsTest, ValidatesCampaignDurations) {
+  EXPECT_TRUE(ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--campaign", "smoke", "--operations", "2048"})
+                  .ok());
+  EXPECT_TRUE(ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--campaign", "warm", "--duration-seconds", "30"})
+                  .ok());
+  EXPECT_TRUE(ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--campaign", "preflight", "--duration-seconds", "300"})
+                  .ok());
+  EXPECT_TRUE(ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--campaign", "sustained", "--duration-seconds", "1800"})
+                  .ok());
+  EXPECT_FALSE(ParseKernelBenchmarkOptions(
+                   {"--path", "/tmp/cedar", "--campaign", "sustained",
+                    "--duration-seconds", "1799"})
+                   .ok());
+}
+
+TEST(BenchmarkOptionsTest, ParsesBoundedWriterClients) {
+  const auto parsed = ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--writer-clients", "32"});
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  EXPECT_EQ(parsed.ValueOrDie().writer_clients, 32U);
+}
+
+TEST(BenchmarkOptionsTest, RejectsUnboundedWriterClients) {
+  EXPECT_FALSE(ParseKernelBenchmarkOptions(
+                   {"--path", "/tmp/cedar", "--writer-clients", "0"})
+                   .ok());
+  EXPECT_FALSE(ParseKernelBenchmarkOptions(
+                   {"--path", "/tmp/cedar", "--writer-clients", "33"})
+                   .ok());
+}
+
+}  // namespace cedar::benchmark

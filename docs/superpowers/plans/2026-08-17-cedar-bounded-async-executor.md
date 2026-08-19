@@ -1,5 +1,10 @@
 # Cedar-Owned Bounded Async Executor Implementation Plan
 
+> Maintenance note (2026-08-19): this plan covers only bounded `CommitAsync`
+> admission and mailbox lifecycle. Cedar Kernel maintenance is specified by
+> `2026-08-18-cedar-admission-gated-rocksdb-maintenance-design.md`; the former
+> maintenance worker and generic write seam are not retained.
+
 > For agentic workers: use executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 Goal: Bound Cedar asynchronous commit submission independently of client thread count while preserving the existing single-WAL durable acceptance contract.
@@ -120,11 +125,11 @@ Files:
 - Modify README.md
 - Modify docs/superpowers/specs/2026-08-17-cedar-bounded-async-executor-design.md
 
-- [ ] Step 1: Print mailbox bounds, peak reservations, accepted count, explicit overload rejection count/reasons, stale rejections, WAL-sync p99, and reopen verification. Do not silently retry rejected CommitAsync calls.
-- [ ] Step 2: Add bounded-client mode capped at mailbox capacity while preserving the 512-client overload mode. Report the two modes separately.
-- [ ] Step 3: Run the 60-second 512-client command and a bounded-client command. Record operations, accepted/rejected counts, throughput, WAL-sync p99, max refresh duration, maximum completion gap, peak reservations, errors, and reopen_verified.
-- [ ] Step 4: Document immediate overload rejection and the fact that mailbox capacity is volatile, not a durable queue. Preserve one-WAL and stale-snapshot constraints.
-- [ ] Step 5: Commit benchmark and documentation changes.
+- [x] Step 1: Print mailbox bounds, peak reservations, accepted count, explicit overload rejection count/reasons, stale rejections, WAL-sync p99, and reopen verification. Do not silently retry rejected CommitAsync calls.
+- [x] Step 2: Add bounded-client mode capped at mailbox capacity while preserving the 512-client overload mode. Report the two modes separately.
+- [x] Step 3: Run the 60-second 512-client command and a bounded-client command. Record operations, accepted/rejected counts, throughput, WAL-sync p99, max refresh duration, maximum completion gap, peak reservations, errors, and reopen_verified.
+- [x] Step 4: Document immediate overload rejection and the fact that mailbox capacity is volatile, not a durable queue. Preserve one-WAL and stale-snapshot constraints.
+- [ ] Step 5: Commit benchmark and documentation changes. (Changes remain uncommitted because the worktree contains pre-existing stage-wide modifications; no unrelated files were staged.)
 
 ### Task 6: Full Verification and Qualification
 
@@ -132,11 +137,11 @@ Files:
 - Modify docs/superpowers/plans/2026-08-17-cedar-bounded-async-executor.md
 - Create docs/superpowers/evidence/2026-08-17-cedar-bounded-async-executor.md
 
-- [ ] Step 1: Build and run the focused suite, then ctest --test-dir build-runtime-control --output-on-failure. Record exact counts and pre-existing failures separately.
-- [ ] Step 2: Configure ASAN/UBSAN with -fsanitize=address,undefined -fno-omit-frame-pointer. Run mailbox, recovery, and 60-second bounded-client tests; record commands and results.
-- [ ] Step 3: Configure TSAN and run mailbox saturation, durable release, close race, and the short 512-client load. Fail on data races or leaked workers.
-- [ ] Step 4: Run 300-second 512-client and bounded-client campaigns. Record throughput, accepted/rejected counts, WAL-sync p50/p99/max, refresh duration, completion gap, mailbox occupancy, errors, and reopen verification.
-- [ ] Step 5: Write the qualification record with hardware, filesystem/device placement, exact RocksDB WAL options, Cedar bounds, worker counts, sanitizer results, crash/reopen result, and residual risk.
+- [x] Step 1: Build and run the focused suite, then ctest --test-dir build-runtime-control --output-on-failure. Record exact counts and pre-existing failures separately.
+- [x] Step 2: Configure ASAN/UBSAN with -fsanitize=address,undefined -fno-omit-frame-pointer. Run mailbox, recovery, and 60-second bounded-client tests; record commands and results.
+- [x] Step 3: Configure TSAN and run mailbox saturation, durable release, close race, and the short 512-client load. Fail on data races or leaked workers.
+- [x] Step 4: Run 300-second 512-client and bounded-client campaigns. Record throughput, accepted/rejected counts, WAL-sync p50/p99/max, refresh duration, completion gap, mailbox occupancy, errors, and reopen verification.
+- [x] Step 5: Write the qualification record with hardware, filesystem/device placement, exact RocksDB WAL options, Cedar bounds, worker counts, sanitizer results, crash/reopen result, and residual risk.
 - [ ] Step 6: Mark completed plan checkboxes and commit the evidence.
 
 ## Self-Review
@@ -145,4 +150,3 @@ Files:
 - Placeholder scan: no TBD, TODO, or unspecified test command is used.
 - Type consistency: ticket fields are id, estimated_bytes, handoff, fail, and release in Tasks 1, 2, and 4; options are submission_workers, max_mailbox_requests, and max_mailbox_bytes throughout.
 - Scope: the plan changes async admission and evidence only. It does not introduce a second log, alter RocksDB ownership, or change synchronous commit semantics.
-

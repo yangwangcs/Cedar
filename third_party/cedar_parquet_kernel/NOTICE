@@ -1,0 +1,7 @@
+Cedar Parquet kernel
+Copyright 2026 The Cedar Authors.
+
+The kernel is informed by the Apache Parquet format specification and the
+Apache Arrow/Parquet C++ implementation, licensed under Apache License 2.0.
+No Arrow, Parquet, Thrift, Boost, RapidJSON, or other upstream runtime code
+is linked by this kernel.

@@ -50,13 +50,13 @@ class KernelMutationTest : public ::testing::Test {
 
 TEST_F(KernelMutationTest, StagesEntityStateWithoutPropertySchemaOrValue) {
   std::unique_ptr<Transaction> transaction = Begin();
-  ASSERT_TRUE(transaction->Assert(EntityFact::Vertex(VertexId{1}), ValidTime{10}).ok());
-  ASSERT_TRUE(transaction->Retract(EntityFact::Vertex(VertexId{2}), ValidTime{10}).ok());
+  ASSERT_TRUE(transaction->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10}).ok());
+  ASSERT_TRUE(transaction->Retract(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{2}}), ValidTime{10}).ok());
 
   const auto before_rollback = database_->BeginSnapshot();
   ASSERT_TRUE(before_rollback.ok()) << before_rollback.status().ToString();
   const auto exists = before_rollback.ValueOrDie().Exists(
-      EntityFact::Vertex(VertexId{1}), ValidTime{10});
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10});
   ASSERT_TRUE(exists.ok()) << exists.status().ToString();
   EXPECT_FALSE(exists.ValueOrDie());
 
@@ -64,7 +64,7 @@ TEST_F(KernelMutationTest, StagesEntityStateWithoutPropertySchemaOrValue) {
   const auto after_rollback = database_->BeginSnapshot();
   ASSERT_TRUE(after_rollback.ok()) << after_rollback.status().ToString();
   const auto still_absent = after_rollback.ValueOrDie().Exists(
-      EntityFact::Vertex(VertexId{1}), ValidTime{10});
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10});
   ASSERT_TRUE(still_absent.ok()) << still_absent.status().ToString();
   EXPECT_FALSE(still_absent.ValueOrDie());
 }
@@ -87,7 +87,7 @@ TEST_F(KernelMutationTest, UsesSchemaVisibleWhenTransactionBegan) {
                   .ok());
 
   EXPECT_TRUE(transaction->Set(
-                  PropertyFact::Vertex(VertexId{1}, PropertyId{7}), ValidTime{10},
+                  PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7}), ValidTime{10},
                   Value::String("Ada"))
                   .ok());
 }
@@ -100,24 +100,37 @@ TEST_F(KernelMutationTest, RejectsPropertyWithWrongTypeOrMissingSchema) {
   std::unique_ptr<Transaction> transaction = Begin();
 
   EXPECT_TRUE(transaction->Set(
-                  PropertyFact::Vertex(VertexId{1}, PropertyId{7}), ValidTime{10},
+                  PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7}), ValidTime{10},
                   Value::Int64(1))
                   .IsSchemaMismatch());
   EXPECT_TRUE(transaction->Unset(
-                  PropertyFact::Vertex(VertexId{1}, PropertyId{8}), ValidTime{10})
+                  PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{8}), ValidTime{10})
                   .IsSchemaMismatch());
 }
 
 TEST_F(KernelMutationTest, RejectsContradictoryDuplicateFactAtOneValidTime) {
   std::unique_ptr<Transaction> transaction = Begin();
-  ASSERT_TRUE(transaction->Assert(EntityFact::Vertex(VertexId{1}), ValidTime{10}).ok());
-  EXPECT_TRUE(transaction->Retract(EntityFact::Vertex(VertexId{1}), ValidTime{10})
+  ASSERT_TRUE(transaction->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10}).ok());
+  EXPECT_TRUE(transaction->Retract(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10})
                   .IsInvalidArgument());
   EXPECT_TRUE(transaction->Rollback().ok());
 }
 
+TEST_F(KernelMutationTest,
+       StagesSameVertexIdInDistinctPartitionsIndependently) {
+  std::unique_ptr<Transaction> transaction = Begin();
+  ASSERT_TRUE(transaction
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{1}, VertexId{1}}),
+                           ValidTime{10})
+                  .ok());
+  ASSERT_TRUE(transaction
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{2}, VertexId{1}}),
+                           ValidTime{10})
+                  .ok());
+}
+
 TEST(KernelMutationOrderTest, SortsValidTimeDescendingWithinOneFact) {
-  const FactRef ref = EntityFact::Vertex(VertexId{1}).ref();
+  const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
   std::vector<PendingFactMutation> mutations = {
       {ref, ValidTime{10}, FactOperation::kPut, 0, std::nullopt},
       {ref, ValidTime{30}, FactOperation::kPut, 0, std::nullopt},

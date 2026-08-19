@@ -19,18 +19,18 @@ namespace cedar {
 namespace {
 
 PendingFactMutation VertexPut(uint64_t vertex_id, uint64_t valid_from) {
-  return {EntityFact::Vertex(VertexId{vertex_id}).ref(), ValidTime{valid_from},
+  return {EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}).ref(), ValidTime{valid_from},
           FactOperation::kPut, 0, std::nullopt};
 }
 
 PendingFactMutation EdgePut(uint64_t edge_id, uint64_t valid_from) {
-  return {EntityFact::Edge(EdgeId{edge_id}).ref(), ValidTime{valid_from},
+  return {EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{edge_id}}).ref(), ValidTime{valid_from},
           FactOperation::kPut, 0, std::nullopt};
 }
 
 PendingFactMutation VertexPropertyPut(uint64_t vertex_id, uint16_t property_id,
                                       uint64_t valid_from, Value value) {
-  return {PropertyFact::Vertex(VertexId{vertex_id}, PropertyId{property_id}).ref(),
+  return {PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}, PropertyId{property_id}).ref(),
           ValidTime{valid_from}, FactOperation::kPut, 1, std::move(value)};
 }
 
@@ -56,7 +56,7 @@ class StrictTransactionTest : public ::testing::Test {
 TEST_F(StrictTransactionTest, RejectsEmptyReadPhantomAtExactFactAndTime) {
   const auto snapshot = store_->BeginSnapshot();
   ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-  const FactRef observed = EntityFact::Vertex(VertexId{1}).ref();
+  const FactRef observed = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
   const auto dependency =
       CaptureStrictReadDependency(*store_, snapshot.ValueOrDie(), observed, ValidTime{10});
   ASSERT_TRUE(dependency.ok()) << dependency.status().ToString();
@@ -77,7 +77,7 @@ TEST_F(StrictTransactionTest,
   const auto snapshot = store_->BeginSnapshot();
   ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
   const auto dependency = CaptureStrictReadDependency(
-      *store_, snapshot.ValueOrDie(), EntityFact::Vertex(VertexId{1}).ref(),
+      *store_, snapshot.ValueOrDie(), EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
       ValidTime{10});
   ASSERT_TRUE(dependency.ok()) << dependency.status().ToString();
   ASSERT_TRUE(dependency.ValueOrDie().observed_event.has_value());
@@ -94,7 +94,7 @@ TEST_F(StrictTransactionTest, RejectsPredecessorAndSuccessorFenceInsertions) {
   ASSERT_TRUE(store_->Commit(StoreCommitBatch{
                          TxnId{1}, 1, {VertexPut(1, 10), VertexPut(1, 30)}, {}, {}, {}})
                   .ok());
-  const FactRef fact = EntityFact::Vertex(VertexId{1}).ref();
+  const FactRef fact = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
   const auto before_predecessor = store_->BeginSnapshot();
   ASSERT_TRUE(before_predecessor.ok()) << before_predecessor.status().ToString();
   const auto predecessor_dependency = CaptureStrictReadDependency(
@@ -138,9 +138,9 @@ TEST_F(StrictTransactionTest, RejectsWhenAnEdgeReadDependencyIncludesEndpoints) 
   const auto snapshot = store_->BeginSnapshot();
   ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
   std::vector<StrictReadDependency> dependencies;
-  for (const FactRef& fact : {EntityFact::Edge(EdgeId{9}).ref(),
-                              EntityFact::Vertex(VertexId{1}).ref(),
-                              EntityFact::Vertex(VertexId{2}).ref()}) {
+  for (const FactRef& fact : {EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{9}}).ref(),
+                              EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
+                              EntityFact::Vertex(VertexRef{PartId{0}, VertexId{2}}).ref()}) {
     const auto dependency =
         CaptureStrictReadDependency(*store_, snapshot.ValueOrDie(), fact, ValidTime{10});
     ASSERT_TRUE(dependency.ok()) << dependency.status().ToString();
@@ -149,7 +149,7 @@ TEST_F(StrictTransactionTest, RejectsWhenAnEdgeReadDependencyIncludesEndpoints) 
 
   ASSERT_TRUE(store_->Commit(StoreCommitBatch{
                          TxnId{2}, 2,
-                         {{EntityFact::Vertex(VertexId{1}).ref(), ValidTime{10},
+                         {{EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(), ValidTime{10},
                            FactOperation::kDelete, 0, std::nullopt}},
                          {}, {}, {}})
                   .ok());
@@ -173,11 +173,11 @@ TEST_F(StrictTransactionTest, StrictTransactionReadsExactEntityAndProperty) {
   ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
 
   const auto exists = transaction.ValueOrDie()->Exists(
-      EntityFact::Vertex(VertexId{1}), ValidTime{10});
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10});
   ASSERT_TRUE(exists.ok()) << exists.status().ToString();
   EXPECT_TRUE(exists.ValueOrDie());
   const auto value = transaction.ValueOrDie()->Get(
-      PropertyFact::Vertex(VertexId{1}, PropertyId{7}), ValidTime{10});
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7}), ValidTime{10});
   ASSERT_TRUE(value.ok()) << value.status().ToString();
   EXPECT_EQ(value.ValueOrDie(), std::optional<Value>{Value::Int64(42)});
   EXPECT_TRUE(transaction.ValueOrDie()->Rollback().ok());
@@ -199,7 +199,7 @@ TEST_F(StrictTransactionTest, StrictTransactionReadsEdgeAndBothEndpoints) {
   ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
 
   const auto visible = transaction.ValueOrDie()->Exists(
-      EntityFact::Edge(EdgeId{9}), ValidTime{10});
+      EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{9}}), ValidTime{10});
   ASSERT_TRUE(visible.ok()) << visible.status().ToString();
   EXPECT_TRUE(visible.ValueOrDie());
   EXPECT_TRUE(transaction.ValueOrDie()->Rollback().ok());
@@ -242,12 +242,12 @@ TEST_F(StrictTransactionTest, SnapshotTransactionScansItsCapturedFactFamily) {
   ASSERT_TRUE(scanned.ok()) << scanned.ToString();
   ASSERT_EQ(events.size(), 2U);
   EXPECT_NE(std::find_if(events.begin(), events.end(), [](const FactEvent& event) {
-              return event.ref == EntityFact::Vertex(VertexId{1}).ref() &&
+              return event.ref == EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref() &&
                      event.valid_from == ValidTime{10};
             }),
             events.end());
   EXPECT_NE(std::find_if(events.begin(), events.end(), [](const FactEvent& event) {
-              return event.ref == EntityFact::Vertex(VertexId{2}).ref() &&
+              return event.ref == EntityFact::Vertex(VertexRef{PartId{0}, VertexId{2}}).ref() &&
                      event.valid_from == ValidTime{20};
             }),
             events.end());

@@ -138,7 +138,7 @@
 - Create: `tests/test_kernel_lifecycle.cc`
 - Modify: `README.md`
 
-- [ ] Write RED tests for separate vertex/edge leases, close waiting for active commit calls, close with live Snapshots, rejection after close, and reopen.
-- [ ] Implement allocation and lifecycle without query registration or T-Cypher cancellation.
-- [ ] Replace README examples with explicit transaction and Snapshot usage.
-- [ ] Run all Stage A/B tests and commit as `feat: complete embedded kernel lifecycle`.
+- [x] Write RED tests for separate vertex/edge leases, close waiting for active commit calls, close with live Snapshots, rejection after close, and reopen.
+- [x] Implement allocation and lifecycle without query registration or T-Cypher cancellation.
+- [x] Replace README examples with explicit transaction and Snapshot usage.
+- [x] Run all Stage A/B tests. The changes await user-directed commit handling.

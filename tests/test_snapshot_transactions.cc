@@ -20,12 +20,12 @@ namespace cedar {
 namespace {
 
 PendingFactMutation VertexPut(uint64_t vertex_id, uint64_t valid_from) {
-  return {EntityFact::Vertex(VertexId{vertex_id}).ref(), ValidTime{valid_from},
+  return {EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}).ref(), ValidTime{valid_from},
           FactOperation::kPut, 0, std::nullopt};
 }
 
 PendingFactMutation EdgePut(uint64_t edge_id, uint64_t valid_from) {
-  return {EntityFact::Edge(EdgeId{edge_id}).ref(), ValidTime{valid_from},
+  return {EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{edge_id}}).ref(), ValidTime{valid_from},
           FactOperation::kPut, 0, std::nullopt};
 }
 

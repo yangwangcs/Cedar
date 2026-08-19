@@ -8,6 +8,14 @@
 
 **Tech Stack:** C++20, RocksDB fork in `third_party/rocksdb`, CMake, GoogleTest, existing Cedar Parquet table and pressure-controller modules, ASAN/UBSAN/TSAN.
 
+**Current gate status (2026-08-18):** correctness, recovery, deterministic N+1
+including shutdown, and the new RocksDB maintenance-thread evidence are green
+(`373/373` CTest). Fresh current-source ASAN, UBSAN, and TSAN focused
+selections are also green at `46/46` each. The remaining release blockers are positive
+manual-conflict evidence, the required 30–60 minute production-device
+campaign, and the 30,000 operations/s qualification gate; the latest local
+30-second run is `22,288 ops/s` and is recorded as `warm_not_sustained`.
+
 ## Global Constraints
 
 - Preserve one RocksDB WAL record and one durable synchronization per committed Cedar epoch.
@@ -53,8 +61,8 @@
 - Consumes: existing `FactStoreOptions`, `ProductionStorageOptions`, `WriteDecidedGroupLocked`.
 - Produces: `ProductionStorageOptions` fields `kernel_mode`, `diagnostic_periodic_tasks`, and `recycle_log_file_num`, with `manual_wal_flush=false`, `use_fsync=false`, `wal_bytes_per_sync=0`, `recycle_log_file_num=0`, and explicit background-job values; stage histograms for append, sync, callback, MemTable, and publication.
 
-- [ ] **Step 1: Add failing profile assertions.** Add a `ProductionProfileUsesCedarWalDefaults` test that opens a production profile and asserts the resolved options expose `manual_wal_flush == false`, `use_fsync == false`, `wal_bytes_per_sync == 0`, `recycle_log_file_num == 0`, `stats_dump_period_sec == 0`, and `stats_persist_period_sec == 0`. Add a `CommitMetricsExposeWalStages` test that commits one epoch and asserts each new histogram has one sample.
-- [ ] **Step 2: Run the focused tests and verify RED.**
+- [x] **Step 1: Add failing profile assertions.** Add a `ProductionProfileUsesCedarWalDefaults` test that opens a production profile and asserts the resolved options expose `manual_wal_flush == false`, `use_fsync == false`, `wal_bytes_per_sync == 0`, `recycle_log_file_num == 0`, `stats_dump_period_sec == 0`, and `stats_persist_period_sec == 0`. Add a `CommitMetricsExposeWalStages` test that commits one epoch and asserts each new histogram has one sample.
+- [x] **Step 2: Run the focused tests and verify RED.**
 
 ```bash
 cmake --build build --target test_rocksdb_profile test_kernel_commit -j2
@@ -62,8 +70,8 @@ ctest --test-dir build -R 'ProductionProfileUsesCedarWalDefaults|CommitMetricsEx
 ```
 
 Expected: compilation or assertion failure because the new fields and profile values do not exist.
-- [ ] **Step 3: Implement the minimum profile and timing fields.** Add named options rather than positional booleans, set the values above in the production branch, remove unconditional production `CreateDBStatistics()`, and add counters for `wal_append`, `wal_sync`, `memtable_insert`, `publication`, `wal_rotation`, and `manifest`. Record these around the existing `store.WriteDecidedGroup` call; do not change write ordering. `diagnostic_periodic_tasks=true` is the only mode allowed to construct statistics or register periodic statistics/info-log/compaction work.
-- [ ] **Step 4: Run the focused tests GREEN and inspect resolved options.**
+- [x] **Step 3: Implement the minimum profile and timing fields.** Add named options rather than positional booleans, set the values above in the production branch, remove unconditional production `CreateDBStatistics()`, and add counters for `wal_append`, `wal_sync`, `memtable_insert`, `publication`, `wal_rotation`, and `manifest`. Record these around the existing `store.WriteDecidedGroup` call; do not change write ordering. `diagnostic_periodic_tasks=true` is the only mode allowed to construct statistics or register periodic statistics/info-log/compaction work.
+- [x] **Step 4: Run the focused tests GREEN and inspect resolved options.**
 
 ```bash
 cmake --build build --target test_rocksdb_profile test_kernel_commit -j2
@@ -92,8 +100,8 @@ git commit -m "perf: make Cedar WAL profile explicit"
 - Consumes: `FactStore::SamplePressure()` and `FactStore::SampleRuntimeMetrics()`.
 - Produces: `CedarRuntimeSnapshot ReadRuntimeSnapshot() const`, `StartRuntimeSampler()`, and `StopRuntimeSampler()`; foreground code reads only the snapshot.
 
-- [ ] **Step 1: Add a sampler test seam and failing tests.** Add a test-only sample counter callback to `FactStoreOptions`, then write tests that enqueue commits while the sampler runs and assert the callback count remains bounded by the configured 50/10/5 ms cadence rather than one call per epoch. Add a stale-snapshot test that sets the sample timestamp older than 250 ms and expects admission to stop increasing.
-- [ ] **Step 2: Run the tests RED.**
+- [x] **Step 1: Add a sampler test seam and failing tests.** Add a test-only sample counter callback to `FactStoreOptions`, then write tests that enqueue commits while the sampler runs and assert the callback count remains bounded by the configured 50/10/5 ms cadence rather than one call per epoch. Add a stale-snapshot test that sets the sample timestamp older than 250 ms and expects admission to stop increasing.
+- [x] **Step 2: Run the tests RED.**
 
 ```bash
 cmake --build build --target test_pressure_controller test_kernel_commit -j2
@@ -101,9 +109,9 @@ ctest --test-dir build -R 'RuntimeSampler|StaleRuntimeSnapshot' --output-on-fail
 ```
 
 Expected: missing sampler symbols or assertion failure from per-epoch polling.
-- [ ] **Step 3: Implement one sampler loop.** Add a `CedarRuntimeSnapshot` containing sample time, immutable/active bytes, cache bytes, WAL bytes, L0, pending compaction, background errors, and `PressureState`. The loop samples every 50 ms in normal, 10 ms in soft, and 5 ms in hard/emergency pressure; publish the complete object under a sequence lock or atomic shared pointer.
-- [ ] **Step 4: Remove foreground polls.** Delete `store.SamplePressure()` from the 5 ms preflight timeout path and delete `store.SampleRuntimeMetrics()` after every write. Replace both with `ReadRuntimeSnapshot()`, preserving conservative stale-snapshot admission behavior.
-- [ ] **Step 5: Run the tests GREEN and run the existing commit suite.**
+- [x] **Step 3: Implement one sampler loop.** Add a `CedarRuntimeSnapshot` containing sample time, immutable/active bytes, cache bytes, WAL bytes, L0, pending compaction, background errors, and `PressureState`. The loop samples every 50 ms in normal, 10 ms in soft, and 5 ms in hard/emergency pressure; publish the complete object under a sequence lock or atomic shared pointer.
+- [x] **Step 4: Remove foreground polls.** Delete `store.SamplePressure()` from the 5 ms preflight timeout path and delete `store.SampleRuntimeMetrics()` after every write. Replace both with `ReadRuntimeSnapshot()`, preserving conservative stale-snapshot admission behavior.
+- [x] **Step 5: Run the tests GREEN and run the existing commit suite.**
 
 ```bash
 cmake --build build --target test_pressure_controller test_kernel_commit -j2
@@ -130,8 +138,8 @@ git commit -m "perf: cache Cedar runtime pressure samples"
 - Consumes: `internal::DecidedEpoch`, `PendingVersionOverlay`, `Store::DecideIndependentAppendGroup`.
 - Produces: `DecidedEpochSlot`, `SlotState`, and discard-reason counters; eligible N+1 epochs use the exact successor base sequence.
 
-- [ ] **Step 1: Write deterministic RED tests.** Add tests for arrivals during sync, queue arrivals after the frozen prefix, cancellation, predecessor failure, indeterminate failure, and shutdown. The normal-arrival test must assert promotion rather than discard. The tests use a WAL-sync/prewrite barrier and inspect `n_plus_one_eligible`, `n_plus_one_promoted`, and `n_plus_one_discarded_by_reason`.
-- [ ] **Step 2: Run the N+1 tests RED.**
+- [x] **Step 1: Write deterministic RED tests.** Add tests for arrivals during sync, queue arrivals after the frozen prefix, cancellation, predecessor failure, indeterminate failure, and shutdown. The normal-arrival test must assert promotion rather than discard. The tests use a WAL-sync/prewrite barrier and inspect `n_plus_one_eligible`, `n_plus_one_promoted`, and `n_plus_one_discarded_by_reason`.
+- [x] **Step 2: Run the N+1 tests RED.**
 
 ```bash
 cmake --build build --target test_kernel_commit test_commit_workloads -j2
@@ -139,16 +147,23 @@ ctest --test-dir build -R 'NPlusOne|PreflightsNextEpoch|RetriesStalePredecided' 
 ```
 
 Expected: the arrival-during-sync case records a discard because the current prefix matching logic invalidates the prepared suffix.
-- [ ] **Step 3: Implement two immutable slots.** Define `DecidedEpochSlot { generation, base_visible_seq, requests, epoch, state }`. Freeze N+1 from a precise queue prefix; later arrivals remain outside the slot. Promote only when predecessor publish, generation, successor base, request identity, cancellation, shutdown, and recovery checks all pass.
-- [ ] **Step 4: Account for every discard reason.** Add enum values `kPredecessorFailure`, `kIndeterminate`, `kCancelled`, `kGenerationMismatch`, `kBaseMismatch`, and `kShutdown`; increment one reason exactly once and never count normal queue arrivals as discards.
-- [ ] **Step 5: Run deterministic and stress tests GREEN.**
+- [x] **Step 3: Implement two immutable slots.** Define `DecidedEpochSlot { generation, base_visible_seq, requests, epoch, state }`. Freeze N+1 from a precise queue prefix; later arrivals remain outside the slot. Promote only when predecessor publish, generation, successor base, request identity, cancellation, shutdown, and recovery checks all pass.
+- [x] **Step 4: Account for every discard reason.** Add enum values `kPredecessorFailure`, `kIndeterminate`, `kCancelled`, `kGenerationMismatch`, `kBaseMismatch`, and `kShutdown`; increment one reason exactly once and never count normal queue arrivals as discards.
+- [x] **Step 5: Run deterministic and stress tests GREEN.** Deterministic matrix is green, including shutdown. A finite 2,048-worker smoke promoted 76/76 eligible epochs (100%) with reopen verification; 1,320 mailbox overload rejections were excluded from the promotion denominator.
 
 ```bash
 cmake --build build --target test_kernel_commit test_commit_workloads -j2
 ctest --test-dir build -R 'NPlusOne|PreflightsNextEpoch|RetriesStalePredecided' --output-on-failure
 ```
 
-Then run the 2,048-worker smoke command from Task 7 and require at least 95% promotion among eligible epochs and less than 1% discard excluding injected faults, cancellation, and shutdown.
+Then run the 2,048-worker smoke command from Task 8 and require at least 95% promotion among eligible epochs and less than 1% discard excluding injected faults, cancellation, and shutdown.
+
+Evidence to date: the deterministic `KernelGroupCommitTest` matrix now covers
+normal promotion plus predecessor invalid failure, predecessor indeterminate
+failure, predecessor cancellation, and shutdown. Indeterminate failure
+correctly blocks the successor because the store enters `recovery_required`.
+The high-concurrency promotion-rate smoke is green; sustained performance and
+production-device evidence remain open.
 - [ ] **Step 6: Commit.**
 
 ```bash
@@ -213,7 +228,7 @@ git commit -m "feat: add Cedar exclusive RocksDB write kernel"
 - Consumes: DB and column-family handles plus `MaintenanceBudget { max_input_bytes, max_output_bytes, deadline_us, allow_flush, allow_compaction, yield_for_wal_sync }`.
 - Produces: `PollCedarMaintenance(DB*, MaintenanceState*)` and `RunCedarMaintenance(DB*, const MaintenanceBudget&, MaintenanceResult*)`; no method schedules work based on host concurrency or periodic timers.
 
-- [ ] **Step 1: Write RED tests for debt and budget.** Create mutable/immutable facts data, call `PollCedarMaintenance`, and assert immutable bytes, L0 files, pending compaction bytes, retained WAL bytes, error, and shutdown state are coherent. Call `RunCedarMaintenance` with zero budget and assert it performs no work; call it with a bounded flush budget and assert consumed input bytes do not exceed the limit.
+- [x] **Step 1: Write RED tests for debt and budget.** Create mutable/immutable facts data, call `PollCedarMaintenance`, and assert immutable bytes, L0 files, pending compaction bytes, retained WAL bytes, error, and shutdown state are coherent. Call `RunCedarMaintenance` with zero budget and assert it performs no work; call it with a bounded flush budget and assert consumed input bytes do not exceed the limit. Active/immutable, zero/bounded budget, shutdown, and injected background-error evidence are covered.
 - [ ] **Step 2: Run the maintenance tests RED.**
 
 ```bash
@@ -222,14 +237,20 @@ ctest --test-dir build -R 'CedarMaintenance' --output-on-failure
 ```
 
 Expected: missing header and symbols.
-- [ ] **Step 3: Implement the poll surface.** Read existing DB mutex-protected state and properties once into `MaintenanceState`; include immutable count/bytes, oldest age, retained WAL bytes, L0, pending compaction bytes, manual conflict, background error, and shutdown. Return a coherent error rather than a partially updated state.
-- [ ] **Step 4: Implement bounded manual flush and compaction.** Reuse `FlushMemTable` and `RunManualCompaction` through a Cedar-only wrapper. Check the deadline and `yield_for_wal_sync` before each bounded input/output unit; allow only atomic file install and cleanup beyond the byte budget. Return consumed bytes, elapsed time, remaining debt, yield reason, and error.
-- [ ] **Step 5: Run budget, error, and shutdown tests GREEN.**
+- [x] **Step 3: Implement the poll surface.** Read existing DB mutex-protected state and properties once into `MaintenanceState`; include immutable count/bytes, oldest age, retained WAL bytes, L0, pending compaction bytes, manual conflict, background error, and shutdown. Return a coherent error rather than a partially updated state. Manual-conflict remains observationally exposed; a positive deterministic conflict trigger is still open.
+- [x] **Step 4: Implement bounded manual flush and compaction.** Reuse `FlushMemTable` and `RunManualCompaction` through a Cedar-only wrapper. Check the deadline and `yield_for_wal_sync` before each bounded input/output unit; allow only atomic file install and cleanup beyond the byte budget. Return consumed bytes, elapsed time, remaining debt, yield reason, and error.
+- [ ] **Step 5: Run budget, error, and shutdown tests GREEN.** Budget, WAL-priority, deterministic shutdown-state, and injected background-error tests pass; positive manual-conflict execution evidence remains open.
 
 ```bash
 cmake --build build --target test_cedar_maintenance -j2
 ctest --test-dir build -R 'CedarMaintenance' --output-on-failure
 ```
+
+Evidence to date: the RocksDbCedarKernel maintenance/lifecycle selection is
+12/12 for the kernel suite and the focused runtime-control sanitizer matrix is
+46/46 per sanitizer; the full native CTest suite is 373/373. The shutdown test blocks the
+RocksDB directory close after `shutting_down_` is published, then verifies
+that Cedar polling is handle-independent and maintenance yields `kShutdown`.
 
 - [ ] **Step 6: Commit.**
 
@@ -345,10 +366,10 @@ git commit -m "test: qualify Cedar runtime crash boundaries"
 cmake -S . -B build -DBUILD_TESTS=ON -DBUILD_BENCHMARKS=ON
 cmake --build build --target cedar_wal_sync_bench cedar_kernel_bench -j2
 ./build/cedar_wal_sync_bench --group-bytes 1048576 --sync full --operations 10000
-./build/cedar_kernel_bench --workload independent_append --async --verify-reopen --profile generic --workers 2048 --group-max 256 --duration 30
-./build/cedar_kernel_bench --workload independent_append --async --verify-reopen --profile lean --workers 2048 --group-max 256 --duration 30
-./build/cedar_kernel_bench --workload independent_append --async --verify-reopen --profile kernel --workers 2048 --group-max 256 --duration 30
-./build/cedar_kernel_bench --workload independent_append --async --verify-reopen --profile kernel --workers 512 --group-max 256 --duration 3600
+./build/cedar_kernel_bench --workload property-put --async --verify-reopen --profile generic --group-workers 2048 --group-max 256 --memory-budget-mib 1024 --duration-seconds 30
+./build/cedar_kernel_bench --workload property-put --async --verify-reopen --profile lean --group-workers 2048 --group-max 256 --memory-budget-mib 1024 --duration-seconds 30
+./build/cedar_kernel_bench --workload property-put --async --verify-reopen --profile kernel --group-workers 2048 --group-max 256 --memory-budget-mib 1024 --duration-seconds 30
+./build/cedar_kernel_bench --workload property-put --async --bounded-clients --verify-reopen --profile kernel --group-workers 512 --group-max 256 --memory-budget-mib 1024 --duration-seconds 1800
 ```
 
 Expected report: comparable runs include reopen verification, bounded memory/WAL/L0/compaction debt, no background errors, at least 95% eligible N+1 promotion, and no unexplained autonomous work. The report must state the remaining durable-sync ceiling rather than claim 30,000 transactions/s without the required sync rate or group occupancy.
@@ -371,16 +392,16 @@ git commit -m "bench: compare Cedar RocksDB runtime profiles"
 - Consumes: all prior task outputs and generic/lean/kernel profiles.
 - Produces: explicit runtime evidence identifying profile, thread counts, WAL options, sampler cadence, maintenance ownership, and rollback state.
 
-- [ ] **Step 1: Run the complete correctness gate.**
+- [x] **Step 1: Run the complete correctness gate.**
 
 ```bash
 cmake --build build --target cedar_core -j2
 ctest --test-dir build --output-on-failure
 ```
 
-Expected: all existing tests, including the current 323-test correctness gate, pass.
-- [ ] **Step 2: Verify profile rollback.** Create data with kernel mode, reopen with generic mode, compare snapshots/scans/transaction resolution, then reopen with lean mode. A recovery-required database must reject profile switching until reopened.
-- [ ] **Step 3: Verify no autonomous work.** Collect sync-point and thread evidence after kernel-mode open, during 60-minute load, and during shutdown; fail if a RocksDB periodic, flush, or compaction policy task runs without a Cedar token.
+Expected: all currently registered correctness tests pass; the exact count is reported by CTest rather than hard-coded because the suite changes as focused runtime gates are added.
+- [x] **Step 2: Verify profile rollback.** Create data with kernel mode, reopen with generic mode, compare snapshots/scans/transaction resolution, then reopen with lean mode. A recovery-required database must reject profile switching until reopened.
+- [ ] **Step 3: Verify no autonomous work.** Kernel-open and deterministic maintenance counters are covered; evidence during the required sustained campaign remains open.
 - [ ] **Step 4: Publish the qualification record.** Record hardware, filesystem, durability primitive, exact options, thread counts, test commits, benchmark CSV, sanitizer results, crash matrix, reopen result, N+1 rate, ending debt, and the physical WAL limit.
 - [ ] **Step 5: Make kernel mode the default only after all evidence is present.** Keep `generic` as an explicit emergency rollback profile and do not enable experimental barrier sync or WAL recycling by default.
 

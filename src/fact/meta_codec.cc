@@ -18,13 +18,14 @@ constexpr size_t kMaxMetaPayloadBytes = 16U * 1024U * 1024U;
 constexpr size_t kMaxPropertyNameBytes = 4096;
 
 enum class MetaRecordKind : uint8_t {
-  kFormatVersion = 1,
+  kSystemIdentity = 1,
   kWatermark = 2,
   kPropertyDefinition = 3,
   kEdgeIdentity = 4,
   kIdAllocator = 5,
   kTransactionOutcome = 6,
   kSequence = 7,
+  kVacuumState = 8,
 };
 
 void AppendU16(std::string* out, uint16_t value) {
@@ -75,6 +76,21 @@ bool ReadU64(const std::string& input, size_t* offset, uint64_t* value) {
 bool IsPhysicalType(uint8_t value) {
   return value >= static_cast<uint8_t>(PhysicalType::kBool) &&
          value <= static_cast<uint8_t>(PhysicalType::kBinary);
+}
+
+void AppendString(std::string* out, const std::string& value) {
+  AppendU16(out, static_cast<uint16_t>(value.size()));
+  out->append(value);
+}
+
+bool ReadString(const std::string& input, size_t* offset, std::string* value) {
+  uint16_t length = 0;
+  if (!ReadU16(input, offset, &length) || input.size() - *offset < length) {
+    return false;
+  }
+  *value = input.substr(*offset, length);
+  *offset += length;
+  return true;
 }
 
 StatusOr<std::string> EncodeRecord(MetaRecordKind kind,
@@ -159,6 +175,25 @@ Status SequenceRecord::Validate() const {
   return Status::OK();
 }
 
+Status VacuumState::Validate() const {
+  if (target.value == 0 ||
+      (phase != VacuumPhase::kPrepared && phase != VacuumPhase::kRunning) ||
+      (!cursor.empty() && cursor.size() != kEncodedFactKeyBytes)) {
+    return Status::InvalidArgument("vacuum state", "zero vacuum target");
+  }
+  return Status::OK();
+}
+
+Status SystemIdentity::Validate() const {
+  if (system != "cedar.authoritative-columnar" || system_format != 1 ||
+      fact_key_format != "part32.fact.v2" ||
+      facts_table_format != "cedar.parquet.facts.v2" ||
+      comparator_digest != "cedar.v2.internal-key.bytewise.v1") {
+    return Status::InvalidArgument("system identity", "unsupported identity");
+  }
+  return Status::OK();
+}
+
 std::string EncodeCurrentFormatKey() { return "format/current"; }
 
 StatusOr<std::string> EncodeSchemaMetaKey(PropertyId property_id,
@@ -173,10 +208,11 @@ StatusOr<std::string> EncodeSchemaMetaKey(PropertyId property_id,
   return key;
 }
 
-StatusOr<std::string> EncodeEdgeIdentityMetaKey(EdgeId edge_id) {
-  if (!edge_id.valid()) return Status::InvalidArgument("edge key", "zero edge ID");
+StatusOr<std::string> EncodeEdgeIdentityMetaKey(EdgeRef edge) {
+  if (!edge.valid()) return Status::InvalidArgument("edge key", "zero edge ID");
   std::string key = "edge/";
-  AppendU64(&key, edge_id.value);
+  AppendU32(&key, edge.home_part_id.value);
+  AppendU64(&key, edge.edge_id.value);
   return key;
 }
 
@@ -212,23 +248,37 @@ std::string EncodeOldestReadableWatermarkKey() {
   return "watermark/oldest_readable";
 }
 
-StatusOr<std::string> EncodeFormatVersion(uint32_t format_version) {
-  if (format_version == 0) return Status::InvalidArgument("format", "zero format version");
+std::string EncodeVacuumStateKey() { return "vacuum/state"; }
+
+StatusOr<std::string> EncodeSystemIdentity(const SystemIdentity& identity) {
+  const Status valid = identity.Validate();
+  if (!valid.ok()) return valid;
   std::string payload;
-  AppendU32(&payload, format_version);
-  return EncodeRecord(MetaRecordKind::kFormatVersion, payload);
+  payload.reserve(128);
+  AppendString(&payload, identity.system);
+  AppendU32(&payload, identity.system_format);
+  AppendString(&payload, identity.fact_key_format);
+  AppendString(&payload, identity.facts_table_format);
+  AppendString(&payload, identity.comparator_digest);
+  return EncodeRecord(MetaRecordKind::kSystemIdentity, payload);
 }
 
-StatusOr<uint32_t> DecodeFormatVersion(const std::string& encoded) {
-  const auto payload = DecodeRecord(MetaRecordKind::kFormatVersion, encoded);
+StatusOr<SystemIdentity> DecodeSystemIdentity(const std::string& encoded) {
+  const auto payload = DecodeRecord(MetaRecordKind::kSystemIdentity, encoded);
   if (!payload.ok()) return payload.status();
   size_t offset = 0;
-  uint32_t version = 0;
-  if (!ReadU32(payload.ValueOrDie(), &offset, &version) || offset != 4 ||
-      version == 0) {
-    return Status::Corruption("format", "invalid format version");
+  SystemIdentity identity;
+  if (!ReadString(payload.ValueOrDie(), &offset, &identity.system) ||
+      !ReadU32(payload.ValueOrDie(), &offset, &identity.system_format) ||
+      !ReadString(payload.ValueOrDie(), &offset, &identity.fact_key_format) ||
+      !ReadString(payload.ValueOrDie(), &offset, &identity.facts_table_format) ||
+      !ReadString(payload.ValueOrDie(), &offset, &identity.comparator_digest) ||
+      offset != payload.ValueOrDie().size()) {
+    return Status::Corruption("system identity", "invalid identity record");
   }
-  return version;
+  const Status valid = identity.Validate();
+  if (!valid.ok()) return Status::Corruption("system identity", valid.ToString());
+  return identity;
 }
 
 StatusOr<std::string> EncodeWatermark(CommitSeq watermark) {
@@ -297,9 +347,12 @@ StatusOr<std::string> EncodeEdgeIdentity(const EdgeIdentity& identity) {
   const Status valid = identity.Validate();
   if (!valid.ok()) return valid;
   std::string payload;
-  payload.reserve(32);
+  payload.reserve(44);
+  AppendU32(&payload, identity.home_part_id.value);
   AppendU64(&payload, identity.edge_id.value);
+  AppendU32(&payload, identity.source_part_id.value);
   AppendU64(&payload, identity.source_vertex_id.value);
+  AppendU32(&payload, identity.target_part_id.value);
   AppendU64(&payload, identity.target_vertex_id.value);
   AppendU64(&payload, identity.edge_type);
   return EncodeRecord(MetaRecordKind::kEdgeIdentity, payload);
@@ -310,16 +363,23 @@ StatusOr<EdgeIdentity> DecodeEdgeIdentity(const std::string& encoded) {
   if (!payload.ok()) return payload.status();
   const std::string& bytes = payload.ValueOrDie();
   size_t offset = 0;
+  uint32_t home_part = 0;
   uint64_t edge_id = 0;
+  uint32_t source_part = 0;
   uint64_t source = 0;
+  uint32_t target_part = 0;
   uint64_t target = 0;
   uint64_t edge_type = 0;
-  if (!ReadU64(bytes, &offset, &edge_id) || !ReadU64(bytes, &offset, &source) ||
-      !ReadU64(bytes, &offset, &target) || !ReadU64(bytes, &offset, &edge_type) ||
+  if (!ReadU32(bytes, &offset, &home_part) || !ReadU64(bytes, &offset, &edge_id) ||
+      !ReadU32(bytes, &offset, &source_part) || !ReadU64(bytes, &offset, &source) ||
+      !ReadU32(bytes, &offset, &target_part) || !ReadU64(bytes, &offset, &target) ||
+      !ReadU64(bytes, &offset, &edge_type) ||
       offset != bytes.size()) {
     return Status::Corruption("edge identity", "invalid edge record");
   }
-  EdgeIdentity identity{EdgeId{edge_id}, VertexId{source}, VertexId{target}, edge_type};
+  EdgeIdentity identity{EdgeRef{PartId{home_part}, EdgeId{edge_id}},
+                        VertexRef{PartId{source_part}, VertexId{source}},
+                        VertexRef{PartId{target_part}, VertexId{target}}, edge_type};
   const Status valid = identity.Validate();
   if (!valid.ok()) return Status::Corruption("edge identity", valid.ToString());
   return identity;
@@ -418,6 +478,39 @@ StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded) {
   const Status valid = record.Validate();
   if (!valid.ok()) return Status::Corruption("sequence record", valid.ToString());
   return record;
+}
+
+StatusOr<std::string> EncodeVacuumState(const VacuumState& state) {
+  const Status valid = state.Validate();
+  if (!valid.ok()) return valid;
+  std::string payload;
+  payload.push_back(static_cast<char>(state.phase));
+  AppendU64(&payload, state.target.value);
+  AppendU32(&payload, static_cast<uint32_t>(state.cursor.size()));
+  payload.append(state.cursor);
+  return EncodeRecord(MetaRecordKind::kVacuumState, payload);
+}
+
+StatusOr<VacuumState> DecodeVacuumState(const std::string& encoded) {
+  const auto payload = DecodeRecord(MetaRecordKind::kVacuumState, encoded);
+  if (!payload.ok()) return payload.status();
+  size_t offset = 0;
+  const std::string& bytes = payload.ValueOrDie();
+  if (bytes.empty()) {
+    return Status::Corruption("vacuum state", "invalid vacuum state record");
+  }
+  const VacuumPhase phase = static_cast<VacuumPhase>(
+      static_cast<uint8_t>(bytes[offset++]));
+  uint64_t target = 0;
+  uint32_t cursor_size = 0;
+  if (!ReadU64(bytes, &offset, &target) || !ReadU32(bytes, &offset, &cursor_size) ||
+      cursor_size != bytes.size() - offset) {
+    return Status::Corruption("vacuum state", "invalid vacuum state record");
+  }
+  VacuumState state{CommitSeq{target}, phase, bytes.substr(offset)};
+  const Status valid = state.Validate();
+  if (!valid.ok()) return Status::Corruption("vacuum state", valid.ToString());
+  return state;
 }
 
 }  // namespace cedar

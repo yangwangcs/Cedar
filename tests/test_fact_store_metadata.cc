@@ -164,7 +164,7 @@ TEST_F(FactStoreMetadataTest, HidesEdgeIdentityCreatedAfterLogicalSnapshot) {
   const StoreCommitBatch batch{
       TxnId{1},
       1,
-      {{EntityFact::Edge(identity.edge_id).ref(), ValidTime{10},
+      {{EntityFact::Edge(identity.edge_ref()).ref(), ValidTime{10},
         FactOperation::kPut, 0, std::nullopt}},
       {identity}};
   ASSERT_TRUE(store_->Commit(batch).ok());
@@ -173,7 +173,7 @@ TEST_F(FactStoreMetadataTest, HidesEdgeIdentityCreatedAfterLogicalSnapshot) {
       store_->BeginSnapshot(SnapshotOptions{CommitSeq{0}});
   ASSERT_TRUE(before_creation.ok()) << before_creation.status().ToString();
   const auto hidden = store_->LookupEdgeIdentity(before_creation.ValueOrDie(),
-                                                 identity.edge_id);
+                                                 identity.edge_ref());
   ASSERT_TRUE(hidden.ok()) << hidden.status().ToString();
   EXPECT_FALSE(hidden.ValueOrDie().has_value());
 
@@ -181,7 +181,7 @@ TEST_F(FactStoreMetadataTest, HidesEdgeIdentityCreatedAfterLogicalSnapshot) {
       store_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
   ASSERT_TRUE(after_creation.ok()) << after_creation.status().ToString();
   const auto visible = store_->LookupEdgeIdentity(after_creation.ValueOrDie(),
-                                                  identity.edge_id);
+                                                  identity.edge_ref());
   ASSERT_TRUE(visible.ok()) << visible.status().ToString();
   EXPECT_EQ(visible.ValueOrDie(), std::optional<EdgeIdentity>{identity});
 }

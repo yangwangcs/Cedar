@@ -321,8 +321,18 @@ A serialized commit publisher performs:
 The default first implementation uses one publisher mutex. RocksDB's internal
 write grouping may share physical syncs across concurrent writers, but Cedar
 does not add a second commit log or acknowledge before synchronous durability.
-If later benchmarks require a Cedar-side group queue, it must preserve the same
-WriteBatch fact and outcome model.
+For concurrent ingest, Cedar provides an opt-in group-commit fast path. It
+accepts only independent, single-vertex assertions with no strict-read or
+temporal predecessor/successor dependency, and never places two mutations for
+the same logical fact `(family, property_id, entity_id)` in one batch. The
+leader waits for at most the configured microsecond window, writes every fact,
+outcome, and sequence record in one `sync = true` WriteBatch, then publishes
+the final contiguous watermark.
+Each caller receives its own commit sequence only after that synchronous write
+succeeds. All other transaction shapes, duplicate transaction IDs, same-fact
+requests, and failed dependency checks use the normal single-transaction path.
+The default batch size is one and the default window is zero, so existing
+latency behavior is unchanged unless the caller explicitly opts in.
 
 The prior PREPARE/Decision protocol and the planned Cedar Atomic Commit log are
 removed. One RocksDB WriteBatch recorded by the RocksDB WAL is the sole durable
@@ -455,11 +465,13 @@ that projection.
 
 ## 13. Build and Distribution
 
-RocksDB v11.1.2 is pinned as a repository dependency and built statically.
-RocksDB tests, tools, benchmarks, JNI, and shared libraries are disabled. Cedar
-controls the enabled compression libraries and exposes their exact versions in
-its format/provenance report. No system RocksDB fallback is used in release
-builds.
+RocksDB v11.1.2 is pinned as a repository dependency and built once into a
+reusable static-library cache. The cache key binds its source revision,
+compiler, target, and sanitizer profile, so normal Cedar build directories link
+the same compatible archive rather than recompiling RocksDB. RocksDB tests,
+tools, benchmarks, JNI, and shared libraries are disabled. Cedar controls the
+enabled compression libraries and exposes their exact versions in its
+format/provenance report. No system RocksDB fallback is used in release builds.
 
 Only `cedar_core` and its public headers are installed. Query, benchmark, and
 projection targets link to `cedar_core` but are not compiled into it.

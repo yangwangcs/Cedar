@@ -11,9 +11,10 @@
 namespace cedar {
 namespace {
 
-constexpr uint8_t kFactKeyVersion = 1;
+constexpr uint8_t kFactKeyVersion = 2;
 constexpr uint8_t kFactValueVersion = 1;
 constexpr uint8_t kNoValueKind = 0;
+constexpr uint8_t kEdgeIdentityValueKind = 9;
 constexpr size_t kFactValueHeaderBytes = 11;
 constexpr size_t kFactValueChecksumBytes = 4;
 
@@ -153,6 +154,51 @@ StatusOr<Value> DecodeValuePayload(PhysicalType type,
   return Status::Corruption("fact value", "invalid physical value payload");
 }
 
+StatusOr<std::string> EncodeEdgeIdentityPayload(const EdgeIdentity& identity) {
+  const Status valid = identity.Validate();
+  if (!valid.ok()) return valid;
+  std::string payload;
+  payload.reserve(44);
+  AppendU32(&payload, identity.home_part_id.value);
+  AppendU64(&payload, identity.edge_id.value);
+  AppendU32(&payload, identity.source_part_id.value);
+  AppendU64(&payload, identity.source_vertex_id.value);
+  AppendU32(&payload, identity.target_part_id.value);
+  AppendU64(&payload, identity.target_vertex_id.value);
+  AppendU64(&payload, identity.edge_type);
+  return payload;
+}
+
+StatusOr<EdgeIdentity> DecodeEdgeIdentityPayload(const std::string& payload) {
+  if (payload.size() != 44) {
+    return Status::Corruption("edge identity fact", "invalid identity payload length");
+  }
+  size_t offset = 0;
+  uint32_t home_part = 0;
+  uint64_t edge_id = 0;
+  uint32_t source_part = 0;
+  uint64_t source = 0;
+  uint32_t target_part = 0;
+  uint64_t target = 0;
+  uint64_t edge_type = 0;
+  if (!ReadU32(payload, &offset, &home_part) ||
+      !ReadU64(payload, &offset, &edge_id) ||
+      !ReadU32(payload, &offset, &source_part) ||
+      !ReadU64(payload, &offset, &source) ||
+      !ReadU32(payload, &offset, &target_part) ||
+      !ReadU64(payload, &offset, &target) ||
+      !ReadU64(payload, &offset, &edge_type) || offset != payload.size()) {
+    return Status::Corruption("edge identity fact", "invalid identity payload");
+  }
+  EdgeIdentity identity{EdgeRef{PartId{home_part}, EdgeId{edge_id}},
+                        VertexRef{PartId{source_part}, VertexId{source}},
+                        VertexRef{PartId{target_part}, VertexId{target}},
+                        edge_type};
+  const Status valid = identity.Validate();
+  if (!valid.ok()) return Status::Corruption("edge identity fact", valid.ToString());
+  return identity;
+}
+
 }  // namespace
 
 std::string EncodeFactKey(const FactRef& ref, ValidTime valid_from,
@@ -161,6 +207,7 @@ std::string EncodeFactKey(const FactRef& ref, ValidTime valid_from,
   std::string encoded;
   encoded.reserve(kEncodedFactKeyBytes);
   encoded.push_back(static_cast<char>(kFactKeyVersion));
+  AppendU32(&encoded, ref.part_id().value);
   encoded.push_back(static_cast<char>(ref.family()));
   AppendU16(&encoded, ref.property_id().value);
   AppendU64(&encoded, ref.entity_id());
@@ -175,19 +222,25 @@ StatusOr<DecodedFactKey> DecodeFactKey(const std::string& encoded) {
   }
   size_t offset = 0;
   const uint8_t version = static_cast<uint8_t>(encoded[offset++]);
-  const uint8_t family = static_cast<uint8_t>(encoded[offset++]);
+  uint32_t part_id = 0;
+  uint8_t family = 0;
   uint16_t property_id = 0;
   uint64_t entity_id = 0;
   uint64_t valid_from_desc = 0;
   uint64_t commit_seq_desc = 0;
-  if (version != kFactKeyVersion || !ReadU16(encoded, &offset, &property_id) ||
+  if (version != kFactKeyVersion || !ReadU32(encoded, &offset, &part_id) ||
+      offset >= encoded.size()) {
+    return Status::Corruption("fact key", "invalid key encoding");
+  }
+  family = static_cast<uint8_t>(encoded[offset++]);
+  if (!ReadU16(encoded, &offset, &property_id) ||
       !ReadU64(encoded, &offset, &entity_id) ||
       !ReadU64(encoded, &offset, &valid_from_desc) ||
       !ReadU64(encoded, &offset, &commit_seq_desc)) {
     return Status::Corruption("fact key", "invalid key encoding");
   }
-  const FactRef ref(static_cast<FactFamily>(family), PropertyId{property_id},
-                    entity_id);
+  const FactRef ref(PartId{part_id}, static_cast<FactFamily>(family),
+                    PropertyId{property_id}, entity_id);
   const CommitSeq commit_seq{~commit_seq_desc};
   if (!ref.Validate().ok() || commit_seq.value == 0) {
     return Status::Corruption("fact key", "invalid fact identity");
@@ -200,7 +253,12 @@ StatusOr<std::string> EncodeFactValue(const FactEvent& event) {
   if (!valid.ok()) return valid;
   std::string payload;
   uint8_t kind = kNoValueKind;
-  if (event.value.has_value()) {
+  if (event.edge_identity.has_value()) {
+    kind = kEdgeIdentityValueKind;
+    auto encoded_payload = EncodeEdgeIdentityPayload(*event.edge_identity);
+    if (!encoded_payload.ok()) return encoded_payload.status();
+    payload = encoded_payload.ConsumeValueOrDie();
+  } else if (event.value.has_value()) {
     kind = static_cast<uint8_t>(event.value->type());
     auto encoded_payload = EncodeValuePayload(*event.value);
     if (!encoded_payload.ok()) return encoded_payload.status();
@@ -247,6 +305,18 @@ StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
     return Status::Corruption("fact value", "CRC32C mismatch");
   }
   std::optional<Value> value;
+  if (kind == kEdgeIdentityValueKind) {
+    const auto identity = DecodeEdgeIdentityPayload(
+        encoded.substr(offset, payload_length));
+    if (!identity.ok()) return identity.status();
+    value = std::nullopt;
+    FactEvent event{ref, valid_from, commit_seq,
+                    static_cast<FactOperation>(operation), schema_epoch, value,
+                    identity.ValueOrDie()};
+    const Status valid = event.Validate();
+    if (!valid.ok()) return Status::Corruption("fact value", valid.ToString());
+    return event;
+  }
   if (kind == kNoValueKind) {
     if (payload_length != 0) {
       return Status::Corruption("fact value", "missing value kind");

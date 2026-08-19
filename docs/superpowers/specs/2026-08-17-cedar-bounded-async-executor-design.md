@@ -1,7 +1,12 @@
 # Cedar-Owned Bounded Async Executor Design
 
+> Maintenance note (2026-08-19): this document is authoritative only for
+> bounded `CommitAsync` admission and mailbox lifecycle. The superseded Cedar
+> maintenance worker and generic write seam are not valid implementations;
+> maintenance is defined by the admission-gated Kernel design.
+
 **Date:** 2026-08-17  
-**Status:** Draft for user review  
+**Status:** Implemented; sustained-load evidence captured, host throughput gate unmet
 **Scope:** Cedar Kernel Mode asynchronous commit submission
 
 ## 1. Decision
@@ -229,6 +234,14 @@ than hidden, and records throughput, WAL-sync p99, stale-snapshot failures,
 mailbox occupancy, and reopen verification. A passing run must show no stale
 snapshot admission caused by unbounded client contention; it need not claim
 zero overload rejections because bounded admission is the intended contract.
+
+The benchmark has two explicit modes. The default overload mode retains the
+requested client count and records each immediate `ResourceExhausted` as an
+overload rejection without retrying that transaction. `--bounded-clients`
+caps only the benchmark's client count at the production request bound (32);
+it does not enlarge or otherwise alter Cedar's mailbox. In both modes,
+`operations` means successfully committed operations and peak reservation
+metrics expose the actual admission high-water mark.
 
 ## 10. Rollout and Rollback
 

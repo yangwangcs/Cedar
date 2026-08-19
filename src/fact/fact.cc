@@ -8,7 +8,8 @@ namespace {
 
 bool IsStateFamily(FactFamily family) {
   return family == FactFamily::kVertexState ||
-         family == FactFamily::kEdgeState;
+         family == FactFamily::kEdgeState ||
+         family == FactFamily::kEdgeIdentity;
 }
 
 bool IsKnownFamily(FactFamily family) {
@@ -70,30 +71,32 @@ Status FactRef::Validate() const {
   return Status::OK();
 }
 
-EntityFact EntityFact::Vertex(VertexId vertex_id) {
-  return EntityFact(
-      FactRef(FactFamily::kVertexState, PropertyId{}, vertex_id.value));
+EntityFact EntityFact::Vertex(VertexRef vertex) {
+  return EntityFact(FactRef(vertex.part_id, FactFamily::kVertexState,
+                            PropertyId{}, vertex.vertex_id.value));
 }
 
-EntityFact EntityFact::Edge(EdgeId edge_id) {
-  return EntityFact(FactRef(FactFamily::kEdgeState, PropertyId{}, edge_id.value));
+EntityFact EntityFact::Edge(EdgeRef edge) {
+  return EntityFact(FactRef(edge.home_part_id, FactFamily::kEdgeState,
+                            PropertyId{}, edge.edge_id.value));
 }
 
-PropertyFact PropertyFact::Vertex(VertexId vertex_id, PropertyId property_id) {
-  return PropertyFact(FactRef(FactFamily::kVertexProperty, property_id,
-                              vertex_id.value));
+PropertyFact PropertyFact::Vertex(VertexRef vertex, PropertyId property_id) {
+  return PropertyFact(FactRef(vertex.part_id, FactFamily::kVertexProperty,
+                              property_id, vertex.vertex_id.value));
 }
 
-PropertyFact PropertyFact::Edge(EdgeId edge_id, PropertyId property_id) {
-  return PropertyFact(
-      FactRef(FactFamily::kEdgeProperty, property_id, edge_id.value));
+PropertyFact PropertyFact::Edge(EdgeRef edge, PropertyId property_id) {
+  return PropertyFact(FactRef(edge.home_part_id, FactFamily::kEdgeProperty,
+                              property_id, edge.edge_id.value));
 }
 
 Status EdgeIdentity::Validate() const {
   if (!edge_id.valid() || !source_vertex_id.valid() ||
-      !target_vertex_id.valid() || edge_type == 0) {
+      !target_vertex_id.valid() || edge_type == 0 ||
+      home_part_id != source_part_id) {
     return Status::InvalidArgument(
-        "edge identity", "edge, endpoints, and type must be nonzero");
+        "edge identity", "invalid edge home partition, endpoints, or type");
   }
   return Status::OK();
 }
@@ -102,11 +105,31 @@ Status FactEvent::Validate() const {
   if (commit_seq.value == 0) {
     return Status::InvalidArgument("fact event", "zero commit sequence");
   }
-  return ValidateMutation(ref, operation, schema_epoch, value);
+  const Status mutation = ValidateMutation(ref, operation, schema_epoch, value);
+  if (!mutation.ok()) return mutation;
+  if (ref.family() == FactFamily::kEdgeIdentity) {
+    if (valid_from.value != 0 || operation != FactOperation::kPut ||
+        schema_epoch != 0 || value.has_value() || !edge_identity.has_value() ||
+        edge_identity->edge_ref() !=
+            EdgeRef{ref.part_id(), EdgeId{ref.entity_id()}}) {
+      return Status::InvalidArgument(
+          "edge identity fact", "identity facts require a valid_from=0 PUT payload");
+    }
+    return edge_identity->Validate();
+  }
+  if (edge_identity.has_value()) {
+    return Status::InvalidArgument("fact event", "edge identity payload on non-identity fact");
+  }
+  return Status::OK();
 }
 
 Status PendingFactMutation::Validate() const {
-  return ValidateMutation(ref, operation, schema_epoch, value);
+  const Status status = ValidateMutation(ref, operation, schema_epoch, value);
+  if (!status.ok()) return status;
+  if (ref.family() == FactFamily::kEdgeIdentity) {
+    return Status::InvalidArgument("fact mutation", "edge identity uses StoreCommitBatch identity payload");
+  }
+  return Status::OK();
 }
 
 }  // namespace cedar

@@ -45,18 +45,41 @@ struct SequenceRecord {
   bool operator==(const SequenceRecord&) const = default;
 };
 
+enum class VacuumPhase : uint8_t { kPrepared = 1, kRunning = 2 };
+
+struct VacuumState {
+  CommitSeq target;
+  VacuumPhase phase = VacuumPhase::kPrepared;
+  std::string cursor;
+
+  Status Validate() const;
+  bool operator==(const VacuumState&) const = default;
+};
+
+struct SystemIdentity {
+  std::string system;
+  uint32_t system_format = 0;
+  std::string fact_key_format;
+  std::string facts_table_format;
+  std::string comparator_digest;
+
+  Status Validate() const;
+  bool operator==(const SystemIdentity&) const = default;
+};
+
 std::string EncodeCurrentFormatKey();
 StatusOr<std::string> EncodeSchemaMetaKey(PropertyId property_id,
                                           uint32_t schema_epoch);
-StatusOr<std::string> EncodeEdgeIdentityMetaKey(EdgeId edge_id);
+StatusOr<std::string> EncodeEdgeIdentityMetaKey(EdgeRef edge);
 std::string EncodeAllocatorMetaKey(IdKind kind);
 StatusOr<std::string> EncodeTransactionMetaKey(TxnId txn_id);
 StatusOr<std::string> EncodeSequenceMetaKey(CommitSeq commit_seq);
 std::string EncodeVisibleWatermarkKey();
 std::string EncodeOldestReadableWatermarkKey();
+std::string EncodeVacuumStateKey();
 
-StatusOr<std::string> EncodeFormatVersion(uint32_t format_version);
-StatusOr<uint32_t> DecodeFormatVersion(const std::string& encoded);
+StatusOr<std::string> EncodeSystemIdentity(const SystemIdentity& identity);
+StatusOr<SystemIdentity> DecodeSystemIdentity(const std::string& encoded);
 StatusOr<std::string> EncodeWatermark(CommitSeq watermark);
 StatusOr<CommitSeq> DecodeWatermark(const std::string& encoded);
 StatusOr<std::string> EncodePropertyDefinition(
@@ -72,6 +95,8 @@ StatusOr<TransactionOutcomeRecord> DecodeTransactionOutcome(
     const std::string& encoded);
 StatusOr<std::string> EncodeSequenceRecord(const SequenceRecord& record);
 StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded);
+StatusOr<std::string> EncodeVacuumState(const VacuumState& state);
+StatusOr<VacuumState> DecodeVacuumState(const std::string& encoded);
 
 }  // namespace cedar
 

@@ -68,7 +68,7 @@ TEST_F(KernelInterfaceTest, OpensExplicitKernelAndCreatesMoveOnlyHandles) {
   ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
   Snapshot moved_snapshot = std::move(snapshot).ConsumeValueOrDie();
   EXPECT_EQ(moved_snapshot.commit_seq(), CommitSeq{0});
-  EXPECT_TRUE(snapshot.ValueOrDie().Exists(EntityFact::Vertex(VertexId{1}),
+  EXPECT_TRUE(snapshot.ValueOrDie().Exists(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
                                            ValidTime{1})
                   .status()
                   .IsInvalidArgument());
@@ -100,11 +100,11 @@ TEST_F(KernelInterfaceTest, RejectsOperationsAfterCloseAndOnMovedFromHandles) {
   EXPECT_TRUE(database.ValueOrDie()->BeginSnapshot().status().IsInvalidArgument());
 }
 
-TEST_F(KernelInterfaceTest, ExposesVacuumAsAnExplicitKernelOperation) {
+TEST_F(KernelInterfaceTest, ExecutesVacuumAsAnExplicitKernelOperation) {
   const auto database = Database::Open(DatabaseOptions{.path = path_});
   ASSERT_TRUE(database.ok()) << database.status().ToString();
 
-  EXPECT_TRUE(database.ValueOrDie()->Vacuum(CommitSeq{1}).IsNotSupportedError());
+  EXPECT_TRUE(database.ValueOrDie()->Vacuum(CommitSeq{0}).ok());
 }
 
 TEST_F(KernelInterfaceTest, TransactionPinsDatabaseUntilRollback) {

@@ -18,11 +18,12 @@
 - Cedar owns commit admission, N+1, sampling cadence, maintenance priority, grant concurrency, byte/deadline budgets, and shutdown ordering.
 - Kernel grants are process-local and never persisted.
 - Recovery work must not require a live Cedar controller.
-- Generic and Lean must reopen Kernel-written databases without conversion.
+- Kernel must reopen Kernel-written databases without conversion. Lean is a
+  fresh-database measurement configuration, not a compatibility path.
 - Production WAL defaults remain `manual_wal_flush=false`, `use_fsync=false`, `wal_bytes_per_sync=0`, and `recycle_log_file_num=0`.
 - No successful run shorter than 1,800 seconds may be labeled sustained.
 - Do not restore a fabricated 30,000 transactions/s pass condition; report the measured durable-sync ceiling and software costs.
-- Keep Kernel opt-in until every correctness, crash, sanitizer, read, write, space, reopen, and 30-minute gate passes.
+- Keep Kernel opt-in until every correctness, crash, sanitizer, read, write, space, reopen, and 30-minute gate passes; do not retain an older Cedar write path as rollback code.
 
 ## File Map
 
@@ -1358,8 +1359,6 @@ if (sample.pipeline_metrics.rocksdb.background_errors != 0 ||
   return "sustained_background_error";
 if (sample.maintenance.write_stopped != 0)
   return "sustained_write_stopped";
-if (options.execution_profile != BenchmarkExecutionProfile::kKernel)
-  return "sustained_reference_profile_complete";
 if (sample.maintenance.unexplained_autonomous_jobs != 0)
   return "sustained_unexplained_autonomous_maintenance";
 if (sample.maintenance.max_snapshot_age_us > 250'000)
@@ -1510,9 +1509,9 @@ DBOptions::cedar_manual_maintenance
 `src/fact/rocksdb_config.cc` sets only
 `cedar_admission_gated_maintenance`. `database.cc` calls only the controller
 adapter. Rewrite old tests to the DB-wide snapshot/grant API. Direct
-`CompactFiles` calls may remain only in Generic/Lean oracle tests or in an
-explicit Kernel manual-conflict test; add a test name/comment that states that
-purpose so it cannot become the Cedar production path.
+`CompactFiles` calls may remain only in an explicit Kernel manual-conflict test;
+add a test name/comment that states that purpose so it cannot become the Cedar
+production path.
 
 - [ ] **Step 4: Replace the benchmark schema without compatibility duplicates**
 
@@ -1828,7 +1827,7 @@ git commit -m "test: verify Cedar kernel across sanitizer profiles"
   modes from Task 8.
 - Produces: reproducible 2,048-operation, 30/60/300-second, and 1,800-second
   campaign results, Lean comparison, production-device evidence, and an
-  explicit rollout or rollback decision.
+  explicit rollout decision.
 
 - [ ] **Step 1: Add campaign option and validation tests**
 
@@ -1899,13 +1898,6 @@ common=(--workload property-put --group-workers 512 --group-max 256
         --group-window-us 200 --verify-reopen --seed 20260818)
 production=("${common[@]}" --memory-budget-mib 1024)
 
-"$bench" --workload property-put --profile generic --operations 2048 \
-  --seed 20260818 --prepare-seed-db "$output_dir/seed-db"
-
-"$bench" "${common[@]}" --seed-db "$output_dir/seed-db" \
-  --database-path "$output_dir/generic-smoke-db" \
-  --profile generic --campaign smoke --operations 2048 \
-  >"$output_dir/generic-smoke.csv"
 "$bench" "${production[@]}" --seed-db "$output_dir/seed-db" \
   --database-path "$output_dir/lean-30s-db" \
   --profile lean --campaign warm --duration-seconds 30 \
@@ -1940,8 +1932,8 @@ The 1,800-second command runs only after the 300-second row has no hang,
 write-stop, rejection, background error, unbounded debt, or reopen failure.
 The runner records command line, seed checkpoint identity, host/device, commit
 revision, RocksDB revision, compiler, and exact configuration next to every
-CSV. Generic omits the production-only memory option; Lean and Kernel use the
-same explicit 1 GiB budget.
+CSV. Lean and Kernel use the same explicit 1 GiB budget. There is no Generic
+benchmark or compatibility workload.
 
 - [ ] **Step 4: Add campaign stop conditions and evidence validation**
 
@@ -1990,12 +1982,12 @@ layouts. Report median/p95/p99 latency, transactions per sync, durable-sync
 ceiling, WAL append/sync/manifest costs, read bytes, live/WAL/obsolete/temp
 space classes, maintenance debt, and every qualification status.
 
-- [ ] **Step 6: Apply rollout/rollback decision**
+- [ ] **Step 6: Apply rollout decision**
 
 Mark Kernel production-ready only if native correctness, crash, reopen,
 sanitizer, read, write, space, N+1, and both 1,800-second campaign rows pass.
-Otherwise keep Kernel opt-in and select Lean at open; no database rewrite or
-Cedar-specific replay is permitted. Record the decision and the limiting
+Otherwise keep Kernel opt-in and use Lean only for fresh-database measurement;
+no database rewrite or Cedar-specific replay is permitted. Record the decision and the limiting
 measurement in the evidence document, including whether the remaining limit is
 durable device sync, WAL serialization, Cedar CPU, RocksDB job CPU, or storage
 space.

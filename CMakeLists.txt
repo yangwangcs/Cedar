@@ -102,6 +102,11 @@ if(BUILD_BENCHMARKS)
     add_executable(cedar_kernel_bench benchmarks/cedar_kernel_bench.cc)
     target_link_libraries(cedar_kernel_bench PRIVATE cedar_kernel_bench_options
         cedar_kernel_bench_workload)
+    add_executable(cedar_kernel_columnar_bench
+        benchmarks/cedar_kernel_columnar_bench.cc)
+    target_include_directories(cedar_kernel_columnar_bench PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
+    target_link_libraries(cedar_kernel_columnar_bench PRIVATE cedar_core)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets

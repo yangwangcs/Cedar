@@ -252,6 +252,13 @@ add_test(NAME KernelBenchmarkCsvContract
         -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
 
+if(TARGET cedar_kernel_columnar_bench)
+    add_test(NAME KernelColumnarBenchmarkSmoke
+        COMMAND ${CMAKE_COMMAND}
+            -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_columnar_bench>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_columnar_benchmark.cmake)
+endif()
+
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)
 target_include_directories(test_commit_publisher PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_commit_publisher

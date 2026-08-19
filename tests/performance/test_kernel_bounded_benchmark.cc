@@ -36,6 +36,11 @@ TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {
   options.storage_profile = StorageProfile::kProductionAppend;
   options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
   options.production.kernel_mode = true;
+  // This test exercises the commit pipeline, not disk-pressure admission.
+  options.runtime_pressure_override_for_testing = [](PressureSample* sample) {
+    sample->free_disk_bytes = UINT64_MAX;
+    sample->free_disk_percent = 100;
+  };
   // A single-request first epoch leaves the queued independent writes for the
   // N+1 preflight; the regular production batch policy would group them first.
   options.group_commit_max_batch_size = 1;

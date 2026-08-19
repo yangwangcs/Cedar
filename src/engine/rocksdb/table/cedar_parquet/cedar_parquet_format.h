@@ -131,11 +131,20 @@ struct CedarParquetColumnarBatch {
   size_t row_count() const { return internal_keys.size(); }
 };
 
+struct CedarParquetScanStats {
+  uint64_t row_groups_skipped = 0;
+  uint64_t pages_skipped = 0;
+  uint64_t pages_read = 0;
+  uint64_t bytes_read = 0;
+  uint64_t rows_emitted = 0;
+};
+
 struct CedarParquetScanSpec {
   std::optional<std::string> sort_key_lower;
   std::optional<std::string> sort_key_upper;
   std::vector<CedarParquetColumnId> projection;
   uint32_t batch_row_limit = 1024;
+  CedarParquetScanStats* stats = nullptr;
 };
 
 using CedarParquetColumnarBatchVisitor =

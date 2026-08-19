@@ -1116,6 +1116,9 @@ Status CedarParquetTableReader::ScanProjected(
   batch.columns = columns;
   const auto flush = [&]() -> Status {
     if (batch.internal_keys.empty()) return Status::OK();
+    if (spec.stats != nullptr) {
+      spec.stats->rows_emitted += batch.row_count();
+    }
     Status status = visitor(batch);
     if (!status.ok()) return status;
     batch = CedarParquetColumnarBatch();
@@ -1128,19 +1131,37 @@ Status CedarParquetTableReader::ScanProjected(
     const auto& row_group = footer_.row_groups[row_group_index];
     const auto& sort_column = row_group.columns.front();
     if (spec.sort_key_lower.has_value() && sort_column.max_value < *spec.sort_key_lower) {
+      if (spec.stats != nullptr) ++spec.stats->row_groups_skipped;
       continue;
     }
     if (spec.sort_key_upper.has_value() && sort_column.min_value > *spec.sort_key_upper) {
+      if (spec.stats != nullptr) {
+        spec.stats->row_groups_skipped += footer_.row_groups.size() - row_group_index;
+      }
       break;
     }
     for (size_t page_index = 0; page_index < sort_column.page_locations.size();
          ++page_index) {
       const auto& page_bounds = sort_column.page_indexes[page_index];
       if (spec.sort_key_lower.has_value() && page_bounds.max_value < *spec.sort_key_lower) {
+        if (spec.stats != nullptr) ++spec.stats->pages_skipped;
         continue;
       }
       if (spec.sort_key_upper.has_value() && page_bounds.min_value > *spec.sort_key_upper) {
+        if (spec.stats != nullptr) {
+          spec.stats->pages_skipped += sort_column.page_locations.size() - page_index;
+        }
         return flush();
+      }
+
+      if (spec.stats != nullptr) {
+        ++spec.stats->pages_read;
+        for (const auto& column : row_group.columns) {
+          if (page_index < column.page_locations.size()) {
+            spec.stats->bytes_read += static_cast<uint64_t>(
+                column.page_locations[page_index].compressed_page_size);
+          }
+        }
       }
 
       std::vector<std::string> sort_keys;

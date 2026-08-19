@@ -293,6 +293,36 @@ TEST(CedarParquetTableReaderTest,
   EXPECT_EQ(reader->PageDecodeCountForTesting(), 0U);
 }
 
+TEST(CedarParquetTableReaderTest, ReportsMetadataPruningAndBytesRead) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {InternalKeyFor(1, 4), InternalKeyFor(2, 3),
+                                         InternalKeyFor(3, 2), InternalKeyFor(4, 1)};
+  const std::vector<std::string> values = {StateFactValue(), StateFactValue(),
+                                           StateFactValue(), StateFactValue()};
+  std::unique_ptr<CedarParquetTableReader> reader =
+      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator);
+
+  CedarParquetScanStats stats;
+  CedarParquetScanSpec spec;
+  spec.sort_key_lower = SortKeyFor(keys[1]);
+  spec.sort_key_upper = SortKeyFor(keys[2]);
+  spec.batch_row_limit = 8;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.stats = &stats;
+  ASSERT_TRUE(reader->ScanProjected(spec, [](const CedarParquetColumnarBatch&) {
+                         return Status::OK();
+                       })
+                  .ok());
+  EXPECT_EQ(stats.row_groups_skipped, 0U);
+  EXPECT_EQ(stats.pages_skipped, 2U);
+  EXPECT_EQ(stats.pages_read, 2U);
+  EXPECT_GT(stats.bytes_read, 0U);
+  EXPECT_EQ(stats.rows_emitted, 2U);
+}
+
 TEST(CedarParquetTableReaderTest,
      RejectsEncodedValuePageWhoseValueCountDoesNotMatchCanonicalRows) {
   Options options;

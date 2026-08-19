@@ -10,7 +10,7 @@
 #include <optional>
 
 #include "cedar/core/status.h"
-#include "cedar/fact/fact_store.h"
+#include "storage/facts/fact_store.h"
 #include "cedar/runtime/pressure_controller.h"
 
 namespace cedar {

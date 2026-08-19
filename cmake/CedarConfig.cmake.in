@@ -1,0 +1,27 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/CedarTargets.cmake")
+
+# Cedar owns these private static implementation archives. They are linked to
+# resolve the Cedar static library, but no implementation headers or CMake
+# targets are exported to consumers.
+set_property(TARGET Cedar::cedar APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+  "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/librocksdb.a"
+  "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/liblz4.a"
+  "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/libzstd.a"
+  Threads::Threads)
+
+if(APPLE)
+  execute_process(COMMAND xcrun --sdk macosx --show-sdk-path
+                  OUTPUT_VARIABLE CEDAR_MACOS_SDK
+                  OUTPUT_STRIP_TRAILING_WHITESPACE)
+  set(CEDAR_MACOS_CXX_HEADERS "${CEDAR_MACOS_SDK}/usr/include/c++/v1")
+  if(EXISTS "${CEDAR_MACOS_CXX_HEADERS}/cstdint" AND
+     NOT EXISTS "/usr/include/c++/v1/cstdint")
+    target_compile_options(Cedar::cedar INTERFACE
+      "-isystem" "${CEDAR_MACOS_CXX_HEADERS}")
+  endif()
+endif()

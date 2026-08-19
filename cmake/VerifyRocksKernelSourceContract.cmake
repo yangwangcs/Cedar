@@ -29,10 +29,10 @@ foreach(source IN LISTS cedar_sources)
 endforeach()
 
 set(expected_rocksdb_include_sources
-    "${CEDAR_SOURCE_DIR}/src/fact/commit_publisher.cc"
-    "${CEDAR_SOURCE_DIR}/src/fact/decided_epoch.cc"
-    "${CEDAR_SOURCE_DIR}/src/fact/fact_store.cc"
-    "${CEDAR_SOURCE_DIR}/src/fact/rocksdb_config.cc")
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/commit_publisher.cc"
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/decided_epoch.cc"
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocks_adapter.cc"
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocksdb_config.cc")
 foreach(source IN LISTS expected_rocksdb_include_sources)
   file(REAL_PATH "${source}" source)
   list(APPEND normalized_expected_rocksdb_include_sources "${source}")
@@ -41,17 +41,38 @@ list(SORT rocksdb_include_sources)
 list(SORT normalized_expected_rocksdb_include_sources)
 if(NOT rocksdb_include_sources STREQUAL normalized_expected_rocksdb_include_sources)
   message(FATAL_ERROR
-          "only private FactStore components may include RocksDB; found: ${rocksdb_include_sources}")
+          "only private Rocks adapter components may include RocksDB; found: ${rocksdb_include_sources}")
 endif()
 
+foreach(directory IN ITEMS "${CEDAR_SOURCE_DIR}/src/kernel"
+        "${CEDAR_SOURCE_DIR}/src/storage/facts")
+  file(GLOB_RECURSE implementation_files "${directory}/*.cc" "${directory}/*.h")
+  foreach(implementation_file IN LISTS implementation_files)
+    file(READ "${implementation_file}" implementation_contents)
+    if(implementation_contents MATCHES "#include[ \\t]*[<\\\"]rocksdb/" OR
+       implementation_contents MATCHES "rocksdb::")
+      message(FATAL_ERROR
+              "RocksDB use escaped the private adapter: ${implementation_file}")
+    endif()
+  endforeach()
+endforeach()
+
 file(READ "${CEDAR_SOURCE_DIR}/CMakeLists.txt" cmake_lists)
-foreach(forbidden_path IN ITEMS src/storage/ src/blob/ src/cache/ src/tcypher/
-        src/optimizer/ src/runtime/ src/observability/ src/benchmark/
+foreach(forbidden_path IN ITEMS src/blob/ src/cache/ src/tcypher/
+        src/optimizer/ src/observability/ src/benchmark/
         src/columnar/sst.cc src/projection/ include/cedar/projection/)
   if(cmake_lists MATCHES "${forbidden_path}")
     message(FATAL_ERROR "legacy source is in Cedar build graph: ${forbidden_path}")
   endif()
 endforeach()
+
+if(EXISTS "${CEDAR_SOURCE_DIR}/archive/pre-rocksdb-kernel-2026-08-01")
+  message(FATAL_ERROR "retired pre-Kernel source archive remains in Cedar")
+endif()
+
+if(NOT EXISTS "${CEDAR_SOURCE_DIR}/third_party/cedar_codecs/PROVENANCE.md")
+  message(FATAL_ERROR "Cedar codec provenance is missing")
+endif()
 
 foreach(forbidden_directory IN ITEMS "${CEDAR_SOURCE_DIR}/src/projection"
         "${CEDAR_SOURCE_DIR}/include/cedar/projection")

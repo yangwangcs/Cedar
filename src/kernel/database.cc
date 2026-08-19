@@ -12,7 +12,7 @@
 #include <pthread/qos.h>
 #endif
 
-#include "fact/group_commit_planner.h"
+#include "storage/facts/group_commit_planner.h"
 #include "kernel/database_impl.h"
 
 namespace cedar {
@@ -72,6 +72,43 @@ void CompleteCommitHandle(const std::shared_ptr<CommitHandle::State>& handle,
   std::lock_guard<std::mutex> lock(handle->mutex);
   handle->result.emplace(std::move(result));
   handle->completed.notify_all();
+}
+
+RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
+  RuntimeMetrics metrics;
+  metrics.retained_wal_bytes = source.retained_wal_bytes;
+  metrics.active_fact_bytes = source.total_active_memtable_bytes;
+  metrics.immutable_fact_bytes = source.total_immutable_memtable_bytes;
+  metrics.immutable_fact_count = source.total_immutable_memtable_count;
+  metrics.l0_file_count = source.total_l0_files;
+  metrics.pending_compaction_bytes = source.total_pending_compaction_bytes;
+  metrics.write_buffer_bytes = source.write_buffer_manager_bytes;
+  metrics.write_buffer_limit_bytes = source.write_buffer_manager_limit_bytes;
+  metrics.background_error_count = source.background_errors_total;
+  metrics.cache_usage_bytes = source.block_cache_usage_bytes;
+  metrics.cache_pinned_bytes = source.block_cache_pinned_bytes;
+  metrics.running_flushes = source.running_flushes;
+  metrics.running_compactions = source.running_compactions;
+  metrics.live_fact_bytes = source.live_sst_bytes;
+  metrics.write_stopped = source.write_stopped;
+  metrics.delayed_write_rate_bytes_per_sec =
+      source.delayed_write_rate_bytes_per_sec;
+  metrics.cache_hits = source.block_cache_hits;
+  metrics.cache_misses = source.block_cache_misses;
+  metrics.compressed_block_count = source.blocks_compressed;
+  metrics.compression_input_bytes = source.compression_input_bytes;
+  metrics.compression_output_bytes = source.compression_output_bytes;
+  metrics.point_read_operations = source.point_read_operations;
+  metrics.multi_get_operations = source.multi_get_operations;
+  metrics.projected_scan_rows = source.projected_scan_rows;
+  metrics.projected_scan_bytes_read = source.projected_scan_bytes_read;
+  metrics.canonical_scan_bytes_read = source.canonical_scan_bytes_read;
+  metrics.logical_facts_bytes = source.logical_facts_bytes;
+  metrics.obsolete_fact_bytes = source.obsolete_sst_bytes;
+  metrics.temporary_output_bytes = source.temporary_output_bytes;
+  metrics.free_disk_bytes = source.free_disk_bytes;
+  metrics.free_disk_percent = source.free_disk_percent;
+  return metrics;
 }
 
 bool CanDecideIndependentAppend(const StoreCommitBatch& batch,
@@ -858,7 +895,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
         RecordLatency(&append_commit_metrics.latency.wal_callback,
                       durability.wal_callback_duration_us.load(
                           std::memory_order_relaxed));
-        append_commit_metrics.rocksdb = runtime_snapshot.rocksdb;
+        append_commit_metrics.runtime = ToRuntimeMetrics(runtime_snapshot.rocksdb);
         if (result.ok()) {
           append_commit_metrics.durably_accepted += durably_accepted_transactions;
         }
@@ -1433,9 +1470,11 @@ CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {
   return metrics;
 }
 
-StatusOr<RocksDbRuntimeMetrics> Database::SampleRuntimeMetrics() const {
+StatusOr<RuntimeMetrics> Database::SampleRuntimeMetrics() const {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
-  return impl_->store.SampleRuntimeMetrics();
+  const auto sampled = impl_->store.SampleRuntimeMetrics();
+  if (!sampled.ok()) return sampled.status();
+  return ToRuntimeMetrics(sampled.ValueOrDie());
 }
 
 }  // namespace cedar

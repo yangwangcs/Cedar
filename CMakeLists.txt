@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.14)
 project(cedar VERSION 2.0.0 LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -51,20 +54,20 @@ add_library(cedar_core STATIC
     src/core/crc32c.cc
     src/core/status.cc
     src/types/value.cc
-    src/fact/commit_publisher.cc
-    src/fact/decided_epoch.cc
-    src/fact/fact.cc
-    src/fact/fact_codec.cc
-    src/fact/group_commit_planner.cc
-    src/fact/pending_version_overlay.cc
-    src/fact/recent_fact_write_index.cc
-    src/fact/version_validation_cache.cc
-    src/fact/meta_codec.cc
-    src/fact/prepared_commit_codec.cc
-    src/fact/rocksdb_config.cc
-    src/fact/vacuum.cc
-    src/fact/fact_store.cc
-    src/fact/pressure_controller.cc
+    src/storage/rocks/commit_publisher.cc
+    src/storage/rocks/decided_epoch.cc
+    src/storage/facts/fact.cc
+    src/storage/facts/fact_codec.cc
+    src/storage/facts/group_commit_planner.cc
+    src/storage/facts/pending_version_overlay.cc
+    src/storage/facts/recent_fact_write_index.cc
+    src/storage/facts/version_validation_cache.cc
+    src/storage/facts/meta_codec.cc
+    src/storage/facts/prepared_commit_codec.cc
+    src/storage/rocks/rocksdb_config.cc
+    src/storage/facts/vacuum.cc
+    src/storage/rocks/rocks_adapter.cc
+    src/runtime/pressure_controller.cc
     src/kernel/database.cc
     src/kernel/async_submission_executor.cc
     src/kernel/maintenance_controller.cc
@@ -73,10 +76,16 @@ add_library(cedar_core STATIC
     src/kernel/temporal_validation.cc
     src/kernel/transaction.cc)
 target_include_directories(cedar_core
-    PUBLIC ${CMAKE_SOURCE_DIR}/include
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+           $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_SOURCE_DIR}/src
             ${CEDAR_ROCKSDB_SOURCE_DIR})
-target_link_libraries(cedar_core PUBLIC cedar_rocksdb)
+target_link_libraries(cedar_core PRIVATE cedar_rocksdb)
+set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
+    "$<BUILD_INTERFACE:cedar_rocksdb>")
+target_compile_features(cedar_core PUBLIC cxx_std_20)
+set_target_properties(cedar_core PROPERTIES EXPORT_NAME cedar)
+add_library(Cedar::cedar ALIAS cedar_core)
 
 add_library(cedar_kernel_bench_options STATIC
     benchmarks/cedar_kernel_bench_options.cc)
@@ -95,12 +104,33 @@ if(BUILD_BENCHMARKS)
         cedar_kernel_bench_workload)
 endif()
 
-install(TARGETS cedar_core
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-    RUNTIME DESTINATION bin)
-install(DIRECTORY include/cedar DESTINATION include
+install(TARGETS cedar_core EXPORT CedarTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES
+    "${CEDAR_ROCKSDB_LIBRARY}"
+    "${CEDAR_ROCKSDB_LZ4_LIBRARY}"
+    "${CEDAR_ROCKSDB_ZSTD_LIBRARY}"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal")
+install(DIRECTORY include/cedar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h")
+configure_package_config_file(
+    cmake/CedarConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/CedarConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Cedar")
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/CedarConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+install(EXPORT CedarTargets
+    FILE CedarTargets.cmake
+    NAMESPACE Cedar::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Cedar")
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/CedarConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/CedarConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Cedar")
 
 option(BUILD_TESTS "Build Cedar test programs" OFF)
 if(BUILD_TESTS)

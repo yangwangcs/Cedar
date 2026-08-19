@@ -6,7 +6,7 @@
 
 #include <vector>
 
-#include "cedar/fact/fact_store.h"
+#include "storage/facts/fact_store.h"
 
 namespace cedar {
 

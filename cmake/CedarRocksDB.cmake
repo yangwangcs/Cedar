@@ -77,9 +77,8 @@ elseif(CEDAR_ENABLE_TSAN)
     set(CEDAR_ROCKSDB_SANITIZER_FLAG "-fsanitize=thread")
 endif()
 
-# These inputs deliberately describe both the codec policy and the archived
-# source identities. Production always builds the pinned archived codecs; a
-# cache built with a different policy must never be reused silently.
+# These inputs deliberately describe the pinned Cedar codec policy and source
+# identities. A cache built with a different policy must never be reused.
 # Native, sanitizer, and release profiles use optimized RocksDB. A Cedar Debug
 # build deliberately keeps RocksDB assertions and SyncPoints so integration
 # regressions can exercise real stall/recovery interleavings.
@@ -91,12 +90,12 @@ endif()
 set(CEDAR_ROCKSDB_CODEC_FLAGS
     "WITH_LZ4=ON|WITH_ZSTD=ON|WITH_SNAPPY=OFF|WITH_ZLIB=OFF|WITH_BZ2=OFF")
 set(CEDAR_LZ4_SOURCE_DIR
-    "${CMAKE_SOURCE_DIR}/archive/pre-rocksdb-kernel-2026-08-01/third_party/lz4")
+    "${CMAKE_SOURCE_DIR}/third_party/cedar_codecs/lz4")
 set(CEDAR_ZSTD_SOURCE_DIR
-    "${CMAKE_SOURCE_DIR}/archive/pre-rocksdb-kernel-2026-08-01/third_party/zstd")
+    "${CMAKE_SOURCE_DIR}/third_party/cedar_codecs/zstd")
 if(NOT EXISTS "${CEDAR_LZ4_SOURCE_DIR}/lib/lz4.c" OR
    NOT EXISTS "${CEDAR_ZSTD_SOURCE_DIR}/lib/zstd.h")
-    message(FATAL_ERROR "Pinned archived LZ4 and Zstd sources are required")
+    message(FATAL_ERROR "Pinned Cedar LZ4 and Zstd sources are required")
 endif()
 file(GLOB_RECURSE CEDAR_CODEC_SOURCE_FILES
      "${CEDAR_LZ4_SOURCE_DIR}/lib/*"

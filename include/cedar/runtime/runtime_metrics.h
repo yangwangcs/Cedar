@@ -1,0 +1,50 @@
+// Copyright 2026 The Cedar Authors
+// Licensed under the Apache License, Version 2.0.
+
+#ifndef CEDAR_RUNTIME_RUNTIME_METRICS_H_
+#define CEDAR_RUNTIME_RUNTIME_METRICS_H_
+
+#include <cstdint>
+
+namespace cedar {
+
+// Cedar-facing storage and runtime measurements. The backing storage engine
+// remains an implementation detail; these fields describe Cedar's workload
+// and capacity state rather than a native engine API.
+struct RuntimeMetrics {
+  uint64_t retained_wal_bytes = 0;
+  uint64_t active_fact_bytes = 0;
+  uint64_t immutable_fact_bytes = 0;
+  uint64_t immutable_fact_count = 0;
+  uint64_t l0_file_count = 0;
+  uint64_t pending_compaction_bytes = 0;
+  uint64_t write_buffer_bytes = 0;
+  uint64_t write_buffer_limit_bytes = 0;
+  uint64_t background_error_count = 0;
+  uint64_t cache_usage_bytes = 0;
+  uint64_t cache_pinned_bytes = 0;
+  uint64_t running_flushes = 0;
+  uint64_t running_compactions = 0;
+  uint64_t live_fact_bytes = 0;
+  uint64_t write_stopped = 0;
+  uint64_t delayed_write_rate_bytes_per_sec = 0;
+  uint64_t cache_hits = 0;
+  uint64_t cache_misses = 0;
+  uint64_t compressed_block_count = 0;
+  uint64_t compression_input_bytes = 0;
+  uint64_t compression_output_bytes = 0;
+  uint64_t point_read_operations = 0;
+  uint64_t multi_get_operations = 0;
+  uint64_t projected_scan_rows = 0;
+  uint64_t projected_scan_bytes_read = 0;
+  uint64_t canonical_scan_bytes_read = 0;
+  uint64_t logical_facts_bytes = 0;
+  uint64_t obsolete_fact_bytes = 0;
+  uint64_t temporary_output_bytes = 0;
+  uint64_t free_disk_bytes = UINT64_MAX;
+  uint64_t free_disk_percent = 100;
+};
+
+}  // namespace cedar
+
+#endif  // CEDAR_RUNTIME_RUNTIME_METRICS_H_

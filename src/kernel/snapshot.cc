@@ -100,7 +100,7 @@ Status MakeFactColumn(FactColumnId id, FactColumn* column) {
     case FactColumnId::kEntityId:
     case FactColumnId::kValidFrom:
     case FactColumnId::kCedarCommitSeq:
-    case FactColumnId::kRocksdbSequence:
+    case FactColumnId::kStorageSequence:
     case FactColumnId::kTimestamp64Value:
     case FactColumnId::kSourceVertexId:
     case FactColumnId::kTargetVertexId:
@@ -161,7 +161,7 @@ Status AppendEventColumn(FactColumn* column, const FactEvent& event) {
       return AppendFactColumnValue(column, event.valid_from.value);
     case FactColumnId::kCedarCommitSeq:
       return AppendFactColumnValue(column, event.commit_seq.value);
-    case FactColumnId::kRocksdbSequence:
+    case FactColumnId::kStorageSequence:
       return Status::NotSupported("fact scan",
                                   "StateColumnarScan has no storage sequence lane");
     case FactColumnId::kOperation:
@@ -420,7 +420,7 @@ Status Snapshot::StateColumnarScan(
   FactColumnarBatch schema;
   schema.columns.reserve(projection.size());
   for (FactColumnId id : projection) {
-    if (id == FactColumnId::kRocksdbSequence) {
+    if (id == FactColumnId::kStorageSequence) {
       return Status::NotSupported("fact scan",
                                   "StateColumnarScan has no storage sequence lane");
     }

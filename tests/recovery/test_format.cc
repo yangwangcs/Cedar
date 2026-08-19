@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "cedar/fact/fact_store.h"
+#include "storage/facts/fact_store.h"
 #include "cedar/format.h"
 
 #include <rocksdb/db.h>

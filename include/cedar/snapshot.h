@@ -12,7 +12,7 @@
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
-#include "cedar/fact/fact_store.h"
+#include "cedar/fact/fact_scan.h"
 
 namespace cedar {
 

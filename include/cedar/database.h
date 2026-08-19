@@ -12,9 +12,11 @@
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
-#include "cedar/fact/fact_store.h"
 #include "cedar/schema.h"
 #include "cedar/snapshot.h"
+#include "cedar/runtime/pressure_controller.h"
+#include "cedar/runtime/runtime_metrics.h"
+#include "cedar/storage_options.h"
 #include "cedar/transaction.h"
 
 namespace cedar {
@@ -155,7 +157,7 @@ struct CommitPipelineMetrics {
   uint64_t async_mailbox_requests_reserved_peak = 0;
   uint64_t async_mailbox_bytes_reserved_peak = 0;
   CommitPipelineLatencyMetrics latency;
-  RocksDbRuntimeMetrics rocksdb;
+  RuntimeMetrics runtime;
   PressureState pressure_state = PressureState::kNormal;
 };
 
@@ -176,7 +178,7 @@ class Database {
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
   CommitPipelineMetrics GetCommitPipelineMetrics() const;
-  StatusOr<RocksDbRuntimeMetrics> SampleRuntimeMetrics() const;
+  StatusOr<RuntimeMetrics> SampleRuntimeMetrics() const;
   Status Vacuum(CommitSeq oldest_readable);
 
  private:

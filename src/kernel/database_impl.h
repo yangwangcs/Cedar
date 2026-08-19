@@ -17,11 +17,11 @@
 #include <vector>
 
 #include "cedar/database.h"
-#include "cedar/fact/fact_store.h"
+#include "storage/facts/fact_store.h"
 #include "cedar/runtime/pressure_controller.h"
-#include "fact/group_commit_planner.h"
-#include "fact/decided_epoch.h"
-#include "fact/pending_version_overlay.h"
+#include "storage/facts/group_commit_planner.h"
+#include "storage/rocks/decided_epoch.h"
+#include "storage/facts/pending_version_overlay.h"
 #include "kernel/async_commit.h"
 #include "kernel/async_submission_executor.h"
 #include "kernel/maintenance_controller.h"

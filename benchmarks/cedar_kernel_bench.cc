@@ -211,20 +211,20 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   sample.operations_per_second = elapsed == 0 ? 0 : completed_operations / elapsed;
   sample.point_read_operations = runtime.ValueOrDie().point_read_operations;
   sample.multi_get_operations = runtime.ValueOrDie().multi_get_operations;
-  sample.live_sst_bytes = runtime.ValueOrDie().live_sst_bytes;
+  sample.live_sst_bytes = runtime.ValueOrDie().live_fact_bytes;
   sample.retained_wal_bytes = runtime.ValueOrDie().retained_wal_bytes;
   sample.projected_scan_rows = runtime.ValueOrDie().projected_scan_rows;
   sample.projected_scan_bytes_read = runtime.ValueOrDie().projected_scan_bytes_read;
   sample.canonical_scan_bytes_read = runtime.ValueOrDie().canonical_scan_bytes_read;
   sample.logical_facts_bytes = runtime.ValueOrDie().logical_facts_bytes;
-  sample.obsolete_sst_bytes = runtime.ValueOrDie().obsolete_sst_bytes;
+  sample.obsolete_sst_bytes = runtime.ValueOrDie().obsolete_fact_bytes;
   sample.temporary_output_bytes = runtime.ValueOrDie().temporary_output_bytes;
   sample.n_plus_one_eligible_epochs = metrics.n_plus_one_eligible_epochs;
   sample.n_plus_one_promoted_epochs = metrics.n_plus_one_promoted_epochs;
   sample.writer_clients = options.writer_clients;
   sample.writer_failures = bounded_writers.failures;
   sample.write_stopped = runtime.ValueOrDie().write_stopped;
-  sample.background_errors = runtime.ValueOrDie().background_errors;
+  sample.background_errors = runtime.ValueOrDie().background_error_count;
   if (options.verify_reopen) {
     uint64_t expected_id = options.operations;
     if (workload == cedar::benchmark::KernelWorkload::kPropertyPut) {

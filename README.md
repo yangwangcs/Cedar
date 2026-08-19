@@ -22,9 +22,11 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-Only `cedar_core` and Cedar's public headers are installed. Columnar and
-adjacency projections are optional derived targets; they are deliberately not
-installed as part of the embedded kernel.
+`Cedar::cedar` is the sole installed consumer target. Cedar packages its
+private storage archives beneath `lib/cedar/internal` only to resolve the
+static library; it installs no RocksDB headers or consumer-facing RocksDB
+target. Columnar and adjacency projections are optional derived targets; they
+are deliberately not installed as part of the embedded kernel.
 
 ## Format and migration
 

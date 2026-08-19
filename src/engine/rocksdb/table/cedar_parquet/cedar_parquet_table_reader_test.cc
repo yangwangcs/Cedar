@@ -3,6 +3,7 @@
 
 #include <string>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <unistd.h>
 #include <vector>
@@ -38,11 +39,30 @@ std::string V2UserKey(uint64_t entity_id) {
   return key;
 }
 
+std::string V2FactUserKey(uint64_t entity_id, uint64_t valid_from,
+                          uint64_t cedar_commit_seq) {
+  std::string key = V2UserKey(entity_id);
+  StoreBigEndian64(&key, 16, ~valid_from);
+  StoreBigEndian64(&key, 24, ~cedar_commit_seq);
+  return key;
+}
+
 std::string InternalKeyFor(uint64_t entity_id, SequenceNumber sequence,
                            ValueType value_type = kTypeValue) {
   std::string internal_key;
   AppendInternalKey(&internal_key,
                     ParsedInternalKey(V2UserKey(entity_id), sequence, value_type));
+  return internal_key;
+}
+
+std::string InternalFactKeyFor(uint64_t entity_id, uint64_t valid_from,
+                               uint64_t cedar_commit_seq,
+                               SequenceNumber sequence) {
+  std::string internal_key;
+  AppendInternalKey(&internal_key,
+                    ParsedInternalKey(
+                        V2FactUserKey(entity_id, valid_from, cedar_commit_seq),
+                        sequence, kTypeValue));
   return internal_key;
 }
 
@@ -321,6 +341,85 @@ TEST(CedarParquetTableReaderTest, ReportsMetadataPruningAndBytesRead) {
   EXPECT_EQ(stats.pages_read, 2U);
   EXPECT_GT(stats.bytes_read, 0U);
   EXPECT_EQ(stats.rows_emitted, 2U);
+}
+
+TEST(CedarParquetTableReaderTest, PrunesNumericCommitRangeBeforeReadingPages) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {
+      InternalFactKeyFor(1, 10, 1, 4), InternalFactKeyFor(2, 20, 2, 3),
+      InternalFactKeyFor(3, 30, 3, 2), InternalFactKeyFor(4, 40, 4, 1)};
+  const std::vector<std::string> values = {StateFactValue(), StateFactValue(),
+                                           StateFactValue(), StateFactValue()};
+  std::unique_ptr<CedarParquetTableReader> reader =
+      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator);
+
+  CedarParquetScanStats stats;
+  CedarParquetScanSpec spec;
+  spec.cedar_commit_seq_min = std::numeric_limits<uint64_t>::max();
+  spec.batch_row_limit = 8;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.stats = &stats;
+  ASSERT_TRUE(reader->ScanProjected(spec, [](const CedarParquetColumnarBatch&) {
+                         return Status::OK();
+                       })
+                  .ok());
+  EXPECT_EQ(stats.pages_read, 0U);
+  EXPECT_EQ(stats.pages_skipped, 4U);
+  EXPECT_EQ(stats.rows_emitted, 0U);
+}
+
+TEST(CedarParquetTableReaderTest,
+     RetainsNumericValidTimeRangeAcrossLittleEndianByteBoundary) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {
+      InternalFactKeyFor(1, 1, 1, 3), InternalFactKeyFor(2, 256, 2, 2),
+      InternalFactKeyFor(3, 2, 3, 1)};
+  const std::vector<std::string> values = {StateFactValue(), StateFactValue(),
+                                           StateFactValue()};
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator,
+      /*row_group_max_rows=*/3, /*page_max_rows=*/3);
+
+  CedarParquetScanSpec spec;
+  spec.valid_from_min = 1;
+  spec.valid_from_max = 1;
+  spec.batch_row_limit = 8;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  std::vector<uint64_t> entities;
+  ASSERT_TRUE(reader->ScanProjected(
+                         spec, [&entities](const CedarParquetColumnarBatch& batch) {
+                           const auto& values =
+                               std::get<std::vector<uint64_t>>(batch.columns[0].values);
+                           entities.insert(entities.end(), values.begin(), values.end());
+                           return Status::OK();
+                         })
+                  .ok());
+  EXPECT_EQ(entities, std::vector<uint64_t>({1}));
+}
+
+TEST(CedarParquetTableReaderTest, ProjectedCursorRejectsReversedNumericRange) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {InternalFactKeyFor(1, 1, 1, 1)};
+  const std::vector<std::string> values = {StateFactValue()};
+  std::unique_ptr<CedarParquetTableReader> reader =
+      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator);
+
+  CedarParquetScanSpec spec;
+  spec.valid_from_min = 2;
+  spec.valid_from_max = 1;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  std::unique_ptr<CedarParquetProjectedCursor> cursor;
+  EXPECT_TRUE(reader->NewProjectedCursor(spec, &cursor).IsInvalidArgument());
+  EXPECT_EQ(cursor, nullptr);
 }
 
 TEST(CedarParquetTableReaderTest,

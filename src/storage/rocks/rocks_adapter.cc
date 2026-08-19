@@ -1257,7 +1257,7 @@ Status FactStore::Open() {
     }
     const auto identity = EncodeSystemIdentity(SystemIdentity{
         "cedar.authoritative-columnar", 1, "part32.fact.v2",
-        "cedar.parquet.facts.v2", "cedar.v2.internal-key.bytewise.v1"});
+        "cedar.parquet.facts.v3", "cedar.v2.internal-key.bytewise.v1"});
     const auto empty_watermark = EncodeWatermark(CommitSeq{});
     if (!identity.ok()) return identity.status();
     if (!empty_watermark.ok()) return empty_watermark.status();
@@ -1558,6 +1558,18 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
 
   rocksdb::cedar_parquet::CedarParquetScanSpec rocks_spec;
   rocks_spec.batch_row_limit = options.batch_row_limit;
+  if (options.event_valid_from_min.has_value()) {
+    rocks_spec.valid_from_min = options.event_valid_from_min->value;
+  }
+  if (options.event_valid_from_max.has_value()) {
+    rocks_spec.valid_from_max = options.event_valid_from_max->value;
+  }
+  if (options.event_commit_seq_min.has_value()) {
+    rocks_spec.cedar_commit_seq_min = options.event_commit_seq_min->value;
+  }
+  if (options.event_commit_seq_max.has_value()) {
+    rocks_spec.cedar_commit_seq_max = options.event_commit_seq_max->value;
+  }
   const std::optional<uint64_t> lower_entity =
       prefix.entity_id().has_value() ? prefix.entity_id() : bounds.entity_id_min;
   const std::optional<uint64_t> upper_entity =

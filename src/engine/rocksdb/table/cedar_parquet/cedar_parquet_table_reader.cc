@@ -255,6 +255,34 @@ uint64_t DecodeLittleEndian(const std::string& bytes) {
   return value;
 }
 
+bool NumericPageIntersects(
+    const CedarParquetFooter::ColumnChunk::PageIndex& page,
+    const std::optional<uint64_t>& lower,
+    const std::optional<uint64_t>& upper) {
+  if (page.all_null) return false;
+  uint64_t minimum = 0;
+  uint64_t maximum = 0;
+  if (!DecodeCedarParquetNumericIndexValue(page.min_value, &minimum) ||
+      !DecodeCedarParquetNumericIndexValue(page.max_value, &maximum)) {
+    return false;
+  }
+  return (!lower.has_value() || maximum >= *lower) &&
+         (!upper.has_value() || minimum <= *upper);
+}
+
+Status ValidateNumericPageIndex(
+    const CedarParquetFooter::ColumnChunk::PageIndex& page) {
+  if (page.all_null) return Status::OK();
+  uint64_t minimum = 0;
+  uint64_t maximum = 0;
+  if (!DecodeCedarParquetNumericIndexValue(page.min_value, &minimum) ||
+      !DecodeCedarParquetNumericIndexValue(page.max_value, &maximum) ||
+      minimum > maximum) {
+    return Status::Corruption("invalid Cedar numeric column-index bounds");
+  }
+  return Status::OK();
+}
+
 Status AppendProjectedValue(CedarParquetColumnVector* column,
                             const std::optional<std::string>& encoded) {
   column->present.push_back(encoded.has_value() ? 1 : 0);
@@ -348,12 +376,30 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
   while (row_group_index_ < reader_->footer_.row_groups.size()) {
     const auto& row_group = reader_->footer_.row_groups[row_group_index_];
     const auto& sort_column = row_group.columns.front();
+    const auto& valid_column = row_group.columns[7];
+    const auto& commit_column = row_group.columns[8];
     if (page_index_ >= sort_column.page_locations.size()) {
       ++row_group_index_;
       page_index_ = 0;
       continue;
     }
     const auto& page_bounds = sort_column.page_indexes[page_index_];
+    if ((spec_.valid_from_min.has_value() || spec_.valid_from_max.has_value()) &&
+        !NumericPageIntersects(valid_column.page_indexes[page_index_],
+                               spec_.valid_from_min, spec_.valid_from_max)) {
+      if (spec_.stats != nullptr) ++spec_.stats->pages_skipped;
+      ++page_index_;
+      continue;
+    }
+    if ((spec_.cedar_commit_seq_min.has_value() ||
+         spec_.cedar_commit_seq_max.has_value()) &&
+        !NumericPageIntersects(commit_column.page_indexes[page_index_],
+                               spec_.cedar_commit_seq_min,
+                               spec_.cedar_commit_seq_max)) {
+      if (spec_.stats != nullptr) ++spec_.stats->pages_skipped;
+      ++page_index_;
+      continue;
+    }
     if (spec_.sort_key_lower.has_value() &&
         page_bounds.max_value < *spec_.sort_key_lower) {
       ++page_index_;
@@ -363,6 +409,14 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
         page_bounds.min_value > *spec_.sort_key_upper) {
       row_group_index_ = reader_->footer_.row_groups.size();
       return Status::OK();
+    }
+
+    if (spec_.stats != nullptr) {
+      ++spec_.stats->pages_read;
+      for (const auto& column : row_group.columns) {
+        spec_.stats->bytes_read += static_cast<uint64_t>(
+            column.page_locations[page_index_].compressed_page_size);
+      }
     }
 
     std::vector<std::string> sort_keys;
@@ -389,6 +443,19 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
       }
       projected_pages.push_back(std::move(values));
     }
+    std::vector<std::optional<std::string>> valid_times;
+    std::vector<std::optional<std::string>> commit_sequences;
+    if (spec_.valid_from_min.has_value() || spec_.valid_from_max.has_value()) {
+      status = reader_->DecodePrimitiveColumnPage(row_group_index_, 7, page_index_,
+                                                  &valid_times);
+      if (!status.ok()) return status;
+    }
+    if (spec_.cedar_commit_seq_min.has_value() ||
+        spec_.cedar_commit_seq_max.has_value()) {
+      status = reader_->DecodePrimitiveColumnPage(row_group_index_, 8, page_index_,
+                                                  &commit_sequences);
+      if (!status.ok()) return status;
+    }
     std::vector<std::string> encoded_values;
     if (request_encoded_values_) {
       status = reader_->DecodeColumnPage(row_group_index_, 2, page_index_,
@@ -409,6 +476,22 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
         // Keep this row group live until the buffered in-range rows are consumed.
         break;
       }
+      if (!valid_times.empty() &&
+          (!valid_times[row].has_value() ||
+           (spec_.valid_from_min.has_value() &&
+            DecodeLittleEndian(*valid_times[row]) < *spec_.valid_from_min) ||
+           (spec_.valid_from_max.has_value() &&
+            DecodeLittleEndian(*valid_times[row]) > *spec_.valid_from_max))) {
+        continue;
+      }
+      if (!commit_sequences.empty() &&
+          (!commit_sequences[row].has_value() ||
+           (spec_.cedar_commit_seq_min.has_value() &&
+            DecodeLittleEndian(*commit_sequences[row]) < *spec_.cedar_commit_seq_min) ||
+           (spec_.cedar_commit_seq_max.has_value() &&
+            DecodeLittleEndian(*commit_sequences[row]) > *spec_.cedar_commit_seq_max))) {
+        continue;
+      }
       batch_.internal_keys.push_back(internal_keys[row]);
       if (request_encoded_values_) batch_.encoded_values.push_back(encoded_values[row]);
       for (size_t column = 0; column < batch_.columns.size(); ++column) {
@@ -418,6 +501,9 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
       }
     }
     if (!batch_.internal_keys.empty()) {
+      if (spec_.stats != nullptr) {
+        spec_.stats->rows_emitted += batch_.internal_keys.size();
+      }
       return Status::OK();
     }
     if (row_group_index_ >= reader_->footer_.row_groups.size()) return Status::OK();
@@ -918,8 +1004,16 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
       std::string maximum;
       for (const auto& value : page) {
         if (!value.has_value()) continue;
-        if (all_null || *value < minimum) minimum = *value;
-        if (all_null || *value > maximum) maximum = *value;
+        std::string index_value = *value;
+        if (column_index == 7 || column_index == 8) {
+          if (!EncodeCedarParquetNumericIndexValueFromLittleEndian(
+                  *value, &index_value)) {
+            return Status::Corruption(
+                "Cedar Parquet numeric materialized value has invalid width");
+          }
+        }
+        if (all_null || index_value < minimum) minimum = index_value;
+        if (all_null || index_value > maximum) maximum = index_value;
         all_null = false;
       }
       const auto& page_bounds = column.page_indexes[page_index];
@@ -1083,6 +1177,28 @@ Status CedarParquetTableReader::ScanProjected(
       *spec.sort_key_lower > *spec.sort_key_upper) {
     return Status::InvalidArgument("Cedar Parquet scan", "invalid sort-key range");
   }
+  if (spec.valid_from_min.has_value() && spec.valid_from_max.has_value() &&
+      *spec.valid_from_min > *spec.valid_from_max) {
+    return Status::InvalidArgument("Cedar Parquet scan", "invalid valid-time range");
+  }
+  if (spec.cedar_commit_seq_min.has_value() && spec.cedar_commit_seq_max.has_value() &&
+      *spec.cedar_commit_seq_min > *spec.cedar_commit_seq_max) {
+    return Status::InvalidArgument("Cedar Parquet scan", "invalid commit-sequence range");
+  }
+  if (spec.valid_from_min.has_value() || spec.valid_from_max.has_value() ||
+      spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) {
+    for (const auto& row_group : footer_.row_groups) {
+      for (size_t column_index : {size_t{7}, size_t{8}}) {
+        if (column_index >= row_group.columns.size()) {
+          return Status::Corruption("Cedar Parquet numeric column is missing");
+        }
+        for (const auto& page : row_group.columns[column_index].page_indexes) {
+          Status numeric_status = ValidateNumericPageIndex(page);
+          if (!numeric_status.ok()) return numeric_status;
+        }
+      }
+    }
+  }
   if ((spec.sort_key_lower.has_value() &&
        spec.sort_key_lower->size() != kCedarParquetV2SortKeyBytes) ||
       (spec.sort_key_upper.has_value() &&
@@ -1130,6 +1246,34 @@ Status CedarParquetTableReader::ScanProjected(
        ++row_group_index) {
     const auto& row_group = footer_.row_groups[row_group_index];
     const auto& sort_column = row_group.columns.front();
+    const auto& valid_column = row_group.columns[7];
+    const auto& commit_column = row_group.columns[8];
+    if ((spec.valid_from_min.has_value() || spec.valid_from_max.has_value()) &&
+        (valid_column.page_indexes.empty() ||
+         std::none_of(valid_column.page_indexes.begin(), valid_column.page_indexes.end(),
+                      [&](const auto& page) {
+                        return NumericPageIntersects(page, spec.valid_from_min,
+                                                     spec.valid_from_max);
+                      }))) {
+      if (spec.stats != nullptr) {
+        ++spec.stats->row_groups_skipped;
+        spec.stats->pages_skipped += sort_column.page_locations.size();
+      }
+      continue;
+    }
+    if ((spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) &&
+        (commit_column.page_indexes.empty() ||
+         std::none_of(commit_column.page_indexes.begin(), commit_column.page_indexes.end(),
+                      [&](const auto& page) {
+                        return NumericPageIntersects(page, spec.cedar_commit_seq_min,
+                                                     spec.cedar_commit_seq_max);
+                      }))) {
+      if (spec.stats != nullptr) {
+        ++spec.stats->row_groups_skipped;
+        spec.stats->pages_skipped += sort_column.page_locations.size();
+      }
+      continue;
+    }
     if (spec.sort_key_lower.has_value() && sort_column.max_value < *spec.sort_key_lower) {
       if (spec.stats != nullptr) ++spec.stats->row_groups_skipped;
       continue;
@@ -1143,6 +1287,19 @@ Status CedarParquetTableReader::ScanProjected(
     for (size_t page_index = 0; page_index < sort_column.page_locations.size();
          ++page_index) {
       const auto& page_bounds = sort_column.page_indexes[page_index];
+      if ((spec.valid_from_min.has_value() || spec.valid_from_max.has_value()) &&
+          !NumericPageIntersects(valid_column.page_indexes[page_index],
+                                 spec.valid_from_min, spec.valid_from_max)) {
+        if (spec.stats != nullptr) ++spec.stats->pages_skipped;
+        continue;
+      }
+      if ((spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) &&
+          !NumericPageIntersects(commit_column.page_indexes[page_index],
+                                 spec.cedar_commit_seq_min,
+                                 spec.cedar_commit_seq_max)) {
+        if (spec.stats != nullptr) ++spec.stats->pages_skipped;
+        continue;
+      }
       if (spec.sort_key_lower.has_value() && page_bounds.max_value < *spec.sort_key_lower) {
         if (spec.stats != nullptr) ++spec.stats->pages_skipped;
         continue;
@@ -1186,6 +1343,17 @@ Status CedarParquetTableReader::ScanProjected(
         }
         projected_pages.push_back(std::move(values));
       }
+      std::vector<std::optional<std::string>> valid_times;
+      std::vector<std::optional<std::string>> commit_sequences;
+      if (spec.valid_from_min.has_value() || spec.valid_from_max.has_value()) {
+        status = DecodePrimitiveColumnPage(row_group_index, 7, page_index, &valid_times);
+        if (!status.ok()) return status;
+      }
+      if (spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) {
+        status = DecodePrimitiveColumnPage(row_group_index, 8, page_index,
+                                           &commit_sequences);
+        if (!status.ok()) return status;
+      }
       std::vector<std::string> encoded_values;
       if (request_encoded_values) {
         status = DecodeColumnPage(row_group_index, 2, page_index, &encoded_values);
@@ -1202,6 +1370,22 @@ Status CedarParquetTableReader::ScanProjected(
         }
         if (spec.sort_key_upper.has_value() && sort_keys[row] > *spec.sort_key_upper) {
           return flush();
+        }
+        if (!valid_times.empty() &&
+            (!valid_times[row].has_value() ||
+             (spec.valid_from_min.has_value() &&
+              DecodeLittleEndian(*valid_times[row]) < *spec.valid_from_min) ||
+             (spec.valid_from_max.has_value() &&
+              DecodeLittleEndian(*valid_times[row]) > *spec.valid_from_max))) {
+          continue;
+        }
+        if (!commit_sequences.empty() &&
+            (!commit_sequences[row].has_value() ||
+             (spec.cedar_commit_seq_min.has_value() &&
+              DecodeLittleEndian(*commit_sequences[row]) < *spec.cedar_commit_seq_min) ||
+             (spec.cedar_commit_seq_max.has_value() &&
+              DecodeLittleEndian(*commit_sequences[row]) > *spec.cedar_commit_seq_max))) {
+          continue;
         }
         batch.internal_keys.push_back(internal_keys[row]);
         if (request_encoded_values) batch.encoded_values.push_back(encoded_values[row]);
@@ -1242,6 +1426,30 @@ Status CedarParquetTableReader::NewProjectedCursor(
       *spec.sort_key_lower > *spec.sort_key_upper) {
     return Status::InvalidArgument("Cedar Parquet projected cursor",
                                    "invalid sort-key range");
+  }
+  if (spec.valid_from_min.has_value() && spec.valid_from_max.has_value() &&
+      *spec.valid_from_min > *spec.valid_from_max) {
+    return Status::InvalidArgument("Cedar Parquet projected cursor",
+                                   "invalid valid-time range");
+  }
+  if (spec.cedar_commit_seq_min.has_value() && spec.cedar_commit_seq_max.has_value() &&
+      *spec.cedar_commit_seq_min > *spec.cedar_commit_seq_max) {
+    return Status::InvalidArgument("Cedar Parquet projected cursor",
+                                   "invalid commit-sequence range");
+  }
+  if (spec.valid_from_min.has_value() || spec.valid_from_max.has_value() ||
+      spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) {
+    for (const auto& row_group : footer_.row_groups) {
+      for (size_t column_index : {size_t{7}, size_t{8}}) {
+        if (column_index >= row_group.columns.size()) {
+          return Status::Corruption("Cedar Parquet numeric column is missing");
+        }
+        for (const auto& page : row_group.columns[column_index].page_indexes) {
+          Status numeric_status = ValidateNumericPageIndex(page);
+          if (!numeric_status.ok()) return numeric_status;
+        }
+      }
+    }
   }
   bool request_encoded_values = false;
   std::vector<CedarParquetColumnVector> columns;

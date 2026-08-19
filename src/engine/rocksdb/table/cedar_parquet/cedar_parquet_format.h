@@ -16,7 +16,7 @@
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 
-inline constexpr char kCedarParquetFormatVersion[] = "cedar.parquet.facts.v2";
+inline constexpr char kCedarParquetFormatVersion[] = "cedar.parquet.facts.v3";
 inline constexpr char kCedarParquetBytewiseComparatorName[] =
     "leveldb.BytewiseComparator";
 inline constexpr char kCedarParquetCanonicalSchemaDigest[] =
@@ -33,6 +33,36 @@ inline constexpr uint64_t kCedarParquetDefaultMaxFooterBytes =
 inline constexpr uint64_t kCedarParquetDefaultMaxIndexBytes =
     4ULL * 1024ULL * 1024ULL;
 inline constexpr size_t kCedarParquetV2UserKeyBytes = 32;
+
+inline std::string EncodeCedarParquetNumericIndexValue(uint64_t value) {
+  std::string encoded(8, '\0');
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    encoded[static_cast<size_t>((56 - shift) / 8)] =
+        static_cast<char>(value >> shift);
+  }
+  return encoded;
+}
+
+inline bool DecodeCedarParquetNumericIndexValue(const std::string& encoded,
+                                                uint64_t* value) {
+  if (value == nullptr || encoded.size() != 8) return false;
+  uint64_t decoded = 0;
+  for (unsigned char byte : encoded) decoded = (decoded << 8) | byte;
+  *value = decoded;
+  return true;
+}
+
+inline bool EncodeCedarParquetNumericIndexValueFromLittleEndian(
+    const std::string& encoded, std::string* index_value) {
+  if (index_value == nullptr || encoded.size() != 8) return false;
+  uint64_t value = 0;
+  for (size_t byte = 0; byte < encoded.size(); ++byte) {
+    value |= static_cast<uint64_t>(static_cast<unsigned char>(encoded[byte]))
+             << (byte * 8);
+  }
+  *index_value = EncodeCedarParquetNumericIndexValue(value);
+  return true;
+}
 inline constexpr size_t kCedarParquetV2SortKeyBytes = 40;
 
 struct CedarParquetTableOptions {
@@ -142,6 +172,10 @@ struct CedarParquetScanStats {
 struct CedarParquetScanSpec {
   std::optional<std::string> sort_key_lower;
   std::optional<std::string> sort_key_upper;
+  std::optional<uint64_t> valid_from_min;
+  std::optional<uint64_t> valid_from_max;
+  std::optional<uint64_t> cedar_commit_seq_min;
+  std::optional<uint64_t> cedar_commit_seq_max;
   std::vector<CedarParquetColumnId> projection;
   uint32_t batch_row_limit = 1024;
   CedarParquetScanStats* stats = nullptr;

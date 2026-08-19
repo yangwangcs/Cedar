@@ -1,7 +1,7 @@
 # Cedar Parquet Kernel Provenance
 
 This directory documents the Cedar-maintained minimal Parquet-format kernel
-implemented in `third_party/rocksdb/table/cedar_parquet`.
+implemented in `src/engine/rocksdb/table/cedar_parquet`.
 
 The initial files are a clean-room, limited implementation based on the
 public Parquet file-format and Thrift compact-protocol specifications. They

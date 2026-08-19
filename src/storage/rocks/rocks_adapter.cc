@@ -198,25 +198,37 @@ rocksdb::cedar_parquet::CedarParquetColumnId ToRocksColumnId(FactColumnId id) {
   return static_cast<rocksdb::cedar_parquet::CedarParquetColumnId>(id);
 }
 
-Status AppendColumnarValue(
+Status AppendSelectedColumnarValues(
     const rocksdb::cedar_parquet::CedarParquetColumnVector& source,
-    size_t row, FactColumn* destination) {
-  if (source.present.size() <= row) {
-    return Status::Corruption("columnar scan", "source null bitmap is shorter than rows");
+    const std::vector<size_t>& selected_rows, size_t begin, size_t end,
+    FactColumn* destination) {
+  if (begin > end || end > selected_rows.size()) {
+    return Status::InvalidArgument("columnar scan", "invalid selection vector range");
   }
-  destination->present.push_back(source.present[row]);
+  for (size_t offset = begin; offset < end; ++offset) {
+    const size_t row = selected_rows[offset];
+    if (source.present.size() <= row) {
+      return Status::Corruption("columnar scan", "source null bitmap is shorter than rows");
+    }
+  }
   return std::visit(
-      [row, destination](const auto& source_values) -> Status {
+      [&, destination](const auto& source_values) -> Status {
         using Vector = std::decay_t<decltype(source_values)>;
-        if (source_values.size() <= row) {
-          return Status::Corruption("columnar scan",
-                                    "source vector is shorter than rows");
-        }
         auto* destination_values = std::get_if<Vector>(&destination->values);
         if (destination_values == nullptr) {
           return Status::Corruption("columnar scan", "projected vector type mismatch");
         }
-        destination_values->push_back(source_values[row]);
+        destination_values->reserve(destination_values->size() + (end - begin));
+        destination->present.reserve(destination->present.size() + (end - begin));
+        for (size_t offset = begin; offset < end; ++offset) {
+          const size_t row = selected_rows[offset];
+          if (source_values.size() <= row) {
+            return Status::Corruption("columnar scan",
+                                      "source vector is shorter than rows");
+          }
+          destination_values->push_back(source_values[row]);
+          destination->present.push_back(source.present[row]);
+        }
         return Status::OK();
       },
       source.values);
@@ -1660,6 +1672,13 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
         if (source.columns.size() != output.columns.size()) {
           return rocksdb::Status::Corruption("columnar scan projection width mismatch");
         }
+        for (size_t column = 0; column < source.columns.size(); ++column) {
+          if (source.columns[column].id != ToRocksColumnId(output.columns[column].id)) {
+            return rocksdb::Status::Corruption("columnar scan projection order mismatch");
+          }
+        }
+        std::vector<size_t> selected_rows;
+        selected_rows.reserve(source.internal_keys.size());
         for (size_t row = 0; row < source.internal_keys.size(); ++row) {
           if (source.internal_keys[row].size() < 8) {
             return rocksdb::Status::Corruption("columnar scan received short internal key");
@@ -1668,19 +1687,24 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
               source.internal_keys[row].substr(0, source.internal_keys[row].size() - 8));
           if (!decoded.ok()) return rocksdb::Status::Corruption(decoded.status().ToString());
           if (!selected(decoded.ValueOrDie())) continue;
+          selected_rows.push_back(row);
+        }
+        size_t selected_begin = 0;
+        while (selected_begin < selected_rows.size()) {
+          const size_t room = options.batch_row_limit - output.row_count();
+          const size_t selected_end = std::min(
+              selected_rows.size(), selected_begin + room);
           for (size_t column = 0; column < source.columns.size(); ++column) {
-            if (source.columns[column].id != ToRocksColumnId(output.columns[column].id)) {
-              return rocksdb::Status::Corruption("columnar scan projection order mismatch");
-            }
-            const Status appended =
-                AppendColumnarValue(source.columns[column], row, &output.columns[column]);
+            const Status appended = AppendSelectedColumnarValues(
+                source.columns[column], selected_rows, selected_begin, selected_end,
+                &output.columns[column]);
             if (!appended.ok()) return rocksdb::Status::Corruption(appended.ToString());
           }
+          selected_begin = selected_end;
           if (output.row_count() == options.batch_row_limit) {
             const Status flushed = flush();
-            if (!flushed.ok()) {
-              return rocksdb::Status::Incomplete("columnar scan visitor stopped");
-            }
+            if (!flushed.ok()) return rocksdb::Status::Incomplete(
+                "columnar scan visitor stopped");
           }
         }
         return rocksdb::Status::OK();

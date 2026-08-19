@@ -1714,14 +1714,14 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
         }
         return rocksdb::Status::OK();
       });
-  if (visitor_error.has_value()) return *visitor_error;
-  if (!scanned.ok()) return FromRocksDb(scanned, "scan projected facts");
   store->projected_scan_pages_skipped.fetch_add(
       scan_stats.pages_skipped, std::memory_order_relaxed);
   store->projected_scan_pages_read.fetch_add(
       scan_stats.pages_read, std::memory_order_relaxed);
   store->projected_scan_physical_bytes_read.fetch_add(
       scan_stats.bytes_read, std::memory_order_relaxed);
+  if (visitor_error.has_value()) return *visitor_error;
+  if (!scanned.ok()) return FromRocksDb(scanned, "scan projected facts");
   return flush();
 }
 

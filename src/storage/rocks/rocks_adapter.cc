@@ -359,6 +359,9 @@ class FactStoreImpl {
   std::atomic<uint64_t> multi_get_operations{0};
   std::atomic<uint64_t> projected_scan_rows{0};
   std::atomic<uint64_t> projected_scan_bytes_read{0};
+  std::atomic<uint64_t> projected_scan_pages_skipped{0};
+  std::atomic<uint64_t> projected_scan_pages_read{0};
+  std::atomic<uint64_t> projected_scan_physical_bytes_read{0};
   std::atomic<uint64_t> canonical_scan_bytes_read{0};
   std::atomic<uint64_t> logical_facts_bytes{0};
   IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
@@ -1570,6 +1573,8 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
 
   rocksdb::cedar_parquet::CedarParquetScanSpec rocks_spec;
   rocks_spec.batch_row_limit = options.batch_row_limit;
+  rocksdb::cedar_parquet::CedarParquetScanStats scan_stats;
+  rocks_spec.stats = &scan_stats;
   if (options.event_valid_from_min.has_value()) {
     rocks_spec.valid_from_min = options.event_valid_from_min->value;
   }
@@ -1711,6 +1716,12 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
       });
   if (visitor_error.has_value()) return *visitor_error;
   if (!scanned.ok()) return FromRocksDb(scanned, "scan projected facts");
+  store->projected_scan_pages_skipped.fetch_add(
+      scan_stats.pages_skipped, std::memory_order_relaxed);
+  store->projected_scan_pages_read.fetch_add(
+      scan_stats.pages_read, std::memory_order_relaxed);
+  store->projected_scan_physical_bytes_read.fetch_add(
+      scan_stats.bytes_read, std::memory_order_relaxed);
   return flush();
 }
 
@@ -3517,6 +3528,12 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
       store->projected_scan_rows.load(std::memory_order_relaxed);
   metrics.projected_scan_bytes_read =
       store->projected_scan_bytes_read.load(std::memory_order_relaxed);
+  metrics.projected_scan_pages_skipped =
+      store->projected_scan_pages_skipped.load(std::memory_order_relaxed);
+  metrics.projected_scan_pages_read =
+      store->projected_scan_pages_read.load(std::memory_order_relaxed);
+  metrics.projected_scan_physical_bytes_read =
+      store->projected_scan_physical_bytes_read.load(std::memory_order_relaxed);
   metrics.canonical_scan_bytes_read =
       store->canonical_scan_bytes_read.load(std::memory_order_relaxed);
   metrics.logical_facts_bytes =

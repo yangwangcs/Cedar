@@ -116,6 +116,10 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.multi_get_operations = source.multi_get_operations;
   metrics.projected_scan_rows = source.projected_scan_rows;
   metrics.projected_scan_bytes_read = source.projected_scan_bytes_read;
+  metrics.projected_scan_pages_skipped = source.projected_scan_pages_skipped;
+  metrics.projected_scan_pages_read = source.projected_scan_pages_read;
+  metrics.projected_scan_physical_bytes_read =
+      source.projected_scan_physical_bytes_read;
   metrics.canonical_scan_bytes_read = source.canonical_scan_bytes_read;
   metrics.logical_facts_bytes = source.logical_facts_bytes;
   metrics.obsolete_fact_bytes = source.obsolete_sst_bytes;

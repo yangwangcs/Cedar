@@ -23,6 +23,14 @@ if(NOT EXISTS "${engine_root}/LICENSE.Apache")
   message(FATAL_ERROR "embedded Cedar engine license is missing")
 endif()
 
+if(NOT EXISTS "${engine_root}/cmake/modules/ReadVersion.cmake")
+  message(FATAL_ERROR "embedded Cedar engine CMake module is missing")
+endif()
+
+if(NOT EXISTS "${engine_root}/docs/README.md")
+  message(FATAL_ERROR "embedded Cedar engine source documentation is missing")
+endif()
+
 if(NOT EXISTS "${CEDAR_SOURCE_DIR}/src/engine/cedar/README.md")
   message(FATAL_ERROR "Cedar engine extension ownership record is missing")
 endif()

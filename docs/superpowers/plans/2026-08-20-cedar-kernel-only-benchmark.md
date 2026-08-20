@@ -51,4 +51,4 @@
 
 - [x] Run `git diff --check`.
 - [x] Run `ctest --test-dir build-debug-perf --output-on-failure -j4`.
-- [ ] Commit the Kernel-only benchmark removal with its tests and documentation.
+- [x] Commit the Kernel-only benchmark removal with its tests and documentation.

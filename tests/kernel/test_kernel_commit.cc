@@ -2029,10 +2029,22 @@ TEST(KernelGroupCommitTest,
   };
 
   std::thread first([&] { submit(0); });
+  bool first_entered = false;
   {
     std::unique_lock<std::mutex> lock(prewrite_mutex);
-    ASSERT_TRUE(prewrite_cv.wait_for(
-        lock, std::chrono::seconds(2), [&] { return first_prewrite_entered; }));
+    first_entered = prewrite_cv.wait_for(
+        lock, std::chrono::seconds(2), [&] { return first_prewrite_entered; });
+  }
+  if (!first_entered) {
+    {
+      std::lock_guard<std::mutex> lock(prewrite_mutex);
+      release_first_prewrite = true;
+    }
+    prewrite_cv.notify_all();
+    first.join();
+    EXPECT_TRUE(database->Close().ok());
+    std::filesystem::remove_all(path);
+    FAIL() << "first prewrite did not start";
   }
   std::vector<std::thread> followers;
   followers.reserve(kTransactions - 1);

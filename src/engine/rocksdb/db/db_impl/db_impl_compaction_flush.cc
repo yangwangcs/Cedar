@@ -3080,7 +3080,11 @@ bool DBImpl::PrepareCedarFlushSchedule(uint64_t* cedar_grant_id) {
       continue;
     }
     const int rank = request_rank(*candidate);
-    if (selected == flush_queue_.end() || rank < selected_rank) {
+    // Cedar grants one native flush at a time.  Service the largest complete
+    // immutable unit first so a continuously-written metadata CF cannot starve
+    // the authoritative facts CF; role is only a deterministic tie-breaker.
+    if (selected == flush_queue_.end() || input_bytes > selected_input_bytes ||
+        (input_bytes == selected_input_bytes && rank < selected_rank)) {
       selected = candidate;
       selected_input_bytes = input_bytes;
       selected_rank = rank;

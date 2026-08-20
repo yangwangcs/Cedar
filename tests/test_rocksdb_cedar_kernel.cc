@@ -417,8 +417,9 @@ TEST_F(CedarKernelMaintenanceTest,
 }
 
 TEST_F(CedarKernelMaintenanceTest,
-       DbWideFlushGrantSelectsMetaDebtBeforeUnpressuredFacts) {
-  WriteDebt(handles_[1], "facts-debt");
+       DbWideFlushGrantSelectsLargestDebtBeforeMetaTieBreak) {
+  WriteDebt(handles_[1], "facts-debt-a");
+  WriteDebt(handles_[1], "facts-debt-b");
   const rocksdb::CedarMaintenanceSnapshot before =
       WriteDebt(handles_[2], "meta-debt");
   rocksdb::CedarMaintenanceResult result;
@@ -426,7 +427,7 @@ TEST_F(CedarKernelMaintenanceTest,
   const rocksdb::Status status =
       rocksdb::RunCedarMaintenance(db_.get(), FlushGrant(before), &result);
   ASSERT_TRUE(status.ok()) << status.ToString();
-  EXPECT_EQ(result.selected_column_family_id, handles_[2]->GetID());
+  EXPECT_EQ(result.selected_column_family_id, handles_[1]->GetID());
 }
 
 TEST_F(CedarKernelMaintenanceTest,

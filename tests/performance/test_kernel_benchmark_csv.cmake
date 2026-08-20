@@ -28,13 +28,14 @@ string(REPLACE "," ";" header_fields "${header}")
 string(REPLACE "," ";" row_fields "${row}")
 list(LENGTH header_fields header_count)
 list(LENGTH row_fields row_count)
-if(NOT header_count EQUAL 62 OR NOT row_count EQUAL 62)
+if(NOT header_count EQUAL 65 OR NOT row_count EQUAL 65)
   message(FATAL_ERROR
     "unexpected Cedar benchmark CSV width: header=${header_count}, row=${row_count}\n${benchmark_output}")
 endif()
 foreach(required_field IN ITEMS
     schema_version commit_epochs epoch_transactions epoch_bytes wal_sync_count
-    wal_rotations queue_p50_us wal_sync_p95_us publication_p99_us qualification)
+    wal_rotations group_fill_p50 group_fill_p95 group_fill_max queue_p50_us
+    wal_sync_p95_us publication_p99_us qualification)
   list(FIND header_fields "${required_field}" field_index)
   if(field_index LESS 0)
     message(FATAL_ERROR "benchmark CSV is missing ${required_field}: ${header}")

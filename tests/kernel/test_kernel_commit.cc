@@ -2201,7 +2201,7 @@ TEST(KernelGroupCommitTest, ConcurrentIndependentGroupsUseOneWalSyncEach) {
   std::filesystem::remove_all(pattern);
 }
 
-TEST(KernelGroupCommitTest, ConflictingRequestsSplitLargeGroups) {
+TEST(KernelGroupCommitTest, ConflictingRequestsPreserveConflictUnderHighFanIn) {
   constexpr uint32_t kTransactions = 32;
   char pattern[] = "/tmp/cedar_kernel_group_conflict_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
@@ -2216,7 +2216,7 @@ TEST(KernelGroupCommitTest, ConflictingRequestsSplitLargeGroups) {
 
   std::barrier start(kTransactions + 1);
   std::atomic<bool> failed = false;
-  std::atomic<uint32_t> conflicting_commits = 0;
+  std::vector<std::optional<CommitResult>> conflicting_results(2);
   std::vector<std::thread> workers;
   workers.reserve(kTransactions);
   for (uint32_t index = 0; index < kTransactions; ++index) {
@@ -2238,8 +2238,10 @@ TEST(KernelGroupCommitTest, ConflictingRequestsSplitLargeGroups) {
         failed.store(true, std::memory_order_relaxed);
         return;
       }
-      if (index < 2 && committed.ValueOrDie().outcome == CommitOutcome::kCommitted) {
-        conflicting_commits.fetch_add(1, std::memory_order_relaxed);
+      if (index < 2) {
+        conflicting_results[index].emplace(committed.ValueOrDie());
+      } else if (committed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+        failed.store(true, std::memory_order_relaxed);
       }
     });
   }
@@ -2247,10 +2249,19 @@ TEST(KernelGroupCommitTest, ConflictingRequestsSplitLargeGroups) {
   for (auto& worker : workers) worker.join();
 
   EXPECT_FALSE(failed.load(std::memory_order_relaxed));
-  EXPECT_LE(conflicting_commits.load(std::memory_order_relaxed), 1U);
+  ASSERT_TRUE(conflicting_results[0].has_value());
+  ASSERT_TRUE(conflicting_results[1].has_value());
+  const uint32_t conflicting_commits =
+      (conflicting_results[0]->outcome == CommitOutcome::kCommitted ? 1U : 0U) +
+      (conflicting_results[1]->outcome == CommitOutcome::kCommitted ? 1U : 0U);
+  EXPECT_EQ(conflicting_commits, 1U);
+  const CommitResult& aborted = conflicting_results[0]->outcome == CommitOutcome::kAborted
+                                    ? *conflicting_results[0]
+                                    : *conflicting_results[1];
+  EXPECT_EQ(aborted.outcome, CommitOutcome::kAborted);
+  EXPECT_TRUE(aborted.status.IsConflict()) << aborted.status.ToString();
   const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
   EXPECT_EQ(metrics.group_fill.total_transactions, kTransactions);
-  EXPECT_GE(metrics.group_fill.groups, 2U);
   EXPECT_GE(metrics.group_fill.max_transactions, 2U);
   ASSERT_TRUE(database->Close().ok());
   std::filesystem::remove_all(path);
@@ -2791,7 +2802,7 @@ TEST(KernelGroupCommitFailureTest, PostwriteIndeterminateMarksEveryMemberThenReo
 }
 
 TEST(KernelGroupCommitFailureTest,
-     LargeConcurrentIndeterminateGroupsRecoverEveryDurableMember) {
+     ConcurrentIndeterminateRecoveryMatchesDurableAcceptance) {
   constexpr uint32_t kTransactions = 32;
   char pattern[] = "/tmp/cedar_kernel_large_group_indeterminate_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

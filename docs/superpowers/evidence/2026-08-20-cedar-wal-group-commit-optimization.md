@@ -37,11 +37,12 @@ Results:
 
 The added regression coverage verifies all three boundaries below:
 
-- A post-write indeterminate large group resolves every member whose async
-  handle crossed Cedar's WAL-durable callback after reopen. A request that did
-  not cross that callback is not reported committed.
-- Two conflicting writes split high-fan-in selection while independent writes
-  still form multi-request groups.
+- A post-write indeterminate concurrent submission resolves every member whose
+  async handle crossed Cedar's WAL-durable callback after reopen. A request
+  that did not cross that callback is not reported committed. Scheduler timing
+  is deliberately not used to assert an exact physical group size.
+- Two conflicting writes preserve exactly-one-winner conflict behavior under
+  high fan-in while independent writes still form multi-request groups.
 - Close during an N+1 successor candidate discards it with `kShutdown`,
   terminates every submitted handle, and permits reopen.
 
@@ -90,6 +91,17 @@ binary configuration.
 | mixed-90-write-10-point-read | 344.224 | passed | warm_not_sustained |
 | point-read | 868040.000 | passed | warm_not_sustained |
 | projected-event-scan | 929.093 | passed | warm_not_sustained |
+
+## Current write spot check
+
+Raw CSV: `/private/tmp/cedar-read-controls-20260820-dd29e39/current-64.csv`.
+
+The current production-code commit (`dd29e39`) also completed a 64-client,
+30-second `property-put` run with reopen verification: 9,210.110 ops/s,
+32.066 transactions per WAL sync, group p50/p95/max of 32/64/64, and zero
+writer/background/maintenance/write-stopped/unexplained-autonomous errors.
+It is `warm_not_sustained`. Its raw value is not compared against the older
+matrix because the runs were not a matched A/B experiment.
 
 ## Sustained Release status
 

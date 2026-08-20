@@ -55,7 +55,11 @@ TEST(RocksDbProfileTest, ResolvesProductionBudgetSplitAndBaseline) {
   EXPECT_TRUE(db_options.paranoid_checks);
   EXPECT_TRUE(db_options.track_and_verify_wals_in_manifest);
   EXPECT_TRUE(db_options.allow_concurrent_memtable_write);
+  EXPECT_TRUE(db_options.enable_write_thread_adaptive_yield);
   EXPECT_FALSE(db_options.enable_pipelined_write);
+  EXPECT_FALSE(db_options.unordered_write);
+  EXPECT_FALSE(db_options.two_write_queues);
+  EXPECT_EQ(db_options.max_write_batch_group_size_bytes, 2ULL * 1024ULL * 1024ULL);
   EXPECT_EQ(db_options.max_background_jobs, 6);
   EXPECT_EQ(db_options.max_subcompactions, 2U);
   EXPECT_EQ(db_options.bytes_per_sync, 1ULL << 20);

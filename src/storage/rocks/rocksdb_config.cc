@@ -223,7 +223,12 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
   result.paranoid_checks = true;
   result.track_and_verify_wals_in_manifest = true;
   result.allow_concurrent_memtable_write = true;
+  result.enable_write_thread_adaptive_yield = true;
   result.enable_pipelined_write = false;
+  result.unordered_write = false;
+  result.two_write_queues = false;
+  // Cedar owns Kernel epoch assembly; this only bounds non-Kernel write groups.
+  result.max_write_batch_group_size_bytes = 2ULL * 1024ULL * 1024ULL;
   result.manual_wal_flush = false;
   result.use_fsync = false;
   result.avoid_unnecessary_blocking_io = true;

@@ -15,6 +15,12 @@
 namespace {
 using Clock = std::chrono::steady_clock;
 
+void PrintLatencyPercentiles(const cedar::CommitLatencyHistogram& histogram) {
+  std::cout << histogram.ApproximatePercentile(50) << ','
+            << histogram.ApproximatePercentile(95) << ','
+            << histogram.ApproximatePercentile(99);
+}
+
 cedar::Status WriteVertex(cedar::Database* database, uint64_t id) {
   auto transaction = database->BeginTransaction();
   if (!transaction.ok()) return transaction.status();
@@ -73,9 +79,84 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
     std::cerr << "--path is required\n";
     return 2;
   }
-  std::filesystem::remove_all(options.path);
+  const auto populate = [&](cedar::Database* database) -> cedar::Status {
+    const bool seed_required =
+        options.workload != cedar::benchmark::KernelWorkload::kPropertyPut;
+    if (!seed_required) return cedar::Status::OK();
+    for (uint64_t index = 0; index < options.operations; ++index) {
+      const auto status = WriteVertex(database, index + 1);
+      if (!status.ok()) return status;
+    }
+    return cedar::Status::OK();
+  };
   cedar::DatabaseOptions db_options =
       cedar::benchmark::MakeBenchmarkDatabaseOptions(options);
+  if (!options.seed_database.empty()) {
+    std::error_code filesystem_error;
+    if (options.prepare_seed_database) {
+      std::filesystem::remove_all(options.seed_database, filesystem_error);
+      if (filesystem_error) {
+        std::cerr << "remove seed database: " << filesystem_error.message() << '\n';
+        return 1;
+      }
+      cedar::DatabaseOptions seed_options = db_options;
+      seed_options.path = options.seed_database;
+      auto seed = cedar::Database::Open(seed_options);
+      if (!seed.ok()) {
+        std::cerr << "open seed database: " << seed.status().ToString() << '\n';
+        return 1;
+      }
+      const cedar::Status populated = populate(seed.ValueOrDie().get());
+      if (!populated.ok()) {
+        std::cerr << "seed write: " << populated.ToString() << '\n';
+        return 1;
+      }
+      const cedar::Status closed = seed.ValueOrDie()->Close();
+      if (!closed.ok()) {
+        std::cerr << "close seed database: " << closed.ToString() << '\n';
+        return 1;
+      }
+    }
+    if (!std::filesystem::exists(
+            std::filesystem::path(options.seed_database) / "CURRENT",
+            filesystem_error) || filesystem_error) {
+      std::cerr << "seed database is not prepared\n";
+      return 1;
+    }
+    std::filesystem::remove_all(options.path, filesystem_error);
+    if (filesystem_error) {
+      std::cerr << "remove benchmark database: " << filesystem_error.message()
+                << '\n';
+      return 1;
+    }
+    cedar::DatabaseOptions seed_options = db_options;
+    seed_options.path = options.seed_database;
+    auto source = cedar::Database::Open(seed_options);
+    if (!source.ok()) {
+      std::cerr << "open seed checkpoint source: "
+                << source.status().ToString() << '\n';
+      return 1;
+    }
+    const cedar::Status checkpoint =
+        source.ValueOrDie()->CreateCheckpoint(options.path);
+    const cedar::Status closed = source.ValueOrDie()->Close();
+    if (!checkpoint.ok()) {
+      std::cerr << "create seed checkpoint: " << checkpoint.ToString() << '\n';
+      return 1;
+    }
+    if (!closed.ok()) {
+      std::cerr << "close checkpoint source: " << closed.ToString() << '\n';
+      return 1;
+    }
+  } else {
+    std::error_code filesystem_error;
+    std::filesystem::remove_all(options.path, filesystem_error);
+    if (filesystem_error) {
+      std::cerr << "remove benchmark database: " << filesystem_error.message()
+                << '\n';
+      return 1;
+    }
+  }
   auto opened = cedar::Database::Open(db_options);
   if (!opened.ok()) {
     std::cerr << opened.status().ToString() << '\n';
@@ -94,14 +175,11 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
     return PointRead(reopened_snapshot.ValueOrDie(), expected_vertex_id);
   };
   const auto workload = options.workload;
-  const bool seed_required = workload != cedar::benchmark::KernelWorkload::kPropertyPut;
-  if (seed_required) {
-    for (uint64_t index = 0; index < options.operations; ++index) {
-      const auto status = WriteVertex(database.get(), index + 1);
-      if (!status.ok()) {
-        std::cerr << "seed write: " << status.ToString() << '\n';
-        return 1;
-      }
+  if (options.seed_database.empty()) {
+    const cedar::Status populated = populate(database.get());
+    if (!populated.ok()) {
+      std::cerr << "seed write: " << populated.ToString() << '\n';
+      return 1;
     }
   }
   auto snapshot_result = database->BeginSnapshot();
@@ -111,6 +189,14 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   }
   auto snapshot = std::make_unique<cedar::Snapshot>(
       std::move(snapshot_result).ConsumeValueOrDie());
+  const auto initial_runtime_result = database->SampleRuntimeMetrics();
+  if (!initial_runtime_result.ok()) {
+    std::cerr << "initial runtime sample: "
+              << initial_runtime_result.status().ToString() << '\n';
+    return 1;
+  }
+  const cedar::RuntimeMetrics initial_runtime =
+      initial_runtime_result.ValueOrDie();
   const bool concurrent_writers =
       workload == cedar::benchmark::KernelWorkload::kPropertyPut &&
       options.writer_clients > 1;
@@ -213,6 +299,42 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   sample.multi_get_operations = runtime.ValueOrDie().multi_get_operations;
   sample.live_sst_bytes = runtime.ValueOrDie().live_fact_bytes;
   sample.retained_wal_bytes = runtime.ValueOrDie().retained_wal_bytes;
+  sample.pending_compaction_bytes = runtime.ValueOrDie().pending_compaction_bytes;
+  sample.maintenance_max_snapshot_age_us =
+      runtime.ValueOrDie().maintenance_snapshot_age_us;
+  sample.maintenance_errors = runtime.ValueOrDie().maintenance_errors;
+  const auto delta = [](uint64_t current, uint64_t initial) {
+    return current >= initial ? current - initial : 0;
+  };
+  sample.maintenance_recovery_exception_jobs = delta(
+      runtime.ValueOrDie().recovery_flush_exceptions,
+      initial_runtime.recovery_flush_exceptions);
+  const uint64_t autonomous_flushes =
+      delta(runtime.ValueOrDie().background_flush_calls,
+            initial_runtime.background_flush_calls) >=
+              delta(runtime.ValueOrDie().maintenance_flush_grants_accepted,
+                    initial_runtime.maintenance_flush_grants_accepted) +
+                  sample.maintenance_recovery_exception_jobs
+          ? delta(runtime.ValueOrDie().background_flush_calls,
+                  initial_runtime.background_flush_calls) -
+                delta(runtime.ValueOrDie().maintenance_flush_grants_accepted,
+                      initial_runtime.maintenance_flush_grants_accepted) -
+                sample.maintenance_recovery_exception_jobs
+          : 0;
+  const uint64_t autonomous_compactions =
+      delta(runtime.ValueOrDie().manual_compaction_calls,
+            initial_runtime.manual_compaction_calls) >=
+              delta(runtime.ValueOrDie().maintenance_compaction_grants_accepted,
+                    initial_runtime.maintenance_compaction_grants_accepted)
+          ? delta(runtime.ValueOrDie().manual_compaction_calls,
+                  initial_runtime.manual_compaction_calls) -
+                delta(runtime.ValueOrDie().maintenance_compaction_grants_accepted,
+                      initial_runtime.maintenance_compaction_grants_accepted)
+          : 0;
+  sample.unexplained_autonomous_jobs =
+      autonomous_flushes + autonomous_compactions +
+      delta(runtime.ValueOrDie().periodic_task_registrations,
+            initial_runtime.periodic_task_registrations);
   sample.projected_scan_rows = runtime.ValueOrDie().projected_scan_rows;
   sample.projected_scan_bytes_read = runtime.ValueOrDie().projected_scan_bytes_read;
   sample.canonical_scan_bytes_read = runtime.ValueOrDie().canonical_scan_bytes_read;
@@ -225,6 +347,7 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   sample.writer_failures = bounded_writers.failures;
   sample.write_stopped = runtime.ValueOrDie().write_stopped;
   sample.background_errors = runtime.ValueOrDie().background_error_count;
+  sample.commit_pipeline = metrics;
   if (options.verify_reopen) {
     uint64_t expected_id = options.operations;
     if (workload == cedar::benchmark::KernelWorkload::kPropertyPut) {
@@ -240,26 +363,63 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   } else {
     sample.reopen_verified = true;
   }
-  std::cout << "profile,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
-               "live_sst_bytes,retained_wal_bytes,n_plus_one_eligible_epochs,"
+  std::cout << "schema_version,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
+               "live_sst_bytes,retained_wal_bytes,pending_compaction_bytes,"
+               "maintenance_snapshot_age_us,maintenance_errors,"
+               "maintenance_recovery_exception_jobs,unexplained_autonomous_jobs,"
+               "n_plus_one_eligible_epochs,"
                "n_plus_one_promoted_epochs,projected_scan_rows,projected_scan_bytes_read,"
                "canonical_scan_bytes_read,logical_facts_bytes,obsolete_sst_bytes,"
                "temporary_output_bytes,writer_clients,writer_failures,write_stopped,"
-               "background_errors,qualification\n";
-  std::cout << cedar::benchmark::BenchmarkExecutionProfileName(options.execution_profile)
-            << ',' << cedar::benchmark::KernelWorkloadName(options.workload) << ','
+               "background_errors,commit_epochs,epoch_transactions,epoch_bytes,wal_sync_count,wal_rotations,"
+               "queue_p50_us,queue_p95_us,queue_p99_us,validation_p50_us,validation_p95_us,validation_p99_us,"
+               "assembly_p50_us,assembly_p95_us,assembly_p99_us,wal_append_p50_us,wal_append_p95_us,wal_append_p99_us,"
+               "wal_sync_p50_us,wal_sync_p95_us,wal_sync_p99_us,wal_callback_p50_us,wal_callback_p95_us,wal_callback_p99_us,"
+               "manifest_p50_us,manifest_p95_us,manifest_p99_us,memtable_p50_us,memtable_p95_us,memtable_p99_us,"
+               "publication_p50_us,publication_p95_us,publication_p99_us,end_to_end_p50_us,end_to_end_p95_us,end_to_end_p99_us,qualification\n";
+  std::cout << "1," << cedar::benchmark::KernelWorkloadName(options.workload) << ','
             << sample.operations << ',' << sample.elapsed_seconds << ','
             << sample.operations_per_second << ',' << sample.point_read_operations << ','
             << sample.multi_get_operations << ','
             << sample.live_sst_bytes << ',' << sample.retained_wal_bytes << ','
+            << sample.pending_compaction_bytes << ','
+            << sample.maintenance_max_snapshot_age_us << ','
+            << sample.maintenance_errors << ','
+            << sample.maintenance_recovery_exception_jobs << ','
+            << sample.unexplained_autonomous_jobs << ','
             << sample.n_plus_one_eligible_epochs << ',' << sample.n_plus_one_promoted_epochs
             << ',' << sample.projected_scan_rows << ',' << sample.projected_scan_bytes_read
             << ',' << sample.canonical_scan_bytes_read << ',' << sample.logical_facts_bytes
             << ',' << sample.obsolete_sst_bytes << ',' << sample.temporary_output_bytes
             << ',' << sample.writer_clients << ',' << sample.writer_failures
             << ',' << sample.write_stopped << ',' << sample.background_errors
-            << ',' << cedar::benchmark::BenchmarkQualificationStatus(options, sample) << '\n';
-  return 0;
+            << ',' << sample.commit_pipeline.epochs
+            << ',' << sample.commit_pipeline.epoch_transactions
+            << ',' << sample.commit_pipeline.epoch_bytes
+            << ',' << sample.commit_pipeline.latency.wal_sync.count
+            << ',' << sample.commit_pipeline.wal_rotations << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.queue);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.validation);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.assembly);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.wal_append);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.wal_sync);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.wal_callback);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.manifest);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.memtable_insert);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.publication);
+  std::cout << ',';
+  PrintLatencyPercentiles(sample.commit_pipeline.latency.end_to_end);
+  std::cout << ',' << cedar::benchmark::BenchmarkQualificationStatus(options, sample)
+            << '\n';
+  return cedar::benchmark::CampaignExitCode(options, sample);
 }
 }  // namespace
 

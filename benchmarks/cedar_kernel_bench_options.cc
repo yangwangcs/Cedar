@@ -28,10 +28,6 @@ Status Invalid(const std::string& message) {
 
 }  // namespace
 
-const char* BenchmarkExecutionProfileName(BenchmarkExecutionProfile profile) {
-  return profile == BenchmarkExecutionProfile::kKernel ? "kernel" : "lean";
-}
-
 const char* KernelWorkloadName(KernelWorkload workload) {
   switch (workload) {
     case KernelWorkload::kPropertyPut: return "property-put";
@@ -92,10 +88,6 @@ StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(
         return Invalid("writer clients must be in [1, 32]");
       }
       options.writer_clients = static_cast<uint32_t>(*parsed);
-    } else if (name == "--profile") {
-      if (value == "kernel") options.execution_profile = BenchmarkExecutionProfile::kKernel;
-      else if (value == "lean") options.execution_profile = BenchmarkExecutionProfile::kLean;
-      else return Invalid("profile must be lean or kernel");
     } else if (name == "--campaign") {
       if (value == "none") options.campaign = CampaignKind::kNone;
       else if (value == "smoke") options.campaign = CampaignKind::kSmoke;
@@ -129,11 +121,26 @@ StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(
   if (options.path.empty() && !options.database_path.empty()) {
     options.path = options.database_path;
   }
+  if (options.prepare_seed_database && options.seed_database.empty()) {
+    return Invalid("prepare-seed requires --seed-db");
+  }
+  if (!options.seed_database.empty() && !options.database_path.empty()) {
+    std::error_code error;
+    const auto seed = std::filesystem::weakly_canonical(options.seed_database, error);
+    if (error) return Invalid("cannot resolve --seed-db");
+    const auto destination =
+        std::filesystem::weakly_canonical(options.database_path, error);
+    if (error) return Invalid("cannot resolve --database-path");
+    if (seed == destination) {
+      return Invalid("seed and destination paths must differ");
+    }
+  }
   if (options.campaign == CampaignKind::kWarm && options.duration_seconds != 30) {
     return Invalid("warm campaign requires duration-seconds=30");
   }
-  if (options.campaign == CampaignKind::kPreflight && options.duration_seconds != 300) {
-    return Invalid("preflight campaign requires duration-seconds=300");
+  if (options.campaign == CampaignKind::kPreflight &&
+      options.duration_seconds != 60 && options.duration_seconds != 300) {
+    return Invalid("preflight campaign requires duration-seconds=60 or 300");
   }
   if (options.campaign == CampaignKind::kSustained && options.duration_seconds < 1'800) {
     return Invalid("sustained campaign requires duration-seconds>=1800");
@@ -150,8 +157,15 @@ std::string BenchmarkQualificationStatus(const KernelBenchmarkOptions& options,
   if (sample.writer_failures != 0) return "sustained_writer_failure";
   if (sample.write_stopped != 0) return "sustained_write_stopped";
   if (sample.background_errors != 0) return "sustained_background_error";
+  if (sample.maintenance_errors != 0) return "sustained_maintenance_error";
   if (sample.unexplained_autonomous_jobs != 0) {
     return "sustained_unexplained_autonomous_maintenance";
+  }
+  if (sample.maintenance_max_snapshot_age_us > 250'000) {
+    return "sustained_stale_maintenance_snapshot";
+  }
+  if (sample.pending_compaction_bytes >= 32ULL * 1024ULL * 1024ULL * 1024ULL) {
+    return "sustained_pending_compaction_debt";
   }
   if (sample.n_plus_one_eligible_epochs == 0) return "sustained_n_plus_one_not_exercised";
   if (sample.n_plus_one_promoted_epochs * 100 <
@@ -159,6 +173,30 @@ std::string BenchmarkQualificationStatus(const KernelBenchmarkOptions& options,
     return "sustained_n_plus_one_below_95_percent";
   }
   return "sustained_local_gates_passed";
+}
+
+int CampaignExitCode(const KernelBenchmarkOptions& options,
+                     const KernelBenchmarkSample& sample) {
+  if (options.campaign == CampaignKind::kNone) return 0;
+  const bool duration_complete =
+      options.campaign == CampaignKind::kSmoke ||
+      sample.elapsed_seconds >= static_cast<double>(options.duration_seconds);
+  if (!duration_complete ||
+      (options.verify_reopen && !sample.reopen_verified) || sample.writer_failures != 0 ||
+      sample.write_stopped != 0 || sample.background_errors != 0 ||
+      sample.maintenance_errors != 0 ||
+      sample.unexplained_autonomous_jobs != 0 ||
+      sample.retained_wal_bytes >= 1024ULL * 1024ULL * 1024ULL ||
+      sample.maintenance_max_snapshot_age_us > 250'000 ||
+      sample.pending_compaction_bytes >= 32ULL * 1024ULL * 1024ULL * 1024ULL) {
+    return 1;
+  }
+  if (options.campaign == CampaignKind::kSustained &&
+      BenchmarkQualificationStatus(options, sample) !=
+          "sustained_local_gates_passed") {
+    return 1;
+  }
+  return 0;
 }
 
 }  // namespace cedar::benchmark

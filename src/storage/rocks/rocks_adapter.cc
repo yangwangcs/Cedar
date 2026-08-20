@@ -25,6 +25,7 @@
 #include <rocksdb/cedar_maintenance.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/statistics.h>
 #include <rocksdb/table.h>
@@ -198,25 +199,37 @@ rocksdb::cedar_parquet::CedarParquetColumnId ToRocksColumnId(FactColumnId id) {
   return static_cast<rocksdb::cedar_parquet::CedarParquetColumnId>(id);
 }
 
-Status AppendColumnarValue(
+Status AppendSelectedColumnarValues(
     const rocksdb::cedar_parquet::CedarParquetColumnVector& source,
-    size_t row, FactColumn* destination) {
-  if (source.present.size() <= row) {
-    return Status::Corruption("columnar scan", "source null bitmap is shorter than rows");
+    const std::vector<size_t>& selected_rows, size_t begin, size_t end,
+    FactColumn* destination) {
+  if (begin > end || end > selected_rows.size()) {
+    return Status::InvalidArgument("columnar scan", "invalid selection vector range");
   }
-  destination->present.push_back(source.present[row]);
+  for (size_t offset = begin; offset < end; ++offset) {
+    const size_t row = selected_rows[offset];
+    if (source.present.size() <= row) {
+      return Status::Corruption("columnar scan", "source null bitmap is shorter than rows");
+    }
+  }
   return std::visit(
-      [row, destination](const auto& source_values) -> Status {
+      [&, destination](const auto& source_values) -> Status {
         using Vector = std::decay_t<decltype(source_values)>;
-        if (source_values.size() <= row) {
-          return Status::Corruption("columnar scan",
-                                    "source vector is shorter than rows");
-        }
         auto* destination_values = std::get_if<Vector>(&destination->values);
         if (destination_values == nullptr) {
           return Status::Corruption("columnar scan", "projected vector type mismatch");
         }
-        destination_values->push_back(source_values[row]);
+        destination_values->reserve(destination_values->size() + (end - begin));
+        destination->present.reserve(destination->present.size() + (end - begin));
+        for (size_t offset = begin; offset < end; ++offset) {
+          const size_t row = selected_rows[offset];
+          if (source_values.size() <= row) {
+            return Status::Corruption("columnar scan",
+                                      "source vector is shorter than rows");
+          }
+          destination_values->push_back(source_values[row]);
+          destination->present.push_back(source.present[row]);
+        }
         return Status::OK();
       },
       source.values);
@@ -347,6 +360,9 @@ class FactStoreImpl {
   std::atomic<uint64_t> multi_get_operations{0};
   std::atomic<uint64_t> projected_scan_rows{0};
   std::atomic<uint64_t> projected_scan_bytes_read{0};
+  std::atomic<uint64_t> projected_scan_pages_skipped{0};
+  std::atomic<uint64_t> projected_scan_pages_read{0};
+  std::atomic<uint64_t> projected_scan_physical_bytes_read{0};
   std::atomic<uint64_t> canonical_scan_bytes_read{0};
   std::atomic<uint64_t> logical_facts_bytes{0};
   IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
@@ -1257,7 +1273,7 @@ Status FactStore::Open() {
     }
     const auto identity = EncodeSystemIdentity(SystemIdentity{
         "cedar.authoritative-columnar", 1, "part32.fact.v2",
-        "cedar.parquet.facts.v2", "cedar.v2.internal-key.bytewise.v1"});
+        "cedar.parquet.facts.v3", "cedar.v2.internal-key.bytewise.v1"});
     const auto empty_watermark = EncodeWatermark(CommitSeq{});
     if (!identity.ok()) return identity.status();
     if (!empty_watermark.ok()) return empty_watermark.status();
@@ -1361,6 +1377,38 @@ Status FactStore::Close() {
   impl_->accepting_snapshots = false;
   impl_.reset();
   return Status::OK();
+}
+
+Status FactStore::CreateCheckpoint(const std::string& checkpoint_path) const {
+  if (checkpoint_path.empty() ||
+      !std::filesystem::path(checkpoint_path).is_absolute()) {
+    return Status::InvalidArgument("fact store checkpoint",
+                                   "checkpoint path must be absolute");
+  }
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) {
+      return Status::InvalidArgument("fact store checkpoint", "store is not open");
+    }
+  }
+  std::error_code filesystem_error;
+  if (std::filesystem::exists(checkpoint_path, filesystem_error)) {
+    return Status::InvalidArgument("fact store checkpoint",
+                                   "destination already exists");
+  }
+  if (filesystem_error) {
+    return Status::IOError("fact store checkpoint", filesystem_error.message());
+  }
+  rocksdb::Checkpoint* raw_checkpoint = nullptr;
+  const rocksdb::Status created =
+      rocksdb::Checkpoint::Create(store->db.get(), &raw_checkpoint);
+  if (!created.ok()) return FromRocksDb(created, "create fact store checkpoint");
+  std::unique_ptr<rocksdb::Checkpoint> checkpoint(raw_checkpoint);
+  const rocksdb::Status checkpointed = checkpoint->CreateCheckpoint(
+      checkpoint_path, std::numeric_limits<uint64_t>::max());
+  return FromRocksDb(checkpointed, "create fact store checkpoint");
 }
 
 StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const {
@@ -1558,6 +1606,20 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
 
   rocksdb::cedar_parquet::CedarParquetScanSpec rocks_spec;
   rocks_spec.batch_row_limit = options.batch_row_limit;
+  rocksdb::cedar_parquet::CedarParquetScanStats scan_stats;
+  rocks_spec.stats = &scan_stats;
+  if (options.event_valid_from_min.has_value()) {
+    rocks_spec.valid_from_min = options.event_valid_from_min->value;
+  }
+  if (options.event_valid_from_max.has_value()) {
+    rocks_spec.valid_from_max = options.event_valid_from_max->value;
+  }
+  if (options.event_commit_seq_min.has_value()) {
+    rocks_spec.cedar_commit_seq_min = options.event_commit_seq_min->value;
+  }
+  if (options.event_commit_seq_max.has_value()) {
+    rocks_spec.cedar_commit_seq_max = options.event_commit_seq_max->value;
+  }
   const std::optional<uint64_t> lower_entity =
       prefix.entity_id().has_value() ? prefix.entity_id() : bounds.entity_id_min;
   const std::optional<uint64_t> upper_entity =
@@ -1648,6 +1710,13 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
         if (source.columns.size() != output.columns.size()) {
           return rocksdb::Status::Corruption("columnar scan projection width mismatch");
         }
+        for (size_t column = 0; column < source.columns.size(); ++column) {
+          if (source.columns[column].id != ToRocksColumnId(output.columns[column].id)) {
+            return rocksdb::Status::Corruption("columnar scan projection order mismatch");
+          }
+        }
+        std::vector<size_t> selected_rows;
+        selected_rows.reserve(source.internal_keys.size());
         for (size_t row = 0; row < source.internal_keys.size(); ++row) {
           if (source.internal_keys[row].size() < 8) {
             return rocksdb::Status::Corruption("columnar scan received short internal key");
@@ -1656,23 +1725,34 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
               source.internal_keys[row].substr(0, source.internal_keys[row].size() - 8));
           if (!decoded.ok()) return rocksdb::Status::Corruption(decoded.status().ToString());
           if (!selected(decoded.ValueOrDie())) continue;
+          selected_rows.push_back(row);
+        }
+        size_t selected_begin = 0;
+        while (selected_begin < selected_rows.size()) {
+          const size_t room = options.batch_row_limit - output.row_count();
+          const size_t selected_end = std::min(
+              selected_rows.size(), selected_begin + room);
           for (size_t column = 0; column < source.columns.size(); ++column) {
-            if (source.columns[column].id != ToRocksColumnId(output.columns[column].id)) {
-              return rocksdb::Status::Corruption("columnar scan projection order mismatch");
-            }
-            const Status appended =
-                AppendColumnarValue(source.columns[column], row, &output.columns[column]);
+            const Status appended = AppendSelectedColumnarValues(
+                source.columns[column], selected_rows, selected_begin, selected_end,
+                &output.columns[column]);
             if (!appended.ok()) return rocksdb::Status::Corruption(appended.ToString());
           }
+          selected_begin = selected_end;
           if (output.row_count() == options.batch_row_limit) {
             const Status flushed = flush();
-            if (!flushed.ok()) {
-              return rocksdb::Status::Incomplete("columnar scan visitor stopped");
-            }
+            if (!flushed.ok()) return rocksdb::Status::Incomplete(
+                "columnar scan visitor stopped");
           }
         }
         return rocksdb::Status::OK();
       });
+  store->projected_scan_pages_skipped.fetch_add(
+      scan_stats.pages_skipped, std::memory_order_relaxed);
+  store->projected_scan_pages_read.fetch_add(
+      scan_stats.pages_read, std::memory_order_relaxed);
+  store->projected_scan_physical_bytes_read.fetch_add(
+      scan_stats.bytes_read, std::memory_order_relaxed);
   if (visitor_error.has_value()) return *visitor_error;
   if (!scanned.ok()) return FromRocksDb(scanned, "scan projected facts");
   return flush();
@@ -2560,7 +2640,7 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     return Status::InvalidArgument("commit", "missing decided epoch");
   }
   if (!epoch->requires_durable_write()) {
-    return epoch->CopyGroupResult();
+    return epoch->TakeGroupResult();
   }
   if (store->visible_seq != epoch->base_visible_seq()) {
     return Status::Conflict("commit", "decided epoch base is no longer current");
@@ -2617,7 +2697,7 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     }
     store->PublishVisible(epoch->visible_seq_target());
   }
-  StoreCommittedGroupResult result = epoch->CopyGroupResult();
+  StoreCommittedGroupResult result = epoch->TakeGroupResult();
   result.wal_append_us = kernel_metrics.wal_append_us;
   result.wal_sync_us = kernel_metrics.wal_sync_us;
   result.manifest_us = kernel_metrics.manifest_us;
@@ -3406,6 +3486,18 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   const auto wal_started_at = std::chrono::steady_clock::now();
   sample.retained_wal_bytes = maintenance.retained_wal_bytes;
   metrics.retained_wal_bytes = sample.retained_wal_bytes;
+  const uint64_t sampled_now_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  metrics.maintenance_snapshot_age_us =
+      sampled_now_us >= maintenance.sampled_at_us
+          ? sampled_now_us - maintenance.sampled_at_us
+          : 0;
+  metrics.background_flush_calls = maintenance.background_flush_calls;
+  metrics.manual_compaction_calls = maintenance.manual_compaction_calls;
+  metrics.periodic_task_registrations = maintenance.periodic_task_registrations;
+  metrics.recovery_flush_exceptions = maintenance.recovery_flush_exceptions;
   timing.recovery_wal_bytes_us = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - wal_started_at)
@@ -3481,6 +3573,12 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
       store->projected_scan_rows.load(std::memory_order_relaxed);
   metrics.projected_scan_bytes_read =
       store->projected_scan_bytes_read.load(std::memory_order_relaxed);
+  metrics.projected_scan_pages_skipped =
+      store->projected_scan_pages_skipped.load(std::memory_order_relaxed);
+  metrics.projected_scan_pages_read =
+      store->projected_scan_pages_read.load(std::memory_order_relaxed);
+  metrics.projected_scan_physical_bytes_read =
+      store->projected_scan_physical_bytes_read.load(std::memory_order_relaxed);
   metrics.canonical_scan_bytes_read =
       store->canonical_scan_bytes_read.load(std::memory_order_relaxed);
   metrics.logical_facts_bytes =

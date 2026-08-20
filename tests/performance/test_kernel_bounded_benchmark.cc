@@ -18,13 +18,22 @@
 namespace cedar::benchmark {
 namespace {
 
-TEST(KernelBoundedBenchmarkTest, LeanUsesProductionStorageWithoutKernelMode) {
+TEST(KernelBoundedBenchmarkTest, BenchmarkAlwaysUsesCedarKernelMode) {
   KernelBenchmarkOptions options;
-  options.path = "/tmp/cedar-lean-profile";
-  options.execution_profile = BenchmarkExecutionProfile::kLean;
+  options.path = "/tmp/cedar-kernel-profile";
   const DatabaseOptions database_options = MakeBenchmarkDatabaseOptions(options);
   EXPECT_EQ(database_options.storage_profile, StorageProfile::kProductionAppend);
-  EXPECT_FALSE(database_options.production.kernel_mode);
+  EXPECT_TRUE(database_options.production.kernel_mode);
+}
+
+TEST(KernelBoundedBenchmarkTest, BenchmarkSampleCarriesAppendStageMetrics) {
+  KernelBenchmarkSample sample;
+  sample.commit_pipeline.latency.queue.buckets[0] = 11;
+  sample.commit_pipeline.latency.wal_sync.total_us = 29;
+  sample.commit_pipeline.latency.publication.max_us = 47;
+  EXPECT_EQ(sample.commit_pipeline.latency.queue.buckets[0], 11U);
+  EXPECT_EQ(sample.commit_pipeline.latency.wal_sync.total_us, 29U);
+  EXPECT_EQ(sample.commit_pipeline.latency.publication.max_us, 47U);
 }
 
 TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {

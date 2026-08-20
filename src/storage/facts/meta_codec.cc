@@ -187,7 +187,7 @@ Status VacuumState::Validate() const {
 Status SystemIdentity::Validate() const {
   if (system != "cedar.authoritative-columnar" || system_format != 1 ||
       fact_key_format != "part32.fact.v2" ||
-      facts_table_format != "cedar.parquet.facts.v2" ||
+      facts_table_format != "cedar.parquet.facts.v3" ||
       comparator_digest != "cedar.v2.internal-key.bytewise.v1") {
     return Status::InvalidArgument("system identity", "unsupported identity");
   }

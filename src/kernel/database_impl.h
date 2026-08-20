@@ -23,6 +23,8 @@
 #include "storage/rocks/decided_epoch.h"
 #include "storage/facts/pending_version_overlay.h"
 #include "kernel/async_commit.h"
+#include "kernel/adaptive_epoch_controller.h"
+#include "kernel/epoch_completion.h"
 #include "kernel/async_submission_executor.h"
 #include "kernel/maintenance_controller.h"
 #include "kernel/maintenance_policy.h"
@@ -101,7 +103,7 @@ class Database::Impl {
     SlotState state = SlotState::kEmpty;
   };
   struct WalDurabilityContext {
-    std::vector<std::shared_ptr<CommitHandle::State>> handles;
+    std::shared_ptr<internal::EpochCompletion> completion;
     std::vector<std::shared_ptr<AsyncSubmissionExecutor::Ticket>> executor_tickets;
     AsyncSubmissionExecutor* executor = nullptr;
     std::chrono::steady_clock::time_point write_started_at;
@@ -126,6 +128,11 @@ class Database::Impl {
         append_commit_max_batch_bytes(options.group_commit_max_batch_bytes),
         append_commit_max_queue_requests(options.group_commit_max_queue_requests),
         append_commit_max_queue_bytes(options.group_commit_max_queue_bytes),
+        adaptive_epoch_controller(internal::AdaptiveEpochController::Options{
+            options.group_commit_max_batch_size,
+            options.group_commit_max_batch_bytes,
+            5'000,
+            options.group_commit_window_us}),
         append_commit_enqueued_observer_for_testing(
             std::move(options.append_commit_enqueued_observer_for_testing)),
         commit_result_processing_observer_for_testing(
@@ -223,6 +230,9 @@ class Database::Impl {
   uint64_t append_commit_max_batch_bytes = 2ULL * 1024ULL * 1024ULL;
   uint32_t append_commit_max_queue_requests = 1024;
   uint64_t append_commit_max_queue_bytes = 16ULL * 1024ULL * 1024ULL;
+  // Accessed only by the ordered append worker. Runtime pressure remains
+  // separately published through atomics for the preflight worker.
+  internal::AdaptiveEpochController adaptive_epoch_controller;
   std::function<void()> append_commit_enqueued_observer_for_testing;
   std::function<void()> commit_result_processing_observer_for_testing;
   std::function<void(uint64_t)> runtime_sampler_interval_observer_for_testing;

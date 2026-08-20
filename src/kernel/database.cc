@@ -74,9 +74,28 @@ void CompleteCommitHandle(const std::shared_ptr<CommitHandle::State>& handle,
   handle->completed.notify_all();
 }
 
+void BindCommitHandleToEpoch(
+    const std::shared_ptr<CommitHandle::State>& handle,
+    const std::shared_ptr<internal::EpochCompletion>& completion,
+    size_t ordinal, bool waits_for_durability) {
+  if (!handle) return;
+  {
+    std::lock_guard<std::mutex> lock(handle->mutex);
+    handle->epoch_completion = completion;
+    handle->epoch_result_ordinal = ordinal;
+    handle->waits_for_epoch_durability = waits_for_durability;
+  }
+  handle->completed.notify_all();
+}
+
 RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   RuntimeMetrics metrics;
   metrics.retained_wal_bytes = source.retained_wal_bytes;
+  metrics.maintenance_snapshot_age_us = source.maintenance_snapshot_age_us;
+  metrics.background_flush_calls = source.background_flush_calls;
+  metrics.manual_compaction_calls = source.manual_compaction_calls;
+  metrics.periodic_task_registrations = source.periodic_task_registrations;
+  metrics.recovery_flush_exceptions = source.recovery_flush_exceptions;
   metrics.active_fact_bytes = source.total_active_memtable_bytes;
   metrics.immutable_fact_bytes = source.total_immutable_memtable_bytes;
   metrics.immutable_fact_count = source.total_immutable_memtable_count;
@@ -102,6 +121,10 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.multi_get_operations = source.multi_get_operations;
   metrics.projected_scan_rows = source.projected_scan_rows;
   metrics.projected_scan_bytes_read = source.projected_scan_bytes_read;
+  metrics.projected_scan_pages_skipped = source.projected_scan_pages_skipped;
+  metrics.projected_scan_pages_read = source.projected_scan_pages_read;
+  metrics.projected_scan_physical_bytes_read =
+      source.projected_scan_physical_bytes_read;
   metrics.canonical_scan_bytes_read = source.canonical_scan_bytes_read;
   metrics.logical_facts_bytes = source.logical_facts_bytes;
   metrics.obsolete_fact_bytes = source.obsolete_sst_bytes;
@@ -454,11 +477,7 @@ void Database::Impl::NotifyWalDurable(void* context) noexcept {
             .count());
     durability->wal_callback_us.store(elapsed, std::memory_order_relaxed);
   }
-  for (const auto& handle : durability->handles) {
-    std::lock_guard<std::mutex> lock(handle->mutex);
-    handle->wal_durable = true;
-    handle->completed.notify_all();
-  }
+  if (durability->completion != nullptr) durability->completion->MarkWalDurable();
   if (durability->executor != nullptr) {
     for (const auto& ticket : durability->executor_tickets) {
       if (ticket != nullptr) durability->executor->Release(ticket->id);
@@ -687,24 +706,49 @@ Status Database::Impl::StartAppendCommitPipeline() {
           ++append_commit_metrics.n_plus_one_promoted_epochs;
           next_epoch_slot.reset();
         } else {
-          const auto deadline = std::chrono::steady_clock::now() +
-              std::chrono::microseconds(std::min(
-                  append_commit_window_us,
-                  runtime_collection_window_us.load(std::memory_order_acquire)));
-          append_commit_cv.wait_until(lock, deadline, [this] {
-            return append_commit_stopping ||
-                   append_commit_requests.size() >= std::min<uint32_t>(
-                       append_commit_max_batch_size,
-                       runtime_target_count.load(std::memory_order_acquire));
-          });
+          const auto limits_for_queue = [this] {
+            internal::EpochQueueSnapshot snapshot;
+            snapshot.depth = append_commit_requests.size();
+            snapshot.pressure_state =
+                runtime_pressure_state.load(std::memory_order_acquire);
+            if (!append_commit_requests.empty()) {
+              snapshot.oldest_age_us = static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() -
+                      append_commit_requests.front()->enqueued_at)
+                      .count());
+            }
+            return adaptive_epoch_controller.NextLimits(snapshot);
+          };
+          internal::EpochLimits collection_limits = limits_for_queue();
+          const uint32_t runtime_maximum = std::min<uint32_t>(
+              append_commit_max_batch_size,
+              runtime_target_count.load(std::memory_order_acquire));
+          const uint32_t wake_at = std::min<uint32_t>(
+              runtime_maximum, std::max<uint32_t>(2, collection_limits.max_transactions));
+          const uint64_t collection_age_us = std::min<uint64_t>(
+              append_commit_window_us,
+              std::min<uint64_t>(
+                  runtime_collection_window_us.load(std::memory_order_acquire),
+                  collection_limits.max_age_us));
+          if (collection_age_us != 0 && append_commit_requests.size() < wake_at) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(collection_age_us);
+            append_commit_cv.wait_until(lock, deadline, [this, wake_at] {
+              return append_commit_stopping || append_commit_requests.size() >= wake_at;
+            });
+          }
+          collection_limits = limits_for_queue();
           internal::CommitConflictIndex conflict_index;
           const size_t maximum = std::min<size_t>(
               append_commit_requests.size(), std::min<uint32_t>(
-                  append_commit_max_batch_size,
-                  runtime_target_count.load(std::memory_order_acquire)));
+                  std::min<uint32_t>(append_commit_max_batch_size,
+                                     runtime_target_count.load(std::memory_order_acquire)),
+                  collection_limits.max_transactions));
           const uint64_t target_bytes = std::min<uint64_t>(
-              append_commit_max_batch_bytes,
-              runtime_target_bytes.load(std::memory_order_acquire));
+              std::min<uint64_t>(append_commit_max_batch_bytes,
+                                 runtime_target_bytes.load(std::memory_order_acquire)),
+              collection_limits.max_encoded_bytes);
           uint64_t batch_bytes = 0;
           requests.reserve(maximum);
           for (size_t index = 0; index < maximum; ++index) {
@@ -773,11 +817,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
       durability.executor = &async_executor;
       size_t fast_path_requests = 0;
       store_requests.reserve(requests.size());
-      durability.handles.reserve(requests.size());
       durability.executor_tickets.reserve(requests.size());
       std::unordered_set<uint64_t> durable_txn_ids;
       size_t durably_accepted_transactions = 0;
-      for (const auto& request : requests) {
+      std::shared_ptr<internal::EpochCompletion> epoch_completion;
+      for (size_t index = 0; index < requests.size(); ++index) {
+        const auto& request = requests[index];
         if (internal::CanUseAppendFastPath(request->batch)) {
           ++fast_path_requests;
         }
@@ -790,11 +835,19 @@ Status Database::Impl::StartAppendCommitPipeline() {
             StoreCommitGroupRequest{std::move(request->batch),
                                     request->handle != nullptr &&
                                         first_durable_transaction});
-        if (request->handle != nullptr && first_durable_transaction) {
-          durability.handles.push_back(request->handle);
-          durability.executor_tickets.push_back(request->executor_ticket);
+        if (request->handle != nullptr) {
+          if (epoch_completion == nullptr) {
+            epoch_completion =
+                std::make_shared<internal::EpochCompletion>(requests.size());
+          }
+          BindCommitHandleToEpoch(request->handle, epoch_completion, index,
+                                  first_durable_transaction);
+          if (first_durable_transaction) {
+            durability.executor_tickets.push_back(request->executor_ticket);
+          }
         }
       }
+      durability.completion = epoch_completion;
       durability.write_started_at = std::chrono::steady_clock::now();
       if (maintenance_controller) {
         maintenance_controller->SetWalSyncCritical(true);
@@ -821,6 +874,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
       }
       const auto write_finished_at = std::chrono::steady_clock::now();
       const CedarRuntimeSnapshot runtime_snapshot = ReadRuntimeSnapshot();
+      std::vector<CommitResult> epoch_results;
+      if (epoch_completion != nullptr) epoch_results.reserve(requests.size());
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
         if (commit_result_processing_observer_for_testing) {
@@ -839,6 +894,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
             runtime_pressure_state.load(std::memory_order_acquire);
         if (result.ok()) {
           const auto& group_metrics = result.ValueOrDie();
+          append_commit_metrics.wal_rotations += group_metrics.wal_rotations;
           RecordLatency(&append_commit_metrics.latency.validation,
                         group_metrics.validation_us);
           RecordLatency(&append_commit_metrics.latency.assembly,
@@ -853,6 +909,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
             RecordLatency(&append_commit_metrics.latency.memtable_insert,
                           group_metrics.memtable_insert_us);
           }
+          uint64_t epoch_bytes = 0;
+          for (const auto& request : requests) {
+            epoch_bytes += request->estimated_bytes;
+          }
+          adaptive_epoch_controller.Observe(internal::EpochObservation{
+              group_metrics.wal_sync_us,
+              append_commit_metrics.latency.queue.ApproximatePercentile(99),
+              requests.size(), epoch_bytes});
         }
         if (discarded_stale_predecision) {
           RecordNPlusOneDiscard(&append_commit_metrics,
@@ -920,6 +984,11 @@ Status Database::Impl::StartAppendCommitPipeline() {
               ++append_commit_metrics.indeterminate;
             }
           }
+          if (epoch_completion != nullptr) {
+            epoch_results.push_back(
+                ToCommitResult(requests[index]->txn_id,
+                               *requests[index]->result));
+          }
         }
         const auto publication_observed_at = std::chrono::steady_clock::now();
         active_append_commit_requests -= requests.size();
@@ -942,15 +1011,10 @@ Status Database::Impl::StartAppendCommitPipeline() {
         ++preflight_request_generation;
         append_commit_cv.notify_all();
       }
-      for (size_t index = 0; index < requests.size(); ++index) {
-        if (requests[index]->handle) {
-          CompleteCommitHandle(requests[index]->handle,
-                               ToCommitResult(requests[index]->txn_id,
-                                              *requests[index]->result));
-        }
+      if (epoch_completion != nullptr) {
+        epoch_completion->Publish(std::move(epoch_results));
       }
       store_requests.clear();
-      durability.handles.clear();
       uint64_t released_bytes = 0;
       for (const auto& request : requests) released_bytes += request->estimated_bytes;
       requests.clear();
@@ -1203,23 +1267,33 @@ Status Database::Impl::SubmitAsyncCommit(
   }
 
   std::unique_lock<std::mutex> lock(request->handle->mutex);
-  const auto accepted = [&] {
-    return request->handle->wal_durable || request->handle->result.has_value();
+  const auto selected = [&] {
+    return request->handle->result.has_value() ||
+           request->handle->epoch_completion != nullptr;
   };
   if (deadline_us == 0) {
-    request->handle->completed.wait(lock, accepted);
+    request->handle->completed.wait(lock, selected);
   } else if (!request->handle->completed.wait_for(
-                 lock, std::chrono::microseconds(deadline_us), accepted)) {
+                 lock, std::chrono::microseconds(deadline_us), selected)) {
     lock.unlock();
     CancelQueuedAsyncCommit(request);
     lock.lock();
     // Cancellation is determinate only while the request is still in a Cedar
     // mailbox or queue. Once the writer has selected it, wait for the real WAL
     // or terminal outcome instead of reporting a failure that may later commit.
-    request->handle->completed.wait(lock, accepted);
+    request->handle->completed.wait(lock, selected);
   }
-  if (!request->handle->wal_durable) return request->handle->result->status;
-  return Status::OK();
+  if (request->handle->result.has_value()) return request->handle->result->status;
+  const std::shared_ptr<internal::EpochCompletion> completion =
+      request->handle->epoch_completion;
+  const size_t ordinal = request->handle->epoch_result_ordinal;
+  const bool waits_for_durability = request->handle->waits_for_epoch_durability;
+  lock.unlock();
+  if (waits_for_durability && completion->WaitForWalDurableOrPublication()) {
+    return Status::OK();
+  }
+  const auto terminal = completion->WaitForResult(ordinal);
+  return terminal.ok() ? terminal.ValueOrDie().status : terminal.status();
 }
 
 Status Database::Impl::DrainAppendCommitPipeline() {
@@ -1344,6 +1418,16 @@ Status Database::Close() {
   impl_->closed = true;
   impl_->closing = false;
   return Status::OK();
+}
+
+Status Database::CreateCheckpoint(const std::string& checkpoint_path) const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  if (impl_->closing) {
+    return Status::ShutdownInProgress("database", "database close is in progress");
+  }
+  return impl_->store.CreateCheckpoint(checkpoint_path);
 }
 
 StatusOr<VertexId> Database::AllocateVertexId() {
@@ -1474,7 +1558,17 @@ StatusOr<RuntimeMetrics> Database::SampleRuntimeMetrics() const {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   const auto sampled = impl_->store.SampleRuntimeMetrics();
   if (!sampled.ok()) return sampled.status();
-  return ToRuntimeMetrics(sampled.ValueOrDie());
+  RuntimeMetrics metrics = ToRuntimeMetrics(sampled.ValueOrDie());
+  if (impl_->maintenance_controller) {
+    const CedarMaintenanceMetrics maintenance =
+        impl_->maintenance_controller->metrics();
+    metrics.maintenance_flush_grants_accepted =
+        maintenance.flush_grants_accepted;
+    metrics.maintenance_compaction_grants_accepted =
+        maintenance.compaction_grants_accepted;
+    metrics.maintenance_errors = maintenance.maintenance_errors;
+  }
+  return metrics;
 }
 
 }  // namespace cedar

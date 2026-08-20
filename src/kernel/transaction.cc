@@ -11,6 +11,7 @@
 
 #include "cedar/database.h"
 #include "kernel/database_impl.h"
+#include "kernel/epoch_completion.h"
 #include "kernel/temporal_validation.h"
 #include "kernel/transaction_mutation.h"
 
@@ -29,8 +30,15 @@ CommitAcceptance CommitHandle::acceptance() const {
 StatusOr<CommitResult> CommitHandle::Wait() const {
   if (state_ == nullptr) return Status::InvalidArgument("async commit", "empty handle");
   std::unique_lock<std::mutex> lock(state_->mutex);
-  state_->completed.wait(lock, [this] { return state_->result.has_value(); });
-  return *state_->result;
+  state_->completed.wait(lock, [this] {
+    return state_->result.has_value() || state_->epoch_completion != nullptr;
+  });
+  if (state_->result.has_value()) return *state_->result;
+  const std::shared_ptr<internal::EpochCompletion> completion =
+      state_->epoch_completion;
+  const size_t ordinal = state_->epoch_result_ordinal;
+  lock.unlock();
+  return completion->WaitForResult(ordinal);
 }
 
 class Transaction::State {

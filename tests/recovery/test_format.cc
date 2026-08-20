@@ -62,7 +62,7 @@ TEST_F(FormatRecoveryTest, RejectsNonmatchingSystemIdentityWithoutChangingIt) {
   ASSERT_TRUE(store.Close().ok());
   const auto identity = EncodeSystemIdentity(SystemIdentity{
       "cedar.authoritative-columnar", 2, "part32.fact.v2",
-      "cedar.parquet.facts.v2", "cedar.v2.internal-key.bytewise.v1"});
+      "cedar.parquet.facts.v3", "cedar.v2.internal-key.bytewise.v1"});
   ASSERT_FALSE(identity.ok());
   ReplaceCurrentIdentity("invalid identity record");
 

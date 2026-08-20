@@ -353,11 +353,20 @@ void CedarParquetTableBuilder::FlushRowGroup() {
       std::string max_value;
       for (size_t row_index = span.begin; row_index < span.end; ++row_index) {
         if (!values[row_index].has_value()) continue;
-        if (all_null || *values[row_index] < min_value) {
-          min_value = *values[row_index];
+        std::string index_value = *values[row_index];
+        if (index == 7 || index == 8) {
+          if (!EncodeCedarParquetNumericIndexValueFromLittleEndian(
+                  *values[row_index], &index_value)) {
+            SetStatus(Status::Corruption(
+                "Cedar Parquet numeric materialized value has invalid width"));
+            return;
+          }
         }
-        if (all_null || *values[row_index] > max_value) {
-          max_value = *values[row_index];
+        if (all_null || index_value < min_value) {
+          min_value = index_value;
+        }
+        if (all_null || index_value > max_value) {
+          max_value = index_value;
         }
         all_null = false;
       }

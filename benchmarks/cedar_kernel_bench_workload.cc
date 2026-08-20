@@ -28,8 +28,7 @@ DatabaseOptions MakeBenchmarkDatabaseOptions(const KernelBenchmarkOptions& optio
   database_options.path = options.path;
   database_options.storage_profile = StorageProfile::kProductionAppend;
   database_options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
-  database_options.production.kernel_mode =
-      options.execution_profile == BenchmarkExecutionProfile::kKernel;
+  database_options.production.kernel_mode = true;
   return database_options;
 }
 

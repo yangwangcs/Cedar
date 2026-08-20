@@ -68,6 +68,8 @@ add_library(cedar_core STATIC
     src/storage/facts/vacuum.cc
     src/storage/rocks/rocks_adapter.cc
     src/runtime/pressure_controller.cc
+    src/kernel/adaptive_epoch_controller.cc
+    src/kernel/epoch_completion.cc
     src/kernel/database.cc
     src/kernel/async_submission_executor.cc
     src/kernel/maintenance_controller.cc
@@ -102,6 +104,11 @@ if(BUILD_BENCHMARKS)
     add_executable(cedar_kernel_bench benchmarks/cedar_kernel_bench.cc)
     target_link_libraries(cedar_kernel_bench PRIVATE cedar_kernel_bench_options
         cedar_kernel_bench_workload)
+    add_executable(cedar_kernel_columnar_bench
+        benchmarks/cedar_kernel_columnar_bench.cc)
+    target_include_directories(cedar_kernel_columnar_bench PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
+    target_link_libraries(cedar_kernel_columnar_bench PRIVATE cedar_core)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets

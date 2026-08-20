@@ -16,7 +16,7 @@
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 
-inline constexpr char kCedarParquetFormatVersion[] = "cedar.parquet.facts.v2";
+inline constexpr char kCedarParquetFormatVersion[] = "cedar.parquet.facts.v3";
 inline constexpr char kCedarParquetBytewiseComparatorName[] =
     "leveldb.BytewiseComparator";
 inline constexpr char kCedarParquetCanonicalSchemaDigest[] =
@@ -33,7 +33,41 @@ inline constexpr uint64_t kCedarParquetDefaultMaxFooterBytes =
 inline constexpr uint64_t kCedarParquetDefaultMaxIndexBytes =
     4ULL * 1024ULL * 1024ULL;
 inline constexpr size_t kCedarParquetV2UserKeyBytes = 32;
+
+inline std::string EncodeCedarParquetNumericIndexValue(uint64_t value) {
+  std::string encoded(8, '\0');
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    encoded[static_cast<size_t>((56 - shift) / 8)] =
+        static_cast<char>(value >> shift);
+  }
+  return encoded;
+}
+
+inline bool DecodeCedarParquetNumericIndexValue(const std::string& encoded,
+                                                uint64_t* value) {
+  if (value == nullptr || encoded.size() != 8) return false;
+  uint64_t decoded = 0;
+  for (unsigned char byte : encoded) decoded = (decoded << 8) | byte;
+  *value = decoded;
+  return true;
+}
+
+inline bool EncodeCedarParquetNumericIndexValueFromLittleEndian(
+    const std::string& encoded, std::string* index_value) {
+  if (index_value == nullptr || encoded.size() != 8) return false;
+  uint64_t value = 0;
+  for (size_t byte = 0; byte < encoded.size(); ++byte) {
+    value |= static_cast<uint64_t>(static_cast<unsigned char>(encoded[byte]))
+             << (byte * 8);
+  }
+  *index_value = EncodeCedarParquetNumericIndexValue(value);
+  return true;
+}
 inline constexpr size_t kCedarParquetV2SortKeyBytes = 40;
+// Scan workers decode whole projected row groups before the caller merges
+// their results. Keep this bound small so a malformed or untrusted scan spec
+// cannot turn a read into unbounded thread or retained-batch allocation.
+inline constexpr uint32_t kCedarParquetMaximumParallelRowGroups = 8;
 
 struct CedarParquetTableOptions {
   uint32_t row_group_max_rows = 16U * 1024U;
@@ -131,11 +165,31 @@ struct CedarParquetColumnarBatch {
   size_t row_count() const { return internal_keys.size(); }
 };
 
+struct CedarParquetScanStats {
+  uint64_t row_groups_skipped = 0;
+  uint64_t pages_skipped = 0;
+  uint64_t pages_read = 0;
+  uint64_t bytes_read = 0;
+  uint64_t rows_emitted = 0;
+  // Peak active Cedar-owned workers used by this completed ScanProjected call.
+  uint32_t max_parallel_row_groups_observed = 0;
+};
+
 struct CedarParquetScanSpec {
   std::optional<std::string> sort_key_lower;
   std::optional<std::string> sort_key_upper;
+  std::optional<uint64_t> valid_from_min;
+  std::optional<uint64_t> valid_from_max;
+  std::optional<uint64_t> cedar_commit_seq_min;
+  std::optional<uint64_t> cedar_commit_seq_max;
   std::vector<CedarParquetColumnId> projection;
   uint32_t batch_row_limit = 1024;
+  // Bounds the number of Cedar-owned row-group scan jobs. A value of one
+  // preserves the serial scan path and is the default for callers that do not
+  // opt into parallel decoding. Values above
+  // kCedarParquetMaximumParallelRowGroups are rejected.
+  uint32_t max_parallel_row_groups = 1;
+  CedarParquetScanStats* stats = nullptr;
 };
 
 using CedarParquetColumnarBatchVisitor =

@@ -184,6 +184,15 @@ Status ValidateScanSpec(const cedar_parquet::CedarParquetScanSpec& spec,
       *spec.sort_key_lower > *spec.sort_key_upper) {
     return Status::InvalidArgument("Cedar columnar scan has invalid sort-key range");
   }
+  if (spec.valid_from_min.has_value() && spec.valid_from_max.has_value() &&
+      *spec.valid_from_min > *spec.valid_from_max) {
+    return Status::InvalidArgument("Cedar columnar scan has invalid valid-time range");
+  }
+  if (spec.cedar_commit_seq_min.has_value() && spec.cedar_commit_seq_max.has_value() &&
+      *spec.cedar_commit_seq_min > *spec.cedar_commit_seq_max) {
+    return Status::InvalidArgument(
+        "Cedar columnar scan has invalid commit-sequence range");
+  }
   *request_encoded_values = false;
   columns->clear();
   columns->reserve(spec.projection.size());

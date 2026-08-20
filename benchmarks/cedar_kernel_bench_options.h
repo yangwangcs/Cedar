@@ -9,10 +9,10 @@
 #include <vector>
 
 #include "cedar/core/status.h"
+#include "cedar/database.h"
 
 namespace cedar::benchmark {
 
-enum class BenchmarkExecutionProfile : uint8_t { kLean, kKernel };
 enum class CampaignKind : uint8_t { kNone, kSmoke, kWarm, kPreflight, kSustained };
 enum class KernelWorkload : uint8_t {
   kPropertyPut,
@@ -35,7 +35,6 @@ struct KernelBenchmarkOptions {
   uint64_t read_operations = 10'000;
   uint32_t writer_clients = 1;
   bool verify_reopen = true;
-  BenchmarkExecutionProfile execution_profile = BenchmarkExecutionProfile::kKernel;
   CampaignKind campaign = CampaignKind::kNone;
   KernelWorkload workload = KernelWorkload::kPropertyPut;
 };
@@ -54,6 +53,10 @@ struct KernelBenchmarkSample {
   uint64_t temporary_output_bytes = 0;
   uint64_t live_sst_bytes = 0;
   uint64_t retained_wal_bytes = 0;
+  uint64_t pending_compaction_bytes = 0;
+  uint64_t maintenance_max_snapshot_age_us = 0;
+  uint64_t maintenance_errors = 0;
+  uint64_t maintenance_recovery_exception_jobs = 0;
   uint64_t n_plus_one_eligible_epochs = 0;
   uint64_t n_plus_one_promoted_epochs = 0;
   uint32_t writer_clients = 1;
@@ -62,14 +65,16 @@ struct KernelBenchmarkSample {
   uint64_t background_errors = 0;
   uint64_t unexplained_autonomous_jobs = 0;
   bool reopen_verified = false;
+  CommitPipelineMetrics commit_pipeline;
 };
 
 StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(
     const std::vector<std::string>& arguments);
-const char* BenchmarkExecutionProfileName(BenchmarkExecutionProfile profile);
 const char* KernelWorkloadName(KernelWorkload workload);
 std::string BenchmarkQualificationStatus(const KernelBenchmarkOptions& options,
                                          const KernelBenchmarkSample& sample);
+int CampaignExitCode(const KernelBenchmarkOptions& options,
+                     const KernelBenchmarkSample& sample);
 
 }  // namespace cedar::benchmark
 

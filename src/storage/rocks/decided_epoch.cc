@@ -4,6 +4,7 @@
 #include "storage/rocks/decided_epoch.h"
 
 #include <cassert>
+#include <utility>
 
 #include <rocksdb/write_batch.h>
 
@@ -42,6 +43,10 @@ const rocksdb::WriteBatch& DecidedEpoch::batch() const {
 
 std::unique_ptr<rocksdb::WriteBatch> DecidedEpoch::ClaimBatchForWrite() {
   return std::move(write_batch_);
+}
+
+StoreCommittedGroupResult DecidedEpoch::TakeGroupResult() {
+  return std::move(group_result_);
 }
 
 }  // namespace cedar::internal

@@ -188,6 +188,20 @@ target_link_libraries(test_kernel_commit
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_commit)
 
+add_executable(test_adaptive_epoch_controller
+    kernel/test_adaptive_epoch_controller.cc)
+target_include_directories(test_adaptive_epoch_controller PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_adaptive_epoch_controller
+    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_adaptive_epoch_controller)
+
+add_executable(test_epoch_completion kernel/test_epoch_completion.cc)
+target_include_directories(test_epoch_completion PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_epoch_completion
+    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_epoch_completion)
+
 add_executable(test_async_submission_executor kernel/test_async_submission_executor.cc)
 target_include_directories(test_async_submission_executor PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_async_submission_executor
@@ -246,6 +260,18 @@ target_include_directories(test_kernel_bounded_benchmark PRIVATE ${CMAKE_SOURCE_
 target_link_libraries(test_kernel_bounded_benchmark
     PRIVATE cedar_kernel_bench_workload ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bounded_benchmark)
+
+add_test(NAME KernelBenchmarkCsvContract
+    COMMAND ${CMAKE_COMMAND}
+        -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
+
+if(TARGET cedar_kernel_columnar_bench)
+    add_test(NAME KernelColumnarBenchmarkSmoke
+        COMMAND ${CMAKE_COMMAND}
+            -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_columnar_bench>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_columnar_benchmark.cmake)
+endif()
 
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)
 target_include_directories(test_commit_publisher PRIVATE ${CMAKE_SOURCE_DIR}/src)

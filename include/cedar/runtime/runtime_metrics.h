@@ -13,6 +13,14 @@ namespace cedar {
 // and capacity state rather than a native engine API.
 struct RuntimeMetrics {
   uint64_t retained_wal_bytes = 0;
+  uint64_t maintenance_snapshot_age_us = 0;
+  uint64_t maintenance_flush_grants_accepted = 0;
+  uint64_t maintenance_compaction_grants_accepted = 0;
+  uint64_t background_flush_calls = 0;
+  uint64_t manual_compaction_calls = 0;
+  uint64_t periodic_task_registrations = 0;
+  uint64_t recovery_flush_exceptions = 0;
+  uint64_t maintenance_errors = 0;
   uint64_t active_fact_bytes = 0;
   uint64_t immutable_fact_bytes = 0;
   uint64_t immutable_fact_count = 0;
@@ -37,6 +45,9 @@ struct RuntimeMetrics {
   uint64_t multi_get_operations = 0;
   uint64_t projected_scan_rows = 0;
   uint64_t projected_scan_bytes_read = 0;
+  uint64_t projected_scan_pages_skipped = 0;
+  uint64_t projected_scan_pages_read = 0;
+  uint64_t projected_scan_physical_bytes_read = 0;
   uint64_t canonical_scan_bytes_read = 0;
   uint64_t logical_facts_bytes = 0;
   uint64_t obsolete_fact_bytes = 0;

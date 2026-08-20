@@ -38,6 +38,15 @@ column() {
     'BEGIN { split(header,h,","); split(row,v,","); for (i in h) if (h[i] == name) { print v[i]; exit } }'
 }
 
+require_zero() {
+  local field="$1"
+  local value="$2"
+  if [[ "$value" != "0" ]]; then
+    echo "benchmark row has non-zero ${field}: ${value}" >&2
+    exit 1
+  fi
+}
+
 for clients in 2 4 8 16 32 64 128; do
   database_path="$output_dir/db-${clients}"
   raw="$output_dir/${clients}.raw.csv"
@@ -46,6 +55,11 @@ for clients in 2 4 8 16 32 64 128; do
       --duration-seconds 30 --campaign warm --verify-reopen false > "$raw"
   header="$(sed -n '1p' "$raw")"
   row="$(sed -n '2p' "$raw")"
+  require_zero writer_failures "$(column writer_failures "$header" "$row")"
+  require_zero background_errors "$(column background_errors "$header" "$row")"
+  require_zero maintenance_errors "$(column maintenance_errors "$header" "$row")"
+  require_zero write_stopped "$(column write_stopped "$header" "$row")"
+  require_zero unexplained_autonomous_jobs "$(column unexplained_autonomous_jobs "$header" "$row")"
   txns="$(column epoch_transactions "$header" "$row")"
   syncs="$(column wal_sync_count "$header" "$row")"
   printf '%s,%s,%s,%s,' "$clients" \

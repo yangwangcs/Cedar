@@ -67,4 +67,4 @@ The hook is intentionally test-only and unused by normal options, but it is an A
 
 ## Commit
 
-Pending at report creation time.
+`a88fcd1 test: qualify 32-member WAL recovery group`

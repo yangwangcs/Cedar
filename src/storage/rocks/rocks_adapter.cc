@@ -3405,17 +3405,10 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   }
   sample.write_stopped = maintenance.write_stopped ? 1 : 0;
   sample.background_error = maintenance.background_errors;
-  const uint64_t all_memtable_bytes =
-      maintenance.total_immutable_memtable_bytes >
-              UINT64_MAX - maintenance.total_active_memtable_bytes
-          ? UINT64_MAX
-          : maintenance.total_immutable_memtable_bytes +
-                maintenance.total_active_memtable_bytes;
-  const auto resolved = internal::ResolveStorageProfile(options_);
-  if (resolved.ok() && resolved.ValueOrDie().facts_write_buffer_bytes != 0) {
+  if (maintenance.write_buffer_manager_limit_bytes != 0) {
     sample.immutable_memtable_percent = std::min<uint64_t>(
-        100, all_memtable_bytes * 100 /
-                 resolved.ValueOrDie().facts_write_buffer_bytes);
+        100, maintenance.write_buffer_manager_bytes * 100 /
+                 maintenance.write_buffer_manager_limit_bytes);
   }
   metrics.l0_files = sample.l0_files;
   metrics.maintenance_generation = maintenance.generation;

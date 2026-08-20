@@ -216,6 +216,27 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
     completed_operations = bounded_writers.committed;
     if (!bounded_writers.status.ok()) {
       std::cerr << "bounded writers: " << bounded_writers.status.ToString() << '\n';
+      const auto runtime = database->SampleRuntimeMetrics();
+      if (runtime.ok()) {
+        const auto& metrics = runtime.ValueOrDie();
+        std::cerr << "runtime at writer failure: write_stopped="
+                  << metrics.write_stopped << " background_errors="
+                  << metrics.background_error_count << " immutable_facts="
+                  << metrics.immutable_fact_count << " l0_files="
+                  << metrics.l0_file_count << " pending_compaction_bytes="
+                  << metrics.pending_compaction_bytes << " retained_wal_bytes="
+                  << metrics.retained_wal_bytes << " free_disk_bytes="
+                  << metrics.free_disk_bytes << " free_disk_percent="
+                  << metrics.free_disk_percent << " write_buffer_bytes="
+                  << metrics.write_buffer_bytes << " write_buffer_limit_bytes="
+                  << metrics.write_buffer_limit_bytes << " immutable_fact_bytes="
+                  << metrics.immutable_fact_bytes << " running_flushes="
+                  << metrics.running_flushes << " running_compactions="
+                  << metrics.running_compactions << '\n';
+      } else {
+        std::cerr << "runtime at writer failure: " << runtime.status().ToString()
+                  << '\n';
+      }
       return 1;
     }
   } else do {

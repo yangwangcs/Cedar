@@ -75,9 +75,11 @@ void PressureController::Observe(const PressureSample& sample) {
     background_rate_ewma_ = Ewma(background_rate_ewma_,
                                   sample.completed_background_bytes_per_sec);
   }
-  projected_debt_bytes_ = ProjectedDebt(
-      std::max(sample.storage_debt_bytes, sample.columnar_flush_pending_bytes),
-      admitted_rate_ewma_, background_rate_ewma_);
+  const uint64_t observed_storage_debt = std::max(
+      sample.storage_debt_bytes, sample.columnar_flush_pending_bytes);
+  projected_debt_bytes_ = ProjectedDebt(observed_storage_debt,
+                                        admitted_rate_ewma_,
+                                        background_rate_ewma_);
 
   const bool valid_rate_sample = sample.sample_interval_us != 0;
   const bool rates_healthy =
@@ -86,8 +88,11 @@ void PressureController::Observe(const PressureSample& sample) {
                        admitted_rate_ewma_ > background_rate_ewma_;
   if (deficit) {
     ++deficit_observations_;
+    deficit_duration_us_ = SaturatingAdd(deficit_duration_us_,
+                                         sample.sample_interval_us);
   } else {
     deficit_observations_ = 0;
+    deficit_duration_us_ = 0;
   }
 
   const bool hard = sample.write_stopped != 0 || sample.background_error != 0 ||
@@ -98,7 +103,8 @@ void PressureController::Observe(const PressureSample& sample) {
                     sample.immutable_memtable_count >= 4 ||
                     sample.columnar_backlog_buffers >= 2 ||
                     sample.immutable_memtable_percent >= 90 ||
-                    (deficit_observations_ >= 3 &&
+                    (deficit_duration_us_ >= kPressureHorizonSeconds * 1'000'000 &&
+                     observed_storage_debt >= kSoftPendingCompactionBytes &&
                      projected_debt_bytes_ >= kHardPendingCompactionBytes);
   const bool soft = LowDiskSoft(sample) || sample.l0_files >= 16 ||
                     sample.pending_compaction_bytes >= kSoftPendingCompactionBytes ||

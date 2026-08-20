@@ -82,6 +82,7 @@ class PressureController {
   uint64_t background_rate_ewma_ = 0;
   uint64_t projected_debt_bytes_ = 0;
   uint32_t deficit_observations_ = 0;
+  uint64_t deficit_duration_us_ = 0;
   uint32_t recovery_observations_ = 0;
 };
 

@@ -363,6 +363,16 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   } else {
     sample.reopen_verified = true;
   }
+  const double transactions_per_sync =
+      sample.commit_pipeline.latency.wal_sync.count == 0
+          ? 0.0
+          : static_cast<double>(sample.commit_pipeline.epoch_transactions) /
+                sample.commit_pipeline.latency.wal_sync.count;
+  const double wal_bytes_per_transaction =
+      sample.commit_pipeline.epoch_transactions == 0
+          ? 0.0
+          : static_cast<double>(sample.commit_pipeline.epoch_bytes) /
+                sample.commit_pipeline.epoch_transactions;
   std::cout << "schema_version,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
                "live_sst_bytes,retained_wal_bytes,pending_compaction_bytes,"
                "maintenance_snapshot_age_us,maintenance_errors,"
@@ -371,7 +381,7 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
                "n_plus_one_promoted_epochs,projected_scan_rows,projected_scan_bytes_read,"
                "canonical_scan_bytes_read,logical_facts_bytes,obsolete_sst_bytes,"
                "temporary_output_bytes,writer_clients,writer_failures,write_stopped,"
-               "background_errors,commit_epochs,epoch_transactions,epoch_bytes,wal_sync_count,wal_rotations,"
+               "background_errors,commit_epochs,epoch_transactions,epoch_bytes,wal_sync_count,transactions_per_sync,wal_bytes_per_transaction,wal_rotations,"
                "group_fill_p50,group_fill_p95,group_fill_max,"
                "queue_p50_us,queue_p95_us,queue_p99_us,validation_p50_us,validation_p95_us,validation_p99_us,"
                "assembly_p50_us,assembly_p95_us,assembly_p99_us,wal_append_p50_us,wal_append_p95_us,wal_append_p99_us,"
@@ -398,6 +408,8 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
             << ',' << sample.commit_pipeline.epoch_transactions
             << ',' << sample.commit_pipeline.epoch_bytes
             << ',' << sample.commit_pipeline.latency.wal_sync.count
+            << ',' << transactions_per_sync
+            << ',' << wal_bytes_per_transaction
             << ',' << sample.commit_pipeline.wal_rotations
             << ',' << sample.commit_pipeline.group_fill.ApproximatePercentile(50)
             << ',' << sample.commit_pipeline.group_fill.ApproximatePercentile(95)

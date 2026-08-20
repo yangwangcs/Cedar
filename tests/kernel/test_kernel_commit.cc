@@ -2027,6 +2027,67 @@ TEST(KernelGroupCommitTest, RetriesStalePredecidedEpochThroughTheNormalWriter) {
   std::filesystem::remove_all(path);
 }
 
+TEST(KernelGroupCommitTest, LargeIndependentGroupUsesOneWalSync) {
+  constexpr uint32_t kTransactions = 32;
+  char pattern[] = "/tmp/cedar_kernel_large_group_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  std::atomic<uint32_t> physical_writes = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = pattern,
+      .group_commit_max_batch_size = kTransactions,
+      .group_commit_window_us = 500'000,
+      .commit_prewrite_fault_injector_for_testing = [&] {
+        physical_writes.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+      },
+      .group_commit_max_queue_requests = 128});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  std::barrier start(kTransactions + 1);
+  std::atomic<bool> failed = false;
+  std::vector<std::thread> workers;
+  workers.reserve(kTransactions);
+  for (uint32_t index = 0; index < kTransactions; ++index) {
+    workers.emplace_back([&, index] {
+      auto transaction = database->BeginTransaction();
+      if (!transaction.ok() ||
+          !transaction.ValueOrDie()
+               ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{20'000 + index}}),
+                        ValidTime{index + 1})
+               .ok()) {
+        failed.store(true, std::memory_order_relaxed);
+        start.arrive_and_wait();
+        return;
+      }
+      start.arrive_and_wait();
+      const auto accepted = transaction.ValueOrDie()->CommitAsync();
+      if (!accepted.ok()) {
+        failed.store(true, std::memory_order_relaxed);
+        return;
+      }
+      const auto completed = accepted.ValueOrDie().Wait();
+      if (!completed.ok() ||
+          completed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+        failed.store(true, std::memory_order_relaxed);
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& worker : workers) worker.join();
+
+  EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_GE(metrics.group_fill.groups, 1U);
+  EXPECT_EQ(metrics.group_fill.total_transactions, kTransactions);
+  EXPECT_GE(metrics.group_fill.max_transactions, 16U);
+  EXPECT_EQ(metrics.latency.wal_sync.count, metrics.group_fill.groups);
+  EXPECT_EQ(physical_writes.load(std::memory_order_relaxed),
+            metrics.group_fill.groups);
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(pattern);
+}
+
 TEST(KernelGroupCommitTest, UsesOnlyCedarWriteSeam) {
   char pattern[] = "/tmp/cedar_kernel_profile_write_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

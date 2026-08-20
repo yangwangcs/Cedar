@@ -53,9 +53,17 @@ TEST(BenchmarkQualificationTest, WriterFailureFailsClosed) {
 
 TEST(BenchmarkOptionsTest, RequiresAbsolutePath) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions({"--path", "relative"}).ok());
-  const auto parsed = ParseKernelBenchmarkOptions({"--path", "/tmp/cedar", "--profile", "kernel"});
+  const auto parsed = ParseKernelBenchmarkOptions({"--path", "/tmp/cedar"});
   ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
-  EXPECT_EQ(parsed.ValueOrDie().execution_profile, BenchmarkExecutionProfile::kKernel);
+}
+
+TEST(BenchmarkOptionsTest, RejectsRemovedExecutionProfileOption) {
+  EXPECT_FALSE(ParseKernelBenchmarkOptions(
+                   {"--path", "/tmp/cedar", "--profile", "lean"})
+                   .ok());
+  EXPECT_FALSE(ParseKernelBenchmarkOptions(
+                   {"--path", "/tmp/cedar", "--profile", "kernel"})
+                   .ok());
 }
 
 TEST(BenchmarkOptionsTest, ParsesKernelWorkloadNames) {

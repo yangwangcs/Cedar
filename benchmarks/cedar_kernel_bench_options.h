@@ -13,7 +13,6 @@
 
 namespace cedar::benchmark {
 
-enum class BenchmarkExecutionProfile : uint8_t { kLean, kKernel };
 enum class CampaignKind : uint8_t { kNone, kSmoke, kWarm, kPreflight, kSustained };
 enum class KernelWorkload : uint8_t {
   kPropertyPut,
@@ -36,7 +35,6 @@ struct KernelBenchmarkOptions {
   uint64_t read_operations = 10'000;
   uint32_t writer_clients = 1;
   bool verify_reopen = true;
-  BenchmarkExecutionProfile execution_profile = BenchmarkExecutionProfile::kKernel;
   CampaignKind campaign = CampaignKind::kNone;
   KernelWorkload workload = KernelWorkload::kPropertyPut;
 };
@@ -72,7 +70,6 @@ struct KernelBenchmarkSample {
 
 StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(
     const std::vector<std::string>& arguments);
-const char* BenchmarkExecutionProfileName(BenchmarkExecutionProfile profile);
 const char* KernelWorkloadName(KernelWorkload workload);
 std::string BenchmarkQualificationStatus(const KernelBenchmarkOptions& options,
                                          const KernelBenchmarkSample& sample);

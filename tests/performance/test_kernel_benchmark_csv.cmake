@@ -10,7 +10,6 @@ execute_process(
           --duration-seconds 1
           --writer-clients 2
           --workload property-put
-          --profile kernel
           --verify-reopen false
           --campaign none
   RESULT_VARIABLE benchmark_result
@@ -29,7 +28,7 @@ string(REPLACE "," ";" header_fields "${header}")
 string(REPLACE "," ";" row_fields "${row}")
 list(LENGTH header_fields header_count)
 list(LENGTH row_fields row_count)
-if(NOT header_count EQUAL 63 OR NOT row_count EQUAL 63)
+if(NOT header_count EQUAL 62 OR NOT row_count EQUAL 62)
   message(FATAL_ERROR
     "unexpected Cedar benchmark CSV width: header=${header_count}, row=${row_count}\n${benchmark_output}")
 endif()

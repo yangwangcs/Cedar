@@ -363,7 +363,7 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
   } else {
     sample.reopen_verified = true;
   }
-  std::cout << "schema_version,profile,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
+  std::cout << "schema_version,workload,operations,elapsed_seconds,operations_per_second,point_read_operations,multi_get_operations,"
                "live_sst_bytes,retained_wal_bytes,pending_compaction_bytes,"
                "maintenance_snapshot_age_us,maintenance_errors,"
                "maintenance_recovery_exception_jobs,unexplained_autonomous_jobs,"
@@ -377,8 +377,7 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
                "wal_sync_p50_us,wal_sync_p95_us,wal_sync_p99_us,wal_callback_p50_us,wal_callback_p95_us,wal_callback_p99_us,"
                "manifest_p50_us,manifest_p95_us,manifest_p99_us,memtable_p50_us,memtable_p95_us,memtable_p99_us,"
                "publication_p50_us,publication_p95_us,publication_p99_us,end_to_end_p50_us,end_to_end_p95_us,end_to_end_p99_us,qualification\n";
-  std::cout << "1," << cedar::benchmark::BenchmarkExecutionProfileName(options.execution_profile)
-            << ',' << cedar::benchmark::KernelWorkloadName(options.workload) << ','
+  std::cout << "1," << cedar::benchmark::KernelWorkloadName(options.workload) << ','
             << sample.operations << ',' << sample.elapsed_seconds << ','
             << sample.operations_per_second << ',' << sample.point_read_operations << ','
             << sample.multi_get_operations << ','

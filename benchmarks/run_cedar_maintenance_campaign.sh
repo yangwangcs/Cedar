@@ -38,15 +38,13 @@ common=(
 )
 
 run_case() {
-  local profile="$1"
-  local campaign="$2"
-  local duration="$3"
-  local name="$4"
-  local prepare="$5"
-  local workload="$6"
-  local writer_clients="$7"
+  local campaign="$1"
+  local duration="$2"
+  local name="$3"
+  local prepare="$4"
+  local workload="$5"
+  local writer_clients="$6"
   local database_path="$output_dir/${name}-db"
-  set +e
   "$bench" \
       --path "$database_path" \
       --database-path "$database_path" \
@@ -54,29 +52,12 @@ run_case() {
       --workload "$workload" \
       --writer-clients "$writer_clients" \
       --prepare-seed "$prepare" \
-      --profile "$profile" \
       --campaign "$campaign" \
       --duration-seconds "$duration" \
       > "$output_dir/${name}.csv"
-  local status=$?
-  set -e
-  if [[ "$status" -ne 0 ]]; then
-    if [[ "$profile" == lean && "$campaign" == sustained ]] && \
-       rg -q ',sustained_(maintenance_error|unexplained_autonomous_maintenance)$' \
-         "$output_dir/${name}.csv"; then
-      printf 'expected_lean_baseline_exit=%s\n' "$status" \
-        > "$output_dir/${name}.expected-baseline.txt"
-      return 0
-    fi
-    return "$status"
-  fi
 }
 
-run_case lean warm 30 lean-30s true mixed-90-write-10-point-read 1
-run_case kernel warm 30 kernel-30s false mixed-90-write-10-point-read 1
-run_case lean preflight 60 lean-60s false mixed-90-write-10-point-read 1
-run_case kernel preflight 60 kernel-60s false mixed-90-write-10-point-read 1
-run_case lean preflight 300 lean-300s false mixed-90-write-10-point-read 1
-run_case kernel preflight 300 kernel-300s false mixed-90-write-10-point-read 1
-run_case lean sustained 1800 lean-1800s false property-put 2
-run_case kernel sustained 1800 kernel-1800s false property-put 2
+run_case warm 30 kernel-30s true mixed-90-write-10-point-read 1
+run_case preflight 60 kernel-60s false mixed-90-write-10-point-read 1
+run_case preflight 300 kernel-300s false mixed-90-write-10-point-read 1
+run_case sustained 1800 kernel-1800s false property-put 2

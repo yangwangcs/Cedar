@@ -28,10 +28,6 @@ Status Invalid(const std::string& message) {
 
 }  // namespace
 
-const char* BenchmarkExecutionProfileName(BenchmarkExecutionProfile profile) {
-  return profile == BenchmarkExecutionProfile::kKernel ? "kernel" : "lean";
-}
-
 const char* KernelWorkloadName(KernelWorkload workload) {
   switch (workload) {
     case KernelWorkload::kPropertyPut: return "property-put";
@@ -92,10 +88,6 @@ StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(
         return Invalid("writer clients must be in [1, 32]");
       }
       options.writer_clients = static_cast<uint32_t>(*parsed);
-    } else if (name == "--profile") {
-      if (value == "kernel") options.execution_profile = BenchmarkExecutionProfile::kKernel;
-      else if (value == "lean") options.execution_profile = BenchmarkExecutionProfile::kLean;
-      else return Invalid("profile must be lean or kernel");
     } else if (name == "--campaign") {
       if (value == "none") options.campaign = CampaignKind::kNone;
       else if (value == "smoke") options.campaign = CampaignKind::kSmoke;

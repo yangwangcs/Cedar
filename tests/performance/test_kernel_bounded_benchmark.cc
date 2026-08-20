@@ -18,13 +18,12 @@
 namespace cedar::benchmark {
 namespace {
 
-TEST(KernelBoundedBenchmarkTest, LeanUsesProductionStorageWithoutKernelMode) {
+TEST(KernelBoundedBenchmarkTest, BenchmarkAlwaysUsesCedarKernelMode) {
   KernelBenchmarkOptions options;
-  options.path = "/tmp/cedar-lean-profile";
-  options.execution_profile = BenchmarkExecutionProfile::kLean;
+  options.path = "/tmp/cedar-kernel-profile";
   const DatabaseOptions database_options = MakeBenchmarkDatabaseOptions(options);
   EXPECT_EQ(database_options.storage_profile, StorageProfile::kProductionAppend);
-  EXPECT_FALSE(database_options.production.kernel_mode);
+  EXPECT_TRUE(database_options.production.kernel_mode);
 }
 
 TEST(KernelBoundedBenchmarkTest, BenchmarkSampleCarriesAppendStageMetrics) {

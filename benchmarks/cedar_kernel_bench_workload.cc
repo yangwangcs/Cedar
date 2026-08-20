@@ -29,6 +29,10 @@ DatabaseOptions MakeBenchmarkDatabaseOptions(const KernelBenchmarkOptions& optio
   database_options.storage_profile = StorageProfile::kProductionAppend;
   database_options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
   database_options.production.kernel_mode = true;
+  database_options.group_commit_max_batch_size = options.group_max_batch;
+  database_options.group_commit_max_batch_bytes = options.group_max_bytes;
+  database_options.group_commit_window_us = options.group_window_us;
+  database_options.group_commit_max_queue_requests = options.group_queue_requests;
   return database_options;
 }
 
@@ -39,7 +43,7 @@ BoundedWriterResult RunBoundedWriters(Database* database, uint32_t clients,
     result.status = Status::InvalidArgument("bounded writers", "database is null");
     return result;
   }
-  if (clients == 0 || clients > 32 || duration_seconds == 0) {
+  if (clients == 0 || clients > 128 || duration_seconds == 0) {
     result.status = Status::InvalidArgument("bounded writers", "bounds are invalid");
     return result;
   }
@@ -58,18 +62,6 @@ BoundedWriterResult RunBoundedWriters(Database* database, uint32_t clients,
   for (uint32_t index = 0; index < clients; ++index) {
     workers.emplace_back([&] {
       start_line.arrive_and_wait();
-      std::vector<CommitHandle> pending;
-      pending.reserve(2);
-      const auto wait_one = [&] {
-        StatusOr<CommitResult> completed = pending.front().Wait();
-        pending.erase(pending.begin());
-        if (!completed.ok()) return completed.status();
-        if (completed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
-          return completed.ValueOrDie().status;
-        }
-        committed.fetch_add(1, std::memory_order_relaxed);
-        return Status::OK();
-      };
       while (std::chrono::steady_clock::now() < deadline) {
         attempted.fetch_add(1, std::memory_order_relaxed);
         auto handle = WriteVertexAsync(database, next_id.fetch_add(1));
@@ -79,22 +71,20 @@ BoundedWriterResult RunBoundedWriters(Database* database, uint32_t clients,
           if (first_failure.ok()) first_failure = handle.status();
           continue;
         }
-        pending.push_back(std::move(handle).ConsumeValueOrDie());
-        if (pending.size() == 2) {
-          const Status status = wait_one();
-          if (!status.ok()) {
-            failures.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lock(status_mutex);
-            if (first_failure.ok()) first_failure = status;
-          }
+        StatusOr<CommitResult> completed_result =
+            std::move(handle).ConsumeValueOrDie().Wait();
+        Status status = Status::OK();
+        if (!completed_result.ok()) {
+          status = completed_result.status();
+        } else if (completed_result.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+          status = completed_result.ValueOrDie().status;
         }
-      }
-      while (!pending.empty()) {
-        const Status status = wait_one();
         if (!status.ok()) {
           failures.fetch_add(1, std::memory_order_relaxed);
           std::lock_guard<std::mutex> lock(status_mutex);
           if (first_failure.ok()) first_failure = status;
+        } else {
+          committed.fetch_add(1, std::memory_order_relaxed);
         }
       }
     });

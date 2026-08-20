@@ -7,6 +7,7 @@
 #include <array>
 #include <charconv>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <string_view>
@@ -84,10 +85,38 @@ StatusOr<KernelBenchmarkOptions> ParseKernelBenchmarkOptions(
       options.read_operations = *parsed;
     } else if (name == "--writer-clients") {
       const auto parsed = ParseUnsigned(value);
-      if (!parsed.has_value() || *parsed == 0 || *parsed > 32) {
-        return Invalid("writer clients must be in [1, 32]");
+      if (!parsed.has_value() || *parsed == 0 || *parsed > 128) {
+        return Invalid("writer clients must be in [1, 128]");
       }
       options.writer_clients = static_cast<uint32_t>(*parsed);
+    } else if (name == "--group-max-batch") {
+      const auto parsed = ParseUnsigned(value);
+      if (!parsed.has_value() || *parsed == 0 ||
+          *parsed > kMaximumCommitBatchCount) {
+        return Invalid("group max batch must be in [1, 512]");
+      }
+      options.group_max_batch = static_cast<uint32_t>(*parsed);
+    } else if (name == "--group-max-bytes") {
+      const auto parsed = ParseUnsigned(value);
+      if (!parsed.has_value() || *parsed == 0 ||
+          *parsed > kMaximumCommitBatchBytes) {
+        return Invalid("group max bytes must be in [1, 2097152]");
+      }
+      options.group_max_bytes = *parsed;
+    } else if (name == "--group-window-us") {
+      const auto parsed = ParseUnsigned(value);
+      if (!parsed.has_value() || *parsed == 0 ||
+          *parsed > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return Invalid("group window must be a positive microsecond duration");
+      }
+      options.group_window_us = *parsed;
+    } else if (name == "--group-queue-requests") {
+      const auto parsed = ParseUnsigned(value);
+      if (!parsed.has_value() || *parsed == 0 ||
+          *parsed > std::numeric_limits<uint32_t>::max()) {
+        return Invalid("group queue requests must fit in uint32_t and be positive");
+      }
+      options.group_queue_requests = static_cast<uint32_t>(*parsed);
     } else if (name == "--campaign") {
       if (value == "none") options.campaign = CampaignKind::kNone;
       else if (value == "smoke") options.campaign = CampaignKind::kSmoke;

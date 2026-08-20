@@ -26,6 +26,22 @@ TEST(KernelBoundedBenchmarkTest, BenchmarkAlwaysUsesCedarKernelMode) {
   EXPECT_TRUE(database_options.production.kernel_mode);
 }
 
+TEST(KernelBoundedBenchmarkTest, BenchmarkPassesGroupAdmissionControlsToDatabase) {
+  KernelBenchmarkOptions options;
+  options.path = "/tmp/cedar-kernel-profile";
+  options.group_max_batch = 256;
+  options.group_max_bytes = 1ULL * 1024ULL * 1024ULL;
+  options.group_window_us = 250;
+  options.group_queue_requests = 2'048;
+
+  const DatabaseOptions database_options = MakeBenchmarkDatabaseOptions(options);
+
+  EXPECT_EQ(database_options.group_commit_max_batch_size, 256U);
+  EXPECT_EQ(database_options.group_commit_max_batch_bytes, 1ULL * 1024ULL * 1024ULL);
+  EXPECT_EQ(database_options.group_commit_window_us, 250U);
+  EXPECT_EQ(database_options.group_commit_max_queue_requests, 2'048U);
+}
+
 TEST(KernelBoundedBenchmarkTest, BenchmarkSampleCarriesAppendStageMetrics) {
   KernelBenchmarkSample sample;
   sample.commit_pipeline.latency.queue.buckets[0] = 11;

@@ -107,6 +107,9 @@ struct DatabaseOptions {
   uint32_t group_commit_max_queue_requests = 1024;
   uint64_t group_commit_max_queue_bytes = 16ULL * 1024ULL * 1024ULL;
   std::function<void()> append_commit_enqueued_observer_for_testing;
+  // Test-only hook after the append worker wakes and releases its queue lock,
+  // before it selects a WAL group.
+  std::function<void()> append_commit_collection_observer_for_testing;
   std::function<void()> commit_result_processing_observer_for_testing;
   StorageProfile storage_profile = StorageProfile::kDeveloper;
   ProductionStorageOptions production;

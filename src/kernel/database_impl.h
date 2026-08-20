@@ -139,6 +139,8 @@ class Database::Impl {
             options.group_commit_window_us}),
         append_commit_enqueued_observer_for_testing(
             std::move(options.append_commit_enqueued_observer_for_testing)),
+        append_commit_collection_observer_for_testing(
+            std::move(options.append_commit_collection_observer_for_testing)),
         commit_result_processing_observer_for_testing(
             std::move(options.commit_result_processing_observer_for_testing)),
         runtime_sampler_interval_observer_for_testing(
@@ -239,6 +241,7 @@ class Database::Impl {
   // separately published through atomics for the preflight worker.
   internal::AdaptiveEpochController adaptive_epoch_controller;
   std::function<void()> append_commit_enqueued_observer_for_testing;
+  std::function<void()> append_commit_collection_observer_for_testing;
   std::function<void()> commit_result_processing_observer_for_testing;
   std::function<void(uint64_t)> runtime_sampler_interval_observer_for_testing;
   std::function<void()> runtime_sampler_thread_started_observer_for_testing;

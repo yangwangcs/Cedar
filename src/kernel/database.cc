@@ -686,6 +686,11 @@ Status Database::Impl::StartAppendCommitPipeline() {
         append_commit_cv.wait(lock, [this] {
           return append_commit_stopping || !append_commit_requests.empty();
         });
+        if (append_commit_collection_observer_for_testing) {
+          lock.unlock();
+          append_commit_collection_observer_for_testing();
+          lock.lock();
+        }
         if (append_commit_stopping && append_commit_requests.empty()) {
           if (next_epoch_slot.has_value() &&
               next_epoch_slot->state == SlotState::kEligible) {

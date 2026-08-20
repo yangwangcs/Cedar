@@ -2807,6 +2807,9 @@ TEST(KernelGroupCommitFailureTest,
   char pattern[] = "/tmp/cedar_kernel_large_group_indeterminate_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
+  std::mutex enqueue_mutex;
+  std::condition_variable enqueue_cv;
+  std::atomic<uint32_t> enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = kTransactions,
@@ -2814,7 +2817,17 @@ TEST(KernelGroupCommitFailureTest,
       .commit_fault_injector_for_testing = [] {
         return Status::Indeterminate("test", "injected after durable group write");
       },
-      .group_commit_max_queue_requests = 128});
+      .group_commit_max_queue_requests = 128,
+      .append_commit_enqueued_observer_for_testing = [&] {
+        enqueued.fetch_add(1, std::memory_order_relaxed);
+        enqueue_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(enqueue_mutex);
+        enqueue_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+          return enqueued.load(std::memory_order_relaxed) == kTransactions;
+        });
+      }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
 
@@ -2860,12 +2873,12 @@ TEST(KernelGroupCommitFailureTest,
   for (auto& worker : workers) worker.join();
 
   EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+  EXPECT_EQ(enqueued.load(std::memory_order_relaxed), kTransactions);
   const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
   EXPECT_EQ(metrics.group_fill.total_transactions, kTransactions);
-  EXPECT_GE(metrics.group_fill.max_transactions, 2U);
-  ASSERT_GE(durable_handle_count.load(std::memory_order_relaxed), 1U);
-  EXPECT_EQ(metrics.durably_accepted,
-            durable_handle_count.load(std::memory_order_relaxed));
+  EXPECT_EQ(metrics.group_fill.max_transactions, kTransactions);
+  ASSERT_EQ(durable_handle_count.load(std::memory_order_relaxed), kTransactions);
+  EXPECT_EQ(metrics.durably_accepted, kTransactions);
   ASSERT_TRUE(database->Close().ok());
   database.reset();
 

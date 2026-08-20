@@ -86,7 +86,10 @@ class Database::Impl {
     internal::CommitFootprint preflight_footprint;
     std::chrono::steady_clock::time_point enqueued_at;
     std::shared_ptr<CommitHandle::State> handle;
-    std::shared_ptr<AsyncSubmissionExecutor::Ticket> executor_ticket;
+    // The mailbox and the active WAL epoch own the ticket. Keeping this as a
+    // weak reference prevents the ticket callbacks from retaining the request
+    // after terminal completion.
+    std::weak_ptr<AsyncSubmissionExecutor::Ticket> executor_ticket;
     std::atomic<bool> cancelled{false};
     bool selected = false;
     std::optional<StatusOr<StoreCommitResult>> result;

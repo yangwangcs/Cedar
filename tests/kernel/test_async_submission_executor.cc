@@ -10,6 +10,10 @@
 
 #include "cedar/core/status.h"
 #include "kernel/async_submission_executor.h"
+#define private public
+#include "cedar/database.h"
+#undef private
+#include "kernel/database_impl.h"
 
 namespace cedar {
 namespace {
@@ -169,6 +173,25 @@ TEST(AsyncSubmissionExecutorTest, CancelsQueuedTicketBeforeHandoff) {
   }
   executor.Stop(Status::ShutdownInProgress("test"));
   EXPECT_EQ(executor.ReservedRequests(), 0U);
+}
+
+TEST(AsyncSubmissionExecutorTest,
+     AppendRequestAndTicketDoNotRetainEachOtherAfterCompletion) {
+  std::weak_ptr<Database::Impl::AppendCommitRequest> weak_request;
+  std::weak_ptr<AsyncSubmissionExecutor::Ticket> weak_ticket;
+  {
+    auto request = std::make_shared<Database::Impl::AppendCommitRequest>();
+    auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
+    ticket->handoff = [request] { return Status::OK(); };
+    ticket->fail = [](const Status&) {};
+    ticket->release = [] {};
+    request->executor_ticket = ticket;
+    weak_request = request;
+    weak_ticket = ticket;
+  }
+
+  EXPECT_TRUE(weak_request.expired());
+  EXPECT_TRUE(weak_ticket.expired());
 }
 
 }  // namespace

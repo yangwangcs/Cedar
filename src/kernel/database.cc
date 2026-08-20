@@ -872,7 +872,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
           BindCommitHandleToEpoch(request->handle, epoch_completion, index,
                                   first_durable_transaction);
           if (first_durable_transaction) {
-            durability.executor_tickets.push_back(request->executor_ticket);
+            const auto ticket = request->executor_ticket.lock();
+            if (ticket != nullptr) durability.executor_tickets.push_back(ticket);
           }
         }
       }
@@ -1234,13 +1235,13 @@ void Database::Impl::CancelQueuedAsyncCommit(
         CommitResult{CommitOutcome::kAborted, CommitSeq{}, request->txn_id,
                      Status::ResourceExhausted(
                          "async commit", "submission was cancelled")});
-    if (request->executor_ticket != nullptr) {
-      async_executor.Release(request->executor_ticket->id);
+    if (const auto ticket = request->executor_ticket.lock(); ticket != nullptr) {
+      async_executor.Release(ticket->id);
     }
-  } else if (request->executor_ticket != nullptr) {
+  } else if (const auto ticket = request->executor_ticket.lock(); ticket != nullptr) {
     // The ticket may still be in the bounded submission mailbox. WorkerMain
     // observes this bit and releases it without handing the request off.
-    async_executor.Cancel(request->executor_ticket->id);
+    async_executor.Cancel(ticket->id);
   }
 }
 

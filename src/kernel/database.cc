@@ -23,6 +23,9 @@ constexpr std::array<uint64_t, CommitLatencyHistogram::kBucketCount>
         10, 50, 100, 250, 500, 1'000, 2'000,
         5'000, 10'000, 25'000, 50'000, 100'000, UINT64_MAX};
 
+constexpr std::array<uint64_t, CommitGroupFillMetrics::kBucketCount>
+    kGroupFillBucketUpperBounds = {1, 2, 4, 8, 16, 32, 64, 128, UINT64_MAX};
+
 constexpr uint64_t kRuntimeSnapshotStaleUs = 250'000;
 
 void ApplyCedarSamplerScheduling() {
@@ -51,6 +54,14 @@ void RecordLatency(CommitLatencyHistogram* histogram, uint64_t elapsed_us) {
       return;
     }
   }
+}
+
+void RecordGroupFill(CommitGroupFillMetrics* metrics, size_t request_count) {
+  ++metrics->groups;
+  metrics->total_transactions += request_count;
+  metrics->max_transactions = std::max<uint64_t>(metrics->max_transactions,
+                                                  request_count);
+  ++metrics->buckets[GroupFillBucket(request_count)];
 }
 
 CommitResult ToCommitResult(TxnId txn_id,
@@ -282,6 +293,22 @@ uint64_t CommitLatencyHistogram::ApproximatePercentile(uint32_t percentile) cons
     }
   }
   return max_us;
+}
+
+uint64_t CommitGroupFillMetrics::ApproximatePercentile(
+    uint32_t percentile) const {
+  if (groups == 0) return 0;
+  const uint64_t clamped = std::min<uint32_t>(percentile, 100);
+  const uint64_t rank = std::max<uint64_t>(1, (groups * clamped + 99) / 100);
+  uint64_t cumulative = 0;
+  for (size_t index = 0; index < buckets.size(); ++index) {
+    cumulative += buckets[index];
+    if (cumulative >= rank) {
+      return index + 1 == buckets.size() ? max_transactions
+                                          : kGroupFillBucketUpperBounds[index];
+    }
+  }
+  return max_transactions;
 }
 
 void Database::Impl::ObserveAppendPressure(const PressureSample& sample) {
@@ -770,6 +797,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
         }
         active_append_commit_requests += requests.size();
         if (!requests.empty()) {
+          RecordGroupFill(&append_commit_metrics.group_fill, requests.size());
           const auto selected_at = std::chrono::steady_clock::now();
           RecordLatency(&append_commit_metrics.latency.collection,
               static_cast<uint64_t>(

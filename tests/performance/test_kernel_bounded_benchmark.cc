@@ -31,9 +31,17 @@ TEST(KernelBoundedBenchmarkTest, BenchmarkSampleCarriesAppendStageMetrics) {
   sample.commit_pipeline.latency.queue.buckets[0] = 11;
   sample.commit_pipeline.latency.wal_sync.total_us = 29;
   sample.commit_pipeline.latency.publication.max_us = 47;
+  sample.commit_pipeline.group_fill.groups = 5;
+  sample.commit_pipeline.group_fill.total_transactions = 11;
+  sample.commit_pipeline.group_fill.max_transactions = 4;
+  sample.commit_pipeline.group_fill.buckets[GroupFillBucket(4)] = 3;
   EXPECT_EQ(sample.commit_pipeline.latency.queue.buckets[0], 11U);
   EXPECT_EQ(sample.commit_pipeline.latency.wal_sync.total_us, 29U);
   EXPECT_EQ(sample.commit_pipeline.latency.publication.max_us, 47U);
+  EXPECT_EQ(sample.commit_pipeline.group_fill.groups, 5U);
+  EXPECT_EQ(sample.commit_pipeline.group_fill.total_transactions, 11U);
+  EXPECT_EQ(sample.commit_pipeline.group_fill.max_transactions, 4U);
+  EXPECT_EQ(sample.commit_pipeline.group_fill.buckets[GroupFillBucket(4)], 3U);
 }
 
 TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {

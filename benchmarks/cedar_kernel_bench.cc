@@ -372,6 +372,7 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
                "canonical_scan_bytes_read,logical_facts_bytes,obsolete_sst_bytes,"
                "temporary_output_bytes,writer_clients,writer_failures,write_stopped,"
                "background_errors,commit_epochs,epoch_transactions,epoch_bytes,wal_sync_count,wal_rotations,"
+               "group_fill_p50,group_fill_p95,group_fill_max,"
                "queue_p50_us,queue_p95_us,queue_p99_us,validation_p50_us,validation_p95_us,validation_p99_us,"
                "assembly_p50_us,assembly_p95_us,assembly_p99_us,wal_append_p50_us,wal_append_p95_us,wal_append_p99_us,"
                "wal_sync_p50_us,wal_sync_p95_us,wal_sync_p99_us,wal_callback_p50_us,wal_callback_p95_us,wal_callback_p99_us,"
@@ -397,7 +398,10 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
             << ',' << sample.commit_pipeline.epoch_transactions
             << ',' << sample.commit_pipeline.epoch_bytes
             << ',' << sample.commit_pipeline.latency.wal_sync.count
-            << ',' << sample.commit_pipeline.wal_rotations << ',';
+            << ',' << sample.commit_pipeline.wal_rotations
+            << ',' << sample.commit_pipeline.group_fill.ApproximatePercentile(50)
+            << ',' << sample.commit_pipeline.group_fill.ApproximatePercentile(95)
+            << ',' << sample.commit_pipeline.group_fill.max_transactions << ',';
   PrintLatencyPercentiles(sample.commit_pipeline.latency.queue);
   std::cout << ',';
   PrintLatencyPercentiles(sample.commit_pipeline.latency.validation);

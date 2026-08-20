@@ -4,9 +4,10 @@
 #ifndef CEDAR_DATABASE_H_
 #define CEDAR_DATABASE_H_
 
-#include <functional>
-#include <cstdint>
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -31,6 +32,29 @@ struct CommitLatencyHistogram {
 
   uint64_t ApproximatePercentile(uint32_t percentile) const;
 };
+
+struct CommitGroupFillMetrics {
+  static constexpr size_t kBucketCount = 9;
+  // Buckets are <=1, <=2, <=4, <=8, <=16, <=32, <=64, <=128, and >128.
+  std::array<uint64_t, kBucketCount> buckets{};
+  uint64_t groups = 0;
+  uint64_t total_transactions = 0;
+  uint64_t max_transactions = 0;
+
+  uint64_t ApproximatePercentile(uint32_t percentile) const;
+};
+
+constexpr size_t GroupFillBucket(size_t request_count) {
+  if (request_count <= 1) return 0;
+  if (request_count <= 2) return 1;
+  if (request_count <= 4) return 2;
+  if (request_count <= 8) return 3;
+  if (request_count <= 16) return 4;
+  if (request_count <= 32) return 5;
+  if (request_count <= 64) return 6;
+  if (request_count <= 128) return 7;
+  return 8;
+}
 
 struct CommitPipelineLatencyMetrics {
   CommitLatencyHistogram collection;
@@ -157,6 +181,7 @@ struct CommitPipelineMetrics {
   uint64_t async_mailbox_bytes_reserved = 0;
   uint64_t async_mailbox_requests_reserved_peak = 0;
   uint64_t async_mailbox_bytes_reserved_peak = 0;
+  CommitGroupFillMetrics group_fill;
   CommitPipelineLatencyMetrics latency;
   RuntimeMetrics runtime;
   PressureState pressure_state = PressureState::kNormal;

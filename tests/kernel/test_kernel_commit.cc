@@ -1096,6 +1096,51 @@ TEST(KernelGroupCommitTest, GroupsIndependentVertexAssertionsIntoOneDurableWrite
   std::filesystem::remove_all(path);
 }
 
+TEST(KernelGroupCommitTest, KernelCommitReportsGroupFill) {
+  char pattern[] = "/tmp/cedar_kernel_group_fill_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 2,
+      .group_commit_window_us = 20'000});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  auto first = database->BeginTransaction();
+  auto second = database->BeginTransaction();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  ASSERT_TRUE(first.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{3}}),
+                           ValidTime{10})
+                  .ok());
+  ASSERT_TRUE(second.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{4}}),
+                           ValidTime{20})
+                  .ok());
+
+  std::optional<StatusOr<CommitResult>> first_result;
+  std::optional<StatusOr<CommitResult>> second_result;
+  std::thread first_thread(
+      [&] { first_result.emplace(first.ValueOrDie()->Commit()); });
+  std::thread second_thread(
+      [&] { second_result.emplace(second.ValueOrDie()->Commit()); });
+  first_thread.join();
+  second_thread.join();
+
+  ASSERT_TRUE(first_result->ok()) << first_result->status().ToString();
+  ASSERT_TRUE(second_result->ok()) << second_result->status().ToString();
+  EXPECT_EQ(first_result->ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(second_result->ValueOrDie().outcome, CommitOutcome::kCommitted);
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.group_fill.groups, 1U);
+  EXPECT_EQ(metrics.group_fill.total_transactions, 2U);
+  EXPECT_EQ(metrics.group_fill.buckets[GroupFillBucket(2)], 1U);
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 TEST(KernelGroupCommitTest, EnablesBoundedGroupCommitByDefault) {
   const DatabaseOptions options;
   EXPECT_EQ(options.group_commit_max_batch_size, 128U);

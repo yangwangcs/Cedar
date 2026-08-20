@@ -529,6 +529,7 @@ void Database::Impl::NotifyWalDurable(void* context) noexcept {
             .count());
     durability->wal_callback_us.store(elapsed, std::memory_order_relaxed);
   }
+  durability->wal_durable.store(true, std::memory_order_release);
   if (durability->completion != nullptr) durability->completion->MarkWalDurable();
   if (durability->executor != nullptr) {
     for (const auto& ticket : durability->executor_tickets) {
@@ -988,7 +989,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
                       durability.wal_callback_duration_us.load(
                           std::memory_order_relaxed));
         append_commit_metrics.runtime = ToRuntimeMetrics(runtime_snapshot.rocksdb);
-        if (result.ok()) {
+        if (durability.wal_durable.load(std::memory_order_acquire)) {
           append_commit_metrics.durably_accepted += durably_accepted_transactions;
         }
         for (size_t index = 0; index < requests.size(); ++index) {

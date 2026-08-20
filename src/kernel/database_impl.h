@@ -107,6 +107,7 @@ class Database::Impl {
     std::vector<std::shared_ptr<AsyncSubmissionExecutor::Ticket>> executor_tickets;
     AsyncSubmissionExecutor* executor = nullptr;
     std::chrono::steady_clock::time_point write_started_at;
+    std::atomic<bool> wal_durable{false};
     std::atomic<uint64_t> wal_callback_us{0};
     std::atomic<uint64_t> wal_callback_duration_us{0};
   };

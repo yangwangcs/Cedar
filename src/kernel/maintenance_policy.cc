@@ -102,7 +102,7 @@ CedarMaintenancePlan SelectCedarMaintenance(
 
   if (emergency_flush) {
     plan.flush = FlushDecision(CedarMaintenancePriority::kEmergency,
-                               flush_budget, metrics.write_stopped == 0);
+                               flush_budget, false);
   } else if (normal_flush) {
     plan.flush = FlushDecision(CedarMaintenancePriority::kNormal, flush_budget);
   }

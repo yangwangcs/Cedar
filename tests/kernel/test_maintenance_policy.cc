@@ -90,6 +90,20 @@ TEST(CedarMaintenancePolicyTest, EmergencyWbmFlushAndCompactionUseSeparateLanes)
   EXPECT_EQ(plan.compaction->priority, CedarMaintenancePriority::kNormal);
 }
 
+TEST(CedarMaintenancePolicyTest,
+     EmergencyWbmFlushDoesNotYieldForWalCriticalWorkBeforeWriteStop) {
+  CedarRuntimeSnapshot snapshot = SnapshotWithDebt(
+      RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts, 10, 80, 0, 0);
+  snapshot.rocksdb.write_buffer_manager_limit_bytes = 100;
+
+  const CedarMaintenancePlan plan =
+      SelectCedarMaintenance(snapshot, CedarMaintenanceHistory{}, true);
+
+  ASSERT_TRUE(plan.flush.has_value());
+  EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kEmergency);
+  EXPECT_FALSE(plan.flush->yield_for_wal_sync);
+}
+
 TEST(CedarMaintenancePolicyTest, WalCriticalSuppressesNormalCompaction) {
   const CedarRuntimeSnapshot snapshot = SnapshotWithDebt(
       RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts, 0, 0, 4, 1);

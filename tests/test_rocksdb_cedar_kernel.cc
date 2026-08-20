@@ -376,6 +376,47 @@ TEST_F(CedarKernelMaintenanceTest,
 }
 
 TEST_F(CedarKernelMaintenanceTest,
+       FlushGrantSurvivesActiveMemtableTelemetryChange) {
+  rocksdb::WriteOptions write_options;
+  write_options.no_slowdown = true;
+  for (uint32_t index = 0; index < 5; ++index) {
+    ASSERT_TRUE(db_->Put(write_options, handles_[1],
+                         "facts-generation-debt-" + std::to_string(index),
+                         std::string(16 * 1024, 'x'))
+                    .ok());
+  }
+  rocksdb::CedarMaintenanceSnapshot before;
+  ASSERT_TRUE(rocksdb::PollCedarMaintenance(db_.get(), &before).ok());
+  ASSERT_GT(before.total_immutable_memtable_bytes, 0U);
+  const rocksdb::CedarMaintenanceGrant grant = FlushGrant(before);
+
+  ASSERT_TRUE(db_->Put(write_options, handles_[1], "facts-active-only", "x").ok());
+
+  rocksdb::CedarMaintenanceSnapshot after_active_write;
+  ASSERT_TRUE(
+      rocksdb::PollCedarMaintenance(db_.get(), &after_active_write).ok());
+  ASSERT_GT(after_active_write.total_active_memtable_bytes, 0U);
+  EXPECT_EQ(after_active_write.total_immutable_memtable_bytes,
+            before.total_immutable_memtable_bytes);
+  EXPECT_EQ(after_active_write.total_immutable_memtable_count,
+            before.total_immutable_memtable_count);
+  EXPECT_EQ(after_active_write.total_l0_files, before.total_l0_files);
+  EXPECT_EQ(after_active_write.total_pending_compaction_bytes,
+            before.total_pending_compaction_bytes);
+  EXPECT_EQ(after_active_write.generation, before.generation);
+
+  rocksdb::CedarMaintenanceResult result;
+  const rocksdb::Status status =
+      rocksdb::RunCedarMaintenance(db_.get(), grant, &result);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  rocksdb::CedarMaintenanceSnapshot after_flush;
+  ASSERT_TRUE(rocksdb::PollCedarMaintenance(db_.get(), &after_flush).ok());
+  EXPECT_EQ(after_flush.background_flush_calls,
+            before.background_flush_calls + 1U);
+}
+
+TEST_F(CedarKernelMaintenanceTest,
        DbWideFlushGrantSelectsMetaDebtBeforeUnpressuredFacts) {
   WriteDebt(handles_[1], "facts-debt");
   const rocksdb::CedarMaintenanceSnapshot before =

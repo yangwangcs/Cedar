@@ -44,34 +44,19 @@ void CedarHashCombine(uint64_t* hash, uint64_t value) {
 
 uint64_t CedarMaintenanceSignature(const CedarMaintenanceSnapshot& snapshot) {
   uint64_t hash = 0xcbf29ce484222325ULL;
-  CedarHashCombine(&hash, snapshot.total_active_memtable_bytes);
-  CedarHashCombine(&hash, snapshot.total_immutable_memtable_bytes);
-  CedarHashCombine(&hash, snapshot.total_immutable_memtable_count);
-  CedarHashCombine(&hash, snapshot.write_buffer_manager_bytes);
-  CedarHashCombine(&hash, snapshot.write_buffer_manager_limit_bytes);
-  CedarHashCombine(&hash, snapshot.retained_wal_bytes);
-  CedarHashCombine(&hash, snapshot.total_l0_files);
-  CedarHashCombine(&hash, snapshot.total_pending_compaction_bytes);
-  CedarHashCombine(&hash, snapshot.running_flushes);
-  CedarHashCombine(&hash, snapshot.running_compactions);
+  // A grant must remain valid while scheduling telemetry changes. The selected
+  // native work is identified only by per-CF maintenance debt and boundaries.
   CedarHashCombine(&hash, snapshot.background_errors);
-  CedarHashCombine(&hash, snapshot.write_delayed);
-  CedarHashCombine(&hash, snapshot.write_stopped);
   CedarHashCombine(&hash, snapshot.manual_conflict);
   CedarHashCombine(&hash, snapshot.recovery_in_progress);
   CedarHashCombine(&hash, snapshot.shutting_down);
-  CedarHashCombine(&hash, snapshot.recovery_flush_exceptions);
   for (const auto& debt : snapshot.column_families) {
     CedarHashCombine(&hash, debt.id);
     CedarHashCombine(&hash, static_cast<uint64_t>(debt.role));
-    CedarHashCombine(&hash, debt.active_memtable_bytes);
     CedarHashCombine(&hash, debt.immutable_memtable_bytes);
     CedarHashCombine(&hash, debt.immutable_memtable_count);
-    CedarHashCombine(&hash, debt.oldest_immutable_age_us);
     CedarHashCombine(&hash, debt.l0_files);
     CedarHashCombine(&hash, debt.pending_compaction_bytes);
-    CedarHashCombine(&hash, debt.flush_pending);
-    CedarHashCombine(&hash, debt.compaction_pending);
   }
   return hash;
 }

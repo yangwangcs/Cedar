@@ -208,6 +208,7 @@ class Database::Impl {
       const std::shared_ptr<AppendCommitRequest>& request);
   void CancelQueuedAsyncCommit(
       const std::shared_ptr<AppendCommitRequest>& request);
+  internal::EpochLimits LimitsForQueueLocked() const;
   Status DrainAppendCommitPipeline();
   void StopAppendCommitPipeline();
   void ObserveShutdownStage(const char* stage) {

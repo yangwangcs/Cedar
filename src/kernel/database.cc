@@ -358,6 +358,31 @@ void Database::Impl::ObserveAppendPressure(const PressureSample& sample) {
   pressure_last_observed_at = now;
 }
 
+internal::EpochLimits Database::Impl::LimitsForQueueLocked() const {
+  internal::EpochQueueSnapshot snapshot;
+  snapshot.depth = append_commit_requests.size();
+  snapshot.pressure_state = runtime_pressure_state.load(std::memory_order_acquire);
+  if (!append_commit_requests.empty()) {
+    snapshot.oldest_age_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() -
+            append_commit_requests.front()->enqueued_at)
+            .count());
+  }
+
+  internal::EpochLimits limits = adaptive_epoch_controller.NextLimits(snapshot);
+  limits.max_transactions = std::min(
+      {limits.max_transactions, append_commit_max_batch_size,
+       runtime_target_count.load(std::memory_order_acquire)});
+  limits.max_encoded_bytes = std::min(
+      {limits.max_encoded_bytes, append_commit_max_batch_bytes,
+       runtime_target_bytes.load(std::memory_order_acquire)});
+  limits.max_age_us = std::min(
+      {limits.max_age_us, append_commit_window_us,
+       runtime_collection_window_us.load(std::memory_order_acquire)});
+  return limits;
+}
+
 void Database::Impl::AccountPressureTime() {
   std::lock_guard<std::mutex> lock(runtime_pressure_mutex);
   if (!pressure_clock_initialized) return;
@@ -562,11 +587,9 @@ Status Database::Impl::StartAppendCommitPipeline() {
         epoch_committed_count = active_epoch_committed_count_hint;
         candidates.assign(append_commit_requests.begin(),
                           append_commit_requests.end());
-        maximum = std::min<uint32_t>(append_commit_max_batch_size,
-                                     runtime_target_count.load(std::memory_order_acquire));
-        target_bytes = std::min<uint64_t>(
-            append_commit_max_batch_bytes,
-            runtime_target_bytes.load(std::memory_order_acquire));
+        const internal::EpochLimits limits = LimitsForQueueLocked();
+        maximum = limits.max_transactions;
+        target_bytes = limits.max_encoded_bytes;
       }
 
       if (epoch_committed_count == 0) {
@@ -733,31 +756,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
           ++append_commit_metrics.n_plus_one_promoted_epochs;
           next_epoch_slot.reset();
         } else {
-          const auto limits_for_queue = [this] {
-            internal::EpochQueueSnapshot snapshot;
-            snapshot.depth = append_commit_requests.size();
-            snapshot.pressure_state =
-                runtime_pressure_state.load(std::memory_order_acquire);
-            if (!append_commit_requests.empty()) {
-              snapshot.oldest_age_us = static_cast<uint64_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() -
-                      append_commit_requests.front()->enqueued_at)
-                      .count());
-            }
-            return adaptive_epoch_controller.NextLimits(snapshot);
-          };
-          internal::EpochLimits collection_limits = limits_for_queue();
-          const uint32_t runtime_maximum = std::min<uint32_t>(
+          internal::EpochLimits collection_limits = LimitsForQueueLocked();
+          const uint32_t queue_ceiling = std::min<uint32_t>(
               append_commit_max_batch_size,
               runtime_target_count.load(std::memory_order_acquire));
           const uint32_t wake_at = std::min<uint32_t>(
-              runtime_maximum, std::max<uint32_t>(2, collection_limits.max_transactions));
-          const uint64_t collection_age_us = std::min<uint64_t>(
-              append_commit_window_us,
-              std::min<uint64_t>(
-                  runtime_collection_window_us.load(std::memory_order_acquire),
-                  collection_limits.max_age_us));
+              queue_ceiling,
+              std::max<uint32_t>(2, collection_limits.max_transactions));
+          const uint64_t collection_age_us = collection_limits.max_age_us;
           if (collection_age_us != 0 && append_commit_requests.size() < wake_at) {
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::microseconds(collection_age_us);
@@ -765,17 +771,11 @@ Status Database::Impl::StartAppendCommitPipeline() {
               return append_commit_stopping || append_commit_requests.size() >= wake_at;
             });
           }
-          collection_limits = limits_for_queue();
+          collection_limits = LimitsForQueueLocked();
           internal::CommitConflictIndex conflict_index;
           const size_t maximum = std::min<size_t>(
-              append_commit_requests.size(), std::min<uint32_t>(
-                  std::min<uint32_t>(append_commit_max_batch_size,
-                                     runtime_target_count.load(std::memory_order_acquire)),
-                  collection_limits.max_transactions));
-          const uint64_t target_bytes = std::min<uint64_t>(
-              std::min<uint64_t>(append_commit_max_batch_bytes,
-                                 runtime_target_bytes.load(std::memory_order_acquire)),
-              collection_limits.max_encoded_bytes);
+              append_commit_requests.size(), collection_limits.max_transactions);
+          const uint64_t target_bytes = collection_limits.max_encoded_bytes;
           uint64_t batch_bytes = 0;
           requests.reserve(maximum);
           for (size_t index = 0; index < maximum; ++index) {

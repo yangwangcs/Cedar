@@ -57,7 +57,7 @@ cmake --build build-bench --target cedar_kernel_bench -j2
 ./build-bench/cedar_kernel_bench --path /tmp/cedar-kernel-bench \
   --workload mixed-90-write-10-point-read --operations 10000 \
   --read-operations 10000 --campaign warm --duration-seconds 30 \
-  --profile kernel
+  --writer-clients 32 --verify-reopen false
 ```
 
 `cedar_kernel_bench` is the only supported benchmark. It exercises Cedar's
@@ -65,6 +65,32 @@ single-WAL Kernel write, read, mixed, and authoritative columnar paths and
 emits Cedar-owned runtime and space metrics. `--campaign sustained` rejects
 durations below 1,800 seconds and only a run that actually reaches that
 duration can receive a sustained qualification status.
+
+For group-commit throughput, the matrix and sustained campaigns are separate:
+
+```bash
+bench="$PWD/build-bench/cedar_kernel_bench"
+benchmarks/run_cedar_group_commit_matrix.sh "$bench" /private/tmp/cedar-group-matrix
+CEDAR_BENCH="$bench" benchmarks/run_cedar_maintenance_campaign.sh \
+  /private/tmp/cedar-maintenance
+```
+
+The matrix measures group fill at 2, 4, 8, 16, 32, 64, and 128 blocking
+writer callers and labels every 30-second result `warm_not_sustained`. The
+maintenance campaign keeps a 2-client `latency-sustained` control and adds a
+32-client `throughput-sustained` case, both with reopen verification. Compare
+results only when commit, binary, host, workload, duration, writer clients,
+group limits, and reopen setting match. The CSV reports committed operations,
+actual WAL sync count, transactions per sync, encoded bytes per transaction,
+group-fill percentiles, retained WAL, compaction debt, and all
+writer/background/maintenance errors.
+
+Cedar production commits require the single embedded-engine WAL and
+`sync = true`. `disableWAL`, `sync = false`, `enable_pipelined_write`,
+`unordered_write`, and `two_write_queues` are not Cedar Kernel production
+settings. Cedar assembles an epoch before calling the exclusive Kernel write;
+the engine continues to own WAL append/sync, MANIFEST, MemTable, VersionSet,
+and recovery.
 
 ### Durable asynchronous commit
 

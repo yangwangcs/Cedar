@@ -68,3 +68,74 @@ The hook is intentionally test-only and unused by normal options, but it is an A
 ## Commit
 
 `a88fcd1 test: qualify 32-member WAL recovery group`
+
+## Review corrections (2026-08-20)
+
+Task review found three gaps in the original qualification. This follow-up changes
+only the test-specific observer behavior and the targeted recovery test; it does
+not change Cedar's group selection, durability policy, WAL ownership, recovery
+ownership, or scheduler behavior.
+
+### Durable identity and recovery coverage
+
+The test no longer assumes that the 32 durable transaction IDs are `1..32`.
+After all async handles have become durable, it now collects the actual IDs,
+asserts that each is present and valid, and inserts their numeric values into a
+set to prove uniqueness and exact cardinality. After reopen, it resolves exactly
+those 32 IDs and requires each recovered outcome to be committed.
+
+### One synchronous physical write
+
+The existing `DatabaseOptions::commit_write_options_observer_for_testing` now
+counts the physical Cedar/RocksDB epoch writes in this test. The test requires
+exactly one observed write and rejects any `sync=false` observation. The injected
+fault remains post-WAL, so the indeterminate public completion continues to test
+the recovery boundary while the observer proves the group used one synchronous
+write.
+
+### Stop-state observer guard
+
+`append_commit_collection_observer_for_testing` is a test-only hook. Before this
+correction, an append worker awakened solely because `append_commit_stopping` was
+set would invoke it before reaching the existing stop check. The worker now skips
+the hook whenever the stop flag is set, including that wakeup path. Normal queued
+request processing and all production paths are unchanged.
+
+### RED
+
+With the new stop-state regression test compiled but the stop guard intentionally
+removed, the focused Debug test failed as expected:
+
+```sh
+cmake --build build-main-debug --target test_kernel_commit -j2 && \
+ctest --test-dir build-main-debug \
+  -R 'KernelGroupCommitFailureTest.CollectionObserverDoesNotRunAfterAppendPipelineStops' \
+  --output-on-failure
+```
+
+```text
+Expected equality of these values:
+  collection_observations.load(std::memory_order_relaxed)
+    Which is: 1
+  0U
+    Which is: 0
+```
+
+This demonstrates that the pre-existing wakeup path ran the hook after stop.
+
+### GREEN
+
+After restoring the minimal `!append_commit_stopping` guard, both the corrected
+large-group recovery qualification and the new stop-state regression passed:
+
+```sh
+cmake --build build-main-debug --target test_kernel_commit -j2 && \
+ctest --test-dir build-main-debug \
+  -R 'KernelGroupCommitFailureTest.(ConcurrentIndeterminateRecoveryMatchesDurableAcceptance|CollectionObserverDoesNotRunAfterAppendPipelineStops)' \
+  --output-on-failure
+```
+
+```text
+100% tests passed, 0 tests failed out of 2
+Total Test time (real) = 0.26 sec
+```

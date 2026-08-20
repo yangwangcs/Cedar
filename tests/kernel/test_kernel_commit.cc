@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "cedar/database.h"
@@ -2810,12 +2811,18 @@ TEST(KernelGroupCommitFailureTest,
   std::mutex enqueue_mutex;
   std::condition_variable enqueue_cv;
   std::atomic<uint32_t> enqueued = 0;
+  std::atomic<uint32_t> physical_writes = 0;
+  std::atomic<bool> physical_write_was_unsynced = false;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = kTransactions,
       .group_commit_window_us = 500'000,
       .commit_fault_injector_for_testing = [] {
         return Status::Indeterminate("test", "injected after durable group write");
+      },
+      .commit_write_options_observer_for_testing = [&](bool sync) {
+        physical_writes.fetch_add(1, std::memory_order_relaxed);
+        if (!sync) physical_write_was_unsynced.store(true, std::memory_order_relaxed);
       },
       .group_commit_max_queue_requests = 128,
       .append_commit_enqueued_observer_for_testing = [&] {
@@ -2879,29 +2886,50 @@ TEST(KernelGroupCommitFailureTest,
   EXPECT_EQ(metrics.group_fill.max_transactions, kTransactions);
   ASSERT_EQ(durable_handle_count.load(std::memory_order_relaxed), kTransactions);
   EXPECT_EQ(metrics.durably_accepted, kTransactions);
+  EXPECT_EQ(physical_writes.load(std::memory_order_relaxed), 1U);
+  EXPECT_FALSE(physical_write_was_unsynced.load(std::memory_order_relaxed));
+  std::unordered_set<uint64_t> durable_txn_values;
+  for (const std::optional<TxnId>& txn_id : durably_accepted_txn_ids) {
+    ASSERT_TRUE(txn_id.has_value());
+    EXPECT_TRUE(txn_id->valid());
+    EXPECT_TRUE(durable_txn_values.insert(txn_id->value).second)
+        << "duplicate durable transaction id=" << txn_id->value;
+  }
+  ASSERT_EQ(durable_txn_values.size(), kTransactions);
   ASSERT_TRUE(database->Close().ok());
   database.reset();
 
   auto reopened = Database::Open(DatabaseOptions{.path = path});
   ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
   database = std::move(reopened).ConsumeValueOrDie();
-  for (uint32_t txn_value = 1; txn_value <= kTransactions; ++txn_value) {
-    const TxnId txn_id{txn_value};
-    const bool durably_accepted = std::any_of(
-        durably_accepted_txn_ids.begin(), durably_accepted_txn_ids.end(),
-        [txn_id](const std::optional<TxnId>& accepted) {
-          return accepted.has_value() && *accepted == txn_id;
-        });
-    const auto resolved = database->ResolveTransaction(txn_id);
+  for (const std::optional<TxnId>& accepted : durably_accepted_txn_ids) {
+    ASSERT_TRUE(accepted.has_value());
+    const auto resolved = database->ResolveTransaction(*accepted);
     ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
-    if (!durably_accepted) {
-      EXPECT_FALSE(resolved.ValueOrDie().has_value());
-      continue;
-    }
-    ASSERT_TRUE(resolved.ValueOrDie().has_value()) << "txn=" << txn_value;
+    ASSERT_TRUE(resolved.ValueOrDie().has_value())
+        << "txn=" << accepted->value;
     EXPECT_EQ(resolved.ValueOrDie()->outcome, CommitOutcome::kCommitted);
   }
   ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitFailureTest,
+     CollectionObserverDoesNotRunAfterAppendPipelineStops) {
+  char pattern[] = "/tmp/cedar_kernel_collection_stop_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::atomic<uint32_t> collection_observations = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .append_commit_collection_observer_for_testing = [&] {
+        collection_observations.fetch_add(1, std::memory_order_relaxed);
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  ASSERT_TRUE(database->Close().ok());
+  EXPECT_EQ(collection_observations.load(std::memory_order_relaxed), 0U);
   std::filesystem::remove_all(path);
 }
 

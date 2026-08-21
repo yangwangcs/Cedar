@@ -296,6 +296,14 @@ target_link_libraries(test_rocksdb_lifecycle
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_rocksdb_lifecycle)
 
+add_executable(test_cedar_files tools/test_cedar_files.cc)
+target_include_directories(test_cedar_files PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_cedar_files PRIVATE
+    CEDAR_BINARY="$<TARGET_FILE:cedar>")
+target_link_libraries(test_cedar_files PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+add_dependencies(test_cedar_files cedar)
+gtest_discover_tests(test_cedar_files)
+
 add_executable(test_vacuum storage/test_vacuum.cc)
 target_include_directories(test_vacuum PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_vacuum

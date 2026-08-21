@@ -8,6 +8,7 @@
 
 #include "cedar/database.h"
 #include "cedar/snapshot.h"
+#include "cedar/storage_files.h"
 #include "cedar/transaction.h"
 
 namespace cedar {
@@ -46,6 +47,14 @@ concept HasTransactionResolution = requires(const T& value) {
 };
 
 static_assert(HasTransactionResolution<Database>);
+
+template <typename T>
+concept HasStorageFileInspection = requires(T options) {
+  { InspectStorageFiles(options) }
+      -> std::same_as<StatusOr<std::vector<StorageFileInfo>>>;
+};
+
+static_assert(HasStorageFileInspection<StorageFileInspectionOptions>);
 
 class KernelInterfaceTest : public ::testing::Test {
  protected:

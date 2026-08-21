@@ -18,6 +18,7 @@
 #include "cedar/runtime/pressure_controller.h"
 #include "cedar/runtime/runtime_metrics.h"
 #include "cedar/storage_options.h"
+#include "cedar/storage_files.h"
 #include "cedar/transaction.h"
 
 namespace cedar {

@@ -65,6 +65,7 @@ add_library(cedar_core STATIC
     src/storage/facts/meta_codec.cc
     src/storage/facts/prepared_commit_codec.cc
     src/storage/rocks/rocksdb_config.cc
+    src/storage/rocks/storage_file_inspection.cc
     src/storage/facts/vacuum.cc
     src/storage/rocks/rocks_adapter.cc
     src/runtime/pressure_controller.cc
@@ -88,6 +89,9 @@ set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
 target_compile_features(cedar_core PUBLIC cxx_std_20)
 set_target_properties(cedar_core PROPERTIES EXPORT_NAME cedar)
 add_library(Cedar::cedar ALIAS cedar_core)
+
+add_executable(cedar tools/cedar_main.cc)
+target_link_libraries(cedar PRIVATE cedar_core)
 
 add_library(cedar_kernel_bench_options STATIC
     benchmarks/cedar_kernel_bench_options.cc)
@@ -115,6 +119,7 @@ install(TARGETS cedar_core EXPORT CedarTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS cedar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES
     "${CEDAR_ROCKSDB_LIBRARY}"
     "${CEDAR_ROCKSDB_LZ4_LIBRARY}"

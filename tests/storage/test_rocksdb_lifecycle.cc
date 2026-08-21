@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "cedar/fact/fact_codec.h"
+#include "cedar/storage_files.h"
 #include "storage/facts/fact_store.h"
 #include "storage/rocks/rocksdb_config.h"
 
@@ -401,6 +402,49 @@ class RocksDbLifecycleTest : public ::testing::Test {
   std::string root_path_;
   std::string database_path_;
 };
+
+TEST_F(RocksDbLifecycleTest, InspectsLiveCedarFilesReadOnly) {
+  PopulateSource();
+  std::unique_ptr<rocksdb::DB> database;
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  ASSERT_TRUE(OpenRawCedarDatabase(database_path_, &database, &handles).ok());
+  ASSERT_EQ(handles.size(), 3U);
+  ASSERT_TRUE(database->Flush(rocksdb::FlushOptions(), handles[1]).ok());
+  CloseRawCedarDatabase(&database, &handles);
+  std::map<std::string, uintmax_t> before;
+  for (const auto& entry : std::filesystem::directory_iterator(database_path_)) {
+    if (entry.is_regular_file()) before.emplace(entry.path().filename().string(),
+                                                 entry.file_size());
+  }
+
+  const auto inspected = InspectStorageFiles({.path = database_path_});
+  ASSERT_TRUE(inspected.ok()) << inspected.status().ToString();
+  ASSERT_FALSE(inspected.ValueOrDie().empty());
+  bool saw_facts = false;
+  for (size_t i = 0; i < inspected.ValueOrDie().size(); ++i) {
+    const auto& file = inspected.ValueOrDie()[i];
+    if (file.column_family_name == "facts") {
+      saw_facts = true;
+      EXPECT_EQ(file.role, StorageFileRole::kAuthoritativeFacts);
+      EXPECT_EQ(file.table_format, StorageTableFormat::kCedarParquet);
+    }
+    if (i > 0) {
+      const auto& previous = inspected.ValueOrDie()[i - 1];
+      EXPECT_LE(std::tie(previous.column_family_name, previous.level,
+                         previous.relative_filename),
+                std::tie(file.column_family_name, file.level,
+                         file.relative_filename));
+    }
+  }
+  EXPECT_TRUE(saw_facts);
+
+  std::map<std::string, uintmax_t> after;
+  for (const auto& entry : std::filesystem::directory_iterator(database_path_)) {
+    if (entry.is_regular_file()) after.emplace(entry.path().filename().string(),
+                                                entry.file_size());
+  }
+  EXPECT_EQ(before, after);
+}
 
 TEST_F(RocksDbLifecycleTest,
        CheckpointReopensCedarParquetFactsWithAnUnflushedWal) {

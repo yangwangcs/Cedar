@@ -37,7 +37,8 @@ set(expected_rocksdb_include_sources
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/commit_publisher.cc"
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/decided_epoch.cc"
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocks_adapter.cc"
-    "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocksdb_config.cc")
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocksdb_config.cc"
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/storage_file_inspection.cc")
 foreach(source IN LISTS expected_rocksdb_include_sources)
   file(REAL_PATH "${source}" source)
   list(APPEND normalized_expected_rocksdb_include_sources "${source}")

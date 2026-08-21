@@ -33,24 +33,34 @@ Status ValidateCallbackFifo(const JourneyRequest& request,
                             const TemporalTraversal& traversal) {
   if (!request.duration_at) return Status::OK();
   const uint64_t first = traversal.effective.from.value;
-  uint64_t second = first;
-  if (traversal.effective.to.has_value()) {
-    if (traversal.effective.to->value <= first + 1) return Status::OK();
-    second = first + 1;
-  } else {
-    return Status::NotSupported("journey", "FIFO cannot be proven for an unbounded duration callback");
+  if (!traversal.effective.to.has_value()) {
+    return Status::NotSupported(
+        "journey", "FIFO cannot be proven for an unbounded duration callback");
   }
-  auto left = request.duration_at(traversal.edge, ValidTime{first});
-  if (!left.ok()) return left.status();
-  auto right = request.duration_at(traversal.edge, ValidTime{second});
-  if (!right.ok()) return right.status();
-  if (!left.ValueOrDie() || !right.ValueOrDie()) return Status::OK();
-  auto left_arrival = AddDuration(ValidTime{first}, *left.ValueOrDie());
-  if (!left_arrival.ok()) return left_arrival.status();
-  auto right_arrival = AddDuration(ValidTime{second}, *right.ValueOrDie());
-  if (!right_arrival.ok()) return right_arrival.status();
-  if (right_arrival.ValueOrDie().value < left_arrival.ValueOrDie().value)
-    return Status::NotSupported("journey", "duration callback is non-FIFO");
+  const uint64_t end = traversal.effective.to->value;
+  if (end <= first) return Status::OK();
+  constexpr uint64_t kMaxFifoValidationPoints = 1'000'000;
+  if (end - first > kMaxFifoValidationPoints) {
+    return Status::NotSupported(
+        "journey", "duration callback interval is too wide to prove FIFO");
+  }
+
+  // ValidTime is an integer domain.  Checking every point in a bounded
+  // interval is a complete proof for callbacks over that interval; sparse
+  // sampling would allow a hidden non-FIFO transition between samples.
+  std::optional<ValidTime> previous_arrival;
+  for (uint64_t time = first; time < end; ++time) {
+    auto value = request.duration_at(traversal.edge, ValidTime{time});
+    if (!value.ok()) return value.status();
+    if (!value.ValueOrDie()) continue;
+    auto current_arrival = AddDuration(ValidTime{time}, *value.ValueOrDie());
+    if (!current_arrival.ok()) return current_arrival.status();
+    if (previous_arrival &&
+        current_arrival.ValueOrDie().value < previous_arrival->value) {
+      return Status::NotSupported("journey", "duration callback is non-FIFO");
+    }
+    previous_arrival = current_arrival.ValueOrDie();
+  }
   return Status::OK();
 }
 

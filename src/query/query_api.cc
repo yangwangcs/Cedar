@@ -170,6 +170,12 @@ StatusOr<PreparedQuery> Database::PrepareQuery(const Query& query) const {
           return Status::SchemaMismatch(
               "query", "journey duration property must be a non-negative integer type");
         }
+        // PrepareQuery has no snapshot (and therefore no complete temporal
+        // value stream) from which to prove that an arbitrary registered
+        // duration function is FIFO.  Earliest-arrival uses one label per
+        // vertex, so accepting an unproven property would be unsound.
+        return Status::NotSupported(
+            "query", "registered journey duration FIFO cannot be proven at prepare time");
       }
       for (internal::PreparedPropertyBinding& binding :
            plan.ValueOrDie().property_bindings) {

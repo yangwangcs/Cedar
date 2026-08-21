@@ -98,7 +98,7 @@ TEST(TemporalJourneyTest, EarliestArrivalMaterializesOrderedJourney) {
   EXPECT_EQ(journey.ValueOrDie().final_arrival, (ValidTime{12}));
 }
 
-TEST(TemporalJourneyTest, PublicEarliestArrivalReturnsJourneyColumn) {
+TEST(TemporalJourneyTest, PrepareRejectsUnprovenRegisteredDurationFifo) {
   JourneyFixture graph;
   ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{
       PropertyId{7}, 0, "duration", PropertyEntityKind::kEdge,
@@ -125,17 +125,28 @@ TEST(TemporalJourneyTest, PublicEarliestArrivalReturnsJourneyColumn) {
                                              Project(target), Project(journey)});
   ASSERT_TRUE(selected.ok()) << selected.status().ToString();
   auto prepared = graph.database->PrepareQuery(selected.ValueOrDie());
-  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  ASSERT_FALSE(prepared.ok());
+  EXPECT_TRUE(prepared.status().IsNotSupportedError())
+      << prepared.status().ToString();
+}
+
+TEST(TemporalJourneyTest, CallbackNonFifoIsRejectedBeforeEarliestSearch) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{31}}, graph.a, graph.b, 0, 10);
   auto snapshot = graph.database->BeginSnapshot();
   ASSERT_TRUE(snapshot.ok());
-  auto cursor = prepared.ValueOrDie().Execute(std::move(snapshot).ConsumeValueOrDie(),
-                                               Bindings{}, QueryOptions{});
-  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
-  auto batch = cursor.ValueOrDie().Next();
-  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
-  ASSERT_TRUE(batch.ValueOrDie());
-  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
-  EXPECT_EQ(batch.ValueOrDie()->Get(journey, 0).final_arrival, (ValidTime{5}));
+  JourneyRequest request{graph.a, graph.b, {ValidTime{0}, ValidTime{10}},
+                         JourneyObjective::kEarliestArrival};
+  request.duration_at = [](EdgeRef, ValidTime time)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{
+        static_cast<uint64_t>(time.value < 5 ? 9 : 0)}};
+  };
+  auto journey = EarliestArrival(snapshot.ValueOrDie(), request);
+  ASSERT_FALSE(journey.ok());
+  EXPECT_TRUE(journey.status().IsNotSupportedError())
+      << journey.status().ToString();
 }
 
 }  // namespace

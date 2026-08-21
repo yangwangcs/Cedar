@@ -81,6 +81,10 @@ TEST(QueryDeltaTest, MergesCorrectionsAcrossMultipleBaseIntervals) {
   ASSERT_TRUE(merged.ok()) << merged.status().ToString();
   const auto intervals = MaterializePresentState(merged.ValueOrDie());
   ASSERT_EQ(intervals.size(), 4U);
+  EXPECT_EQ(std::get<int64_t>(intervals[0].value->data()), 1);
+  EXPECT_EQ(std::get<int64_t>(intervals[1].value->data()), 3);
+  EXPECT_EQ(std::get<int64_t>(intervals[2].value->data()), 2);
+  EXPECT_EQ(std::get<int64_t>(intervals[3].value->data()), 4);
   EXPECT_EQ(intervals[0].interval, (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
   EXPECT_EQ(intervals[1].interval, (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
   EXPECT_EQ(intervals[2].interval, (ValidTimeInterval{ValidTime{10}, ValidTime{15}}));

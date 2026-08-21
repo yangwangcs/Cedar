@@ -29,16 +29,24 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
   }
   internal::QueryDeltaView empty_delta{catalog.base_seq, snapshot_seq, {}, {}, {}, {}};
   internal::QueryDeltaView delta = empty_delta;
+  bool delta_usable = false;
   if (database->query_delta) {
     auto acquired = database->query_delta->AcquireThrough(snapshot_seq);
-    if (acquired.ok()) delta = std::move(acquired).ConsumeValueOrDie();
+    if (acquired.ok()) {
+      delta = std::move(acquired).ConsumeValueOrDie();
+      delta_usable = delta.base_seq == catalog.base_seq &&
+                     delta.through.value >= snapshot_seq.value &&
+                     delta.first_missing.value == 0;
+    } else {
+      delta.first_missing = snapshot_seq;
+    }
   }
   internal::QueryStatisticsView statistics;
   internal::PlanningContext context{snapshot_seq, catalog, delta, statistics,
                                     options};
   context.database_identity = catalog.database_identity;
   context.schema_epoch = 0;
-  context.allow_delta_merge = database->query_delta != nullptr;
+  context.allow_delta_merge = delta_usable;
   return internal::QueryPlanner::Bind(*root, context);
 }
 
@@ -188,7 +196,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         return db->projection_store->ReadChains(request);
       };
       execution_plan.delta_reader =
-          [weak_database, snapshot_seq = snapshot.commit_seq()]
+          [weak_database, snapshot_seq = snapshot.commit_seq()]()
           -> StatusOr<internal::QueryDeltaView> {
         const auto db = weak_database.lock();
         if (!db || !db->query_delta) {

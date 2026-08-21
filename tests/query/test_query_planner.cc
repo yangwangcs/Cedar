@@ -28,7 +28,7 @@ StatusOr<Query> Scan(TemporalScope scope) {
 PlanningContext Context(const ProjectionCatalogView& catalog,
                         const QueryStatisticsView& stats,
                         CommitSeq snapshot = CommitSeq{25}) {
-  static const QueryDeltaView delta{CommitSeq{0}, CommitSeq{25}, {}, {}, {}};
+  static const QueryDeltaView delta{CommitSeq{10}, CommitSeq{25}, {}, {}, {}, {}};
   return PlanningContext{snapshot, catalog, delta, stats, QueryOptions{}, {}, 0,
                          true};
 }

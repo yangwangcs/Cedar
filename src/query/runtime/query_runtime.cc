@@ -4,6 +4,7 @@
 #include "query/runtime/query_runtime.h"
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -249,27 +250,33 @@ StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
       delta = std::move(acquired).ConsumeValueOrDie();
     }
     for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
-      for (const internal::ProjectionInterval& interval : chain.intervals) {
-        if (slice.source == internal::CoverageSource::kDeltaMerge) {
-          std::vector<internal::CorrectedBoundary> base{{interval.effective.from,
-                                               chain.header.base_seq,
-                                               FactOperation::kPut, 0,
-                                               interval.value, std::nullopt}};
-          if (interval.effective.to) base.push_back({*interval.effective.to,
-                                                       chain.header.base_seq,
-                                                       FactOperation::kDelete, 0,
-                                                       std::nullopt, std::nullopt});
+      if (slice.source == internal::CoverageSource::kDeltaMerge) {
+        std::map<uint64_t, std::vector<const internal::ProjectionInterval*>> by_entity;
+        for (const auto& interval : chain.intervals) by_entity[interval.entity_id].push_back(&interval);
+        for (const auto& [entity_id, intervals] : by_entity) {
+          std::vector<internal::CorrectedBoundary> base;
+          for (const auto* interval : intervals) {
+            base.push_back({interval->effective.from, chain.header.base_seq,
+                            FactOperation::kPut, 0, interval->value, std::nullopt});
+            if (interval->effective.to) base.push_back({*interval->effective.to,
+                                                         chain.header.base_seq,
+                                                         FactOperation::kDelete, 0,
+                                                         std::nullopt, std::nullopt});
+          }
+          std::sort(base.begin(), base.end(), [](const auto& a, const auto& b) {
+            return a.valid_from.value < b.valid_from.value;
+          });
           const FactRef ref{chain.header.part_id, plan.entity_family,
-                            slice.property_id.value_or(PropertyId{}), interval.entity_id};
-          auto merged = internal::QueryDelta::MergeBoundaries(base,
-                                                    delta->EventsFor(ref),
-                                                    delta->through);
+                            slice.property_id.value_or(PropertyId{}), entity_id};
+          auto merged = internal::QueryDelta::MergeBoundaries(base, delta->EventsFor(ref), delta->through);
           if (!merged.ok()) return merged.status();
           for (const auto& state : internal::MaterializePresentState(merged.ValueOrDie())) {
             rows.push_back({ref, state.interval, std::nullopt, state.value});
           }
-          continue;
         }
+        continue;
+      }
+      for (const internal::ProjectionInterval& interval : chain.intervals) {
         const FactFamily family = plan.entity_family;
         rows.push_back({FactRef{chain.header.part_id, family, PropertyId{},
                                 interval.entity_id},

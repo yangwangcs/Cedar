@@ -56,10 +56,35 @@ TEST(QueryDeltaTest, MergesCorrectionAtAnOldValidTime) {
       {ref, ValidTime{10}, CommitSeq{6}, FactOperation::kDelete, 0,
        std::nullopt, std::nullopt}};
   const auto merged = QueryDelta::MergeBoundaries(base, delta, CommitSeq{6});
-  ASSERT_TRUE(merged.ok());
+  ASSERT_TRUE(merged.ok()) << merged.status().ToString();
   ASSERT_EQ(merged.ValueOrDie().size(), 1U);
   EXPECT_EQ(merged.ValueOrDie().front().commit_seq, CommitSeq{6});
   EXPECT_EQ(merged.ValueOrDie().front().operation, FactOperation::kDelete);
+}
+
+TEST(QueryDeltaTest, MergesCorrectionsAcrossMultipleBaseIntervals) {
+  const FactRef ref = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}},
+                                           PropertyId{1}).ref();
+  const std::vector<CorrectedBoundary> base{
+      {ValidTime{0}, CommitSeq{10}, FactOperation::kPut, 0,
+       Value::Int64(1), std::nullopt},
+      {ValidTime{10}, CommitSeq{10}, FactOperation::kPut, 0,
+       Value::Int64(2), std::nullopt},
+      {ValidTime{20}, CommitSeq{10}, FactOperation::kDelete, 0,
+       std::nullopt, std::nullopt}};
+  const std::vector<FactEvent> delta{
+      {ref, ValidTime{5}, CommitSeq{11}, FactOperation::kPut, 1,
+       Value::Int64(3), std::nullopt},
+      {ref, ValidTime{15}, CommitSeq{12}, FactOperation::kPut, 1,
+       Value::Int64(4), std::nullopt}};
+  auto merged = QueryDelta::MergeBoundaries(base, delta, CommitSeq{12});
+  ASSERT_TRUE(merged.ok()) << merged.status().ToString();
+  const auto intervals = MaterializePresentState(merged.ValueOrDie());
+  ASSERT_EQ(intervals.size(), 4U);
+  EXPECT_EQ(intervals[0].interval, (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
+  EXPECT_EQ(intervals[1].interval, (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
+  EXPECT_EQ(intervals[2].interval, (ValidTimeInterval{ValidTime{10}, ValidTime{15}}));
+  EXPECT_EQ(intervals[3].interval, (ValidTimeInterval{ValidTime{15}, ValidTime{20}}));
 }
 
 TEST(QueryDeltaTest, NewEdgeIdentityIsRetainedForBothDirections) {

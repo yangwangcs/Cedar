@@ -225,7 +225,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     }
     const bool delta_complete =
         context.projections.base_seq.value <= context.snapshot_seq.value &&
-        context.delta.base_seq.value <= context.projections.base_seq.value &&
+        context.delta.base_seq == context.projections.base_seq &&
         context.delta.through.value >= context.snapshot_seq.value &&
         context.delta.first_missing.value == 0;
     if (context.projections.base_seq.value < context.snapshot_seq.value &&

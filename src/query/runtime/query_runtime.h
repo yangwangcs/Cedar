@@ -65,7 +65,7 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);
 
 StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,
-    QueryReservation* reservation = nullptr,
+    QueryReservation* reservation,
     FragmentBudget* fragment_budget = nullptr);
 
 class QueryRuntime {

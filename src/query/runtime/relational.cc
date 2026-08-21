@@ -215,6 +215,27 @@ struct JoinOutputEstimate {
   size_t bytes = sizeof(BatchStream);
 };
 
+struct HashEntry {
+  const RelationalRow* row = nullptr;
+  size_t next = std::numeric_limits<size_t>::max();
+};
+
+constexpr size_t kNoHashEntry = std::numeric_limits<size_t>::max();
+
+std::optional<size_t> HashBucketCount(size_t entries) {
+  if (entries == 0) return size_t{1};
+  if (entries > std::numeric_limits<size_t>::max() / 2) return std::nullopt;
+  size_t buckets = 1;
+  const size_t minimum = entries * 2;
+  while (buckets < minimum) {
+    if (buckets > std::numeric_limits<size_t>::max() / 2) {
+      return std::nullopt;
+    }
+    buckets *= 2;
+  }
+  return buckets;
+}
+
 std::optional<JoinOutputEstimate> EstimateJoinOutput(const JoinInput& input) {
   JoinOutputEstimate estimate;
   for (const RelationalRow& left : input.left.rows) {
@@ -480,7 +501,16 @@ bool FragmentBudget::TryConsume(size_t fragments) {
 }
 
 Status NeedsSpill() {
-  return Status::ResourceExhausted("query relational", "NeedsSpill");
+  return Status::ResourceExhausted("query relational",
+                                   "NeedsSpill memory_bytes=unknown");
+}
+
+Status NeedsSpill(size_t requested_bytes, size_t available_bytes) {
+  return Status::ResourceExhausted(
+      "query relational", "NeedsSpill memory_bytes=" +
+                              std::to_string(requested_bytes) +
+                              " available_bytes=" +
+                              std::to_string(available_bytes));
 }
 
 bool IsNeedsSpill(const Status& status) {
@@ -511,14 +541,21 @@ StatusOr<BatchStream> Sort(const BatchStream& input,
                            const std::vector<SortKey>& keys,
                            QueryReservation* reservation) {
   if (Status status = ValidateSort(input, keys); !status.ok()) return status;
+  if (reservation == nullptr) return NeedsSpill();
   ReservationGuard guard(reservation, EstimateBytes(input));
-  if (!guard.acquired()) return NeedsSpill();
+  if (!guard.acquired()) {
+    return NeedsSpill(EstimateBytes(input), reservation->limit_bytes() -
+                                                reservation->used_bytes());
+  }
   BatchStream result = input;
-  std::stable_sort(result.rows.begin(), result.rows.end(),
-                   [&keys](const RelationalRow& left,
-                           const RelationalRow& right) {
-                     return RowLess(left, right, keys);
-                   });
+  // Stable insertion sort only swaps adjacent moved rows, so it needs no
+  // unreserved auxiliary buffer after the copied stream has been accounted.
+  for (size_t i = 1; i < result.rows.size(); ++i) {
+    for (size_t j = i; j > 0 && RowLess(result.rows[j], result.rows[j - 1], keys);
+         --j) {
+      std::swap(result.rows[j], result.rows[j - 1]);
+    }
+  }
   result.order_specified = true;
   return result;
 }
@@ -573,31 +610,38 @@ StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input) {
 StatusOr<BatchStream> HashJoin(const JoinInput& input,
                                QueryReservation* reservation) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
+  if (reservation == nullptr) return NeedsSpill();
   const auto output = EstimateJoinOutput(input);
-  if (!output.has_value() ||
+  const auto bucket_count = HashBucketCount(input.right.rows.size());
+  if (!output.has_value() || !bucket_count.has_value() ||
       input.right.rows.size() >
-          std::numeric_limits<size_t>::max() / (sizeof(size_t) + sizeof(const RelationalRow*))) {
+          std::numeric_limits<size_t>::max() / sizeof(HashEntry)) {
     return NeedsSpill();
   }
-  const size_t index_bytes = input.right.rows.size() *
-                             (sizeof(size_t) + sizeof(const RelationalRow*));
-  size_t required_bytes = EstimateBytes(input.right);
-  if (!AddBytes(index_bytes, &required_bytes) ||
-      !AddBytes(output->bytes, &required_bytes)) {
+  size_t index_bytes = input.right.rows.size() * sizeof(HashEntry);
+  if (*bucket_count > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
+      !AddBytes(*bucket_count * sizeof(size_t), &index_bytes)) {
+    return NeedsSpill();
+  }
+  size_t required_bytes = index_bytes;
+  if (!AddBytes(output->bytes, &required_bytes)) {
     return NeedsSpill();
   }
   ReservationGuard guard(reservation, required_bytes);
-  if (!guard.acquired()) return NeedsSpill();
+  if (!guard.acquired()) {
+    return NeedsSpill(required_bytes, reservation->limit_bytes() -
+                                          reservation->used_bytes());
+  }
 
-  struct HashEntry {
-    size_t hash;
-    const RelationalRow* row;
-  };
+  std::vector<size_t> buckets(*bucket_count, kNoHashEntry);
   std::vector<HashEntry> table;
   table.reserve(input.right.rows.size());
   for (const RelationalRow& right : input.right.rows) {
     const RelationalCell& key = right.cells[input.right_key];
-    if (key.present) table.push_back({HashCell(key), &right});
+    if (!key.present) continue;
+    const size_t bucket = HashCell(key) & (*bucket_count - 1);
+    table.push_back({&right, buckets[bucket]});
+    buckets[bucket] = table.size() - 1;
   }
   BatchStream result;
   result.rows.reserve(output->rows);
@@ -605,18 +649,16 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
     bool matched = false;
     const RelationalCell& key = left.cells[input.left_key];
     if (key.present) {
-      const size_t hash = HashCell(key);
-      for (const HashEntry& entry : table) {
-        if (entry.hash == hash) {
-          const RelationalRow* right = entry.row;
-          if (!KeysEqual(key, right->cells[input.right_key])) continue;
-          matched = true;
-          if (input.kind == JoinKind::kInner) {
-            result.rows.push_back(Combine(left, *right));
-          } else if (input.kind == JoinKind::kSemi) {
-            result.rows.push_back(left);
-            break;
-          }
+      for (size_t entry = buckets[HashCell(key) & (*bucket_count - 1)];
+           entry != kNoHashEntry; entry = table[entry].next) {
+        const RelationalRow* right = table[entry].row;
+        if (!KeysEqual(key, right->cells[input.right_key])) continue;
+        matched = true;
+        if (input.kind == JoinKind::kInner) {
+          result.rows.push_back(Combine(left, *right));
+        } else if (input.kind == JoinKind::kSemi) {
+          result.rows.push_back(left);
+          break;
         }
         if (input.kind == JoinKind::kSemi && matched) break;
       }
@@ -629,6 +671,7 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
 StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
                                     QueryReservation* reservation) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
+  if (reservation == nullptr) return NeedsSpill();
   size_t required_bytes = EstimateBytes(input.left);
   const size_t right_bytes = EstimateBytes(input.right);
   const auto output = EstimateJoinOutput(input);
@@ -637,23 +680,76 @@ StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
   }
   if (!AddBytes(output->bytes, &required_bytes)) return NeedsSpill();
   ReservationGuard guard(reservation, required_bytes);
-  if (!guard.acquired()) return NeedsSpill();
-  JoinInput sorted = input;
-  std::stable_sort(sorted.left.rows.begin(), sorted.left.rows.end(),
-                   [&input](const RelationalRow& left,
-                            const RelationalRow& right) {
-                     return CompareCell(left.cells[input.left_key],
-                                        right.cells[input.left_key]) < 0;
-                   });
-  std::stable_sort(sorted.right.rows.begin(), sorted.right.rows.end(),
-                   [&input](const RelationalRow& left,
-                            const RelationalRow& right) {
-                     return CompareCell(left.cells[input.right_key],
-                                        right.cells[input.right_key]) < 0;
-                   });
-  auto joined = IndexNestedLoopJoin(sorted);
-  if (joined.ok()) joined.ValueOrDie().order_specified = true;
-  return joined;
+  if (!guard.acquired()) {
+    return NeedsSpill(required_bytes, reservation->limit_bytes() -
+                                          reservation->used_bytes());
+  }
+  std::vector<RelationalRow> left = input.left.rows;
+  std::vector<RelationalRow> right = input.right.rows;
+  const auto left_less = [&input](const RelationalRow& first,
+                                  const RelationalRow& second) {
+    return CompareCell(first.cells[input.left_key],
+                       second.cells[input.left_key]) < 0;
+  };
+  const auto right_less = [&input](const RelationalRow& first,
+                                   const RelationalRow& second) {
+    return CompareCell(first.cells[input.right_key],
+                       second.cells[input.right_key]) < 0;
+  };
+  std::sort(left.begin(), left.end(), left_less);
+  std::sort(right.begin(), right.end(), right_less);
+
+  BatchStream result;
+  result.rows.reserve(output->rows);
+  size_t left_index = 0;
+  size_t right_index = 0;
+  while (left_index < left.size() && right_index < right.size()) {
+    const int compared = CompareCell(left[left_index].cells[input.left_key],
+                                     right[right_index].cells[input.right_key]);
+    if (compared < 0) {
+      if (input.kind == JoinKind::kAnti) result.rows.push_back(left[left_index]);
+      ++left_index;
+      continue;
+    }
+    if (compared > 0) {
+      ++right_index;
+      continue;
+    }
+    size_t left_end = left_index + 1;
+    while (left_end < left.size() &&
+           CompareCell(left[left_index].cells[input.left_key],
+                       left[left_end].cells[input.left_key]) == 0) {
+      ++left_end;
+    }
+    size_t right_end = right_index + 1;
+    while (right_end < right.size() &&
+           CompareCell(right[right_index].cells[input.right_key],
+                       right[right_end].cells[input.right_key]) == 0) {
+      ++right_end;
+    }
+    if (KeysEqual(left[left_index].cells[input.left_key],
+                  right[right_index].cells[input.right_key])) {
+      for (size_t left_row = left_index; left_row < left_end; ++left_row) {
+        if (input.kind == JoinKind::kInner) {
+          for (size_t right_row = right_index; right_row < right_end; ++right_row) {
+            result.rows.push_back(Combine(left[left_row], right[right_row]));
+          }
+        } else if (input.kind == JoinKind::kSemi) {
+          result.rows.push_back(left[left_row]);
+        }
+      }
+    } else if (input.kind == JoinKind::kAnti) {
+      result.rows.insert(result.rows.end(), left.begin() + left_index,
+                         left.begin() + left_end);
+    }
+    left_index = left_end;
+    right_index = right_end;
+  }
+  if (input.kind == JoinKind::kAnti) {
+    result.rows.insert(result.rows.end(), left.begin() + left_index, left.end());
+  }
+  result.order_specified = true;
+  return result;
 }
 
 StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,

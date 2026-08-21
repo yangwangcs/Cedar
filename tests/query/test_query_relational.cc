@@ -106,7 +106,9 @@ TEST(RelationalTest, UnionDistinctStableSortAndLimitAreExact) {
                               BatchStream{{Row(2, 20), Row(1, 11)}});
   EXPECT_EQ(Distinct(rows).rows.size(), 3U);
 
-  auto sorted = Sort(rows, {{0, SortDirection::kAscending}});
+  QueryReservation sort_reservation(1 << 20);
+  auto sorted = Sort(rows, {{0, SortDirection::kAscending}},
+                     &sort_reservation);
   ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
   EXPECT_EQ(sorted.ValueOrDie().rows,
             (std::vector<RelationalRow>{Row(1, 10), Row(1, 11), Row(2, 20),
@@ -181,6 +183,39 @@ TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
   ASSERT_FALSE(sort_overflow.ok());
   EXPECT_TRUE(IsNeedsSpill(sort_overflow.status()));
   EXPECT_EQ(sort_spill.used_bytes(), 0U);
+}
+
+TEST(RelationalTest, HashAndSortOperatorsRequireReservationAndDiagnoseSpill) {
+  JoinInput input{{{Row(1, 10)}}, {{Row(1, 20)}}, 0, 0,
+                  JoinKind::kInner};
+  auto hash = HashJoin(input, nullptr);
+  ASSERT_FALSE(hash.ok());
+  EXPECT_TRUE(IsNeedsSpill(hash.status()));
+  EXPECT_NE(hash.status().ToString().find("memory_bytes"), std::string::npos);
+
+  auto sort_merge = SortMergeJoin(input, nullptr);
+  ASSERT_FALSE(sort_merge.ok());
+  EXPECT_TRUE(IsNeedsSpill(sort_merge.status()));
+
+  auto sort = Sort(BatchStream{{Row(2, 20), Row(1, 10)}},
+                   {{0, SortDirection::kAscending}}, nullptr);
+  ASSERT_FALSE(sort.ok());
+  EXPECT_TRUE(IsNeedsSpill(sort.status()));
+}
+
+TEST(RelationalTest, HashAndSortMergeProduceAllAndOnlyMatchingRows) {
+  JoinInput input{{{Row(3, 30), Row(1, 10), Row(1, 11), Row(2, 20)}},
+                  {{Row(1, 100), Row(2, 200), Row(1, 101)}}, 0, 0,
+                  JoinKind::kInner};
+  QueryReservation reservation(1 << 20);
+  auto hashed = HashJoin(input, &reservation);
+  ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
+  EXPECT_EQ(hashed.ValueOrDie().rows.size(), 5U);
+
+  auto merged = SortMergeJoin(input, &reservation);
+  ASSERT_TRUE(merged.ok()) << merged.status().ToString();
+  EXPECT_EQ(merged.ValueOrDie().rows.size(), 5U);
+  EXPECT_TRUE(merged.ValueOrDie().order_specified);
 }
 
 TEST(RelationalTest, ChoosesAlgorithmsAtExactPlannerBoundaries) {
@@ -290,21 +325,25 @@ TEST(QueryRuntimeRelationalTest,
   input.left_key = 0;
   input.right_key = 0;
   input.estimated_rows = 4095;
+  QueryReservation reservation(1 << 20);
 
-  auto nested = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input);
+  auto nested = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
+                                          &reservation);
   ASSERT_TRUE(nested.ok()) << nested.status().ToString();
   EXPECT_EQ(nested.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kIndexNestedLoop});
   EXPECT_EQ(nested.ValueOrDie().stream.rows.size(), 1U);
 
   input.estimated_rows = 4096;
-  auto hashed = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input);
+  auto hashed = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
+                                          &reservation);
   ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
   EXPECT_EQ(hashed.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kHash});
 
   input.sorted_keys = true;
-  auto merged = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input);
+  auto merged = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
+                                          &reservation);
   ASSERT_TRUE(merged.ok()) << merged.status().ToString();
   EXPECT_EQ(merged.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kSortMerge});
@@ -327,7 +366,7 @@ TEST(QueryRuntimeRelationalTest,
   aggregate.aggregates = {{AggregateKind::kCount, 1},
                           {AggregateKind::kSum, 1}};
   auto rows = ExecuteRelationalPlanNode(LogicalOpKind::kAggregateRows,
-                                        aggregate);
+                                        aggregate, nullptr);
   ASSERT_TRUE(rows.ok()) << rows.status().ToString();
   EXPECT_EQ(rows.ValueOrDie().stream.rows.front().cells,
             (std::vector<RelationalCell>{Int64(1), Int64(2), Int64(30)}));

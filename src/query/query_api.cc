@@ -11,6 +11,8 @@
 #include "cedar/query/result.h"
 #include "kernel/database_impl.h"
 #include "query/runtime/query_runtime.h"
+#include "query/planner/query_planner.h"
+#include "query/logical/logical_plan.h"
 
 namespace cedar {
 namespace {
@@ -44,14 +46,17 @@ class PreparedQuery::State {
  public:
   State(std::weak_ptr<Database::Impl> database,
         internal::PreparedQueryPlan plan,
-        std::vector<PropertyDefinition> schema_fingerprint)
+        std::vector<PropertyDefinition> schema_fingerprint,
+        std::shared_ptr<const internal::LogicalPlanNode> logical_root)
       : database(std::move(database)),
         plan(std::move(plan)),
-        schema_fingerprint(std::move(schema_fingerprint)) {}
+        schema_fingerprint(std::move(schema_fingerprint)),
+        logical_root(std::move(logical_root)) {}
 
   std::weak_ptr<Database::Impl> database;
   internal::PreparedQueryPlan plan;
   std::vector<PropertyDefinition> schema_fingerprint;
+  std::shared_ptr<const internal::LogicalPlanNode> logical_root;
 };
 
 StatusOr<PreparedQuery> Database::PrepareQuery(const Query& query) const {
@@ -98,7 +103,8 @@ StatusOr<PreparedQuery> Database::PrepareQuery(const Query& query) const {
     }
   }
   return PreparedQuery(std::make_shared<const PreparedQuery::State>(
-      impl_, std::move(plan).ConsumeValueOrDie(), std::move(fingerprint)));
+      impl_, std::move(plan).ConsumeValueOrDie(), std::move(fingerprint),
+      internal::LogicalPlanInspector::InspectShared(query)));
 }
 
 StatusOr<QueryCursor> PreparedQuery::Execute(
@@ -124,6 +130,31 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
   }
   return internal::QueryRuntime::Execute(
       state_->plan, std::move(snapshot), bindings, options);
+}
+
+StatusOr<std::string> PreparedQuery::ExplainLogical() const {
+  if (!state_ || !state_->logical_root) {
+    return Status::InvalidArgument("prepared query", "moved-from query");
+  }
+  return internal::QueryPlanner::ExplainLogical(*state_->logical_root);
+}
+
+StatusOr<std::string> PreparedQuery::ExplainPhysical(
+    const Snapshot& snapshot, const QueryOptions& options) const {
+  if (!state_ || !state_->logical_root) {
+    return Status::InvalidArgument("prepared query", "moved-from query");
+  }
+  // Database-owned projection and delta views are intentionally not exposed
+  // through the public API yet. The explain path therefore binds an explicit
+  // empty derived catalog, making canonical fallback visible and truthful.
+  internal::ProjectionCatalogView catalog;
+  internal::QueryDeltaView delta{CommitSeq{0}, snapshot.commit_seq(), {}, {}, {}};
+  internal::QueryStatisticsView statistics;
+  const internal::PlanningContext context{snapshot.commit_seq(), catalog, delta,
+                                          statistics, options};
+  auto plan = internal::QueryPlanner::Bind(*state_->logical_root, context);
+  if (!plan.ok()) return plan.status();
+  return internal::QueryPlanner::ExplainPhysical(plan.ValueOrDie());
 }
 
 }  // namespace cedar

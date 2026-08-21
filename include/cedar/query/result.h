@@ -119,6 +119,12 @@ class PreparedQuery {
 
   StatusOr<QueryCursor> Execute(Snapshot snapshot, const Bindings& bindings,
                                 const QueryOptions& options) const;
+  // Explain does not execute the query. Logical explanation is independent of
+  // any snapshot; physical explanation binds a plan at the borrowed snapshot
+  // cut and reports canonical fallback when no derived catalog is available.
+  StatusOr<std::string> ExplainLogical() const;
+  StatusOr<std::string> ExplainPhysical(const Snapshot& snapshot,
+                                         const QueryOptions& options) const;
 
  private:
   class State;

@@ -70,6 +70,9 @@ class LogicalPlanInspector {
   static const LogicalPlanNode* Inspect(const Query& query) {
     return query.root_.get();
   }
+  static std::shared_ptr<const LogicalPlanNode> InspectShared(const Query& query) {
+    return query.root_;
+  }
 };
 
 }  // namespace cedar::internal

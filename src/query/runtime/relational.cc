@@ -637,6 +637,101 @@ std::vector<ValidTimeInterval> NormalizeIntervals(
   return normalized;
 }
 
+// Counts the normalized coverage fragments for one left interval without
+// allocating an intermediate intersection vector. The cursor advances over
+// covered regions and uncovered gaps, so adjacent/overlapping intersections
+// are counted exactly as Publish will coalesce them.
+StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
+                                        const BatchStream& right,
+                                        size_t left_key, size_t right_key,
+                                        JoinKind kind) {
+  size_t fragments = 0;
+  ValidTime cursor = left.effective->from;
+  while (true) {
+    std::optional<ValidTime> coverage_end;
+    std::optional<ValidTime> next_start;
+    for (const RelationalRow& candidate : right.rows) {
+      if (!KeysEqual(left.cells[left_key], candidate.cells[right_key])) {
+        continue;
+      }
+      const auto intersection =
+          Intersect(*left.effective, *candidate.effective);
+      if (!intersection) continue;
+      if (!Before(cursor, intersection->from) &&
+          EndsAfter(intersection->to, cursor)) {
+        if (!coverage_end.has_value() || !intersection->to.has_value() ||
+            Before(*coverage_end, *intersection->to)) {
+          coverage_end = intersection->to;
+        }
+      } else if (Before(cursor, intersection->from) &&
+                 (!next_start.has_value() ||
+                  Before(intersection->from, *next_start))) {
+        next_start = intersection->from;
+      }
+    }
+    if (!coverage_end.has_value() && next_start.has_value()) {
+      if (kind == JoinKind::kAnti && Before(cursor, *next_start)) {
+        if (fragments == std::numeric_limits<size_t>::max()) {
+          return Status::ResourceExhausted("query",
+                                           "temporal output row overflow");
+        }
+        ++fragments;
+      }
+      cursor = *next_start;
+      continue;
+    }
+    if (coverage_end.has_value()) {
+      // Extend through every interval that overlaps the current covered
+      // region; this is the allocation-free equivalent of NormalizeIntervals.
+      while (coverage_end.has_value()) {
+        std::optional<ValidTime> extended = coverage_end;
+        for (const RelationalRow& candidate : right.rows) {
+          if (!KeysEqual(left.cells[left_key], candidate.cells[right_key])) {
+            continue;
+          }
+          const auto intersection =
+              Intersect(*left.effective, *candidate.effective);
+          if (!intersection || Before(*extended, intersection->from) ||
+              !EndsAfter(intersection->to, *extended)) {
+            continue;
+          }
+          if (!intersection->to.has_value() ||
+              !extended.has_value() || Before(*extended, *intersection->to)) {
+            extended = intersection->to;
+          }
+        }
+        if (extended == coverage_end) break;
+        coverage_end = extended;
+      }
+      if (fragments == std::numeric_limits<size_t>::max()) {
+        return Status::ResourceExhausted("query", "temporal output row overflow");
+      }
+      if (kind == JoinKind::kSemi) ++fragments;
+      if (!coverage_end.has_value()) break;
+      cursor = *coverage_end;
+      if (!EndsAfter(left.effective->to, cursor)) break;
+      continue;
+    }
+    if (!next_start.has_value()) {
+      if (kind == JoinKind::kAnti && EndsAfter(left.effective->to, cursor)) {
+        if (fragments == std::numeric_limits<size_t>::max()) {
+          return Status::ResourceExhausted("query", "temporal output row overflow");
+        }
+        ++fragments;
+      }
+      break;
+    }
+    if (kind == JoinKind::kAnti && Before(cursor, *next_start)) {
+      if (fragments == std::numeric_limits<size_t>::max()) {
+        return Status::ResourceExhausted("query", "temporal output row overflow");
+      }
+      ++fragments;
+    }
+    cursor = *next_start;
+  }
+  return fragments;
+}
+
 std::vector<RelationalCell> GroupCells(const RelationalRow& row,
                                        const std::vector<size_t>& group_by) {
   std::vector<RelationalCell> cells;
@@ -742,28 +837,108 @@ size_t EstimateAggregateOutputBytes(
   return bytes;
 }
 
-size_t EstimateTemporalAggregateOutputBytes(const std::vector<Group>& groups,
-                                            size_t* row_bound) {
+bool SameGroup(const RelationalRow& left, const RelationalRow& right,
+               const std::vector<size_t>& group_by) {
+  for (size_t column : group_by) {
+    if (left.cells[column] != right.cells[column]) return false;
+  }
+  return true;
+}
+
+StatusOr<size_t> CountTemporalGroupFragments(
+    const BatchStream& input, const std::vector<size_t>& group_by,
+    size_t representative) {
+  std::optional<ValidTime> cursor;
+  for (const RelationalRow& row : input.rows) {
+    if (!SameGroup(input.rows[representative], row, group_by)) continue;
+    if (!cursor.has_value() || Before(row.effective->from, *cursor)) {
+      cursor = row.effective->from;
+    }
+  }
+  size_t fragments = 0;
+  std::optional<int64_t> last_count;
+  while (cursor.has_value()) {
+    int64_t count = 0;
+    std::optional<ValidTime> next;
+    for (const RelationalRow& row : input.rows) {
+      if (!SameGroup(input.rows[representative], row, group_by)) continue;
+      if (!Before(*cursor, row.effective->from) &&
+          (!row.effective->to.has_value() ||
+           Before(*cursor, *row.effective->to))) {
+        ++count;
+      }
+      if (Before(*cursor, row.effective->from) &&
+          (!next.has_value() || Before(row.effective->from, *next))) {
+        next = row.effective->from;
+      }
+      if (row.effective->to.has_value() &&
+          Before(*cursor, *row.effective->to) &&
+          (!next.has_value() || Before(*row.effective->to, *next))) {
+        next = *row.effective->to;
+      }
+    }
+    if (count > 0) {
+      if (!last_count.has_value() || *last_count != count) {
+        if (fragments == std::numeric_limits<size_t>::max()) {
+          return Status::ResourceExhausted("query",
+                                           "temporal output row overflow");
+        }
+        ++fragments;
+      }
+      last_count = count;
+    } else {
+      last_count.reset();
+    }
+    if (!next.has_value()) break;
+    cursor = next;
+  }
+  return fragments;
+}
+
+StatusOr<size_t> EstimateTemporalAggregateOutputBytesExact(
+    const BatchStream& input, const std::vector<size_t>& group_by,
+    size_t* row_bound) {
   size_t bytes = sizeof(BatchStream);
   *row_bound = 0;
-  for (const Group& group : groups) {
-    const size_t group_rows = group.rows.size();
-    if (group_rows > (std::numeric_limits<size_t>::max() - *row_bound) / 2) {
-      return std::numeric_limits<size_t>::max();
+  for (size_t representative = 0; representative < input.rows.size();
+       ++representative) {
+    bool already_seen = false;
+    for (size_t prior = 0; prior < representative; ++prior) {
+      if (SameGroup(input.rows[representative], input.rows[prior], group_by)) {
+        already_seen = true;
+        break;
+      }
     }
-    const size_t group_bound = group_rows * 2;
-    *row_bound += group_bound;
+    if (already_seen) continue;
+    for (const RelationalRow& row : input.rows) {
+      if (!SameGroup(input.rows[representative], row, group_by) ||
+          !row.effective || !IntervalValid(*row.effective)) {
+        return Status::InvalidArgument("temporal aggregate",
+                                       "input interval is absent or invalid");
+      }
+    }
+    auto group_fragments =
+        CountTemporalGroupFragments(input, group_by, representative);
+    if (!group_fragments.ok()) return group_fragments.status();
+    if (group_fragments.ValueOrDie() >
+        std::numeric_limits<size_t>::max() - *row_bound) {
+      return Status::ResourceExhausted("query", "temporal output row overflow");
+    }
+    *row_bound += group_fragments.ValueOrDie();
     size_t row_bytes = sizeof(RelationalRow) + sizeof(RelationalCell);
-    for (const RelationalCell& cell : group.key) {
+    for (size_t column : group_by) {
+      const RelationalCell& cell = input.rows[representative].cells[column];
       if (!AddBytes(EstimateCellBytes(cell), &row_bytes)) {
         return std::numeric_limits<size_t>::max();
       }
     }
-    if (group_bound != 0 &&
-        row_bytes > (std::numeric_limits<size_t>::max() - bytes) / group_bound) {
-      return std::numeric_limits<size_t>::max();
+    if (group_fragments.ValueOrDie() != 0 &&
+        row_bytes >
+            (std::numeric_limits<size_t>::max() - bytes) /
+                group_fragments.ValueOrDie()) {
+      return Status::ResourceExhausted("query", "temporal output byte overflow");
     }
-    bytes += row_bytes * group_bound;
+    bytes += row_bytes * group_fragments.ValueOrDie();
   }
   return bytes;
 }
@@ -1228,25 +1403,16 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
                                      "right interval is absent or invalid");
     }
   }
-  if (!input.left.rows.empty() && budget->limit_fragments() == 0) {
-    return TemporalBudgetExhausted(0, 0, 0, 0);
-  }
-  if (max_output_rows == 0 && !input.left.rows.empty()) {
-    return TemporalBudgetExhausted(0, 1, 0, budget->limit_fragments());
-  }
-
   size_t output_rows = 0;
   size_t output_bytes = sizeof(BatchStream);
   for (const RelationalRow& left : input.left.rows) {
-    size_t intersections = 0;
-    for (const RelationalRow& right : input.right.rows) {
-      if (!KeysEqual(left.cells[input.left_key],
-                     right.cells[input.right_key]) ||
-          !Intersect(*left.effective, *right.effective).has_value()) {
-        continue;
-      }
-      ++intersections;
-      if (input.kind == JoinKind::kInner) {
+    if (input.kind == JoinKind::kInner) {
+      for (const RelationalRow& right : input.right.rows) {
+        if (!KeysEqual(left.cells[input.left_key],
+                       right.cells[input.right_key]) ||
+            !Intersect(*left.effective, *right.effective).has_value()) {
+          continue;
+        }
         if (!AddBytes(EstimateCombinedRowBytes(left, right), &output_bytes) ||
             output_rows == std::numeric_limits<size_t>::max()) {
           return MemoryExhausted(std::numeric_limits<size_t>::max(),
@@ -1256,34 +1422,43 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
         }
         ++output_rows;
       }
-    }
-    if (input.kind != JoinKind::kInner) {
-      if (input.kind == JoinKind::kAnti &&
-          intersections == std::numeric_limits<size_t>::max()) {
+    } else {
+      auto fragments = CountCoverageFragments(
+          left, input.right, input.left_key, input.right_key, input.kind);
+      if (!fragments.ok()) return fragments.status();
+      if (fragments.ValueOrDie() >
+          std::numeric_limits<size_t>::max() - output_rows) {
         return MemoryExhausted(std::numeric_limits<size_t>::max(),
                                reservation == nullptr
                                    ? 0
                                    : AvailableBytes(*reservation));
       }
-      const size_t row_bound = input.kind == JoinKind::kSemi
-                                   ? intersections
-                                   : std::max(size_t{1}, intersections + 1);
-      for (size_t row = 0; row < row_bound; ++row) {
-        if (!AddBytes(EstimateRowBytes(left), &output_bytes) ||
-            output_rows == std::numeric_limits<size_t>::max()) {
-          return MemoryExhausted(std::numeric_limits<size_t>::max(),
-                                 reservation == nullptr
-                                     ? 0
-                                     : AvailableBytes(*reservation));
-        }
-        ++output_rows;
+      if (fragments.ValueOrDie() != 0 &&
+          EstimateRowBytes(left) >
+              (std::numeric_limits<size_t>::max() - output_bytes) /
+                  fragments.ValueOrDie()) {
+        return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                               reservation == nullptr
+                                   ? 0
+                                   : AvailableBytes(*reservation));
       }
+      output_rows += fragments.ValueOrDie();
+      output_bytes += EstimateRowBytes(left) * fragments.ValueOrDie();
     }
   }
   if (output_rows > max_output_rows) {
     return TemporalBudgetExhausted(0, output_rows, output_bytes,
                                    budget->limit_fragments(),
                                    "output row budget exceeded");
+  }
+  if (budget->limit_fragments() == 0 && output_rows != 0) {
+    return TemporalBudgetExhausted(0, output_rows, output_bytes, output_rows,
+                                   "interval fragment budget exceeded");
+  }
+  if (output_rows == 0) {
+    BatchStream empty;
+    empty.order_specified = true;
+    return empty;
   }
 
   size_t scratch_bytes = EstimateBytes(input.left);
@@ -1461,33 +1636,47 @@ StatusOr<BatchStream> TemporalAggregate(const TemporalAggregateInput& input,
       !status.ok()) {
     return status;
   }
-  if (!input.input.rows.empty() && budget->limit_fragments() == 0) {
-    return TemporalBudgetExhausted(0, 0, 0, 0);
-  }
-  if (max_output_rows == 0 && !input.input.rows.empty()) {
-    return TemporalBudgetExhausted(0, 1, 0, budget->limit_fragments());
-  }
-  if (input.input.rows.size() >
-          std::numeric_limits<size_t>::max() / 2 ||
-      input.input.rows.size() * 2 > max_output_rows) {
-    return TemporalBudgetExhausted(
-        0, input.input.rows.size() * 2, 0, budget->limit_fragments(),
-        "output row budget exceeded");
-  }
   const size_t scratch_bytes = EstimateGroupingScratch(
       input.input, input.group_by, 2 * sizeof(TemporalEvent));
-  if (reservation == nullptr) return MemoryExhausted(scratch_bytes, 0);
+  size_t output_rows = 0;
+  auto output_estimate = EstimateTemporalAggregateOutputBytesExact(
+      input.input, input.group_by, &output_rows);
+  if (!output_estimate.ok()) return output_estimate.status();
+  const size_t output_bytes = output_estimate.ValueOrDie();
+  if (output_rows > max_output_rows) {
+    return TemporalBudgetExhausted(0, output_rows, output_bytes,
+                                   budget->limit_fragments(),
+                                   "output row budget exceeded");
+  }
+  if (budget->limit_fragments() == 0 && output_rows != 0) {
+    return TemporalBudgetExhausted(0, output_rows, output_bytes,
+                                   output_rows,
+                                   "interval fragment budget exceeded");
+  }
+  if (output_rows == 0) {
+    BatchStream empty;
+    empty.order_specified = true;
+    return empty;
+  }
+  if (reservation == nullptr) {
+    return TemporalBudgetExhausted(scratch_bytes, 0, 0,
+                                   budget->limit_fragments(),
+                                   "memory budget exceeded");
+  }
   ReservationGuard scratch_guard(reservation, scratch_bytes);
   if (!scratch_guard.acquired()) {
-    return MemoryExhausted(scratch_bytes, AvailableBytes(*reservation));
+    return TemporalBudgetExhausted(scratch_bytes, 0, 0,
+                                   budget->limit_fragments(),
+                                   "memory budget exceeded");
   }
   auto groups = BuildGroups(input.input, input.group_by);
   if (!groups.ok()) return groups.status();
-  size_t output_rows = 0;
-  const size_t output_bytes =
-      EstimateTemporalAggregateOutputBytes(groups.ValueOrDie(), &output_rows);
   auto lease = RetainOutput(reservation, output_bytes, false);
-  if (!lease.ok()) return lease.status();
+  if (!lease.ok()) {
+    return TemporalBudgetExhausted(output_bytes, output_rows, output_bytes,
+                                   budget->limit_fragments(),
+                                   "memory budget exceeded");
+  }
   BatchStream result;
   result.order_specified = true;
   result.reservation_lease = std::move(lease).ConsumeValueOrDie();

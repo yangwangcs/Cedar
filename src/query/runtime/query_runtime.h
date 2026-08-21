@@ -59,6 +59,7 @@ struct PreparedQueryPlan {
         property_bindings(other.property_bindings),
         predicate(other.predicate),
         output_columns(other.output_columns),
+        effective_output_slot(other.effective_output_slot),
         referenced_properties(other.referenced_properties) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
@@ -69,6 +70,7 @@ struct PreparedQueryPlan {
     property_bindings = other.property_bindings;
     predicate = other.predicate;
     output_columns = other.output_columns;
+    effective_output_slot = other.effective_output_slot;
     referenced_properties = other.referenced_properties;
     relational_kind.reset();
     relational_input.reset();

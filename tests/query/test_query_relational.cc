@@ -421,6 +421,30 @@ TEST(RelationalTest, TemporalJoinPreflightsExactOutputRowsBeforeReservation) {
   EXPECT_EQ(reservation.peak_bytes(), 0U);
 }
 
+TEST(RelationalTest, TemporalAntiJoinAcceptsFullyCoveredLeftInterval) {
+  TemporalJoinInput input{{{TemporalRow(1, 0, 10)}},
+                          {{TemporalRow(1, 0, 10)}}, 0, 0, JoinKind::kAnti};
+  FragmentBudget fragments(0);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &fragments, &reservation);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_TRUE(result.ValueOrDie().rows.empty());
+  EXPECT_EQ(reservation.peak_bytes(), 0U);
+}
+
+TEST(RelationalTest, TemporalSemiJoinPreflightsCoalescedOutputRows) {
+  TemporalJoinInput input{{{TemporalRow(1, 0, 10)}},
+                          {{TemporalRow(1, 0, 7), TemporalRow(1, 5, 10)}},
+                          0, 0, JoinKind::kSemi};
+  FragmentBudget fragments(1);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &fragments, &reservation, 1);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(result.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+}
+
 TEST(RelationalTest,
      TemporalAggregatePreflightsExactOutputRowsBeforeReservation) {
   TemporalAggregateInput input{
@@ -431,6 +455,32 @@ TEST(RelationalTest,
   ASSERT_FALSE(result.ok());
   EXPECT_TRUE(result.status().IsResourceExhausted());
   EXPECT_EQ(reservation.peak_bytes(), 0U);
+}
+
+TEST(RelationalTest, TemporalAggregatePreflightsPublishedFragments) {
+  TemporalAggregateInput input{
+      BatchStream{{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}}, {0}};
+  FragmentBudget fragments(1);
+  QueryReservation reservation(1 << 20);
+  auto result = TemporalAggregate(input, &fragments, &reservation, 1);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(result.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+}
+
+TEST(RelationalTest, TemporalAggregateMemoryFailuresDiagnoseAllDimensions) {
+  TemporalAggregateInput input{
+      BatchStream{{TemporalRow(1, 0, 10)}}, {0}};
+  FragmentBudget fragments(8);
+  QueryReservation reservation(1);
+  auto result = TemporalAggregate(input, &fragments, &reservation);
+  ASSERT_FALSE(result.ok());
+  const std::string diagnostic = result.status().ToString();
+  EXPECT_NE(diagnostic.find("memory_bytes="), std::string::npos);
+  EXPECT_NE(diagnostic.find("output_rows="), std::string::npos);
+  EXPECT_NE(diagnostic.find("output_bytes="), std::string::npos);
+  EXPECT_NE(diagnostic.find("interval_fragments="), std::string::npos);
 }
 
 TEST(RelationalTest, TemporalBudgetFailuresDiagnoseAllDimensions) {
@@ -679,6 +729,22 @@ TEST(QueryRuntimeRelationalTest,
   EXPECT_NE(result.status().ToString().find("output row budget"),
             std::string::npos);
   EXPECT_EQ(reservation.peak_bytes(), 0U);
+}
+
+TEST(QueryRuntimeRelationalTest,
+     CopiedPlanRetainsEffectiveOutputSlotForIntervalMaterialization) {
+  PreparedQueryPlan original;
+  original.output_columns = {
+      {SlotId{1}, "key", QueryType::kInt64, false},
+      {SlotId{2}, "count", QueryType::kInt64, false},
+      {SlotId{3}, "effective", QueryType::kValidTimeInterval, false}};
+  original.effective_output_slot = SlotId{3};
+  PreparedQueryPlan copied = original;
+  EXPECT_EQ(copied.effective_output_slot, std::optional<SlotId>{SlotId{3}});
+  PreparedQueryPlan assigned;
+  assigned = original;
+  EXPECT_EQ(assigned.effective_output_slot,
+            std::optional<SlotId>{SlotId{3}});
 }
 
 }  // namespace

@@ -27,6 +27,8 @@ struct JourneyRequest {
       duration_at;
   std::optional<ValidTime> arrival_deadline;
   uint32_t max_hops = 0;
+  ExpandDirection direction = ExpandDirection::kOut;
+  std::optional<uint64_t> edge_type;
 };
 
 struct JourneyOptions {

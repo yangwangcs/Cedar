@@ -71,8 +71,8 @@ StatusOr<std::optional<ValidDuration>> PropertyDuration(
 StatusOr<std::vector<JourneyTraversal>> ExpandAt(
     Snapshot& snapshot, const JourneyRequest& request, VertexRef vertex,
     ValidTime arrival, const JourneyOptions& options) {
-  GraphExpansionRequest graph{{vertex}, request.interval, ExpandDirection::kOut,
-                              std::nullopt};
+  GraphExpansionRequest graph{{vertex}, request.interval, request.direction,
+                              request.edge_type};
   GraphFrontierOptions graph_options;
   graph_options.reservation = nullptr;
   graph_options.delta = options.delta;
@@ -85,20 +85,34 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
   if (!expanded.ok()) return expanded.status();
   std::vector<JourneyTraversal> result;
   for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
-    if (traversal.source != vertex) continue;
+    TemporalTraversal oriented = traversal;
+    if (request.direction == ExpandDirection::kOut) {
+      if (traversal.source != vertex) continue;
+    } else if (request.direction == ExpandDirection::kIn) {
+      if (traversal.target != vertex) continue;
+      oriented.source = traversal.target;
+      oriented.target = traversal.source;
+    } else if (traversal.source == vertex) {
+      // Already oriented for an outbound move.
+    } else if (traversal.target == vertex) {
+      oriented.source = traversal.target;
+      oriented.target = traversal.source;
+    } else {
+      continue;
+    }
     ValidTime departure = arrival;
-    if (departure.value < traversal.effective.from.value)
-      departure = traversal.effective.from;
-    auto duration = PropertyDuration(snapshot, traversal.edge, departure, request);
+    if (departure.value < oriented.effective.from.value)
+      departure = oriented.effective.from;
+    auto duration = PropertyDuration(snapshot, oriented.edge, departure, request);
     if (!duration.ok()) return duration.status();
     if (!duration.ValueOrDie()) continue;
     auto end = AddDuration(departure, *duration.ValueOrDie());
     if (!end.ok()) return end.status();
-    if (!TraversalFits(traversal.effective, departure, *duration.ValueOrDie()))
+    if (!TraversalFits(oriented.effective, departure, *duration.ValueOrDie()))
       continue;
     if (request.interval.to && end.ValueOrDie().value >= request.interval.to->value)
       continue;
-    result.push_back({traversal, departure, end.ValueOrDie(), *duration.ValueOrDie()});
+    result.push_back({oriented, departure, end.ValueOrDie(), *duration.ValueOrDie()});
   }
   return result;
 }

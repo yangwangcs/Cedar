@@ -585,25 +585,30 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
       journey_request.interval = interval.ValueOrDie();
       journey_request.duration_property = plan.graph_duration_property;
       journey_request.max_hops = plan.graph_k_hops;
+      journey_request.direction = plan.graph_expand->direction;
+      journey_request.edge_type = plan.graph_expand->edge_type;
       journey_request.objective = static_cast<internal::JourneyObjective>(plan.graph_journey - 1);
-      auto discovered = internal::ExpandTemporal(snapshot,
+      internal::GraphFrontierOptions discovery_options = options;
+      discovery_options.reservation = nullptr;
+      auto discovered = internal::KHopExpand(
+          snapshot,
           internal::GraphExpansionRequest{{vertex}, interval.ValueOrDie(),
-                                           ExpandDirection::kOut, std::nullopt},
-          internal::GraphFrontierOptions{nullptr, delta, plan.graph_k_hops,
-                                         {}, snapshot.adjacency_index(),
-                                         options.projection_generation,
-                                         check_abort});
+                                           plan.graph_expand->direction,
+                                           plan.graph_expand->edge_type},
+          discovery_options);
       if (!discovered.ok()) return discovered.status();
       std::set<VertexRef, std::function<bool(const VertexRef&, const VertexRef&)>> targets(
           [](const VertexRef& a, const VertexRef& b) { return std::tie(a.part_id.value, a.vertex_id.value) < std::tie(b.part_id.value, b.vertex_id.value); });
-      for (const auto& traversal : discovered.ValueOrDie()) targets.insert(traversal.target);
+      for (const auto& label : discovered.ValueOrDie().labels) {
+        if (label.depth != 0) targets.insert(label.vertex);
+      }
       for (const VertexRef& target : targets) {
         journey_request.target = target;
         auto journey = internal::FindJourney(snapshot, journey_request,
                                              internal::JourneyOptions{reservation, delta,
-                                                                      snapshot.adjacency_index(),
-                                                                      options.projection_generation,
-                                                                      check_abort,
+                                                                     snapshot.adjacency_index(),
+                                                                     options.projection_generation,
+                                                                     check_abort,
                                                                       0});
         if (!journey.ok()) {
           if (journey.status().IsNotFound()) continue;

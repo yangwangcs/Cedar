@@ -149,5 +149,32 @@ TEST(TemporalJourneyTest, CallbackNonFifoIsRejectedBeforeEarliestSearch) {
       << journey.status().ToString();
 }
 
+TEST(TemporalJourneyTest, WaitingCannotCrossSourceVisibilityGap) {
+  JourneyFixture graph;
+  graph.Vertex(graph.b); graph.Vertex(graph.d);
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EntityFact::Vertex(graph.a), ValidTime{0});
+    if (!status.ok()) return status;
+    status = txn.Retract(EntityFact::Vertex(graph.a), ValidTime{3});
+    if (!status.ok()) return status;
+    status = txn.Assert(EntityFact::Vertex(graph.a), ValidTime{5});
+    if (!status.ok()) return status;
+    return txn.Retract(EntityFact::Vertex(graph.a), ValidTime{20});
+  });
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{41}}, graph.a, graph.b, 5, 20);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.b, {ValidTime{0}, ValidTime{20}},
+                         JourneyObjective::kEarliestArrival};
+  request.duration_at = [](EdgeRef, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{1}};
+  };
+  auto journey = EarliestArrival(snapshot.ValueOrDie(), request);
+  ASSERT_FALSE(journey.ok());
+  EXPECT_TRUE(journey.status().IsNotFound())
+      << journey.status().ToString();
+}
+
 }  // namespace
 }  // namespace cedar::internal

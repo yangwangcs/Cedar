@@ -29,6 +29,41 @@ Status Charge(const JourneyOptions& options) {
   return options.reservation->ReserveGraphLabels(1);
 }
 
+StatusOr<std::vector<StateInterval>> VertexIntervals(
+    Snapshot& snapshot, VertexRef vertex, const QueryDeltaView* delta) {
+  const FactRef ref = EntityFact::Vertex(vertex).ref();
+  std::vector<FactEvent> events;
+  FactScanSpec spec;
+  spec.part_id = ref.part_id();
+  spec.family = ref.family();
+  spec.property_id = ref.property_id();
+  spec.entity_id_min = ref.entity_id();
+  spec.entity_id_max = ref.entity_id();
+  Status scanned = snapshot.EventScan(spec, [&events](const FactEventBatch& batch) {
+    events.insert(events.end(), batch.events.begin(), batch.events.end());
+    return Status::OK();
+  });
+  if (!scanned.ok()) return scanned;
+  if (delta != nullptr) {
+    auto tail = delta->EventsFor(ref);
+    events.insert(events.end(), tail.begin(), tail.end());
+  }
+  auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
+  if (!corrected.ok()) return corrected.status();
+  return MaterializePresentState(corrected.ValueOrDie());
+}
+
+bool CoversWaitingInterval(const std::vector<StateInterval>& intervals,
+                           ValidTime arrival, ValidTime departure) {
+  if (arrival.value >= departure.value) return true;
+  for (const StateInterval& interval : intervals) {
+    if (interval.interval.from.value > arrival.value) continue;
+    if (!interval.interval.to || departure.value <= interval.interval.to->value)
+      return true;
+  }
+  return false;
+}
+
 Status ValidateCallbackFifo(const JourneyRequest& request,
                             const TemporalTraversal& traversal) {
   if (!request.duration_at) return Status::OK();
@@ -158,6 +193,15 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
     ValidTime departure = arrival;
     if (departure.value < oriented.effective.from.value)
       departure = oriented.effective.from;
+    if (departure.value > arrival.value) {
+      auto source_intervals = VertexIntervals(snapshot, oriented.source,
+                                              options.delta);
+      if (!source_intervals.ok()) return source_intervals.status();
+      if (!CoversWaitingInterval(source_intervals.ValueOrDie(), arrival,
+                                 departure)) {
+        continue;
+      }
+    }
     auto duration = PropertyDuration(snapshot, oriented.edge, departure, request,
                                      options.delta);
     if (!duration.ok()) return duration.status();

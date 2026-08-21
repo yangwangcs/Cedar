@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "cedar/database.h"
+#include "cedar/query.h"
 #include "cedar/snapshot.h"
 #include "cedar/storage_files.h"
 #include "cedar/transaction.h"
@@ -19,6 +20,10 @@ static_assert(!std::is_copy_constructible_v<Snapshot>);
 static_assert(!std::is_copy_constructible_v<Transaction>);
 static_assert(std::is_move_constructible_v<Snapshot>);
 static_assert(std::is_move_constructible_v<Transaction>);
+static_assert(std::is_copy_constructible_v<PreparedQuery>);
+static_assert(std::is_copy_assignable_v<PreparedQuery>);
+static_assert(!std::is_copy_constructible_v<QueryCursor>);
+static_assert(std::is_move_constructible_v<QueryCursor>);
 
 template <typename T>
 concept HasLegacyPut = requires(T& value) {

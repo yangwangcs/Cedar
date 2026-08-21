@@ -1550,6 +1550,32 @@ StatusOr<PropertyDefinition> Database::RegisterProperty(
   return impl_->store.RegisterProperty(std::move(definition));
 }
 
+Status Database::Impl::ValidatePreparedQuery(
+    CommitSeq snapshot_seq,
+    const std::vector<PropertyDefinition>& schema_fingerprint) const {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (closed || closing) {
+    return Status::ShutdownInProgress("query", "database is closing or closed");
+  }
+  auto current_snapshot = store.BeginSnapshot();
+  if (!current_snapshot.ok()) return current_snapshot.status();
+  if (snapshot_seq.value <
+      current_snapshot.ValueOrDie().oldest_readable_seq().value) {
+    return Status::SnapshotExpired(
+        "query", "snapshot is below durable retention boundary");
+  }
+  for (const PropertyDefinition& expected : schema_fingerprint) {
+    const auto current = store.LookupProperty(expected.property_id);
+    if (!current.ok()) return current.status();
+    if (!current.ValueOrDie().has_value() ||
+        *current.ValueOrDie() != expected) {
+      return Status::SchemaMismatch(
+          "query", "referenced property schema has changed");
+    }
+  }
+  return Status::OK();
+}
+
 Status Database::Vacuum(CommitSeq oldest_readable) {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   std::lock_guard<std::mutex> lock(impl_->mutex);

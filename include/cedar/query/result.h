@@ -1,0 +1,131 @@
+// Copyright 2026 The Cedar Authors
+// Licensed under the Apache License, Version 2.0.
+
+#ifndef CEDAR_QUERY_RESULT_H_
+#define CEDAR_QUERY_RESULT_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <variant>
+#include <vector>
+
+#include "cedar/core/status.h"
+#include "cedar/query/types.h"
+
+namespace cedar {
+
+class Database;
+class Snapshot;
+template <typename T, bool Optional>
+class Slot;
+template <typename T>
+constexpr QueryType QueryTypeOf();
+
+namespace internal {
+class QueryRuntime;
+}
+
+using QueryColumnVector = std::variant<
+    std::vector<uint8_t>, std::vector<int32_t>, std::vector<int64_t>,
+    std::vector<float>, std::vector<double>, std::vector<uint64_t>,
+    std::vector<std::string>, std::vector<VertexRef>, std::vector<EdgeRef>,
+    std::vector<ValidTime>, std::vector<ValidDuration>,
+    std::vector<CommitSeq>, std::vector<ValidTimeInterval>>;
+
+struct QueryColumn {
+  SlotId slot;
+  QueryType type;
+  QueryColumnVector values;
+  std::vector<uint8_t> present;
+};
+
+class QueryBatch {
+ public:
+  size_t row_count() const { return row_count_; }
+  const std::vector<QueryColumn>& columns() const { return columns_; }
+
+  template <typename T, bool Optional>
+  T Get(const Slot<T, Optional>& slot, size_t row) const {
+    if (row >= row_count_) throw std::out_of_range("query row");
+    for (const QueryColumn& column : columns_) {
+      if (column.slot != slot.id()) continue;
+      if (column.type != QueryTypeOf<T>()) {
+        throw std::invalid_argument("query slot type mismatch");
+      }
+      if (!column.present.empty() && column.present.at(row) == 0) {
+        throw std::invalid_argument("query value is absent");
+      }
+      if constexpr (std::is_same_v<T, bool>) {
+        return std::get<std::vector<uint8_t>>(column.values).at(row) != 0;
+      } else if constexpr (std::is_same_v<T, Timestamp64>) {
+        return Timestamp64{
+            std::get<std::vector<uint64_t>>(column.values).at(row)};
+      } else if constexpr (std::is_same_v<T, Binary>) {
+        return Binary{std::get<std::vector<std::string>>(column.values).at(row)};
+      } else {
+        return std::get<std::vector<T>>(column.values).at(row);
+      }
+    }
+    throw std::out_of_range("query slot");
+  }
+
+ private:
+  QueryBatch(size_t row_count, std::vector<QueryColumn> columns)
+      : row_count_(row_count), columns_(std::move(columns)) {}
+
+  size_t row_count_ = 0;
+  std::vector<QueryColumn> columns_;
+
+  friend class QueryCursor;
+  friend class internal::QueryRuntime;
+};
+
+class QueryCursor {
+ public:
+  ~QueryCursor();
+  QueryCursor(QueryCursor&&) noexcept;
+  QueryCursor& operator=(QueryCursor&&) noexcept;
+
+  QueryCursor(const QueryCursor&) = delete;
+  QueryCursor& operator=(const QueryCursor&) = delete;
+
+  StatusOr<std::optional<QueryBatch>> Next();
+  Status Close();
+
+ private:
+  class State;
+  explicit QueryCursor(std::unique_ptr<State> state);
+
+  std::unique_ptr<State> state_;
+
+  friend class internal::QueryRuntime;
+};
+
+class PreparedQuery {
+ public:
+  PreparedQuery(const PreparedQuery&) = default;
+  PreparedQuery& operator=(const PreparedQuery&) = default;
+  PreparedQuery(PreparedQuery&&) noexcept = default;
+  PreparedQuery& operator=(PreparedQuery&&) noexcept = default;
+
+  StatusOr<QueryCursor> Execute(Snapshot snapshot, const Bindings& bindings,
+                                const QueryOptions& options) const;
+
+ private:
+  class State;
+  explicit PreparedQuery(std::shared_ptr<const State> state)
+      : state_(std::move(state)) {}
+
+  std::shared_ptr<const State> state_;
+
+  friend class Database;
+};
+
+}  // namespace cedar
+
+#endif  // CEDAR_QUERY_RESULT_H_

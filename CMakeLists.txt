@@ -58,6 +58,9 @@ add_library(cedar_core STATIC
     src/query/temporal/corrected_chain.cc
     src/query/logical/expression.cc
     src/query/logical/logical_plan.cc
+    src/query/query_api.cc
+    src/query/runtime/canonical_source.cc
+    src/query/runtime/query_runtime.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

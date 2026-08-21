@@ -13,6 +13,7 @@
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
+#include "cedar/query/result.h"
 #include "cedar/schema.h"
 #include "cedar/snapshot.h"
 #include "cedar/runtime/pressure_controller.h"
@@ -22,6 +23,8 @@
 #include "cedar/transaction.h"
 
 namespace cedar {
+
+class Query;
 
 struct CommitLatencyHistogram {
   static constexpr size_t kBucketCount = 13;
@@ -210,6 +213,7 @@ class Database {
   StatusOr<std::unique_ptr<Transaction>> BeginTransaction(
       TransactionOptions options = {});
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
+  StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
   CommitPipelineMetrics GetCommitPipelineMetrics() const;
   StatusOr<RuntimeMetrics> SampleRuntimeMetrics() const;
@@ -223,6 +227,7 @@ class Database {
 
   friend class Snapshot;
   friend class Transaction;
+  friend class PreparedQuery;
 };
 
 }  // namespace cedar

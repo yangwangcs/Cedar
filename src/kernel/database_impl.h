@@ -222,6 +222,9 @@ class Database::Impl {
       shutdown_stage_observer_for_testing(stage);
     }
   }
+  Status ValidatePreparedQuery(
+      CommitSeq snapshot_seq,
+      const std::vector<PropertyDefinition>& schema_fingerprint) const;
 
   mutable std::mutex mutex;
   std::condition_variable commits_drained;

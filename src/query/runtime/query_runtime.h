@@ -57,6 +57,7 @@ struct PreparedQueryPlan {
   std::vector<PreparedPropertyBinding> property_bindings;
   std::shared_ptr<const ExpressionNode> predicate;
   std::vector<RowColumn> output_columns;
+  std::optional<SlotId> effective_output_slot;
   std::vector<PropertyId> referenced_properties;
   std::optional<LogicalOpKind> relational_kind;
   std::optional<RuntimeRelationalInput> relational_input;

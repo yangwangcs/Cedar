@@ -314,6 +314,11 @@ QueryColumnVector EmptyColumn(QueryType type) {
   }
 }
 
+void ReserveColumn(QueryColumn* column, size_t rows) {
+  std::visit([rows](auto& values) { values.reserve(rows); }, column->values);
+  column->present.reserve(rows);
+}
+
 template <typename T>
 void Append(QueryColumn* column, T value, bool present) {
   std::get<std::vector<T>>(column->values).push_back(std::move(value));
@@ -366,6 +371,7 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
   for (const RowColumn& output : plan.output_columns) {
     columns.push_back(
         QueryColumn{output.slot, output.type, EmptyColumn(output.type), {}});
+    ReserveColumn(&columns.back(), count);
   }
   for (size_t index = offset; index < offset + count; ++index) {
     const RuntimeRow& row = rows[index];
@@ -465,18 +471,19 @@ Status AppendRelationalCell(QueryColumn* column,
 
 std::optional<size_t> EffectiveOutputColumn(
     const internal::RelationalRow& row,
-    const std::vector<RowColumn>& output_columns) {
-  if (!row.effective.has_value() ||
+    const std::vector<RowColumn>& output_columns,
+    std::optional<SlotId> effective_output_slot) {
+  if (!row.effective.has_value() || !effective_output_slot.has_value() ||
       row.cells.size() + 1 != output_columns.size()) {
     return std::nullopt;
   }
-  std::optional<size_t> effective_column;
   for (size_t column = 0; column < output_columns.size(); ++column) {
-    if (output_columns[column].type != QueryType::kValidTimeInterval) continue;
-    if (effective_column.has_value()) return std::nullopt;
-    effective_column = column;
+    if (output_columns[column].slot != *effective_output_slot) continue;
+    return output_columns[column].type == QueryType::kValidTimeInterval
+               ? std::optional<size_t>{column}
+               : std::nullopt;
   }
-  return effective_column;
+  return std::nullopt;
 }
 
 size_t RelationalValueBytes(const internal::RelationalCell& cell) {
@@ -497,7 +504,8 @@ size_t RelationalValueBytes(const internal::RelationalCell& cell) {
 
 StatusOr<size_t> EstimateRelationalBatchBytes(
     const internal::BatchStream& stream,
-    const std::vector<RowColumn>& output_columns) {
+    const std::vector<RowColumn>& output_columns,
+    std::optional<SlotId> effective_output_slot) {
   constexpr size_t kBatchRows = 1024;
   const size_t batch_count =
       stream.rows.empty() ? 0 : (stream.rows.size() - 1) / kBatchRows + 1;
@@ -518,7 +526,7 @@ StatusOr<size_t> EstimateRelationalBatchBytes(
   bytes += batch_count * output_columns.size() * sizeof(QueryColumn);
   for (const internal::RelationalRow& row : stream.rows) {
     const std::optional<size_t> effective_column =
-        EffectiveOutputColumn(row, output_columns);
+        EffectiveOutputColumn(row, output_columns, effective_output_slot);
     if (row.cells.size() != output_columns.size() &&
         !effective_column.has_value()) {
       return Status::InvalidArgument("query runtime",
@@ -544,17 +552,19 @@ StatusOr<size_t> EstimateRelationalBatchBytes(
 
 StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
     const internal::BatchStream& stream, size_t offset, size_t count,
-    const std::vector<RowColumn>& output_columns) {
+    const std::vector<RowColumn>& output_columns,
+    std::optional<SlotId> effective_output_slot) {
   std::vector<QueryColumn> columns;
   columns.reserve(output_columns.size());
   for (const RowColumn& output : output_columns) {
     columns.push_back(
         QueryColumn{output.slot, output.type, EmptyColumn(output.type), {}});
+    ReserveColumn(&columns.back(), count);
   }
   for (size_t row_index = offset; row_index < offset + count; ++row_index) {
     const internal::RelationalRow& row = stream.rows[row_index];
     const std::optional<size_t> effective_column =
-        EffectiveOutputColumn(row, output_columns);
+        EffectiveOutputColumn(row, output_columns, effective_output_slot);
     if (row.cells.size() != columns.size() && !effective_column.has_value()) {
       return Status::InvalidArgument("query runtime",
                                      "relational output schema differs");
@@ -646,7 +656,8 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
         return *state_->terminal_error;
       }
       auto materialized_bytes =
-          EstimateRelationalBatchBytes(stream, state_->plan.output_columns);
+          EstimateRelationalBatchBytes(stream, state_->plan.output_columns,
+                                       state_->plan.effective_output_slot);
       if (!materialized_bytes.ok()) {
         state_->terminal_error = materialized_bytes.status();
         state_->snapshot.reset();
@@ -680,14 +691,16 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       for (size_t offset = 0; offset < stream.rows.size(); offset += kBatchRows) {
         const size_t count = std::min(kBatchRows, stream.rows.size() - offset);
         auto columns = BuildRelationalColumns(
-            stream, offset, count, state_->plan.output_columns);
+            stream, offset, count, state_->plan.output_columns,
+            state_->plan.effective_output_slot);
         if (!columns.ok()) {
           state_->terminal_error = columns.status();
           state_->snapshot.reset();
           return *state_->terminal_error;
         }
         state_->batches.emplace_back(
-            QueryBatch(count, std::move(columns).ConsumeValueOrDie()));
+            QueryBatch(count, std::move(columns).ConsumeValueOrDie(),
+                       state_->materialized_output_lease));
       }
     } else {
     auto rows = MaterializeRows(*state_->snapshot, state_->plan);

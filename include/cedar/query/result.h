@@ -75,11 +75,15 @@ class QueryBatch {
   }
 
  private:
-  QueryBatch(size_t row_count, std::vector<QueryColumn> columns)
-      : row_count_(row_count), columns_(std::move(columns)) {}
+  QueryBatch(size_t row_count, std::vector<QueryColumn> columns,
+             std::shared_ptr<void> lifetime_guard = {})
+      : row_count_(row_count), columns_(std::move(columns)),
+        lifetime_guard_(std::move(lifetime_guard)) {}
 
   size_t row_count_ = 0;
   std::vector<QueryColumn> columns_;
+  // Keeps Cedar-owned decoded-buffer accounting alive after cursor Close().
+  std::shared_ptr<void> lifetime_guard_;
 
   friend class QueryCursor;
   friend class internal::QueryRuntime;

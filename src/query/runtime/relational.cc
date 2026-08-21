@@ -569,6 +569,26 @@ Status Publish(RelationalRow row, FragmentBudget* budget,
   return Status::OK();
 }
 
+void SortAndCoalesceTemporalRows(std::vector<RelationalRow>* rows,
+                                 size_t key_column) {
+  StableInsertionSort(rows, [key_column](const RelationalRow& left,
+                                         const RelationalRow& right) {
+    return TemporalRowLess(left, right, key_column);
+  });
+  size_t output = 0;
+  for (size_t input = 0; input < rows->size(); ++input) {
+    if (output != 0 && (*rows)[output - 1].cells == (*rows)[input].cells &&
+        (*rows)[output - 1].effective->to.has_value() &&
+        *(*rows)[output - 1].effective->to == (*rows)[input].effective->from) {
+      (*rows)[output - 1].effective->to = (*rows)[input].effective->to;
+      continue;
+    }
+    if (output != input) (*rows)[output] = std::move((*rows)[input]);
+    ++output;
+  }
+  rows->resize(output);
+}
+
 std::vector<ValidTimeInterval> NormalizeIntervals(
     std::vector<ValidTimeInterval> intervals) {
   std::sort(intervals.begin(), intervals.end(), [](const auto& left,
@@ -1189,6 +1209,9 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
                                      "right interval is absent or invalid");
     }
   }
+  if (!input.left.rows.empty() && budget->limit_fragments() == 0) {
+    return Status::ResourceExhausted("query", "interval_fragments=0");
+  }
 
   size_t output_rows = 0;
   size_t output_bytes = sizeof(BatchStream);
@@ -1341,6 +1364,7 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
       }
     }
   }
+  SortAndCoalesceTemporalRows(&result.rows, input.left_key);
   return result;
 }
 
@@ -1393,6 +1417,9 @@ StatusOr<BatchStream> TemporalAggregate(const TemporalAggregateInput& input,
   if (Status status = ValidateGroupBy(input.input, input.group_by);
       !status.ok()) {
     return status;
+  }
+  if (!input.input.rows.empty() && budget->limit_fragments() == 0) {
+    return Status::ResourceExhausted("query", "interval_fragments=0");
   }
   const size_t scratch_bytes = EstimateGroupingScratch(
       input.input, input.group_by, 2 * sizeof(TemporalEvent));

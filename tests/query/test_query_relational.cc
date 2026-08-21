@@ -339,6 +339,49 @@ TEST(RelationalTest, IntervalMergeEstablishesKeyAndEffectiveTimeOrder) {
             (ValidTimeInterval{ValidTime{20}, ValidTime{30}}));
 }
 
+TEST(RelationalTest, IntervalMergeGloballyOrdersInterleavedOverlaps) {
+  TemporalJoinInput input{
+      {{TemporalRow(1, 10, 80, 1), TemporalRow(1, 55, 70, 2)}},
+      {{TemporalRow(1, 10, 60, 10), TemporalRow(1, 70, 80, 20)}}, 0, 0,
+      JoinKind::kInner};
+  FragmentBudget budget(8);
+  QueryReservation reservation(1 << 20);
+
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
+
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_TRUE(result.ValueOrDie().order_specified);
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 3U);
+  EXPECT_EQ(result.ValueOrDie().rows[0].effective,
+            (ValidTimeInterval{ValidTime{10}, ValidTime{60}}));
+  EXPECT_EQ(result.ValueOrDie().rows[1].effective,
+            (ValidTimeInterval{ValidTime{55}, ValidTime{60}}));
+  EXPECT_EQ(result.ValueOrDie().rows[2].effective,
+            (ValidTimeInterval{ValidTime{70}, ValidTime{80}}));
+}
+
+TEST(RelationalTest, TemporalOperatorsRejectZeroFragmentsBeforeOutputReserve) {
+  TemporalJoinInput join_input{{{TemporalRow(1, 0, 10)}},
+                               {{TemporalRow(1, 0, 10)}}, 0, 0,
+                               JoinKind::kInner};
+  FragmentBudget no_fragments(0);
+  QueryReservation join_reservation(1 << 20);
+  auto join = IntervalMergeJoin(join_input, &no_fragments, &join_reservation);
+  ASSERT_FALSE(join.ok());
+  EXPECT_TRUE(join.status().IsResourceExhausted());
+  EXPECT_EQ(join_reservation.peak_bytes(), 0U);
+
+  TemporalAggregateInput aggregate_input{
+      BatchStream{{TemporalRow(1, 0, 10)}}, {0}};
+  FragmentBudget aggregate_no_fragments(0);
+  QueryReservation aggregate_reservation(1 << 20);
+  auto aggregate = TemporalAggregate(aggregate_input, &aggregate_no_fragments,
+                                     &aggregate_reservation);
+  ASSERT_FALSE(aggregate.ok());
+  EXPECT_TRUE(aggregate.status().IsResourceExhausted());
+  EXPECT_EQ(aggregate_reservation.peak_bytes(), 0U);
+}
+
 TEST(RelationalTest, TemporalAntiJoinDerivesMissingFragments) {
   TemporalJoinInput input{{{TemporalRow(1, 0, 20)}},
                           {{TemporalRow(1, 5, 10), TemporalRow(1, 15, 20)}},
@@ -607,6 +650,7 @@ TEST(QueryRuntimeRelationalTest,
       Slot<ValidTimeInterval>::WithId(SlotId{3}, "effective");
   plan.output_columns = {Project(key).column, Project(count).column,
                          Project(effective).column};
+  plan.effective_output_slot = effective.id();
 
   auto cursor = QueryRuntime::Execute(
       plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});

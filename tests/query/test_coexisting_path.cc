@@ -6,6 +6,8 @@
 #include <cstdlib>
 
 #include "cedar/database.h"
+#include "cedar/query/query.h"
+#include "cedar/query/result.h"
 #include "cedar/transaction.h"
 #include "query/runtime/graph_frontier.h"
 
@@ -163,6 +165,73 @@ TEST(CoexistingPathTest, PathColumnOffsetsDecodeUnequalVertexAndEdgeLengths) {
   EXPECT_EQ(column.row_offsets, column.vertex_offsets);
   EXPECT_EQ(column.Value(0), one);
   EXPECT_EQ(column.Value(1), two);
+}
+
+TEST(CoexistingPathTest, PublicQueryMaterializesPathAndChargesSurvivorsOnce) {
+  GraphFixture graph;
+  graph.Vertex(graph.a);
+  graph.Vertex(graph.b);
+  const EdgeRef edge{PartId{0}, EdgeId{81}};
+  graph.Edge({edge, graph.a, graph.b, 1}, 0, 20);
+
+  const auto vertex = Slot<VertexRef>::Named("vertex");
+  const auto edge_slot = Slot<EdgeRef>::Named("edge");
+  const auto destination = Slot<VertexRef>::Named("destination");
+  const auto path = Slot<PathValue>::Named("path");
+  auto source = Query::Vertices(
+      vertex, History{ValidTimeInterval{ValidTime{0}, ValidTime{20}}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().CoexistingShortestPath(
+      ExpandSpec{vertex, edge_slot, destination, ExpandDirection::kOut}, 1,
+      path);
+  ASSERT_TRUE(query.ok());
+  auto prepared = graph.database->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  QueryOptions options;
+  options.budget.graph_labels = 2;
+  options.budget.interval_fragments = 2;
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  const PathValue expected{{graph.a, graph.b}, {edge},
+                           ValidTimeInterval{ValidTime{0}, ValidTime{20}}};
+  EXPECT_EQ(batch.ValueOrDie()->Get<PathValue>(path, 0), expected);
+  EXPECT_THROW(
+      batch.ValueOrDie()->Get<PathValue>(
+          Slot<PathValue>::WithId(vertex.id(), "wrong_type"), 0),
+      std::invalid_argument);
+}
+
+TEST(CoexistingPathTest, PublicQueryReturnsEmptyCursorWhenTargetIsAbsent) {
+  GraphFixture graph;
+  graph.Vertex(graph.a);
+  graph.Vertex(graph.b);
+  const auto vertex = Slot<VertexRef>::Named("vertex");
+  const auto edge_slot = Slot<EdgeRef>::Named("edge");
+  const auto destination = Slot<VertexRef>::Named("destination");
+  const auto path = Slot<PathValue>::Named("path");
+  auto source = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().CoexistingShortestPath(
+      ExpandSpec{vertex, edge_slot, destination, ExpandDirection::kOut}, 1,
+      path);
+  ASSERT_TRUE(query.ok());
+  auto prepared = graph.database->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  EXPECT_FALSE(batch.ValueOrDie().has_value());
 }
 
 }  // namespace cedar::internal

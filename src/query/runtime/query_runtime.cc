@@ -576,7 +576,12 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
                                             plan.graph_expand->direction,
                                             plan.graph_expand->edge_type};
     if (plan.graph_coexisting) {
-      auto expanded = ExpandTemporal(snapshot, request, options);
+      // Candidate discovery must not consume the live label/fragment
+      // reservation. CoexistingShortestPath charges only its surviving
+      // labels, so charging raw traversals here would count each edge twice.
+      internal::GraphFrontierOptions discovery_options = options;
+      discovery_options.reservation = nullptr;
+      auto expanded = ExpandTemporal(snapshot, request, discovery_options);
       if (!expanded.ok()) return expanded.status();
       std::vector<VertexRef> targets;
       for (const auto& traversal : expanded.ValueOrDie()) {

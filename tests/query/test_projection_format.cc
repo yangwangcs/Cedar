@@ -316,6 +316,17 @@ TEST(ProjectionFormatTest, AdjacencyBuildsAndUsesBloomMask) {
   EXPECT_FALSE(PageMayContainEntity(page, 7));
 }
 
+TEST(ProjectionFormatTest, RejectsColumnCopiesPastAllocationBudget) {
+  ProjectionChain chain = Fixture();
+  for (size_t i = 0; i < 32; ++i)
+    chain.intervals.push_back({{ValidTime{31 + i}, ValidTime{32 + i}}, Value::String(std::string(128, 'x')), 42});
+  auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok());
+  auto decoded = DecodeProjectionPage(encoded.ValueOrDie(), 512);
+  ASSERT_FALSE(decoded.ok());
+  EXPECT_TRUE(decoded.status().IsResourceExhausted());
+}
+
 TEST(ProjectionFormatTest, EncodesMultiplePagesAndRejectsTruncatedDirectory) {
   ProjectionChain chain = Fixture();
   chain.page_directory.resize(2);

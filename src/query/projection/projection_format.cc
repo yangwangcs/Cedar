@@ -53,6 +53,15 @@ bool GetBlob(const std::string& in, size_t* at, std::string* blob) {
   uint32_t n = 0; if (!G32(in, at, &n) || *at > in.size() || n > in.size() - *at) return false;
   *blob = in.substr(*at, n); *at += n; return true;
 }
+bool GetBlobBudget(const std::string& in, size_t* at, std::string* blob,
+                   size_t limit, size_t* used) {
+  uint32_t n = 0;
+  if (!G32(in, at, &n) || *at > in.size() || n > in.size() - *at) return false;
+  size_t remaining = limit - std::min(limit, *used);
+  if (n > remaining) return false;
+  *used += n;
+  *blob = in.substr(*at, n); *at += n; return true;
+}
 std::string EncodeRle(const std::vector<uint32_t>& values) {
   std::string out;
   for (size_t i = 0; i < values.size();) { size_t j = i + 1; while (j < values.size() && values[j] == values[i]) ++j; P32(&out, values[i]); P32(&out, uint32_t(j - i)); i = j; }
@@ -96,6 +105,9 @@ Status DecodePayload(const std::string& s, size_t row_limit, size_t* allocation_
   if (ni > row_limit / sizeof(ProjectionInterval) || nb > row_limit / sizeof(ProjectionBoundary) ||
       nd > row_limit / sizeof(Value))
     return Status::ResourceExhausted("projection", "decoded rows exceed budget");
+  size_t reserve_cost = size_t(nd) * (sizeof(Value) + sizeof(size_t));
+  if (reserve_cost > row_limit - std::min(row_limit, *allocation_used)) return Status::ResourceExhausted("projection", "dictionary capacity exceeds budget");
+  *allocation_used += reserve_cost;
   std::vector<Value> dictionary; std::vector<size_t> dictionary_sizes; dictionary.reserve(nd); dictionary_sizes.reserve(nd);
   for (uint32_t n = 0; n < nd; ++n) {
     std::string encoded; if (!GetBlob(s, &p, &encoded)) return Status::Corruption("projection", "invalid value dictionary");
@@ -104,7 +116,7 @@ Status DecodePayload(const std::string& s, size_t row_limit, size_t* allocation_
     auto value = Value::Decode(encoded); if (!value) return Status::Corruption("projection", "invalid dictionary value"); dictionary.push_back(*value); dictionary_sizes.push_back(encoded.size()); *allocation_used += value_cost;
   }
   std::string presence, operations, ie, it, ito, irle, be, bt, brle;
-  if (!GetBlob(s, &p, &presence) || !GetBlob(s, &p, &operations) || !GetBlob(s, &p, &ie) || !GetBlob(s, &p, &it) || !GetBlob(s, &p, &ito) || !GetBlob(s, &p, &irle) || !GetBlob(s, &p, &be) || !GetBlob(s, &p, &bt) || !GetBlob(s, &p, &brle) || presence.size() != (ni + 7) / 8 || operations.size() != (nb + 7) / 8) return Status::Corruption("projection", "invalid column stream");
+  if (!GetBlobBudget(s, &p, &presence, row_limit, allocation_used) || !GetBlobBudget(s, &p, &operations, row_limit, allocation_used) || !GetBlobBudget(s, &p, &ie, row_limit, allocation_used) || !GetBlobBudget(s, &p, &it, row_limit, allocation_used) || !GetBlobBudget(s, &p, &ito, row_limit, allocation_used) || !GetBlobBudget(s, &p, &irle, row_limit, allocation_used) || !GetBlobBudget(s, &p, &be, row_limit, allocation_used) || !GetBlobBudget(s, &p, &bt, row_limit, allocation_used) || !GetBlobBudget(s, &p, &brle, row_limit, allocation_used) || presence.size() != (ni + 7) / 8 || operations.size() != (nb + 7) / 8) return Status::ResourceExhausted("projection", "column streams exceed budget");
   if ((ni % 8 != 0 && (uint8_t(presence.back()) & ~uint8_t((1u << (ni % 8)) - 1))) ||
       (nb % 8 != 0 && (uint8_t(operations.back()) & ~uint8_t((1u << (nb % 8)) - 1))))
     return Status::Corruption("projection", "non-zero bitset padding");

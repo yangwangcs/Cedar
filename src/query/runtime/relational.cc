@@ -222,6 +222,118 @@ struct HashEntry {
 
 constexpr size_t kNoHashEntry = std::numeric_limits<size_t>::max();
 
+bool AddOutputEstimate(JoinOutputEstimate* estimate,
+                       const RelationalRow& left,
+                       const RelationalRow* right) {
+  const size_t bytes = right == nullptr ? EstimateRowBytes(left)
+                                        : EstimateCombinedRowBytes(left, *right);
+  if (!AddBytes(bytes, &estimate->bytes) ||
+      estimate->rows == std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  ++estimate->rows;
+  return true;
+}
+
+StatusOr<JoinOutputEstimate> EstimateHashOutput(
+    const JoinInput& input, const std::vector<size_t>& buckets,
+    const std::vector<HashEntry>& table) {
+  JoinOutputEstimate estimate;
+  for (const RelationalRow& left : input.left.rows) {
+    bool matched = false;
+    if (left.cells[input.left_key].present) {
+      for (size_t entry = buckets[HashCell(left.cells[input.left_key]) &
+                                   (buckets.size() - 1)];
+           entry != kNoHashEntry; entry = table[entry].next) {
+        const RelationalRow* right = table[entry].row;
+        if (!KeysEqual(left.cells[input.left_key],
+                       right->cells[input.right_key])) {
+          continue;
+        }
+        matched = true;
+        if (input.kind == JoinKind::kInner &&
+            !AddOutputEstimate(&estimate, left, right)) {
+          return Status::ResourceExhausted("query relational",
+                                           "join output size overflows");
+        }
+        if (input.kind == JoinKind::kSemi) break;
+      }
+    }
+    if ((input.kind == JoinKind::kSemi && matched) ||
+        (input.kind == JoinKind::kAnti && !matched)) {
+      if (!AddOutputEstimate(&estimate, left, nullptr)) {
+        return Status::ResourceExhausted("query relational",
+                                         "join output size overflows");
+      }
+    }
+  }
+  return estimate;
+}
+
+StatusOr<JoinOutputEstimate> EstimateSortedMergeOutput(
+    const std::vector<RelationalRow>& left,
+    const std::vector<RelationalRow>& right, const JoinInput& input) {
+  JoinOutputEstimate estimate;
+  size_t left_index = 0;
+  size_t right_index = 0;
+  while (left_index < left.size() && right_index < right.size()) {
+    const int compared = CompareCell(left[left_index].cells[input.left_key],
+                                     right[right_index].cells[input.right_key]);
+    if (compared < 0) {
+      if (input.kind == JoinKind::kAnti &&
+          !AddOutputEstimate(&estimate, left[left_index], nullptr)) {
+        return Status::ResourceExhausted("query relational",
+                                         "join output size overflows");
+      }
+      ++left_index;
+      continue;
+    }
+    if (compared > 0) {
+      ++right_index;
+      continue;
+    }
+    size_t left_end = left_index + 1;
+    while (left_end < left.size() && CompareCell(left[left_index].cells[input.left_key],
+                                                   left[left_end].cells[input.left_key]) == 0) {
+      ++left_end;
+    }
+    size_t right_end = right_index + 1;
+    while (right_end < right.size() && CompareCell(right[right_index].cells[input.right_key],
+                                                     right[right_end].cells[input.right_key]) == 0) {
+      ++right_end;
+    }
+    const bool equal = KeysEqual(left[left_index].cells[input.left_key],
+                                 right[right_index].cells[input.right_key]);
+    for (size_t left_row = left_index; left_row < left_end; ++left_row) {
+      if (equal && input.kind == JoinKind::kInner) {
+        for (size_t right_row = right_index; right_row < right_end; ++right_row) {
+          if (!AddOutputEstimate(&estimate, left[left_row], &right[right_row])) {
+            return Status::ResourceExhausted("query relational",
+                                             "join output size overflows");
+          }
+        }
+      } else if ((equal && input.kind == JoinKind::kSemi) ||
+                 (!equal && input.kind == JoinKind::kAnti)) {
+        if (!AddOutputEstimate(&estimate, left[left_row], nullptr)) {
+          return Status::ResourceExhausted("query relational",
+                                           "join output size overflows");
+        }
+      }
+    }
+    left_index = left_end;
+    right_index = right_end;
+  }
+  if (input.kind == JoinKind::kAnti) {
+    for (; left_index < left.size(); ++left_index) {
+      if (!AddOutputEstimate(&estimate, left[left_index], nullptr)) {
+        return Status::ResourceExhausted("query relational",
+                                         "join output size overflows");
+      }
+    }
+  }
+  return estimate;
+}
+
 std::optional<size_t> HashBucketCount(size_t entries) {
   if (entries == 0) return size_t{1};
   if (entries > std::numeric_limits<size_t>::max() / 2) return std::nullopt;
@@ -611,9 +723,8 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
                                QueryReservation* reservation) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
-  const auto output = EstimateJoinOutput(input);
   const auto bucket_count = HashBucketCount(input.right.rows.size());
-  if (!output.has_value() || !bucket_count.has_value() ||
+  if (!bucket_count.has_value() ||
       input.right.rows.size() >
           std::numeric_limits<size_t>::max() / sizeof(HashEntry)) {
     return NeedsSpill();
@@ -623,14 +734,10 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
       !AddBytes(*bucket_count * sizeof(size_t), &index_bytes)) {
     return NeedsSpill();
   }
-  size_t required_bytes = index_bytes;
-  if (!AddBytes(output->bytes, &required_bytes)) {
-    return NeedsSpill();
-  }
-  ReservationGuard guard(reservation, required_bytes);
-  if (!guard.acquired()) {
-    return NeedsSpill(required_bytes, reservation->limit_bytes() -
-                                          reservation->used_bytes());
+  ReservationGuard index_guard(reservation, index_bytes);
+  if (!index_guard.acquired()) {
+    return NeedsSpill(index_bytes, reservation->limit_bytes() -
+                                      reservation->used_bytes());
   }
 
   std::vector<size_t> buckets(*bucket_count, kNoHashEntry);
@@ -643,8 +750,15 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
     table.push_back({&right, buckets[bucket]});
     buckets[bucket] = table.size() - 1;
   }
+  auto output = EstimateHashOutput(input, buckets, table);
+  if (!output.ok()) return output.status();
+  ReservationGuard output_guard(reservation, output.ValueOrDie().bytes);
+  if (!output_guard.acquired()) {
+    return NeedsSpill(output.ValueOrDie().bytes,
+                      reservation->limit_bytes() - reservation->used_bytes());
+  }
   BatchStream result;
-  result.rows.reserve(output->rows);
+  result.rows.reserve(output.ValueOrDie().rows);
   for (const RelationalRow& left : input.left.rows) {
     bool matched = false;
     const RelationalCell& key = left.cells[input.left_key];
@@ -672,17 +786,15 @@ StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
                                     QueryReservation* reservation) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
-  size_t required_bytes = EstimateBytes(input.left);
+  size_t input_bytes = EstimateBytes(input.left);
   const size_t right_bytes = EstimateBytes(input.right);
-  const auto output = EstimateJoinOutput(input);
-  if (!output.has_value() || !AddBytes(right_bytes, &required_bytes)) {
+  if (!AddBytes(right_bytes, &input_bytes)) {
     return NeedsSpill();
   }
-  if (!AddBytes(output->bytes, &required_bytes)) return NeedsSpill();
-  ReservationGuard guard(reservation, required_bytes);
-  if (!guard.acquired()) {
-    return NeedsSpill(required_bytes, reservation->limit_bytes() -
-                                          reservation->used_bytes());
+  ReservationGuard input_guard(reservation, input_bytes);
+  if (!input_guard.acquired()) {
+    return NeedsSpill(input_bytes, reservation->limit_bytes() -
+                                        reservation->used_bytes());
   }
   std::vector<RelationalRow> left = input.left.rows;
   std::vector<RelationalRow> right = input.right.rows;
@@ -698,9 +810,16 @@ StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
   };
   std::sort(left.begin(), left.end(), left_less);
   std::sort(right.begin(), right.end(), right_less);
+  auto output = EstimateSortedMergeOutput(left, right, input);
+  if (!output.ok()) return output.status();
+  ReservationGuard output_guard(reservation, output.ValueOrDie().bytes);
+  if (!output_guard.acquired()) {
+    return NeedsSpill(output.ValueOrDie().bytes,
+                      reservation->limit_bytes() - reservation->used_bytes());
+  }
 
   BatchStream result;
-  result.rows.reserve(output->rows);
+  result.rows.reserve(output.ValueOrDie().rows);
   size_t left_index = 0;
   size_t right_index = 0;
   while (left_index < left.size() && right_index < right.size()) {

@@ -74,7 +74,11 @@ void CollectPushdowns(const LogicalPlanNode& node, PhysicalPlan* plan) {
 
 std::optional<CoverageRegion> MatchingRegion(const CoverageRegion& region,
                                               const LogicalPlanNode& logical) {
-  const auto scope = logical.scope();
+  const LogicalPlanNode* scoped = &logical;
+  while (!scoped->scope() && !scoped->inputs().empty()) {
+    scoped = scoped->inputs().front().get();
+  }
+  const auto scope = scoped->scope();
   if (!scope) return std::nullopt;
   if (!ValidRange(region.valid_time)) return std::nullopt;
   const LogicalPlanNode* scan = &logical;
@@ -87,12 +91,25 @@ std::optional<CoverageRegion> MatchingRegion(const CoverageRegion& region,
   return region;
 }
 
+const LogicalPlanNode* FindScopedNode(const LogicalPlanNode& logical) {
+  const LogicalPlanNode* node = &logical;
+  while (!node->scope() && !node->inputs().empty()) node = node->inputs().front().get();
+  return node->scope() ? node : nullptr;
+}
+
+bool ContainsKind(const LogicalPlanNode& node, LogicalOpKind kind) {
+  if (node.kind() == kind) return true;
+  return std::any_of(node.inputs().begin(), node.inputs().end(),
+                     [kind](const auto& child) { return ContainsKind(*child, kind); });
+}
+
 }  // namespace
 
 StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
                                           const PlanningContext& context) {
-  const auto scope = logical.scope();
-  if (!scope) return Status::InvalidArgument("query planner", "plan has no temporal scope");
+  const LogicalPlanNode* scoped_node = FindScopedNode(logical);
+  if (!scoped_node) return Status::InvalidArgument("query planner", "plan has no temporal scope");
+  const auto scope = scoped_node->scope();
   const auto requested = ScopeInterval(*scope);
   if (!requested || !ValidRange(*requested)) {
     if (std::holds_alternative<History>(*scope) &&
@@ -133,9 +150,9 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   plan.estimate.uncertain = !context.statistics.known;
   plan.conservative = !context.statistics.known;
 
-  const bool broad = estimate_rows > 4096 || logical.kind() == LogicalOpKind::kSort ||
-                     logical.kind() == LogicalOpKind::kAggregateRows ||
-                     logical.kind() == LogicalOpKind::kTemporalAggregate;
+  const bool broad = estimate_rows > 4096 || ContainsKind(logical, LogicalOpKind::kSort) ||
+                     ContainsKind(logical, LogicalOpKind::kAggregateRows) ||
+                     ContainsKind(logical, LogicalOpKind::kTemporalAggregate);
   plan.lane = context.options.mode == QueryExecutionMode::kAuto
                   ? (broad ? QueryExecutionMode::kAnalytical : QueryExecutionMode::kInteractive)
                   : context.options.mode;

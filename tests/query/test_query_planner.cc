@@ -40,7 +40,11 @@ TEST(QueryPlannerTest, SplitsCoverageWithoutOverlapOrGap) {
   QueryStatisticsView stats;
   auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{300}}});
   ASSERT_TRUE(query.ok()) << query.status().ToString();
-  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()), Context(catalog, stats));
+  const auto root = LogicalPlanInspector::Inspect(query.ValueOrDie());
+  auto projected = query.ValueOrDie().Select(
+      std::vector<cedar::Projection>{cedar::Projection{root->schema().columns()[0]}});
+  ASSERT_TRUE(projected.ok()) << projected.status().ToString();
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(projected.ValueOrDie()), Context(catalog, stats));
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
   ASSERT_EQ(plan.ValueOrDie().slices().size(), 3U);
   EXPECT_EQ(plan.ValueOrDie().slices()[0].source, CoverageSource::kDeltaMerge);

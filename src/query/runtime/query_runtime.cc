@@ -590,6 +590,66 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   return plan;
 }
 
+StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
+    LogicalOpKind kind, RuntimeRelationalInput input,
+    QueryReservation* reservation, FragmentBudget* fragment_budget) {
+  if (kind == LogicalOpKind::kAggregateRows) {
+    auto result = AggregateRows(
+        {std::move(input.left), std::move(input.group_by),
+         std::move(input.aggregates)});
+    if (!result.ok()) return result.status();
+    return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                   std::nullopt};
+  }
+  if (kind == LogicalOpKind::kTemporalAggregate) {
+    auto result = TemporalAggregate(
+        {std::move(input.left), std::move(input.group_by)}, fragment_budget);
+    if (!result.ok()) return result.status();
+    return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                   std::nullopt};
+  }
+
+  JoinKind join_kind;
+  switch (kind) {
+    case LogicalOpKind::kInnerJoin:
+      join_kind = JoinKind::kInner;
+      break;
+    case LogicalOpKind::kSemiJoin:
+      join_kind = JoinKind::kSemi;
+      break;
+    case LogicalOpKind::kAntiJoin:
+      join_kind = JoinKind::kAnti;
+      break;
+    default:
+      return Status::NotSupported("query runtime",
+                                  "logical node is not relational");
+  }
+
+  const JoinAlgorithm algorithm = ChooseJoinAlgorithm(
+      input.estimated_rows, input.sorted_keys, input.temporal);
+  StatusOr<BatchStream> result = Status::NotSupported(
+      "query runtime", "relational join algorithm is unavailable");
+  if (algorithm == JoinAlgorithm::kIntervalMerge) {
+    result = IntervalMergeJoin(
+        {std::move(input.left), std::move(input.right), input.left_key,
+         input.right_key, join_kind},
+        fragment_budget);
+  } else {
+    JoinInput join{std::move(input.left), std::move(input.right),
+                   input.left_key, input.right_key, join_kind};
+    if (algorithm == JoinAlgorithm::kIndexNestedLoop) {
+      result = IndexNestedLoopJoin(std::move(join));
+    } else if (algorithm == JoinAlgorithm::kHash) {
+      result = HashJoin(std::move(join), reservation);
+    } else {
+      result = SortMergeJoin(std::move(join), reservation);
+    }
+  }
+  if (!result.ok()) return result.status();
+  return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                 algorithm};
+}
+
 StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             Snapshot snapshot,
                                             const Bindings&,

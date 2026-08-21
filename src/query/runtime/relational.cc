@@ -1,0 +1,705 @@
+// Copyright 2026 The Cedar Authors
+// Licensed under the Apache License, Version 2.0.
+
+#include "query/runtime/relational.h"
+
+#include <algorithm>
+#include <bit>
+#include <functional>
+#include <limits>
+#include <numeric>
+#include <unordered_map>
+#include <utility>
+
+#include "query/temporal/interval.h"
+
+namespace cedar::internal {
+namespace {
+
+constexpr size_t kEstimatedCellBytes = 32;
+
+Status ValidateKey(const BatchStream& stream, size_t key) {
+  for (const RelationalRow& row : stream.rows) {
+    if (key >= row.cells.size()) {
+      return Status::InvalidArgument("relational operator",
+                                     "key column is out of range");
+    }
+  }
+  return Status::OK();
+}
+
+Status ValidateJoin(const JoinInput& input) {
+  if (Status status = ValidateKey(input.left, input.left_key); !status.ok()) {
+    return status;
+  }
+  if (Status status = ValidateKey(input.right, input.right_key); !status.ok()) {
+    return status;
+  }
+  for (const RelationalRow& left : input.left.rows) {
+    for (const RelationalRow& right : input.right.rows) {
+      if (left.cells[input.left_key].type !=
+          right.cells[input.right_key].type) {
+        return Status::InvalidArgument("relational join",
+                                       "join key types differ");
+      }
+    }
+  }
+  return Status::OK();
+}
+
+bool KeysEqual(const RelationalCell& left, const RelationalCell& right) {
+  return left.present && right.present && left.type == right.type &&
+         left.value == right.value;
+}
+
+template <typename T>
+int CompareSimple(const T& left, const T& right) {
+  if (left < right) return -1;
+  if (right < left) return 1;
+  return 0;
+}
+
+int CompareCell(const RelationalCell& left, const RelationalCell& right) {
+  if (left.type != right.type) {
+    return left.type < right.type ? -1 : 1;
+  }
+  if (left.present != right.present) return left.present ? 1 : -1;
+  if (!left.present) return 0;
+  return std::visit(
+      [](const auto& left_value, const auto& right_value) -> int {
+        using Left = std::decay_t<decltype(left_value)>;
+        using Right = std::decay_t<decltype(right_value)>;
+        if constexpr (!std::is_same_v<Left, Right>) {
+          return 0;
+        } else if constexpr (std::is_arithmetic_v<Left> ||
+                             std::is_same_v<Left, std::string>) {
+          return CompareSimple(left_value, right_value);
+        } else if constexpr (std::is_same_v<Left, Binary>) {
+          return CompareSimple(left_value.value, right_value.value);
+        } else if constexpr (std::is_same_v<Left, VertexRef>) {
+          if (int part = CompareSimple(left_value.part_id.value,
+                                       right_value.part_id.value);
+              part != 0) {
+            return part;
+          }
+          return CompareSimple(left_value.vertex_id.value,
+                               right_value.vertex_id.value);
+        } else if constexpr (std::is_same_v<Left, EdgeRef>) {
+          if (int part = CompareSimple(left_value.home_part_id.value,
+                                       right_value.home_part_id.value);
+              part != 0) {
+            return part;
+          }
+          return CompareSimple(left_value.edge_id.value,
+                               right_value.edge_id.value);
+        } else if constexpr (std::is_same_v<Left, ValidTimeInterval>) {
+          if (int from = CompareSimple(left_value.from.value,
+                                       right_value.from.value);
+              from != 0) {
+            return from;
+          }
+          if (left_value.to.has_value() != right_value.to.has_value()) {
+            return left_value.to.has_value() ? -1 : 1;
+          }
+          return left_value.to.has_value()
+                     ? CompareSimple(left_value.to->value,
+                                     right_value.to->value)
+                     : 0;
+        } else {
+          return CompareSimple(left_value.value, right_value.value);
+        }
+      },
+      left.value, right.value);
+}
+
+size_t HashCell(const RelationalCell& cell) {
+  if (!cell.present) return 0;
+  size_t hash = static_cast<size_t>(cell.type) + 0x9e3779b9U;
+  std::visit(
+      [&hash](const auto& value) {
+        using T = std::decay_t<decltype(value)>;
+        auto combine = [&hash](size_t part) {
+          hash ^= part + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+        };
+        if constexpr (std::is_same_v<T, bool> ||
+                      std::is_same_v<T, int32_t> ||
+                      std::is_same_v<T, int64_t>) {
+          combine(std::hash<T>{}(value));
+        } else if constexpr (std::is_same_v<T, float>) {
+          combine(std::hash<uint32_t>{}(std::bit_cast<uint32_t>(value)));
+        } else if constexpr (std::is_same_v<T, double>) {
+          combine(std::hash<uint64_t>{}(std::bit_cast<uint64_t>(value)));
+        } else if constexpr (std::is_same_v<T, std::string>) {
+          combine(std::hash<std::string>{}(value));
+        } else if constexpr (std::is_same_v<T, Binary>) {
+          combine(std::hash<std::string>{}(value.value));
+        } else if constexpr (std::is_same_v<T, VertexRef>) {
+          combine(value.part_id.value);
+          combine(value.vertex_id.value);
+        } else if constexpr (std::is_same_v<T, EdgeRef>) {
+          combine(value.home_part_id.value);
+          combine(value.edge_id.value);
+        } else if constexpr (std::is_same_v<T, ValidTimeInterval>) {
+          combine(value.from.value);
+          combine(value.to ? value.to->value : std::numeric_limits<uint64_t>::max());
+          combine(value.to.has_value());
+        } else {
+          combine(value.value);
+        }
+      },
+      cell.value);
+  return hash;
+}
+
+size_t EstimateBytes(const BatchStream& stream) {
+  size_t cells = 0;
+  for (const RelationalRow& row : stream.rows) {
+    if (row.cells.size() >
+        (std::numeric_limits<size_t>::max() - cells)) {
+      return std::numeric_limits<size_t>::max();
+    }
+    cells += row.cells.size();
+  }
+  if (cells > std::numeric_limits<size_t>::max() / kEstimatedCellBytes) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return cells * kEstimatedCellBytes;
+}
+
+class ReservationGuard {
+ public:
+  ReservationGuard(QueryReservation* reservation, size_t bytes)
+      : reservation_(reservation), bytes_(bytes), acquired_(reservation == nullptr) {
+    if (reservation_ != nullptr) acquired_ = reservation_->TryGrow(bytes_);
+  }
+  ~ReservationGuard() {
+    if (reservation_ != nullptr && acquired_) reservation_->Release(bytes_);
+  }
+  bool acquired() const { return acquired_; }
+
+ private:
+  QueryReservation* reservation_;
+  size_t bytes_;
+  bool acquired_;
+};
+
+RelationalRow Combine(const RelationalRow& left, const RelationalRow& right) {
+  RelationalRow result = left;
+  result.cells.insert(result.cells.end(), right.cells.begin(), right.cells.end());
+  return result;
+}
+
+bool RowLess(const RelationalRow& left, const RelationalRow& right,
+             const std::vector<SortKey>& keys) {
+  for (const SortKey& key : keys) {
+    const int compared = CompareCell(left.cells[key.column],
+                                     right.cells[key.column]);
+    if (compared == 0) continue;
+    return key.direction == SortDirection::kAscending ? compared < 0
+                                                      : compared > 0;
+  }
+  return false;
+}
+
+Status ValidateSort(const BatchStream& input,
+                    const std::vector<SortKey>& keys) {
+  for (const RelationalRow& row : input.rows) {
+    for (const SortKey& key : keys) {
+      if (key.column >= row.cells.size()) {
+        return Status::InvalidArgument("relational sort",
+                                       "sort column is out of range");
+      }
+    }
+  }
+  for (const SortKey& key : keys) {
+    std::optional<QueryType> type;
+    for (const RelationalRow& row : input.rows) {
+      if (!type.has_value()) type = row.cells[key.column].type;
+      if (*type != row.cells[key.column].type) {
+        return Status::InvalidArgument("relational sort",
+                                       "sort column types differ");
+      }
+    }
+  }
+  return Status::OK();
+}
+
+bool Before(ValidTime left, ValidTime right) { return left.value < right.value; }
+
+bool EndsAfter(const std::optional<ValidTime>& end, ValidTime point) {
+  return !end.has_value() || Before(point, *end);
+}
+
+bool IntervalValid(const ValidTimeInterval& interval) {
+  return !interval.to.has_value() || Before(interval.from, *interval.to);
+}
+
+Status Publish(RelationalRow row, FragmentBudget* budget, BatchStream* output) {
+  if (budget == nullptr || !budget->TryConsume()) {
+    return Status::ResourceExhausted("query",
+                                     "interval fragment budget exceeded");
+  }
+  if (!output->rows.empty() &&
+      output->rows.back().cells == row.cells &&
+      output->rows.back().effective.has_value() && row.effective.has_value() &&
+      output->rows.back().effective->to.has_value() &&
+      *output->rows.back().effective->to == row.effective->from) {
+    output->rows.back().effective->to = row.effective->to;
+    return Status::OK();
+  }
+  output->rows.push_back(std::move(row));
+  return Status::OK();
+}
+
+std::vector<RelationalCell> GroupCells(const RelationalRow& row,
+                                       const std::vector<size_t>& group_by) {
+  std::vector<RelationalCell> cells;
+  cells.reserve(group_by.size());
+  for (size_t column : group_by) cells.push_back(row.cells[column]);
+  return cells;
+}
+
+struct Group {
+  std::vector<RelationalCell> key;
+  std::vector<const RelationalRow*> rows;
+};
+
+StatusOr<std::vector<Group>> BuildGroups(const BatchStream& input,
+                                         const std::vector<size_t>& group_by) {
+  for (const RelationalRow& row : input.rows) {
+    for (size_t column : group_by) {
+      if (column >= row.cells.size()) {
+        return Status::InvalidArgument("relational aggregate",
+                                       "group column is out of range");
+      }
+    }
+  }
+  std::vector<Group> groups;
+  for (const RelationalRow& row : input.rows) {
+    std::vector<RelationalCell> key = GroupCells(row, group_by);
+    auto found = std::find_if(groups.begin(), groups.end(),
+                              [&key](const Group& group) {
+                                return group.key == key;
+                              });
+    if (found == groups.end()) {
+      groups.push_back({std::move(key), {&row}});
+    } else {
+      found->rows.push_back(&row);
+    }
+  }
+  if (input.rows.empty() && group_by.empty()) groups.push_back({{}, {}});
+  return groups;
+}
+
+StatusOr<RelationalCell> AggregateOne(const Group& group,
+                                      const AggregateSpec& spec) {
+  if (spec.kind == AggregateKind::kCount) {
+    int64_t count = 0;
+    for (const RelationalRow* row : group.rows) {
+      if (spec.input_column >= row->cells.size()) {
+        return Status::InvalidArgument("row aggregate",
+                                       "aggregate column is out of range");
+      }
+      if (row->cells[spec.input_column].present) ++count;
+    }
+    return RelationalCell::Present(QueryType::kInt64, count);
+  }
+
+  const RelationalCell* accumulated = nullptr;
+  int64_t int64_sum = 0;
+  double double_sum = 0;
+  for (const RelationalRow* row : group.rows) {
+    if (spec.input_column >= row->cells.size()) {
+      return Status::InvalidArgument("row aggregate",
+                                     "aggregate column is out of range");
+    }
+    const RelationalCell& cell = row->cells[spec.input_column];
+    if (!cell.present) continue;
+    if (accumulated != nullptr && accumulated->type != cell.type) {
+      return Status::InvalidArgument("row aggregate",
+                                     "aggregate input types differ");
+    }
+    if (spec.kind == AggregateKind::kSum) {
+      if (cell.type == QueryType::kInt64) {
+        const int64_t value = std::get<int64_t>(cell.value);
+        if ((value > 0 && int64_sum > std::numeric_limits<int64_t>::max() - value) ||
+            (value < 0 && int64_sum < std::numeric_limits<int64_t>::min() - value)) {
+          return Status::NumericOverflow("row aggregate", "sum overflow");
+        }
+        int64_sum += value;
+      } else if (cell.type == QueryType::kFloat64) {
+        double_sum += std::get<double>(cell.value);
+      } else {
+        return Status::InvalidArgument("row aggregate",
+                                       "sum requires exact int64 or float64 input");
+      }
+    } else if (accumulated == nullptr ||
+               (spec.kind == AggregateKind::kMin &&
+                CompareCell(cell, *accumulated) < 0) ||
+               (spec.kind == AggregateKind::kMax &&
+                CompareCell(cell, *accumulated) > 0)) {
+      accumulated = &cell;
+    }
+    if (accumulated == nullptr) accumulated = &cell;
+  }
+  if (spec.kind == AggregateKind::kSum) {
+    if (accumulated == nullptr) {
+      return RelationalCell::Missing(QueryType::kInt64);
+    }
+    return accumulated->type == QueryType::kInt64
+               ? RelationalCell::Present(QueryType::kInt64, int64_sum)
+               : RelationalCell::Present(QueryType::kFloat64, double_sum);
+  }
+  return accumulated != nullptr ? *accumulated
+                                : RelationalCell::Missing(QueryType::kInt64);
+}
+
+}  // namespace
+
+bool QueryReservation::TryGrow(size_t bytes) {
+  if (bytes > limit_bytes_ - used_bytes_) return false;
+  used_bytes_ += bytes;
+  peak_bytes_ = std::max(peak_bytes_, used_bytes_);
+  return true;
+}
+
+void QueryReservation::Release(size_t bytes) {
+  used_bytes_ = bytes >= used_bytes_ ? 0 : used_bytes_ - bytes;
+}
+
+bool FragmentBudget::TryConsume(size_t fragments) {
+  if (fragments > limit_ - used_) return false;
+  used_ += fragments;
+  return true;
+}
+
+Status NeedsSpill() {
+  return Status::ResourceExhausted("query relational", "NeedsSpill");
+}
+
+bool IsNeedsSpill(const Status& status) {
+  return status.IsResourceExhausted() &&
+         status.ToString().find("NeedsSpill") != std::string::npos;
+}
+
+BatchStream UnionAll(BatchStream left, BatchStream right) {
+  left.rows.reserve(left.rows.size() + right.rows.size());
+  std::move(right.rows.begin(), right.rows.end(),
+            std::back_inserter(left.rows));
+  left.order_specified = false;
+  return left;
+}
+
+BatchStream Distinct(const BatchStream& input) {
+  BatchStream result;
+  for (const RelationalRow& row : input.rows) {
+    if (std::find(result.rows.begin(), result.rows.end(), row) ==
+        result.rows.end()) {
+      result.rows.push_back(row);
+    }
+  }
+  return result;
+}
+
+StatusOr<BatchStream> Sort(const BatchStream& input,
+                           const std::vector<SortKey>& keys,
+                           QueryReservation* reservation) {
+  if (Status status = ValidateSort(input, keys); !status.ok()) return status;
+  ReservationGuard guard(reservation, EstimateBytes(input));
+  if (!guard.acquired()) return NeedsSpill();
+  BatchStream result = input;
+  std::stable_sort(result.rows.begin(), result.rows.end(),
+                   [&keys](const RelationalRow& left,
+                           const RelationalRow& right) {
+                     return RowLess(left, right, keys);
+                   });
+  result.order_specified = true;
+  return result;
+}
+
+BatchStream Limit(const BatchStream& input, size_t offset, size_t count) {
+  BatchStream result;
+  result.order_specified = input.order_specified;
+  if (offset >= input.rows.size()) return result;
+  const size_t available = input.rows.size() - offset;
+  const size_t emitted = std::min(count, available);
+  result.rows.insert(result.rows.end(), input.rows.begin() + offset,
+                     input.rows.begin() + offset + emitted);
+  return result;
+}
+
+JoinAlgorithm ChooseJoinAlgorithm(size_t estimated_rows, bool sorted_keys,
+                                  bool temporal) {
+  if (temporal) return JoinAlgorithm::kIntervalMerge;
+  if (estimated_rows < 4096) return JoinAlgorithm::kIndexNestedLoop;
+  return sorted_keys ? JoinAlgorithm::kSortMerge : JoinAlgorithm::kHash;
+}
+
+StatusOr<BatchStream> IndexNestedLoopJoin(JoinInput input) {
+  if (Status status = ValidateJoin(input); !status.ok()) return status;
+  BatchStream result;
+  for (const RelationalRow& left : input.left.rows) {
+    bool matched = false;
+    for (const RelationalRow& right : input.right.rows) {
+      if (!KeysEqual(left.cells[input.left_key],
+                     right.cells[input.right_key])) {
+        continue;
+      }
+      matched = true;
+      if (input.kind == JoinKind::kInner) {
+        result.rows.push_back(Combine(left, right));
+      } else if (input.kind == JoinKind::kSemi) {
+        result.rows.push_back(left);
+        break;
+      }
+    }
+    if (!matched && input.kind == JoinKind::kAnti) result.rows.push_back(left);
+  }
+  return result;
+}
+
+StatusOr<BatchStream> HashJoin(JoinInput input,
+                               QueryReservation* reservation) {
+  if (Status status = ValidateJoin(input); !status.ok()) return status;
+  ReservationGuard guard(reservation, EstimateBytes(input.right));
+  if (!guard.acquired()) return NeedsSpill();
+
+  std::unordered_map<size_t, std::vector<const RelationalRow*>> table;
+  for (const RelationalRow& right : input.right.rows) {
+    const RelationalCell& key = right.cells[input.right_key];
+    if (key.present) table[HashCell(key)].push_back(&right);
+  }
+  BatchStream result;
+  for (const RelationalRow& left : input.left.rows) {
+    bool matched = false;
+    const RelationalCell& key = left.cells[input.left_key];
+    if (key.present) {
+      const auto bucket = table.find(HashCell(key));
+      if (bucket != table.end()) {
+        for (const RelationalRow* right : bucket->second) {
+          if (!KeysEqual(key, right->cells[input.right_key])) continue;
+          matched = true;
+          if (input.kind == JoinKind::kInner) {
+            result.rows.push_back(Combine(left, *right));
+          } else if (input.kind == JoinKind::kSemi) {
+            result.rows.push_back(left);
+            break;
+          }
+        }
+      }
+    }
+    if (!matched && input.kind == JoinKind::kAnti) result.rows.push_back(left);
+  }
+  return result;
+}
+
+StatusOr<BatchStream> SortMergeJoin(JoinInput input,
+                                    QueryReservation* reservation) {
+  if (Status status = ValidateJoin(input); !status.ok()) return status;
+  const size_t left_bytes = EstimateBytes(input.left);
+  const size_t right_bytes = EstimateBytes(input.right);
+  if (left_bytes > std::numeric_limits<size_t>::max() - right_bytes) {
+    return NeedsSpill();
+  }
+  ReservationGuard guard(reservation, left_bytes + right_bytes);
+  if (!guard.acquired()) return NeedsSpill();
+  std::stable_sort(input.left.rows.begin(), input.left.rows.end(),
+                   [&input](const RelationalRow& left,
+                            const RelationalRow& right) {
+                     return CompareCell(left.cells[input.left_key],
+                                        right.cells[input.left_key]) < 0;
+                   });
+  std::stable_sort(input.right.rows.begin(), input.right.rows.end(),
+                   [&input](const RelationalRow& left,
+                            const RelationalRow& right) {
+                     return CompareCell(left.cells[input.right_key],
+                                        right.cells[input.right_key]) < 0;
+                   });
+  auto joined = IndexNestedLoopJoin(std::move(input));
+  if (joined.ok()) joined.ValueOrDie().order_specified = true;
+  return joined;
+}
+
+StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
+                                        FragmentBudget* budget) {
+  JoinInput validation{input.left, input.right, input.left_key,
+                       input.right_key, input.kind};
+  if (Status status = ValidateJoin(validation); !status.ok()) return status;
+  if (budget == nullptr) {
+    return Status::InvalidArgument("temporal join",
+                                   "fragment budget is required");
+  }
+  for (const RelationalRow& row : input.left.rows) {
+    if (!row.effective || !IntervalValid(*row.effective)) {
+      return Status::InvalidArgument("temporal join",
+                                     "left interval is absent or invalid");
+    }
+  }
+  for (const RelationalRow& row : input.right.rows) {
+    if (!row.effective || !IntervalValid(*row.effective)) {
+      return Status::InvalidArgument("temporal join",
+                                     "right interval is absent or invalid");
+    }
+  }
+
+  BatchStream result;
+  result.order_specified = true;
+  for (const RelationalRow& left : input.left.rows) {
+    std::vector<ValidTimeInterval> overlaps;
+    for (const RelationalRow& right : input.right.rows) {
+      if (!KeysEqual(left.cells[input.left_key],
+                     right.cells[input.right_key])) {
+        continue;
+      }
+      auto intersection = Intersect(*left.effective, *right.effective);
+      if (!intersection) continue;
+      if (input.kind == JoinKind::kInner) {
+        RelationalRow row = Combine(left, right);
+        row.effective = *intersection;
+        if (Status status = Publish(std::move(row), budget, &result);
+            !status.ok()) {
+          return status;
+        }
+      } else {
+        overlaps.push_back(*intersection);
+      }
+    }
+    if (input.kind == JoinKind::kSemi) {
+      std::sort(overlaps.begin(), overlaps.end(),
+                [](const auto& a, const auto& b) {
+                  return a.from.value < b.from.value;
+                });
+      for (const auto& overlap : overlaps) {
+        RelationalRow row = left;
+        row.effective = overlap;
+        if (Status status = Publish(std::move(row), budget, &result);
+            !status.ok()) {
+          return status;
+        }
+      }
+    } else if (input.kind == JoinKind::kAnti) {
+      std::sort(overlaps.begin(), overlaps.end(),
+                [](const auto& a, const auto& b) {
+                  return a.from.value < b.from.value;
+                });
+      ValidTime cursor = left.effective->from;
+      bool exhausted = false;
+      for (const ValidTimeInterval& overlap : overlaps) {
+        if (Before(cursor, overlap.from)) {
+          RelationalRow row = left;
+          row.effective = ValidTimeInterval{cursor, overlap.from};
+          if (Status status = Publish(std::move(row), budget, &result);
+              !status.ok()) {
+            return status;
+          }
+        }
+        if (!overlap.to.has_value()) {
+          exhausted = true;
+          break;
+        }
+        if (Before(cursor, *overlap.to)) cursor = *overlap.to;
+      }
+      if (!exhausted && EndsAfter(left.effective->to, cursor)) {
+        RelationalRow row = left;
+        row.effective = ValidTimeInterval{cursor, left.effective->to};
+        if (Status status = Publish(std::move(row), budget, &result);
+            !status.ok()) {
+          return status;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+StatusOr<BatchStream> AggregateRows(AggregateInput input) {
+  auto groups = BuildGroups(input.input, input.group_by);
+  if (!groups.ok()) return groups.status();
+  BatchStream result;
+  for (const Group& group : groups.ValueOrDie()) {
+    RelationalRow output{group.key, std::nullopt};
+    for (const AggregateSpec& spec : input.aggregates) {
+      auto aggregate = AggregateOne(group, spec);
+      if (!aggregate.ok()) return aggregate.status();
+      output.cells.push_back(std::move(aggregate).ConsumeValueOrDie());
+    }
+    result.rows.push_back(std::move(output));
+  }
+  return result;
+}
+
+StatusOr<BatchStream> TemporalAggregate(TemporalAggregateInput input,
+                                        FragmentBudget* budget) {
+  if (budget == nullptr) {
+    return Status::InvalidArgument("temporal aggregate",
+                                   "fragment budget is required");
+  }
+  auto groups = BuildGroups(input.input, input.group_by);
+  if (!groups.ok()) return groups.status();
+  BatchStream result;
+  result.order_specified = true;
+  struct Event {
+    ValidTime time;
+    int delta;
+  };
+  for (const Group& group : groups.ValueOrDie()) {
+    std::vector<Event> events;
+    int unbounded = 0;
+    for (const RelationalRow* row : group.rows) {
+      if (!row->effective || !IntervalValid(*row->effective)) {
+        return Status::InvalidArgument("temporal aggregate",
+                                       "input interval is absent or invalid");
+      }
+      events.push_back({row->effective->from, 1});
+      if (row->effective->to) {
+        events.push_back({*row->effective->to, -1});
+      } else {
+        ++unbounded;
+      }
+    }
+    std::sort(events.begin(), events.end(), [](const Event& left,
+                                               const Event& right) {
+      if (left.time.value != right.time.value) {
+        return left.time.value < right.time.value;
+      }
+      return left.delta < right.delta;
+    });
+    if (events.empty()) continue;
+    int64_t count = 0;
+    ValidTime previous = events.front().time;
+    size_t index = 0;
+    while (index < events.size()) {
+      const ValidTime time = events[index].time;
+      if (Before(previous, time) && count > 0) {
+        RelationalRow row{
+            group.key, ValidTimeInterval{previous, time}};
+        row.cells.push_back(
+            RelationalCell::Present(QueryType::kInt64, count));
+        if (Status status = Publish(std::move(row), budget, &result);
+            !status.ok()) {
+          return status;
+        }
+      }
+      while (index < events.size() && events[index].time == time &&
+             events[index].delta < 0) {
+        count += events[index++].delta;
+      }
+      while (index < events.size() && events[index].time == time) {
+        count += events[index++].delta;
+      }
+      previous = time;
+    }
+    if (count > 0 && unbounded > 0) {
+      RelationalRow row{group.key,
+                        ValidTimeInterval{previous, std::nullopt}};
+      row.cells.push_back(RelationalCell::Present(QueryType::kInt64, count));
+      if (Status status = Publish(std::move(row), budget, &result);
+          !status.ok()) {
+        return status;
+      }
+    }
+  }
+  return result;
+}
+
+}  // namespace cedar::internal

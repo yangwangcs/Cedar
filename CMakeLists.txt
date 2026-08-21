@@ -63,6 +63,8 @@ add_library(cedar_core STATIC
     src/query/runtime/property_binding.cc
     src/query/runtime/query_runtime.cc
     src/query/runtime/temporal_source.cc
+    src/query/runtime/vector_kernels.cc
+    src/query/runtime/relational.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

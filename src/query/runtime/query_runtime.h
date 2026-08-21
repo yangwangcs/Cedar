@@ -13,6 +13,8 @@
 #include "cedar/schema.h"
 #include "cedar/snapshot.h"
 #include "query/logical/expression.h"
+#include "query/logical/logical_plan.h"
+#include "query/runtime/relational.h"
 
 namespace cedar::internal {
 
@@ -36,6 +38,30 @@ struct PreparedQueryPlan {
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);
+
+// Private pull-runtime boundary between logical relational nodes and physical
+// vector operators. It is intentionally unavailable from the public Query API.
+struct RuntimeRelationalInput {
+  BatchStream left;
+  BatchStream right;
+  size_t left_key = 0;
+  size_t right_key = 0;
+  size_t estimated_rows = 0;
+  bool sorted_keys = false;
+  bool temporal = false;
+  std::vector<size_t> group_by;
+  std::vector<AggregateSpec> aggregates;
+};
+
+struct RuntimeRelationalResult {
+  BatchStream stream;
+  std::optional<JoinAlgorithm> join_algorithm;
+};
+
+StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
+    LogicalOpKind kind, RuntimeRelationalInput input,
+    QueryReservation* reservation = nullptr,
+    FragmentBudget* fragment_budget = nullptr);
 
 class QueryRuntime {
  public:

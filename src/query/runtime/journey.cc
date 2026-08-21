@@ -18,13 +18,6 @@ struct VertexLess {
            std::tie(b.part_id.value, b.vertex_id.value);
   }
 };
-struct EdgeLess {
-  bool operator()(const EdgeRef& a, const EdgeRef& b) const {
-    return std::tie(a.home_part_id.value, a.edge_id.value) <
-           std::tie(b.home_part_id.value, b.edge_id.value);
-  }
-};
-
 Status Check(const JourneyOptions& options) {
   if (options.check_abort) return options.check_abort();
   return Status::OK();
@@ -36,15 +29,65 @@ Status Charge(const JourneyOptions& options) {
   return options.reservation->ReserveGraphLabels(1);
 }
 
+Status ValidateCallbackFifo(const JourneyRequest& request,
+                            const TemporalTraversal& traversal) {
+  if (!request.duration_at) return Status::OK();
+  const uint64_t first = traversal.effective.from.value;
+  uint64_t second = first;
+  if (traversal.effective.to.has_value()) {
+    if (traversal.effective.to->value <= first + 1) return Status::OK();
+    second = first + 1;
+  } else {
+    return Status::NotSupported("journey", "FIFO cannot be proven for an unbounded duration callback");
+  }
+  auto left = request.duration_at(traversal.edge, ValidTime{first});
+  if (!left.ok()) return left.status();
+  auto right = request.duration_at(traversal.edge, ValidTime{second});
+  if (!right.ok()) return right.status();
+  if (!left.ValueOrDie() || !right.ValueOrDie()) return Status::OK();
+  auto left_arrival = AddDuration(ValidTime{first}, *left.ValueOrDie());
+  if (!left_arrival.ok()) return left_arrival.status();
+  auto right_arrival = AddDuration(ValidTime{second}, *right.ValueOrDie());
+  if (!right_arrival.ok()) return right_arrival.status();
+  if (right_arrival.ValueOrDie().value < left_arrival.ValueOrDie().value)
+    return Status::NotSupported("journey", "duration callback is non-FIFO");
+  return Status::OK();
+}
+
 StatusOr<std::optional<ValidDuration>> PropertyDuration(
     Snapshot& snapshot, EdgeRef edge, ValidTime time,
-    const JourneyRequest& request) {
+    const JourneyRequest& request, const QueryDeltaView* delta) {
   if (request.duration_at) return request.duration_at(edge, time);
   if (!request.duration_property) return std::optional<ValidDuration>{};
-  auto value = snapshot.Get(PropertyFact::Edge(edge, *request.duration_property), time);
-  if (!value.ok()) return value.status();
-  if (!value.ValueOrDie()) return std::optional<ValidDuration>{};
-  const Value& raw = *value.ValueOrDie();
+  const FactRef ref = PropertyFact::Edge(edge, *request.duration_property).ref();
+  std::vector<FactEvent> events;
+  FactScanSpec spec;
+  spec.part_id = ref.part_id();
+  spec.family = ref.family();
+  spec.property_id = ref.property_id();
+  spec.entity_id_min = ref.entity_id();
+  spec.entity_id_max = ref.entity_id();
+  Status scanned = snapshot.EventScan(spec, [&events](const FactEventBatch& batch) {
+    events.insert(events.end(), batch.events.begin(), batch.events.end());
+    return Status::OK();
+  });
+  if (!scanned.ok()) return scanned;
+  if (delta != nullptr) {
+    auto tail = delta->EventsFor(ref);
+    events.insert(events.end(), tail.begin(), tail.end());
+  }
+  auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
+  if (!corrected.ok()) return corrected.status();
+  auto intervals = MaterializePresentState(corrected.ValueOrDie());
+  std::optional<Value> value;
+  for (const auto& interval : intervals) {
+    if (time.value < interval.interval.from.value) continue;
+    if (interval.interval.to && time.value >= interval.interval.to->value) continue;
+    value = interval.value;
+    break;
+  }
+  if (!value) return std::optional<ValidDuration>{};
+  const Value& raw = *value;
   uint64_t duration = 0;
   switch (raw.type()) {
     case PhysicalType::kInt32: {
@@ -85,6 +128,8 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
   if (!expanded.ok()) return expanded.status();
   std::vector<JourneyTraversal> result;
   for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
+    if (Status fifo = ValidateCallbackFifo(request, traversal); !fifo.ok())
+      return fifo;
     TemporalTraversal oriented = traversal;
     if (request.direction == ExpandDirection::kOut) {
       if (traversal.source != vertex) continue;
@@ -103,7 +148,8 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
     ValidTime departure = arrival;
     if (departure.value < oriented.effective.from.value)
       departure = oriented.effective.from;
-    auto duration = PropertyDuration(snapshot, oriented.edge, departure, request);
+    auto duration = PropertyDuration(snapshot, oriented.edge, departure, request,
+                                     options.delta);
     if (!duration.ok()) return duration.status();
     if (!duration.ValueOrDie()) continue;
     auto end = AddDuration(departure, *duration.ValueOrDie());
@@ -197,10 +243,16 @@ StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
 StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
                                         const JourneyRequest& request,
                                         const JourneyOptions& options) {
+  if (!request.interval.to && !request.arrival_deadline)
+    return Status::NotSupported("journey", "latest departure requires a finite time bound");
   JourneyRequest copy = request;
   copy.objective = JourneyObjective::kEarliestArrival;
   const ValidTime deadline = request.arrival_deadline.value_or(
       request.interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}));
+  if (deadline.value <= request.interval.from.value)
+    return Status::NotFound("journey", "target is unreachable");
+  if (deadline.value - request.interval.from.value > 1'000'000)
+    return Status::ResourceExhausted("journey", "latest departure candidate range is too wide");
   // Reverse feasibility is equivalent to enumerating candidate departure
   // boundaries and selecting the latest one; the edge searches remain
   // authoritative and preserve the same half-open checks.
@@ -209,7 +261,10 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
        t < deadline.value && t != std::numeric_limits<uint64_t>::max(); ++t) {
     copy.interval.from = ValidTime{t};
     auto candidate = EarliestArrival(snapshot, copy, options);
-    if (!candidate.ok()) continue;
+    if (!candidate.ok()) {
+      if (candidate.status().IsNotFound()) continue;
+      return candidate.status();
+    }
     if (candidate.ValueOrDie().final_arrival.value <= deadline.value &&
         (!best || candidate.ValueOrDie().initial_departure.value > best->initial_departure.value))
       best = candidate.ValueOrDie();
@@ -221,6 +276,12 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
 StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
                                        const JourneyRequest& request,
                                        const JourneyOptions& options) {
+  if (!request.interval.to)
+    return Status::NotSupported("journey", "fastest duration requires a finite time bound");
+  if (request.interval.to->value <= request.interval.from.value)
+    return Status::NotFound("journey", "target is unreachable");
+  if (request.interval.to->value - request.interval.from.value > 1'000'000)
+    return Status::ResourceExhausted("journey", "fastest duration candidate range is too wide");
   // Keep non-dominated departure/arrival labels per vertex.  This bounded
   // search intentionally shares traversal feasibility with earliest arrival.
   std::vector<JourneyValue> candidates;
@@ -230,7 +291,10 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
     JourneyRequest point = request;
     point.interval.from = ValidTime{t};
     auto result = EarliestArrival(snapshot, point, options);
-    if (!result.ok()) continue;
+    if (!result.ok()) {
+      if (result.status().IsNotFound()) continue;
+      return result.status();
+    }
     candidates.push_back(std::move(result).ConsumeValueOrDie());
     if (options.max_labels && candidates.size() > options.max_labels)
       return Status::ResourceExhausted("journey", "Pareto label budget exceeded");

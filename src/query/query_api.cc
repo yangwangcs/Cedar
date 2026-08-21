@@ -156,6 +156,21 @@ StatusOr<PreparedQuery> Database::PrepareQuery(const Query& query) const {
             "query", "referenced property is not registered");
       }
       const PropertyDefinition resolved = *definition.ValueOrDie();
+      const bool is_journey_duration =
+          plan.ValueOrDie().graph_duration_property.has_value() &&
+          *plan.ValueOrDie().graph_duration_property == property;
+      if (is_journey_duration) {
+        if (resolved.entity_kind != PropertyEntityKind::kEdge) {
+          return Status::SchemaMismatch(
+              "query", "journey duration property must belong to edges");
+        }
+        if (resolved.physical_type != PhysicalType::kInt32 &&
+            resolved.physical_type != PhysicalType::kInt64 &&
+            resolved.physical_type != PhysicalType::kTimestamp64) {
+          return Status::SchemaMismatch(
+              "query", "journey duration property must be a non-negative integer type");
+        }
+      }
       for (internal::PreparedPropertyBinding& binding :
            plan.ValueOrDie().property_bindings) {
         if (binding.property != property) continue;

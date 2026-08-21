@@ -553,7 +553,8 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation,
     QueryExecutionMode mode,
-    const std::function<Status()>& check_abort = {}) {
+    const std::function<Status()>& check_abort = {},
+    uint64_t max_journey_labels = 0) {
   if (!plan.graph_expand) {
     return Status::InvalidArgument("graph expansion", "missing graph specification");
   }
@@ -609,7 +610,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
                                                                      snapshot.adjacency_index(),
                                                                      options.projection_generation,
                                                                      check_abort,
-                                                                      0});
+                                                                     max_journey_labels});
         if (!journey.ok()) {
           if (journey.status().IsNotFound()) continue;
           return journey.status();
@@ -1299,7 +1300,8 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                                                      state->options.budget.deadline_us)
                                                return Status::DeadlineExceeded("query", "deadline_us budget exhausted");
                                              return Status::OK();
-                                           })
+                                           },
+                                           state_->options.budget.graph_labels)
                     : MaterializeRows(*state_->snapshot, state_->plan,
                                       &state_->reservation);
     // The lease owns the pre-materialization reservation. Reset it now that
@@ -1542,6 +1544,14 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
       plan.graph_journey = graph->journey_objective() + 1;
       plan.graph_journey_slot = graph->journey_slot();
       plan.graph_duration_property = graph->journey_duration_property();
+      if (plan.graph_duration_property.has_value()) {
+        if (std::find(plan.referenced_properties.begin(),
+                      plan.referenced_properties.end(),
+                      *plan.graph_duration_property) ==
+            plan.referenced_properties.end()) {
+          plan.referenced_properties.push_back(*plan.graph_duration_property);
+        }
+      }
     }
     if (plan.graph_coexisting) {
       for (const RowColumn& column : plan.output_columns) {

@@ -104,7 +104,6 @@ struct JourneyValue {
 };
 
 struct JourneyColumn {
-  std::vector<uint32_t> row_offsets;
   std::vector<uint32_t> vertex_offsets;
   std::vector<uint32_t> edge_offsets;
   std::vector<uint32_t> departure_offsets;
@@ -119,7 +118,6 @@ struct JourneyColumn {
 
   static JourneyColumn FromValues(const std::vector<JourneyValue>& values) {
     JourneyColumn column;
-    column.row_offsets.push_back(0);
     column.vertex_offsets.push_back(0);
     column.edge_offsets.push_back(0);
     column.departure_offsets.push_back(0);
@@ -136,7 +134,6 @@ struct JourneyColumn {
       column.edge_offsets.push_back(static_cast<uint32_t>(column.edges.size()));
       column.departure_offsets.push_back(static_cast<uint32_t>(column.departures.size()));
       column.arrival_offsets.push_back(static_cast<uint32_t>(column.arrivals.size()));
-      column.row_offsets.push_back(column.vertex_offsets.back());
     }
     return column;
   }

@@ -34,9 +34,11 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
     if (acquired.ok()) delta = std::move(acquired).ConsumeValueOrDie();
   }
   internal::QueryStatisticsView statistics;
-  return internal::QueryPlanner::Bind(
-      *root, internal::PlanningContext{snapshot_seq, catalog, delta, statistics,
-                                       options});
+  internal::PlanningContext context{snapshot_seq, catalog, delta, statistics,
+                                    options};
+  context.database_identity = catalog.database_identity;
+  context.schema_epoch = 0;
+  return internal::QueryPlanner::Bind(*root, context);
 }
 
 std::optional<PhysicalType> PhysicalTypeOf(QueryType type) {

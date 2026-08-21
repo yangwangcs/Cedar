@@ -1370,7 +1370,8 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
         if (node->kind() == LogicalOpKind::kExpandOut ||
             node->kind() == LogicalOpKind::kExpandIn ||
             node->kind() == LogicalOpKind::kExpandBoth ||
-            node->kind() == LogicalOpKind::kKHopExpand) {
+            node->kind() == LogicalOpKind::kKHopExpand ||
+            node->kind() == LogicalOpKind::kCoexistingShortestPath) {
           graph = node;
           return;
         }

@@ -474,6 +474,7 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
       auto expanded = ExpandTemporal(snapshot, layer, options);
       if (!expanded.ok()) return expanded.status();
       for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
+        // debug
         if (options.check_abort) {
           if (Status status = options.check_abort(); !status.ok()) return status;
         }
@@ -525,6 +526,195 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
     }
     frontier = std::move(next);
   }
+  return result;
+}
+
+namespace {
+
+bool IntervalContains(const ValidTimeInterval& outer,
+                      const ValidTimeInterval& inner) {
+  if (outer.from.value > inner.from.value) return false;
+  if (!outer.to.has_value()) return true;
+  if (!inner.to.has_value()) return false;
+  return outer.to->value >= inner.to->value;
+}
+
+bool EdgeRefLess(const EdgeRef& left, const EdgeRef& right) {
+  if (left.home_part_id.value != right.home_part_id.value)
+    return left.home_part_id.value < right.home_part_id.value;
+  return left.edge_id.value < right.edge_id.value;
+}
+
+std::vector<EdgeRef> LabelEdges(const std::vector<CoexistingLabel>& labels,
+                                uint64_t id) {
+  std::vector<EdgeRef> edges;
+  while (id != std::numeric_limits<uint64_t>::max() && id < labels.size()) {
+    const CoexistingLabel& label = labels[id];
+    if (label.depth != 0) edges.push_back(label.incoming_edge);
+    id = label.predecessor_label;
+  }
+  std::reverse(edges.begin(), edges.end());
+  return edges;
+}
+
+bool LabelPathLess(const std::vector<CoexistingLabel>& labels, uint64_t left,
+                  uint64_t right) {
+  const std::vector<EdgeRef> a = LabelEdges(labels, left);
+  const std::vector<EdgeRef> b = LabelEdges(labels, right);
+  return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                                       EdgeRefLess);
+}
+
+PathValue ReconstructPath(const std::vector<CoexistingLabel>& labels,
+                          uint64_t id) {
+  PathValue path;
+  if (id >= labels.size()) return path;
+  path.common = labels[id].common;
+  std::vector<uint64_t> chain;
+  for (uint64_t current = id; current != std::numeric_limits<uint64_t>::max() &&
+                               current < labels.size();
+       current = labels[current].predecessor_label) {
+    chain.push_back(current);
+  }
+  std::reverse(chain.begin(), chain.end());
+  path.vertices.reserve(chain.size());
+  for (uint64_t label_id : chain) {
+    path.vertices.push_back(labels[label_id].vertex);
+    if (labels[label_id].depth != 0)
+      path.edges.push_back(labels[label_id].incoming_edge);
+  }
+  return path;
+}
+
+Status ChargeCoexistingLabel(const GraphFrontierOptions& options) {
+  if (options.check_abort) {
+    if (Status status = options.check_abort(); !status.ok()) return status;
+  }
+  if (options.reservation == nullptr) return Status::OK();
+  if (Status status = options.reservation->ReserveGraphLabels(1);
+      !status.ok())
+    return status;
+  return options.reservation->ReserveIntervalFragments(1);
+}
+
+}  // namespace
+
+StatusOr<CoexistingPathResult> CoexistingShortestPath(
+    Snapshot& snapshot, const GraphExpansionRequest& request,
+    const VertexRef& target, const GraphFrontierOptions& options) {
+  const auto interval = RequestInterval(request.interval);
+  if (!interval.has_value()) {
+    return Status::InvalidArgument("coexisting shortest path",
+                                   "invalid request interval");
+  }
+  CoexistingPathResult result;
+  if (options.max_hops == 0 || request.frontier.empty()) return result;
+
+  // Keep labels grouped by vertex.  Entries are ids into result.labels, so
+  // dominance never invalidates predecessor references.
+  std::map<VertexKey, std::vector<uint64_t>> by_vertex;
+  std::vector<uint64_t> frontier;
+  for (const VertexRef& source : request.frontier) {
+    const uint64_t id = result.labels.size();
+    if (Status status = ChargeCoexistingLabel(options); !status.ok())
+      return status;
+    result.labels.push_back(
+        CoexistingLabel{source, *interval, 0,
+                        std::numeric_limits<uint64_t>::max(), EdgeRef{}});
+    by_vertex[VertexKey{source}].push_back(id);
+    frontier.push_back(id);
+  }
+
+  std::optional<uint32_t> target_depth;
+  std::vector<uint64_t> target_labels;
+  GraphFrontierOptions expansion_options = options;
+  // ExpandTemporal charges raw traversals. Coexisting execution charges only
+  // labels that survive interval dominance, as required by QueryReservation.
+  expansion_options.reservation = nullptr;
+  for (uint32_t depth = 1;
+       depth <= options.max_hops && !frontier.empty(); ++depth) {
+    if (target_depth.has_value() && depth > *target_depth) break;
+    std::vector<uint64_t> next;
+    for (uint64_t prior_id : frontier) {
+      if (options.check_abort) {
+        if (Status status = options.check_abort(); !status.ok()) return status;
+      }
+      // Copy the small label: accepted candidates append to result.labels and
+      // may reallocate the backing vector while this expansion is in flight.
+      const CoexistingLabel prior = result.labels[prior_id];
+      GraphExpansionRequest layer = request;
+      layer.frontier = {prior.vertex};
+      layer.interval = prior.common;
+      auto expanded = ExpandTemporal(snapshot, layer, expansion_options);
+      if (!expanded.ok()) return expanded.status();
+      for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
+        if (options.check_abort) {
+          if (Status status = options.check_abort(); !status.ok()) return status;
+        }
+        VertexRef destination;
+        if (request.direction == ExpandDirection::kOut) {
+          if (traversal.source != prior.vertex) continue;
+          destination = traversal.target;
+        } else if (request.direction == ExpandDirection::kIn) {
+          if (traversal.target != prior.vertex) continue;
+          destination = traversal.source;
+        } else {
+          if (traversal.source == prior.vertex) destination = traversal.target;
+          else if (traversal.target == prior.vertex) destination = traversal.source;
+          else continue;
+        }
+        const ValidTimeInterval common = traversal.effective;
+        auto& existing = by_vertex[VertexKey{destination}];
+        bool dominated = false;
+        for (uint64_t existing_id : existing) {
+          const CoexistingLabel& label = result.labels[existing_id];
+          if (label.depth <= depth && IntervalContains(label.common, common)) {
+            dominated = true;
+            break;
+          }
+        }
+        if (dominated) continue;
+        existing.erase(std::remove_if(existing.begin(), existing.end(),
+                                      [&](uint64_t existing_id) {
+          const CoexistingLabel& label = result.labels[existing_id];
+          const bool remove = depth <= label.depth &&
+                              IntervalContains(common, label.common);
+          if (remove && destination == target) {
+            target_labels.erase(std::remove(target_labels.begin(),
+                                            target_labels.end(), existing_id),
+                                target_labels.end());
+          }
+          return remove;
+        }), existing.end());
+        if (Status status = ChargeCoexistingLabel(options); !status.ok())
+          return status;
+        const uint64_t id = result.labels.size();
+        result.labels.push_back(CoexistingLabel{destination, common, depth,
+                                                prior_id, traversal.edge});
+        existing.push_back(id);
+        if (destination == target) {
+          if (!target_depth.has_value()) target_depth = depth;
+          if (depth == *target_depth) {
+            target_labels.push_back(id);
+          }
+        }
+        if (!target_depth.has_value() || depth < *target_depth)
+          next.push_back(id);
+      }
+    }
+    frontier = std::move(next);
+  }
+
+  // A shortest witness can have several disjoint maximal intervals. Keep the
+  // deterministic edge-sequence winner when equal-hop labels overlap.
+  std::sort(target_labels.begin(), target_labels.end(),
+            [&](uint64_t left, uint64_t right) {
+    const auto& a = result.labels[left].common;
+    const auto& b = result.labels[right].common;
+    if (a.from.value != b.from.value) return a.from.value < b.from.value;
+    return LabelPathLess(result.labels, left, right);
+  });
+  for (uint64_t id : target_labels) result.paths.push_back(ReconstructPath(result.labels, id));
   return result;
 }
 

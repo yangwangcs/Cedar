@@ -30,6 +30,40 @@ namespace internal {
 class QueryRuntime;
 }
 
+// A path is materialized only for a selected shortest-path target.  Keeping
+// the nested values in this small value type lets the public column use flat
+// buffers instead of a vector-of-vectors representation.
+struct PathValue {
+  std::vector<VertexRef> vertices;
+  std::vector<EdgeRef> edges;
+  ValidTimeInterval common;
+
+  bool operator==(const PathValue&) const = default;
+};
+
+struct PathColumn {
+  std::vector<uint32_t> row_offsets;
+  std::vector<VertexRef> vertices;
+  std::vector<EdgeRef> edges;
+  std::vector<ValidTimeInterval> intervals;
+
+  static PathColumn FromValues(const std::vector<PathValue>& values) {
+    PathColumn column;
+    column.row_offsets.reserve(values.size() + 1);
+    column.row_offsets.push_back(0);
+    for (const PathValue& value : values) {
+      column.vertices.insert(column.vertices.end(), value.vertices.begin(),
+                             value.vertices.end());
+      column.edges.insert(column.edges.end(), value.edges.begin(),
+                          value.edges.end());
+      column.intervals.push_back(value.common);
+      column.row_offsets.push_back(
+          static_cast<uint32_t>(column.vertices.size()));
+    }
+    return column;
+  }
+};
+
 using QueryColumnVector = std::variant<
     std::vector<uint8_t>, std::vector<int32_t>, std::vector<int64_t>,
     std::vector<float>, std::vector<double>, std::vector<uint64_t>,

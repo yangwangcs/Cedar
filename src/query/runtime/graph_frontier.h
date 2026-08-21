@@ -5,6 +5,7 @@
 #define CEDAR_QUERY_RUNTIME_GRAPH_FRONTIER_H_
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <map>
 
 #include "cedar/query/query.h"
+#include "cedar/query/result.h"
 #include "cedar/query/types.h"
 #include "cedar/snapshot.h"
 #include "query/projection/query_delta.h"
@@ -110,6 +112,26 @@ struct KHopResult {
   std::vector<GraphLabel> labels;
   std::vector<TemporalTraversal> traversals;
 };
+
+// A coexisting label keeps one common valid-time witness and a predecessor
+// id.  Path vectors are deliberately absent from frontier state and are
+// reconstructed only for selected targets.
+struct CoexistingLabel {
+  VertexRef vertex;
+  ValidTimeInterval common;
+  uint32_t depth = 0;
+  uint64_t predecessor_label = std::numeric_limits<uint64_t>::max();
+  EdgeRef incoming_edge;
+};
+
+struct CoexistingPathResult {
+  std::vector<CoexistingLabel> labels;
+  std::vector<PathValue> paths;
+};
+
+StatusOr<CoexistingPathResult> CoexistingShortestPath(
+    Snapshot& snapshot, const GraphExpansionRequest& request,
+    const VertexRef& target, const GraphFrontierOptions& options = {});
 
 StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
     Snapshot& snapshot, const GraphExpansionRequest& request,

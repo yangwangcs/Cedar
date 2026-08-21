@@ -15,6 +15,48 @@
 namespace cedar {
 namespace {
 
+struct TemporalScopeCase {
+  TemporalScope scope;
+  internal::LogicalOpKind kind;
+};
+
+void ExpectSameScope(const TemporalScope& actual,
+                     const TemporalScope& expected) {
+  ASSERT_EQ(actual.index(), expected.index());
+  std::visit(
+      [](const auto& actual_scope, const auto& expected_scope) {
+        using Actual = std::decay_t<decltype(actual_scope)>;
+        using Expected = std::decay_t<decltype(expected_scope)>;
+        if constexpr (!std::is_same_v<Actual, Expected>) {
+          ADD_FAILURE() << "temporal scope alternatives differ";
+        } else if constexpr (std::is_same_v<Actual, At>) {
+          EXPECT_EQ(actual_scope.time, expected_scope.time);
+        } else {
+          EXPECT_EQ(actual_scope.interval, expected_scope.interval);
+        }
+      },
+      actual, expected);
+}
+
+void ExpectTemporalScopePlan(
+    const StatusOr<Query>& query, internal::LogicalOpKind temporal_kind,
+    internal::LogicalOpKind scan_kind, const TemporalScope& expected_scope) {
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  const internal::LogicalPlanNode* temporal =
+      internal::LogicalPlanInspector::Inspect(query.ValueOrDie());
+  ASSERT_NE(temporal, nullptr);
+  EXPECT_EQ(temporal->kind(), temporal_kind);
+  ASSERT_TRUE(temporal->scope().has_value());
+  ExpectSameScope(*temporal->scope(), expected_scope);
+  ASSERT_EQ(temporal->inputs().size(), 1U);
+
+  const auto& scan = temporal->inputs()[0];
+  ASSERT_NE(scan, nullptr);
+  EXPECT_EQ(scan->kind(), scan_kind);
+  EXPECT_FALSE(scan->scope().has_value());
+  EXPECT_TRUE(scan->inputs().empty());
+}
+
 TEST(LogicalPlanTest, BuildsTypedVertexPropertyPredicate) {
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
   OptionalSlot<int64_t> age = OptionalSlot<int64_t>::Named("age");
@@ -30,6 +72,30 @@ TEST(LogicalPlanTest, BuildsTypedVertexPropertyPredicate) {
       {Project(vertex), Project(age)});
   ASSERT_TRUE(selected.ok()) << selected.status().ToString();
   EXPECT_EQ(selected.ValueOrDie().schema().columns().size(), 2U);
+}
+
+TEST(LogicalPlanTest, MaterializesTemporalScopesAboveSourceScans) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const Slot<EdgeRef> edge = Slot<EdgeRef>::Named("e");
+  const ValidTimeInterval interval{ValidTime{10}, ValidTime{20}};
+  const std::vector<TemporalScopeCase> cases{
+      {At{ValidTime{1}}, internal::LogicalOpKind::kStateAt},
+      {Events{interval}, internal::LogicalOpKind::kEventsBetween},
+      {Changes{interval}, internal::LogicalOpKind::kChangesBetween},
+      {Overlaps{interval}, internal::LogicalOpKind::kStateOverlaps},
+      {Throughout{interval}, internal::LogicalOpKind::kStateThroughout},
+      {History{interval}, internal::LogicalOpKind::kHistory},
+  };
+
+  for (const TemporalScopeCase& test_case : cases) {
+    ExpectTemporalScopePlan(Query::Vertices(vertex, test_case.scope),
+                            test_case.kind,
+                            internal::LogicalOpKind::kVertexScan,
+                            test_case.scope);
+    ExpectTemporalScopePlan(Query::Edges(edge, test_case.scope),
+                            test_case.kind, internal::LogicalOpKind::kEdgeScan,
+                            test_case.scope);
+  }
 }
 
 template <typename Left, typename Right>
@@ -62,6 +128,28 @@ TEST(LogicalPlanTest, RejectsDuplicateSlotIds) {
   const auto selected = source.ValueOrDie().Select(
       {Project(vertex), Project(vertex)});
   EXPECT_TRUE(selected.status().IsInvalidArgument());
+}
+
+TEST(LogicalPlanTest, RejectsPredicatesWithSlotsOutsideInputSchema) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const Slot<int64_t> missing = Slot<int64_t>::Named("missing");
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+
+  const auto filtered = source.ValueOrDie().Where(
+      Not(Equal(ValueOf(missing), Literal<int64_t>(18))));
+  EXPECT_TRUE(filtered.status().IsInvalidArgument());
+}
+
+TEST(LogicalPlanTest, RejectsPredicatesWithSlotsOfWrongInputType) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const Slot<int64_t> wrong_type = Slot<int64_t>::WithId(vertex.id());
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+
+  const auto filtered = source.ValueOrDie().Where(
+      Not(Equal(ValueOf(wrong_type), Literal<int64_t>(18))));
+  EXPECT_TRUE(filtered.status().IsInvalidArgument());
 }
 
 TEST(LogicalPlanTest, RejectsExpandSlotsDuplicatingInputSchema) {

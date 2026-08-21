@@ -24,11 +24,22 @@ Status ValidateScope(const TemporalScope& scope) {
 }
 
 bool Contains(const RowSchema& schema, const RowColumn& expected) {
-  return std::find(schema.columns().begin(), schema.columns().end(), expected) != schema.columns().end();
+  return std::find(schema.columns().begin(), schema.columns().end(), expected) !=
+         schema.columns().end();
 }
 
 bool HasSlotId(const RowSchema& schema, SlotId slot) {
-  return std::any_of(schema.columns().begin(), schema.columns().end(), [slot](const RowColumn& column) { return column.slot == slot; });
+  return std::any_of(schema.columns().begin(), schema.columns().end(),
+                     [slot](const RowColumn& column) {
+                       return column.slot == slot;
+                     });
+}
+
+bool ContainsSlot(const RowSchema& schema, SlotId slot, QueryType type) {
+  return std::any_of(schema.columns().begin(), schema.columns().end(),
+                     [slot, type](const RowColumn& column) {
+                       return column.slot == slot && column.type == type;
+                     });
 }
 
 Status ValidateColumns(const std::vector<RowColumn>& columns) {
@@ -42,35 +53,82 @@ Status ValidateColumns(const std::vector<RowColumn>& columns) {
 }
 
 std::shared_ptr<const internal::LogicalPlanNode> Append(internal::LogicalOpKind kind,
-    const std::shared_ptr<const internal::LogicalPlanNode>& input, RowSchema schema,
-    internal::LogicalPlanPayload payload = {}) {
-  return std::make_shared<const internal::LogicalPlanNode>(kind, std::move(schema),
+    const std::shared_ptr<const internal::LogicalPlanNode>& input,
+    RowSchema schema, internal::LogicalPlanPayload payload = {}) {
+  return std::make_shared<const internal::LogicalPlanNode>(
+      kind, std::move(schema),
       std::vector<std::shared_ptr<const internal::LogicalPlanNode>>{input},
       std::move(payload));
+}
+
+internal::LogicalOpKind TemporalKind(const TemporalScope& scope) {
+  return std::visit([](const auto& value) {
+    using T = std::decay_t<decltype(value)>;
+    if constexpr (std::is_same_v<T, At>) {
+      return internal::LogicalOpKind::kStateAt;
+    } else if constexpr (std::is_same_v<T, Events>) {
+      return internal::LogicalOpKind::kEventsBetween;
+    } else if constexpr (std::is_same_v<T, Changes>) {
+      return internal::LogicalOpKind::kChangesBetween;
+    } else if constexpr (std::is_same_v<T, Overlaps>) {
+      return internal::LogicalOpKind::kStateOverlaps;
+    } else if constexpr (std::is_same_v<T, Throughout>) {
+      return internal::LogicalOpKind::kStateThroughout;
+    } else {
+      return internal::LogicalOpKind::kHistory;
+    }
+  }, scope);
+}
+
+std::shared_ptr<const internal::LogicalPlanNode> MakeScopedScan(
+    internal::LogicalOpKind scan_kind, RowColumn column, TemporalScope scope) {
+  RowSchema schema({column});
+  const auto scan = std::make_shared<const internal::LogicalPlanNode>(
+      scan_kind, schema,
+      std::vector<std::shared_ptr<const internal::LogicalPlanNode>>{});
+  internal::LogicalPlanPayload payload;
+  payload.scope = std::move(scope);
+  return Append(TemporalKind(*payload.scope), scan, std::move(schema),
+                std::move(payload));
+}
+
+Status ValidateExpressionSlots(const internal::ExpressionNode& expression,
+                               const RowSchema& schema) {
+  if (expression.kind() == internal::ExpressionKind::kSlot &&
+      !ContainsSlot(schema, expression.slot(), expression.type())) {
+    return Status::InvalidArgument("filter references a slot outside the input schema");
+  }
+  for (const auto& child : expression.children()) {
+    if (!child) {
+      return Status::InvalidArgument("filter predicate contains an invalid expression");
+    }
+    if (Status status = ValidateExpressionSlots(*child, schema); !status.ok()) {
+      return status;
+    }
+  }
+  return Status::OK();
 }
 
 }  // namespace
 
 StatusOr<Query> Query::Vertices(Slot<VertexRef> vertex, TemporalScope scope) {
-  if (vertex.id().value == 0) return Status::InvalidArgument("vertex SlotId is invalid");
+  if (vertex.id().value == 0) {
+    return Status::InvalidArgument("vertex SlotId is invalid");
+  }
   if (Status status = ValidateScope(scope); !status.ok()) return status;
-  internal::LogicalPlanPayload payload;
-  payload.scope = std::move(scope);
-  return Query(std::make_shared<const internal::LogicalPlanNode>(internal::LogicalOpKind::kVertexScan,
-      RowSchema({{vertex.id(), vertex.type(), false}}),
-      std::vector<std::shared_ptr<const internal::LogicalPlanNode>>{},
-      std::move(payload)));
+  return Query(MakeScopedScan(internal::LogicalOpKind::kVertexScan,
+                              {vertex.id(), vertex.type(), false},
+                              std::move(scope)));
 }
 
 StatusOr<Query> Query::Edges(Slot<EdgeRef> edge, TemporalScope scope) {
-  if (edge.id().value == 0) return Status::InvalidArgument("edge SlotId is invalid");
+  if (edge.id().value == 0) {
+    return Status::InvalidArgument("edge SlotId is invalid");
+  }
   if (Status status = ValidateScope(scope); !status.ok()) return status;
-  internal::LogicalPlanPayload payload;
-  payload.scope = std::move(scope);
-  return Query(std::make_shared<const internal::LogicalPlanNode>(internal::LogicalOpKind::kEdgeScan,
-      RowSchema({{edge.id(), edge.type(), false}}),
-      std::vector<std::shared_ptr<const internal::LogicalPlanNode>>{},
-      std::move(payload)));
+  return Query(MakeScopedScan(internal::LogicalOpKind::kEdgeScan,
+                              {edge.id(), edge.type(), false},
+                              std::move(scope)));
 }
 
 StatusOr<Query> Query::Expand(const ExpandSpec& spec) const {
@@ -87,17 +145,23 @@ StatusOr<Query> Query::Expand(const ExpandSpec& spec) const {
   std::vector<RowColumn> columns = schema().columns();
   columns.push_back({spec.edge.id(), spec.edge.type(), false});
   columns.push_back({spec.destination.id(), spec.destination.type(), false});
-  const auto kind = spec.direction == ExpandDirection::kOut ? internal::LogicalOpKind::kExpandOut :
-      spec.direction == ExpandDirection::kIn ? internal::LogicalOpKind::kExpandIn : internal::LogicalOpKind::kExpandBoth;
+  const auto kind = spec.direction == ExpandDirection::kOut
+                        ? internal::LogicalOpKind::kExpandOut
+                    : spec.direction == ExpandDirection::kIn
+                        ? internal::LogicalOpKind::kExpandIn
+                        : internal::LogicalOpKind::kExpandBoth;
   internal::LogicalPlanPayload payload;
   payload.expand_spec = spec;
   return Query(Append(kind, root_, RowSchema(std::move(columns)),
                       std::move(payload)));
 }
 
-StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex, PropertyId property, RowColumn output) const {
+StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex,
+                                               PropertyId property,
+                                               RowColumn output) const {
   if (!root_ || !property.valid() || output.slot.value == 0 ||
-      !Contains(schema(), {vertex, QueryType::kVertexRef, false}) || HasSlotId(schema(), output.slot)) {
+      !Contains(schema(), {vertex, QueryType::kVertexRef, false}) ||
+      HasSlotId(schema(), output.slot)) {
     return Status::InvalidArgument("property binding is invalid or duplicates a SlotId");
   }
   std::vector<RowColumn> columns = schema().columns();
@@ -109,9 +173,15 @@ StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex, PropertyId property
 }
 
 StatusOr<Query> Query::Where(Expr<bool> predicate) const {
-  if (!root_ || !predicate.valid()) return Status::InvalidArgument("filter predicate is invalid");
+  if (!root_ || !predicate.valid()) {
+    return Status::InvalidArgument("filter predicate is invalid");
+  }
+  const auto expression = internal::ExpressionInspector::Share(predicate);
+  if (Status status = ValidateExpressionSlots(*expression, schema()); !status.ok()) {
+    return status;
+  }
   internal::LogicalPlanPayload payload;
-  payload.predicate = internal::ExpressionInspector::Share(predicate);
+  payload.predicate = std::move(expression);
   return Query(Append(internal::LogicalOpKind::kFilter, root_, schema(),
                       std::move(payload)));
 }
@@ -121,11 +191,14 @@ StatusOr<Query> Query::Select(std::vector<Projection> projections) const {
   std::vector<RowColumn> columns;
   columns.reserve(projections.size());
   for (const Projection& projection : projections) {
-    if (!Contains(schema(), projection.column)) return Status::InvalidArgument("projection is not in the input schema");
+    if (!Contains(schema(), projection.column)) {
+      return Status::InvalidArgument("projection is not in the input schema");
+    }
     columns.push_back(projection.column);
   }
   if (Status status = ValidateColumns(columns); !status.ok()) return status;
-  return Query(Append(internal::LogicalOpKind::kProject, root_, RowSchema(std::move(columns))));
+  return Query(Append(internal::LogicalOpKind::kProject, root_,
+                      RowSchema(std::move(columns))));
 }
 
 const RowSchema& Query::schema() const {

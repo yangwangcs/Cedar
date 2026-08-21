@@ -29,6 +29,15 @@
   run boundary. Query cursors wire cancellation and deadline checks into this
   callback, covering external spill boundaries.
 
+## Accounting caveat
+
+The canonical binder now charges the actual string/binary payload as soon as
+the bound rows are returned, and `BuildColumns` reserves payload bytes before
+copying. The underlying history reader still constructs its `Value` before the
+runtime reservation hook, and vector allocator capacity overhead is not
+charged byte-for-byte; strict allocation-before-reservation for that reader
+requires a lower-level reservation-aware history API.
+
 ## Remaining review items
 
 The following Important findings are not fully closed in this change:

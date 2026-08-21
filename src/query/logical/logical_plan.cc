@@ -74,9 +74,14 @@ StatusOr<Query> Query::Edges(Slot<EdgeRef> edge, TemporalScope scope) {
 }
 
 StatusOr<Query> Query::Expand(const ExpandSpec& spec) const {
-  if (!root_ || !Contains(schema(), {spec.source.id(), QueryType::kVertexRef, false}) ||
+  if (!root_ ||
+      !Contains(schema(), {spec.source.id(), QueryType::kVertexRef, false}) ||
       spec.edge.id().value == 0 || spec.destination.id().value == 0 ||
-      spec.edge.id() == spec.destination.id() || spec.source.id() == spec.edge.id() || spec.source.id() == spec.destination.id()) {
+      spec.edge.id() == spec.destination.id() ||
+      spec.source.id() == spec.edge.id() ||
+      spec.source.id() == spec.destination.id() ||
+      HasSlotId(schema(), spec.edge.id()) ||
+      HasSlotId(schema(), spec.destination.id())) {
     return Status::InvalidArgument("expand slots are invalid or duplicate");
   }
   std::vector<RowColumn> columns = schema().columns();

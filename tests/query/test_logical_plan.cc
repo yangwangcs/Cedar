@@ -64,6 +64,30 @@ TEST(LogicalPlanTest, RejectsDuplicateSlotIds) {
   EXPECT_TRUE(selected.status().IsInvalidArgument());
 }
 
+TEST(LogicalPlanTest, RejectsExpandSlotsDuplicatingInputSchema) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const OptionalSlot<int64_t> age = OptionalSlot<int64_t>::Named("age");
+  const Slot<VertexRef> destination = Slot<VertexRef>::Named("dst");
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  const auto bound = source.ValueOrDie().BindVertexProperty(
+      vertex, PropertyId{7}, age);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+
+  const ExpandSpec duplicate_edge{
+      vertex, Slot<EdgeRef>::WithId(age.id()), destination,
+      ExpandDirection::kOut};
+  const auto duplicate_edge_result = bound.ValueOrDie().Expand(duplicate_edge);
+  EXPECT_TRUE(duplicate_edge_result.status().IsInvalidArgument());
+
+  const ExpandSpec duplicate_destination{
+      vertex, Slot<EdgeRef>::Named("e"), Slot<VertexRef>::WithId(age.id()),
+      ExpandDirection::kOut};
+  const auto duplicate_destination_result =
+      bound.ValueOrDie().Expand(duplicate_destination);
+  EXPECT_TRUE(duplicate_destination_result.status().IsInvalidArgument());
+}
+
 TEST(LogicalPlanTest, RetainsFilterExpandAndPropertyBindingSemantics) {
   const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
   const Slot<EdgeRef> edge = Slot<EdgeRef>::Named("e");

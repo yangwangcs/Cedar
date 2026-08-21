@@ -125,6 +125,7 @@ struct PlanningContext {
   QueryOptions options;
   std::string database_identity;
   uint32_t schema_epoch = 0;
+  bool allow_delta_merge = false;
 };
 
 class QueryPlanner {

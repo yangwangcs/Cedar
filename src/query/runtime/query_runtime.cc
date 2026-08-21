@@ -227,6 +227,45 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
       plan.scope);
 }
 
+StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
+    const internal::PreparedQueryPlan& plan) {
+  if (!plan.physical_plan || !plan.projection_reader) {
+    return Status::NotFound("query runtime", "projection reader is unavailable");
+  }
+  std::vector<RuntimeRow> rows;
+  bool found = false;
+  for (const auto& slice : plan.physical_plan->coverage_slices) {
+    if (slice.source != internal::CoverageSource::kProjection) {
+      continue;
+    }
+    auto chains = plan.projection_reader(slice);
+    if (!chains.ok()) return chains.status();
+    found = true;
+    for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
+      for (const internal::ProjectionInterval& interval : chain.intervals) {
+        const FactFamily family = plan.entity_family;
+        rows.push_back({FactRef{chain.header.part_id, family, PropertyId{},
+                                interval.entity_id},
+                        interval.effective, std::nullopt, interval.value});
+      }
+    }
+  }
+  if (!found) return Status::NotFound("query runtime", "projection slice is unavailable");
+  return rows;
+}
+
+bool RowInInterval(const RuntimeRow& row, const ValidTimeInterval& interval) {
+  const uint64_t from = row.point ? row.point->value
+                                  : row.effective ? row.effective->from.value : 0;
+  const uint64_t to = row.point ? from + 1
+                                : row.effective && row.effective->to
+                                      ? row.effective->to->value
+                                      : std::numeric_limits<uint64_t>::max();
+  const uint64_t end = interval.to ? interval.to->value
+                                   : std::numeric_limits<uint64_t>::max();
+  return from < end && interval.from.value < to;
+}
+
 StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
     Snapshot& snapshot, std::vector<RuntimeRow> rows,
     const internal::PreparedPropertyBinding& binding) {
@@ -258,7 +297,23 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
 
 StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
-  auto rows = ReadSourceRows(snapshot, plan);
+  StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan);
+  if (plan.physical_plan && plan.projection_reader) {
+    auto derived = ReadProjectionRows(plan);
+    if (derived.ok()) {
+      std::vector<RuntimeRow> combined;
+      for (const auto& slice : plan.physical_plan->coverage_slices) {
+        const auto& source = slice.source;
+        const auto& input = source == internal::CoverageSource::kProjection
+                                ? derived.ValueOrDie()
+                                : rows.ValueOrDie();
+        for (const auto& row : input) {
+          if (RowInInterval(row, slice.interval)) combined.push_back(row);
+        }
+      }
+      rows = std::move(combined);
+    }
+  }
   if (!rows.ok()) return rows.status();
   if (!plan.property_bindings.empty()) {
     rows = BindPropertyRows(snapshot, std::move(rows).ConsumeValueOrDie(),

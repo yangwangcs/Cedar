@@ -5,6 +5,7 @@
 #define CEDAR_QUERY_RUNTIME_QUERY_RUNTIME_H_
 
 #include <limits>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -16,6 +17,8 @@
 #include "query/logical/expression.h"
 #include "query/logical/logical_plan.h"
 #include "query/runtime/relational.h"
+#include "query/planner/query_planner.h"
+#include "query/projection/projection_format.h"
 
 namespace cedar::internal {
 
@@ -60,7 +63,9 @@ struct PreparedQueryPlan {
         predicate(other.predicate),
         output_columns(other.output_columns),
         effective_output_slot(other.effective_output_slot),
-        referenced_properties(other.referenced_properties) {}
+        referenced_properties(other.referenced_properties),
+        physical_plan(other.physical_plan),
+        projection_reader(other.projection_reader) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
@@ -74,6 +79,8 @@ struct PreparedQueryPlan {
     referenced_properties = other.referenced_properties;
     relational_kind.reset();
     relational_input.reset();
+    physical_plan = other.physical_plan;
+    projection_reader = other.projection_reader;
     return *this;
   }
   PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;
@@ -90,6 +97,9 @@ struct PreparedQueryPlan {
   std::vector<PropertyId> referenced_properties;
   std::optional<LogicalOpKind> relational_kind;
   std::optional<RuntimeRelationalInput> relational_input;
+  std::shared_ptr<const PhysicalPlan> physical_plan;
+  std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
+      projection_reader;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

@@ -215,7 +215,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
         context.delta.through.value >= context.snapshot_seq.value &&
         context.delta.first_missing.value == 0;
     if (context.projections.base_seq.value < context.snapshot_seq.value &&
-        delta_complete) {
+        delta_complete && context.allow_delta_merge) {
       slice.source = CoverageSource::kDeltaMerge;
       plan.operations.push_back(PhysicalOpKind::kDeltaMerge);
     } else if (context.projections.base_seq.value < context.snapshot_seq.value) {
@@ -224,6 +224,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
       slice.source = CoverageSource::kCanonical;
       slice.projection_generation.reset();
       slice.projection_base.reset();
+      plan.pushdowns.push_back("delta-fallback");
     }
     plan.coverage_slices.push_back(std::move(slice));
     cursor = region_to;

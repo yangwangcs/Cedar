@@ -1,8 +1,7 @@
 # Task 10 Report
 
-Status: PARTIAL: planner correctness and real binding complete; physical
-projection execution remains explicitly blocked by the existing runtime row
-boundary.
+Status: DONE for the supported physical boundary; delta merge remains an
+explicit canonical fallback until its merge adapter is enabled.
 
 Implemented the Cedar-owned late-binding planner in
 `src/query/planner/query_planner.{h,cc}`. The planner now provides:
@@ -43,6 +42,11 @@ Follow-up fixes after review:
   canonical slice. `QueryProjectionStore::ReadChains` is a Cedar-owned,
   snapshot/base-checked segment decoder.
 - Added incomplete-delta and identity mismatch safety tests.
+- `PreparedQueryPlan` now carries a bound `PhysicalPlan` and a Cedar-owned
+  projection reader. Projection slices are decoded into `RuntimeRow` intervals
+  by `QueryRuntime`; canonical and delta-fallback slices are read from the
+  canonical source, clipped to their own half-open ranges, and concatenated
+  without overlap before the existing predicate/property/output pipeline.
 
 Verification after fixes:
 
@@ -52,10 +56,7 @@ ctest --test-dir build/query-debug --output-on-failure -R 'QueryPlanner|QueryCan
 git diff --check: PASS
 ```
 
-Remaining blocker: `QueryRuntime::Execute` still consumes only
-`PreparedQueryPlan` and constructs `RuntimeRow` from `TemporalSource`; there is
-no existing adapter from decoded `ProjectionChain` to `RuntimeRow`/`BatchStream`,
-nor a database-owned reader handle in its signature. `ReadChains` is therefore
-not silently wired into output execution. Completing Step 8 requires extending
-that runtime boundary and a derived-vs-canonical fixture; until then execution
-continues canonically for correctness.
+Delta merge is deliberately disabled in the production planning context until
+the runtime has a boundary-event adapter. The planner marks this as
+`delta-fallback` and never claims an unmerged `(base,S]` tail is executable;
+the physical executor still handles mixed projection/canonical slices.

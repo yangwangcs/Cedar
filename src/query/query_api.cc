@@ -156,6 +156,34 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         !physical.status().IsInvalidArgument()) {
       return physical.status();
     }
+    if (physical.ok()) {
+      internal::PreparedQueryPlan execution_plan = state_->plan;
+      execution_plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(
+          physical.ValueOrDie());
+      const FactFamily family = execution_plan.entity_family;
+      const std::weak_ptr<Database::Impl> weak_database = database;
+      execution_plan.projection_reader =
+          [weak_database, family, snapshot_seq = snapshot.commit_seq()](
+              const internal::CoverageSlice& slice)
+          -> StatusOr<std::vector<internal::ProjectionChain>> {
+        const auto db = weak_database.lock();
+        if (!db || !db->projection_store) {
+          return Status::NotFound("query", "projection store is unavailable");
+        }
+        internal::CoverageRequest request;
+        request.kind = family == FactFamily::kEdgeState
+                           ? internal::ProjectionKind::kAdjacency
+                           : internal::ProjectionKind::kState;
+        request.part_id = PartId{0};
+        request.entity_min = 0;
+        request.entity_max_exclusive = UINT64_MAX;
+        request.valid_time = slice.interval;
+        request.snapshot_seq = snapshot_seq;
+        return db->projection_store->ReadChains(request);
+      };
+      return internal::QueryRuntime::Execute(
+          execution_plan, std::move(snapshot), bindings, options);
+    }
   }
   if (!state_->plan.canonical_temporal) {
     return Status::NotSupported(

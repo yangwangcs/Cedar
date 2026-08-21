@@ -21,7 +21,8 @@ template <typename ImplT>
 StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
     const std::shared_ptr<ImplT>& database,
     const std::shared_ptr<const internal::LogicalPlanNode>& root,
-    CommitSeq snapshot_seq, const QueryOptions& options) {
+    CommitSeq snapshot_seq, const QueryOptions& options,
+    std::shared_ptr<const internal::QueryDeltaView>* bound_delta) {
   internal::ProjectionCatalogView catalog;
   if (database->projection_store) {
     const auto manifest = database->projection_store->current_manifest();
@@ -37,6 +38,9 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
       delta_usable = delta.base_seq == catalog.base_seq &&
                      delta.through.value >= snapshot_seq.value &&
                      delta.first_missing.value == 0;
+      if (delta_usable && bound_delta) {
+        *bound_delta = std::make_shared<const internal::QueryDeltaView>(delta);
+      }
     } else {
       delta.first_missing = snapshot_seq;
     }
@@ -158,8 +162,10 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         "query", "snapshot belongs to a different database");
   }
   if (snapshot.commit_seq().value != 0) {
+    std::shared_ptr<const internal::QueryDeltaView> bound_delta;
     auto physical = BindPhysicalForSnapshot(database, state_->logical_root,
-                                            snapshot.commit_seq(), options);
+                                            snapshot.commit_seq(), options,
+                                            &bound_delta);
     // The canonical runtime retains the established handling for unbounded
     // History and synthetic zero-sequence test snapshots. A planner refusal
     // for those shapes must not change their existing execution contract.
@@ -171,6 +177,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       internal::PreparedQueryPlan execution_plan = state_->plan;
       execution_plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(
           physical.ValueOrDie());
+      execution_plan.bound_delta_view = bound_delta;
       const FactFamily family = execution_plan.entity_family;
       const std::weak_ptr<Database::Impl> weak_database = database;
       execution_plan.projection_reader =
@@ -231,7 +238,7 @@ StatusOr<std::string> PreparedQuery::ExplainPhysical(
   const auto database = state_->database.lock();
   if (!database) return Status::ShutdownInProgress("query", "database no longer exists");
   auto plan = BindPhysicalForSnapshot(database, state_->logical_root,
-                                      snapshot.commit_seq(), options);
+                                      snapshot.commit_seq(), options, nullptr);
   if (!plan.ok()) return plan.status();
   return internal::QueryPlanner::ExplainPhysical(plan.ValueOrDie());
 }

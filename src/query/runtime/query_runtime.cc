@@ -245,9 +245,13 @@ StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
     std::optional<internal::QueryDeltaView> delta;
     if (slice.source == internal::CoverageSource::kDeltaMerge) {
       if (!plan.delta_reader) return Status::NotFound("query runtime", "delta reader unavailable");
-      auto acquired = plan.delta_reader();
-      if (!acquired.ok()) return acquired.status();
-      delta = std::move(acquired).ConsumeValueOrDie();
+      if (plan.bound_delta_view) {
+        delta = *plan.bound_delta_view;
+      } else {
+        auto acquired = plan.delta_reader();
+        if (!acquired.ok()) return acquired.status();
+        delta = std::move(acquired).ConsumeValueOrDie();
+      }
     }
     for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
       if (slice.source == internal::CoverageSource::kDeltaMerge) {

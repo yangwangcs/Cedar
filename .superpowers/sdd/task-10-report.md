@@ -71,3 +71,7 @@ builds Put/Delete boundaries from projection intervals, acquires the exact
 Delta view through the snapshot, calls `MergeBoundaries`, and materializes the
 corrected state intervals before clipping and concatenation. Partial entity
 coverage remains canonical by construction.
+
+The acquired contiguous Delta view is now stored as an immutable shared view in
+the prepared execution plan; runtime does not reacquire a moving maintenance
+view during materialization.

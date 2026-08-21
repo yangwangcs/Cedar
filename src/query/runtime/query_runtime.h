@@ -66,7 +66,8 @@ struct PreparedQueryPlan {
         referenced_properties(other.referenced_properties),
         physical_plan(other.physical_plan),
         projection_reader(other.projection_reader),
-        delta_reader(other.delta_reader) {}
+        delta_reader(other.delta_reader),
+        bound_delta_view(other.bound_delta_view) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
@@ -102,6 +103,7 @@ struct PreparedQueryPlan {
   std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
       projection_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;
+  std::shared_ptr<const QueryDeltaView> bound_delta_view;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

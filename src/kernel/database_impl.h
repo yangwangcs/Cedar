@@ -29,6 +29,7 @@
 #include "kernel/maintenance_controller.h"
 #include "kernel/maintenance_policy.h"
 #include "query/projection/projection_store.h"
+#include "query/projection/query_delta.h"
 
 namespace cedar {
 
@@ -231,6 +232,10 @@ class Database::Impl {
   std::condition_variable commits_drained;
   FactStore store;
   std::unique_ptr<internal::QueryProjectionStore> projection_store;
+  // Derived, rebuildable commit tail.  It is deliberately independent from
+  // the durable commit path; queue overflow records a gap but never rejects a
+  // commit that RocksDB has already published.
+  std::unique_ptr<internal::QueryDelta> query_delta;
   AsyncSubmissionExecutor async_executor;
   uint64_t next_vertex_id = 0;
   uint64_t vertex_lease_limit = 0;

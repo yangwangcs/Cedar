@@ -1787,6 +1787,58 @@ StatusOr<SequenceRecord> FactStore::ReadSequence(
   return record;
 }
 
+StatusOr<std::vector<SequenceRecord>> FactStore::ReadSequenceRange(
+    const StoreSnapshot& snapshot, CommitSeq first, CommitSeq last) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("scan sequence range",
+                                     "snapshot belongs to another store");
+    }
+  }
+  if (first.value == 0 || last.value < first.value ||
+      last.value > snapshot.commit_seq().value) {
+    return Status::InvalidArgument("scan sequence range", "invalid snapshot range");
+  }
+  const auto first_key = EncodeSequenceMetaKey(first);
+  if (!first_key.ok()) return first_key.status();
+  std::vector<SequenceRecord> records;
+  records.reserve(static_cast<size_t>(last.value - first.value + 1));
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->meta_cf));
+  iterator->Seek(first_key.ValueOrDie());
+  CommitSeq expected = first;
+  while (iterator->Valid() && expected.value <= last.value) {
+    if (!StartsWith(iterator->key(), kSequenceMetaPrefix)) break;
+    const auto expected_key = EncodeSequenceMetaKey(expected);
+    if (!expected_key.ok()) return expected_key.status();
+    if (iterator->key().ToString() != expected_key.ValueOrDie()) {
+      return Status::Corruption("scan sequence range", "sequence key disagrees with requested range");
+    }
+    const auto decoded = DecodeSequenceRecord(iterator->value().ToString());
+    if (!decoded.ok()) {
+      return decoded.status();
+    }
+    if (decoded.ValueOrDie().commit_seq != expected) {
+      return Status::Corruption("scan sequence range", "non-contiguous sequence metadata");
+    }
+    records.push_back(decoded.ValueOrDie());
+    if (expected.value == last.value) break;
+    ++expected.value;
+    iterator->Next();
+  }
+  const rocksdb::Status iterator_status = iterator->status();
+  if (!iterator_status.ok()) return FromRocksDb(iterator_status, "read sequence range");
+  if (records.size() != static_cast<size_t>(last.value - first.value + 1)) {
+    return Status::Corruption("scan sequence range", "missing sequence metadata");
+  }
+  return records;
+}
+
 StatusOr<FactEvent> FactStore::ReadExactFact(
     const StoreSnapshot& snapshot, const std::string& encoded_fact_key) const {
   std::shared_ptr<FactStoreImpl> store;
@@ -1811,6 +1863,57 @@ StatusOr<FactEvent> FactStore::ReadExactFact(
   if (!got.ok()) return FromRocksDb(got, "read scan fact");
   return DecodeFactValue(key.ValueOrDie().ref, key.ValueOrDie().valid_from,
                          key.ValueOrDie().commit_seq, encoded);
+}
+
+StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
+    const StoreSnapshot& snapshot,
+    const std::vector<std::string>& encoded_fact_keys) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("scan facts", "snapshot belongs to another store");
+    }
+  }
+  if (encoded_fact_keys.empty()) return std::vector<FactEvent>{};
+  std::vector<DecodedFactKey> decoded_keys;
+  decoded_keys.reserve(encoded_fact_keys.size());
+  std::vector<rocksdb::Slice> keys;
+  keys.reserve(encoded_fact_keys.size());
+  for (const std::string& encoded : encoded_fact_keys) {
+    const auto decoded = DecodeFactKey(encoded);
+    if (!decoded.ok()) return decoded.status();
+    if (decoded.ValueOrDie().commit_seq.value > snapshot.commit_seq().value) {
+      return Status::InvalidArgument("scan facts", "outside snapshot range");
+    }
+    decoded_keys.push_back(decoded.ValueOrDie());
+    keys.emplace_back(encoded);
+  }
+  std::vector<rocksdb::ColumnFamilyHandle*> families(keys.size(), store->facts_cf);
+  std::vector<std::string> values;
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  const std::vector<rocksdb::Status> statuses =
+      store->db->MultiGet(options, families, keys, &values);
+  store->multi_get_operations.fetch_add(encoded_fact_keys.size(),
+                                        std::memory_order_relaxed);
+  std::vector<FactEvent> events;
+  events.reserve(encoded_fact_keys.size());
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    if (!statuses[i].ok()) {
+      if (statuses[i].IsNotFound()) {
+        return Status::Corruption("scan facts", "sequence references missing fact");
+      }
+      return FromRocksDb(statuses[i], "read exact facts");
+    }
+    const auto event = DecodeFactValue(decoded_keys[i].ref,
+                                       decoded_keys[i].valid_from,
+                                       decoded_keys[i].commit_seq, values[i]);
+    if (!event.ok()) return event.status();
+    events.push_back(event.ValueOrDie());
+  }
+  return events;
 }
 
 StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {

@@ -194,4 +194,9 @@ void QueryProjectionStore::CollectRetired() { std::lock_guard<std::mutex> lock(m
 Status QueryProjectionStore::Quarantine(const std::string& filename) { std::lock_guard<std::mutex> lock(mutex_); if (!SafeName(filename) || filename == "PROJECTION-CURRENT") return Status::InvalidArgument("projection store", "invalid quarantine filename"); auto referenced = [&](const std::shared_ptr<ProjectionGeneration::State>& generation) { if (!generation) return false; for (const auto& file : generation->segment_files) if (file == filename) return true; return generation->manifest_file == (fs::path(projections_path_) / filename).string(); }; if (referenced(current_)) return Status::Conflict("projection store", "cannot quarantine referenced current file"); for (const auto& generation : retired_) if (referenced(generation) && generation->pins.load() != 0) return Status::Conflict("projection store", "cannot quarantine pinned file"); std::error_code ec; fs::create_directories(fs::path(projections_path_) / "quarantine", ec); if (ec) return Status::IOError("projection store", ec.message()); fs::rename(fs::path(projections_path_) / filename, fs::path(projections_path_) / "quarantine" / filename, ec); if (ec) return Status::IOError("projection store", ec.message()); return SyncDirectory(fs::path(projections_path_) / "quarantine"); }
 bool QueryProjectionStore::projections_enabled() const { std::lock_guard<std::mutex> lock(mutex_); return enabled_; }
 std::optional<uint64_t> QueryProjectionStore::current_generation_id() const { std::lock_guard<std::mutex> lock(mutex_); return current_ ? std::optional<uint64_t>(current_->manifest.generation_id) : std::nullopt; }
+std::optional<CommitSeq> QueryProjectionStore::current_base_seq() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return current_ ? std::optional<CommitSeq>(current_->manifest.base_seq)
+                  : std::nullopt;
+}
 }  // namespace cedar::internal

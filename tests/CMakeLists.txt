@@ -47,6 +47,11 @@ target_include_directories(test_projection_store PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_link_libraries(test_projection_store PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_projection_store)
 
+add_executable(test_query_delta query/test_query_delta.cc)
+target_include_directories(test_query_delta PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_delta PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_delta)
+
 set(CEDAR_TEST_LIBS
     cedar_core
     ${GTEST_MAIN_TARGET}

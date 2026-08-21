@@ -384,8 +384,19 @@ class FactStore {
   // and never expose RocksDB types to callers.
   StatusOr<SequenceRecord> ReadSequence(const StoreSnapshot& snapshot,
                                         CommitSeq commit_seq) const;
+  // Reads an ordered, contiguous range of durable sequence records.  The
+  // range is validated against the supplied Snapshot and a missing sequence
+  // is canonical corruption rather than a silently shortened result.
+  StatusOr<std::vector<SequenceRecord>> ReadSequenceRange(
+      const StoreSnapshot& snapshot, CommitSeq first,
+      CommitSeq last) const;
   StatusOr<FactEvent> ReadExactFact(const StoreSnapshot& snapshot,
                                     const std::string& encoded_fact_key) const;
+  // Reads exact fact keys through one RocksDB MultiGet while preserving the
+  // caller's key order.  Missing values are canonical corruption.
+  StatusOr<std::vector<FactEvent>> ReadExactFacts(
+      const StoreSnapshot& snapshot,
+      const std::vector<std::string>& encoded_fact_keys) const;
   StatusOr<StoreCommitResult> Commit(const StoreCommitBatch& batch);
   StatusOr<StoreCommitResult> CommitWithWalCallback(
       const StoreCommitBatch& batch, WalDurableCallback on_wal_durable,

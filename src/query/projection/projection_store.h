@@ -85,6 +85,7 @@ class QueryProjectionStore {
   void CollectRetired();
   bool projections_enabled() const;
   std::optional<uint64_t> current_generation_id() const;
+  std::optional<CommitSeq> current_base_seq() const;
 
  private:
   explicit QueryProjectionStore(ProjectionStoreOptions options);

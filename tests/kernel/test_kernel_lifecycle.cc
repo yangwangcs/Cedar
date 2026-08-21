@@ -138,6 +138,7 @@ TEST_F(KernelLifecycleTest, ClosePublishesDeterministicPipelineShutdownOrder) {
                         "maintenance_join",
                         "sampler_join",
                         "final_runtime_snapshot",
+                        "query_delta_stopped",
                         "rocksdb_close",
                     }));
 }

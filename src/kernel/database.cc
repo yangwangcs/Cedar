@@ -931,6 +931,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
       const auto write_finished_at = std::chrono::steady_clock::now();
       const CedarRuntimeSnapshot runtime_snapshot = ReadRuntimeSnapshot();
       std::vector<CommitResult> epoch_results;
+      std::vector<internal::QueryDeltaCommit> published_delta;
+      published_delta.reserve(requests.size());
       if (epoch_completion != nullptr) epoch_results.reserve(requests.size());
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
@@ -1025,6 +1027,32 @@ Status Database::Impl::StartAppendCommitPipeline() {
                 std::move(result.ValueOrDie().results[index]));
             if (requests[index]->result->ok()) {
               ++append_commit_metrics.published;
+              if (query_delta != nullptr) {
+                const CommitSeq sequence =
+                    requests[index]->result->ValueOrDie().commit_seq;
+                internal::QueryDeltaCommit descriptor(sequence);
+                descriptor.facts.reserve(requests[index]->batch.mutations.size() +
+                                         requests[index]->batch.edge_identities.size());
+                for (const PendingFactMutation& mutation :
+                     requests[index]->batch.mutations) {
+                  descriptor.facts.push_back(
+                      FactEvent{mutation.ref, mutation.valid_from, sequence,
+                                mutation.operation, mutation.schema_epoch,
+                                mutation.value, std::nullopt});
+                }
+                for (const EdgeIdentity& identity :
+                     requests[index]->batch.edge_identities) {
+                  const FactRef identity_ref =
+                      FactRef(identity.home_part_id, FactFamily::kEdgeIdentity,
+                              PropertyId{}, identity.edge_id.value);
+                  descriptor.facts.push_back(
+                      FactEvent{identity_ref, ValidTime{0}, sequence,
+                                FactOperation::kPut, 0, std::nullopt,
+                                identity});
+                  descriptor.edge_identities.push_back(identity);
+                }
+                published_delta.push_back(std::move(descriptor));
+              }
             } else {
               ++append_commit_metrics.aborted;
               if (requests[index]->result->status().IsIndeterminate() ||
@@ -1066,6 +1094,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
         active_pending_version_overlay.reset();
         ++preflight_request_generation;
         append_commit_cv.notify_all();
+      }
+      // QueryDelta observes only after visible publication and outside the
+      // append bookkeeping lock.  It performs no exact-fact reads here; a
+      // rejected descriptor is repaired later from durable sequence records.
+      if (query_delta != nullptr) {
+        for (const internal::QueryDeltaCommit& descriptor : published_delta) {
+          query_delta->EnqueuePublished(descriptor).IgnoreError();
+        }
       }
       if (epoch_completion != nullptr) {
         epoch_completion->Publish(std::move(epoch_results));
@@ -1454,6 +1490,30 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
     return projections.status();
   }
   impl->projection_store = projections.ConsumeValueOrDie();
+  const CommitSeq projection_base =
+      impl->projection_store->current_base_seq().value_or(CommitSeq{0});
+  impl->query_delta = std::make_unique<internal::QueryDelta>(
+      internal::QueryDeltaOptions{projection_base});
+  // Reconstruct the derived tail from durable sequence metadata before any
+  // new publication can be observed.  A derived rebuild failure must not make
+  // authoritative Open fail; in that case start a fresh tail at the current
+  // durable watermark and let canonical reads serve the older range.
+  const CommitSeq recovered_visible = impl->store.visible_seq();
+  if (recovered_visible.value > projection_base.value) {
+    auto recovery_snapshot = impl->store.BeginSnapshot();
+    if (recovery_snapshot.ok()) {
+      const Status repaired = impl->query_delta->RepairThrough(
+          impl->store, recovery_snapshot.ValueOrDie(), recovered_visible,
+          internal::QueryDeltaRepairLimits{262144, 512ULL << 20});
+      if (!repaired.ok()) {
+        impl->query_delta = std::make_unique<internal::QueryDelta>(
+            internal::QueryDeltaOptions{recovered_visible});
+      }
+    } else {
+      impl->query_delta = std::make_unique<internal::QueryDelta>(
+          internal::QueryDeltaOptions{recovered_visible});
+    }
+  }
   const Status pipeline_started = impl->StartAppendCommitPipeline();
   if (!pipeline_started.ok()) {
     impl->store.Close().IgnoreError();
@@ -1492,6 +1552,8 @@ Status Database::Close() {
   impl_->StopAppendCommitPipeline();
   impl_->RefreshRuntimeSnapshot().IgnoreError();
   impl_->ObserveShutdownStage("final_runtime_snapshot");
+  impl_->query_delta.reset();
+  impl_->ObserveShutdownStage("query_delta_stopped");
   impl_->projection_store.reset();
   impl_->ObserveShutdownStage("rocksdb_close");
   lock.lock();

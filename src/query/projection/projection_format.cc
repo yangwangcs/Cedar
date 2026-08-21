@@ -154,6 +154,12 @@ StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, Compression
       return Status::InvalidArgument("projection", "unknown fact operation");
     previous_time = boundary.time.value; previous_entity = boundary.entity_id;
   }
+  for (const auto& interval : c.intervals)
+    if (interval.value.Encode().size() > UINT32_MAX)
+      return Status::ResourceExhausted("projection", "typed value exceeds column limit");
+  for (const auto& boundary : c.boundaries)
+    if (boundary.value.Encode().size() > UINT32_MAX)
+      return Status::ResourceExhausted("projection", "typed value exceeds column limit");
   auto pages = Pages(c); if (pages.size() > UINT32_MAX) return Status::ResourceExhausted("projection", "too many pages");
   std::string out("CDRPRJ1\0", 8); P32(&out, 1); out.push_back(char(c.header.kind)); out.push_back(char(codec));
   P64(&out, c.header.generation_id); P64(&out, c.header.base_seq.value); P32(&out, c.header.part_id.value); P16(&out, c.header.property_id.value); P32(&out, c.header.schema_epoch);

@@ -92,9 +92,14 @@ class QueryProjectionStore {
   std::optional<ProjectionManifest> current_manifest() const;
   StatusOr<std::vector<ProjectionChain>> ReadChains(
       const CoverageRequest& request) const;
+  StatusOr<std::vector<ProjectionChain>> ReadChains(
+      const CoverageRequest& request, const ProjectionGeneration& generation) const;
 
  private:
   explicit QueryProjectionStore(ProjectionStoreOptions options);
+  static StatusOr<std::vector<ProjectionChain>> ReadChainsForGeneration(
+      const std::shared_ptr<ProjectionGeneration::State>& state,
+      const CoverageRequest& request);
   Status LoadCurrent();
   Status PublishCurrent(uint64_t generation);
   ProjectionStoreOptions options_;

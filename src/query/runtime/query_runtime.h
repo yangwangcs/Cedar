@@ -19,6 +19,7 @@
 #include "query/runtime/relational.h"
 #include "query/planner/query_planner.h"
 #include "query/projection/projection_format.h"
+#include "query/projection/projection_store.h"
 
 namespace cedar::internal {
 
@@ -65,6 +66,7 @@ struct PreparedQueryPlan {
         effective_output_slot(other.effective_output_slot),
         referenced_properties(other.referenced_properties),
         physical_plan(other.physical_plan),
+        projection_generation(other.projection_generation),
         projection_reader(other.projection_reader),
         delta_reader(other.delta_reader),
         bound_delta_view(other.bound_delta_view) {}
@@ -82,6 +84,7 @@ struct PreparedQueryPlan {
     relational_kind.reset();
     relational_input.reset();
     physical_plan = other.physical_plan;
+    projection_generation = other.projection_generation;
     projection_reader = other.projection_reader;
     delta_reader = other.delta_reader;
     bound_delta_view = other.bound_delta_view;
@@ -102,6 +105,7 @@ struct PreparedQueryPlan {
   std::optional<LogicalOpKind> relational_kind;
   std::optional<RuntimeRelationalInput> relational_input;
   std::shared_ptr<const PhysicalPlan> physical_plan;
+  std::optional<ProjectionGeneration> projection_generation;
   std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
       projection_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;

@@ -107,3 +107,26 @@ Final review follow-up:
 - Projection readers retain generation/base checks and return `Conflict` if a
   rollover changes the requested generation; no silent generation switch is
   permitted. This is conflict-safe validation, not a claimed pinned handle.
+
+Final Important follow-up: projection execution now pins the planned
+`ProjectionGeneration` in `PreparedQueryPlan`. After physical binding,
+`PreparedQuery::Execute` acquires the exact generation/base/identity/key
+coverage described by each derived slice and returns `Conflict` if rollover
+occurs during planning. The projection reader carries that immutable handle
+and reads the pinned manifest/segment directory through the store overload;
+it never re-resolves `PROJECTION-CURRENT`. Retired generations remain readable
+while the plan/reader holds a pin, while store close or an invalidated handle
+returns an explicit unavailable status. Added rollover and close invalidation
+coverage tests in `test_projection_store.cc`.
+
+Verification from the task worktree:
+
+```text
+cmake --build build -j2 --target cedar_core test_query_planner test_query_canonical test_query_delta test_projection_store test_query_relational: PASS
+./build/tests/test_query_planner: 10/10 PASS
+./build/tests/test_query_canonical: 18/18 PASS
+./build/tests/test_query_delta: 10/10 PASS
+./build/tests/test_projection_store: 11/11 PASS
+./build/tests/test_query_relational: 41/41 PASS
+git diff --check: PASS
+```

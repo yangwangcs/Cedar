@@ -115,6 +115,50 @@ TEST_F(ProjectionStoreTest, OldReaderPinsRetiredGeneration) {
   EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
 }
 
+TEST_F(ProjectionStoreTest, PinnedReaderRetainsRetiredGeneration) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  auto& store = *opened.ValueOrDie();
+  ASSERT_TRUE(store.Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.expected_base_seq = CommitSeq{10};
+  request.database_identity = "test-db";
+  auto pin = store.Acquire(request);
+  ASSERT_TRUE(pin.has_value());
+  ASSERT_TRUE(store.Build(Build(20, "seg-b")).ok());
+  request.snapshot_seq = CommitSeq{20};
+
+  auto chains = store.ReadChains(request, *pin);
+  ASSERT_TRUE(chains.ok()) << chains.status().ToString();
+  ASSERT_EQ(chains.ValueOrDie().size(), 1U);
+  EXPECT_EQ(chains.ValueOrDie().front().header.generation_id, 10U);
+  EXPECT_TRUE(store.ReadChains(request).status().IsConflict());
+}
+
+TEST_F(ProjectionStoreTest, PinnedReaderFailsAfterStoreClose) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  auto pin = opened.ValueOrDie()->Acquire(request);
+  ASSERT_TRUE(pin.has_value());
+  opened.ValueOrDie().reset();
+  EXPECT_FALSE(pin->exists());
+}
+
 TEST_F(ProjectionStoreTest, BadCurrentDisablesProjections) {
   std::filesystem::create_directories(path_ + "/manifests");
   std::ofstream(path_ + "/PROJECTION-CURRENT") << "bad";

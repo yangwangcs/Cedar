@@ -22,7 +22,8 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
     const std::shared_ptr<ImplT>& database,
     const std::shared_ptr<const internal::LogicalPlanNode>& root,
     CommitSeq snapshot_seq, const QueryOptions& options,
-    std::shared_ptr<const internal::QueryDeltaView>* bound_delta) {
+    std::shared_ptr<const internal::QueryDeltaView>* bound_delta,
+    std::optional<internal::ProjectionGeneration>* pinned_generation) {
   internal::ProjectionCatalogView catalog;
   if (database->projection_store) {
     const auto manifest = database->projection_store->current_manifest();
@@ -51,7 +52,42 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
   context.database_identity = catalog.database_identity;
   context.schema_epoch = 0;
   context.allow_delta_merge = delta_usable;
-  return internal::QueryPlanner::Bind(*root, context);
+  auto physical = internal::QueryPlanner::Bind(*root, context);
+  if (!physical.ok() || !pinned_generation || !database->projection_store) {
+    return physical;
+  }
+  for (const auto& slice : physical.ValueOrDie().coverage_slices) {
+    if (slice.source == internal::CoverageSource::kCanonical ||
+        !slice.projection_generation) {
+      continue;
+    }
+    internal::CoverageRequest request;
+    request.kind = slice.kind;
+    request.part_id = slice.part_id;
+    request.property_id = slice.property_id;
+    request.schema_epoch = slice.schema_epoch;
+    request.entity_min = slice.entity_min;
+    request.entity_max_exclusive = slice.entity_max_exclusive;
+    request.valid_time = slice.interval;
+    request.snapshot_seq = snapshot_seq;
+    request.generation_id = slice.projection_generation;
+    request.expected_base_seq = slice.projection_base;
+    request.database_identity = slice.database_identity;
+    auto acquired = database->projection_store->Acquire(request);
+    if (!acquired.has_value()) {
+      return Status::Conflict("query", "projection generation rolled over during planning");
+    }
+    if (pinned_generation->has_value() &&
+        ((*pinned_generation)->generation_id() != acquired->generation_id() ||
+         !(*pinned_generation)->manifest() || !acquired->manifest() ||
+         (*pinned_generation)->manifest()->base_seq != acquired->manifest()->base_seq)) {
+      return Status::Conflict("query", "physical plan spans multiple projection generations");
+    }
+    if (!pinned_generation->has_value()) {
+      *pinned_generation = std::move(acquired);
+    }
+  }
+  return physical;
 }
 
 std::optional<PhysicalType> PhysicalTypeOf(QueryType type) {
@@ -163,9 +199,10 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
   }
   if (snapshot.commit_seq().value != 0) {
     std::shared_ptr<const internal::QueryDeltaView> bound_delta;
+    std::optional<internal::ProjectionGeneration> pinned_generation;
     auto physical = BindPhysicalForSnapshot(database, state_->logical_root,
                                             snapshot.commit_seq(), options,
-                                            &bound_delta);
+                                            &bound_delta, &pinned_generation);
     // The canonical runtime retains the established handling for unbounded
     // History and synthetic zero-sequence test snapshots. A planner refusal
     // for those shapes must not change their existing execution contract.
@@ -178,15 +215,20 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       execution_plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(
           physical.ValueOrDie());
       execution_plan.bound_delta_view = bound_delta;
+      execution_plan.projection_generation = std::move(pinned_generation);
       const FactFamily family = execution_plan.entity_family;
       const std::weak_ptr<Database::Impl> weak_database = database;
       execution_plan.projection_reader =
-          [weak_database, family, snapshot_seq = snapshot.commit_seq()](
+          [weak_database, family, snapshot_seq = snapshot.commit_seq(),
+           pinned_generation = execution_plan.projection_generation](
               const internal::CoverageSlice& slice)
           -> StatusOr<std::vector<internal::ProjectionChain>> {
         const auto db = weak_database.lock();
         if (!db || !db->projection_store) {
           return Status::NotFound("query", "projection store is unavailable");
+        }
+        if (!pinned_generation || !pinned_generation->exists()) {
+          return Status::NotFound("query", "pinned projection generation is unavailable");
         }
         internal::CoverageRequest request;
         request.kind = slice.kind;
@@ -200,7 +242,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         request.generation_id = slice.projection_generation;
         request.expected_base_seq = slice.projection_base;
         request.database_identity = slice.database_identity;
-        return db->projection_store->ReadChains(request);
+        return db->projection_store->ReadChains(request, *pinned_generation);
       };
       execution_plan.delta_reader =
           [weak_database, snapshot_seq = snapshot.commit_seq()]()
@@ -238,7 +280,8 @@ StatusOr<std::string> PreparedQuery::ExplainPhysical(
   const auto database = state_->database.lock();
   if (!database) return Status::ShutdownInProgress("query", "database no longer exists");
   auto plan = BindPhysicalForSnapshot(database, state_->logical_root,
-                                      snapshot.commit_seq(), options, nullptr);
+                                      snapshot.commit_seq(), options, nullptr,
+                                      nullptr);
   if (!plan.ok()) return plan.status();
   return internal::QueryPlanner::ExplainPhysical(plan.ValueOrDie());
 }

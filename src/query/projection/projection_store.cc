@@ -69,6 +69,48 @@ struct ProjectionGeneration::State {
   std::atomic<bool> retired{false};
 };
 
+StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGeneration(
+    const std::shared_ptr<ProjectionGeneration::State>& state,
+    const CoverageRequest& request) {
+  if (!state || !state->present.load()) {
+    return Status::NotFound("projection store", "projection generation is no longer available");
+  }
+  if (request.generation_id && *request.generation_id != state->manifest.generation_id) {
+    return Status::Conflict("projection store", "projection generation changed");
+  }
+  if (request.expected_base_seq && *request.expected_base_seq != state->manifest.base_seq) {
+    return Status::Conflict("projection store", "projection base changed");
+  }
+  if (!request.database_identity.empty() &&
+      request.database_identity != state->manifest.database_identity) {
+    return Status::IdentityConflict("projection store", "projection identity changed");
+  }
+  if (request.snapshot_seq.value < state->manifest.base_seq.value) {
+    return Status::NotFound("projection store", "coverage is unavailable");
+  }
+  std::vector<ProjectionChain> result;
+  for (const auto& region : state->manifest.regions) {
+    if (region.kind != request.kind || region.part_id != request.part_id ||
+        region.property_id != request.property_id || region.schema_epoch != request.schema_epoch ||
+        region.entity_min > request.entity_min || region.entity_max_exclusive < request.entity_max_exclusive ||
+        region.valid_time.from.value > request.valid_time.from.value ||
+        (region.valid_time.to && (!request.valid_time.to ||
+                                  region.valid_time.to->value < request.valid_time.to->value))) {
+      continue;
+    }
+    for (const auto& segment : region.segments) {
+      std::ifstream in(fs::path(state->directory) / segment.filename, std::ios::binary);
+      if (!in) return Status::IOError("projection store", "segment read failed");
+      std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto decoded = DecodeProjectionPage(bytes);
+      if (!decoded.ok()) return decoded.status();
+      result.push_back(std::move(decoded).ConsumeValueOrDie());
+    }
+  }
+  if (result.empty()) return Status::NotFound("projection store", "coverage is unavailable");
+  return result;
+}
+
 ProjectionGeneration::ProjectionGeneration(std::shared_ptr<State> state, bool pin)
     : state_(std::move(state)), pin_(pin) { if (pin_ && state_) ++state_->pins; }
 ProjectionGeneration::~ProjectionGeneration() { if (pin_ && state_) --state_->pins; }
@@ -82,7 +124,16 @@ const ProjectionManifest* ProjectionGeneration::manifest() const { return state_
 
 QueryProjectionStore::QueryProjectionStore(ProjectionStoreOptions options)
     : options_(std::move(options)), projections_path_(options_.path), manifests_path_(fs::path(options_.path) / "manifests") {}
-QueryProjectionStore::~QueryProjectionStore() { std::lock_guard<std::mutex> lock(mutex_); closed_ = true; current_.reset(); retired_.clear(); }
+QueryProjectionStore::~QueryProjectionStore() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  closed_ = true;
+  if (current_) current_->present = false;
+  for (const auto& generation : retired_) {
+    if (generation) generation->present = false;
+  }
+  current_.reset();
+  retired_.clear();
+}
 
 StatusOr<std::unique_ptr<QueryProjectionStore>> QueryProjectionStore::Open(ProjectionStoreOptions options) {
   if (options.path.empty() || options.database_identity.empty()) return Status::InvalidArgument("projection store", "path and database identity are required");
@@ -182,6 +233,9 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
 
 std::optional<ProjectionGeneration> QueryProjectionStore::Acquire(const CoverageRequest& request) const {
   std::lock_guard<std::mutex> lock(mutex_); if (!enabled_ || !current_ || current_->retired || request.snapshot_seq.value < current_->manifest.base_seq.value) return std::nullopt;
+  if (request.generation_id && *request.generation_id != current_->manifest.generation_id) return std::nullopt;
+  if (request.expected_base_seq && *request.expected_base_seq != current_->manifest.base_seq) return std::nullopt;
+  if (!request.database_identity.empty() && request.database_identity != current_->manifest.database_identity) return std::nullopt;
   for (const auto& r : current_->manifest.regions) {
     if (r.kind != request.kind || r.part_id != request.part_id || r.schema_epoch != request.schema_epoch || r.entity_min > request.entity_min || r.entity_max_exclusive < request.entity_max_exclusive || (r.property_id != request.property_id)) continue;
     if (r.valid_time.from.value > request.valid_time.from.value || (r.valid_time.to && (!request.valid_time.to || r.valid_time.to->value < request.valid_time.to->value))) continue;
@@ -207,36 +261,26 @@ std::optional<ProjectionManifest> QueryProjectionStore::current_manifest() const
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     const CoverageRequest& request) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!enabled_ || !current_ || request.snapshot_seq.value < current_->manifest.base_seq.value) {
-    return Status::NotFound("projection store", "coverage is unavailable");
-  }
+  if (!enabled_ || !current_) return Status::NotFound("projection store", "coverage is unavailable");
   if (request.generation_id && *request.generation_id != current_->manifest.generation_id) {
     return Status::Conflict("projection store", "projection generation is no longer current");
   }
   if (request.expected_base_seq && *request.expected_base_seq != current_->manifest.base_seq) {
     return Status::Conflict("projection store", "projection base changed");
   }
-  if (!request.database_identity.empty() && request.database_identity != current_->manifest.database_identity) {
+  if (!request.database_identity.empty() &&
+      request.database_identity != current_->manifest.database_identity) {
     return Status::IdentityConflict("projection store", "projection identity changed");
   }
-  std::vector<ProjectionChain> result;
-  for (const auto& region : current_->manifest.regions) {
-    if (region.kind != request.kind || region.part_id != request.part_id ||
-        region.property_id != request.property_id || region.schema_epoch != request.schema_epoch ||
-        region.entity_min > request.entity_min || region.entity_max_exclusive < request.entity_max_exclusive ||
-        region.valid_time.from.value > request.valid_time.from.value ||
-        (region.valid_time.to && (!request.valid_time.to ||
-                                  region.valid_time.to->value < request.valid_time.to->value))) continue;
-    for (const auto& segment : region.segments) {
-      std::ifstream in(fs::path(projections_path_) / segment.filename, std::ios::binary);
-      if (!in) return Status::IOError("projection store", "segment read failed");
-      std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      auto decoded = DecodeProjectionPage(bytes);
-      if (!decoded.ok()) return decoded.status();
-      result.push_back(std::move(decoded).ConsumeValueOrDie());
-    }
+  return ReadChainsForGeneration(current_, request);
+}
+
+StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
+    const CoverageRequest& request, const ProjectionGeneration& generation) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (closed_ || !generation.state_) {
+    return Status::NotFound("projection store", "projection generation is no longer available");
   }
-  if (result.empty()) return Status::NotFound("projection store", "coverage is unavailable");
-  return result;
+  return ReadChainsForGeneration(generation.state_, request);
 }
 }  // namespace cedar::internal

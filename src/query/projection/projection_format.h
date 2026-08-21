@@ -41,6 +41,7 @@ struct ProjectionPageDirectoryEntry {
   uint32_t payload_crc32c = 0;
   uint64_t bloom_bits = 0;
   uint8_t bloom_hashes = 0;
+  uint64_t bloom_mask = 0;
   bool operator==(const ProjectionPageDirectoryEntry&) const = default;
 };
 struct ProjectionInterval {
@@ -71,5 +72,6 @@ StatusOr<ProjectionChain> DecodeProjectionPage(const std::string&,
 StatusOr<ProjectionChain> ReadProjectionPage(const std::string&, size_t page_index,
                                               size_t allocation_limit =
                                                   64ULL * 1024ULL * 1024ULL);
+bool PageMayContainEntity(const ProjectionPageDirectoryEntry&, uint64_t entity_id);
 }  // namespace cedar::internal
 #endif

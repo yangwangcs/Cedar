@@ -10,7 +10,7 @@
 namespace cedar::internal {
 namespace {
 constexpr size_t kHeaderBytes = 81;
-constexpr size_t kDirectoryBytes = 83;
+constexpr size_t kDirectoryBytes = 91;
 
 void P16(std::string* s, uint16_t v) { for (int i = 0; i < 2; ++i) s->push_back(char(v >> (8 * i))); }
 void P32(std::string* s, uint32_t v) { for (int i = 0; i < 4; ++i) s->push_back(char(v >> (8 * i))); }
@@ -38,8 +38,12 @@ Status ValidPage(const ProjectionPageDirectoryEntry& d) {
   if (d.edge_type_min.has_value() != d.edge_type_max.has_value() ||
       (d.edge_type_min && d.edge_type_max && *d.edge_type_max < *d.edge_type_min))
     return Status::Corruption("projection", "invalid edge range");
-  if (d.bloom_hashes > 8 || (d.bloom_bits != 0 && d.bloom_bits > (1ULL << 20)))
+  if (d.bloom_hashes > 8 || d.bloom_bits > 64 ||
+      (d.bloom_bits == 0 && (d.bloom_hashes != 0 || d.bloom_mask != 0)) ||
+      (d.bloom_bits != 0 && d.bloom_hashes == 0))
     return Status::Corruption("projection", "invalid bloom metadata");
+  if (d.bloom_bits < 64 && d.bloom_mask >> d.bloom_bits)
+    return Status::Corruption("projection", "bloom mask exceeds bit count");
   return Status::OK();
 }
 
@@ -55,12 +59,12 @@ std::string EncodeRle(const std::vector<uint32_t>& values) {
   return out;
 }
 uint64_t EncodeSignedDelta(uint64_t current, uint64_t previous) {
-  if (current >= previous) return (current - previous) * 2;
-  return (previous - current) * 2 - 1;
+  return current - previous;
 }
 bool DecodeSignedDelta(uint64_t encoded, uint64_t previous, uint64_t* current) {
-  if ((encoded & 1) == 0) { uint64_t delta = encoded / 2; if (delta > UINT64_MAX - previous) return false; *current = previous + delta; return true; }
-  uint64_t delta = encoded / 2; if (delta >= previous) return false; *current = previous - delta - 1; return true;
+  if (encoded > UINT64_MAX - previous) return false;
+  *current = previous + encoded;
+  return true;
 }
 bool DecodeRle(const std::string& in, size_t expected, std::vector<uint32_t>* values) {
   size_t at = 0; values->clear();
@@ -83,16 +87,25 @@ void EncodePayload(std::string* s, const std::vector<ProjectionInterval>& is,
 }
 Status DecodePayload(const std::string& s, size_t row_limit, ProjectionChain* c) {
   size_t p = 0; uint32_t magic = 0, ni = 0, nb = 0, nd = 0;
+  if (row_limit < sizeof(ProjectionInterval) || row_limit < sizeof(ProjectionBoundary))
+    return Status::ResourceExhausted("projection", "row output budget exhausted");
   if (!G32(s, &p, &magic) || magic != kPayloadMagic || !G32(s, &p, &ni) || !G32(s, &p, &nb) || !G32(s, &p, &nd) || ni > row_limit ||
       nb > row_limit - std::min<size_t>(row_limit, ni) || nd > s.size() / 5)
     return Status::Corruption("projection", "invalid column counts");
+  if (ni > row_limit / sizeof(ProjectionInterval) || nb > row_limit / sizeof(ProjectionBoundary) ||
+      nd > row_limit / sizeof(Value))
+    return Status::ResourceExhausted("projection", "decoded rows exceed budget");
   std::vector<Value> dictionary; dictionary.reserve(nd);
   for (uint32_t n = 0; n < nd; ++n) {
     std::string encoded; if (!GetBlob(s, &p, &encoded)) return Status::Corruption("projection", "invalid value dictionary");
+    if (encoded.size() > row_limit) return Status::ResourceExhausted("projection", "dictionary exceeds budget");
     auto value = Value::Decode(encoded); if (!value) return Status::Corruption("projection", "invalid dictionary value"); dictionary.push_back(*value);
   }
   std::string presence, operations, ie, it, ito, irle, be, bt, brle;
   if (!GetBlob(s, &p, &presence) || !GetBlob(s, &p, &operations) || !GetBlob(s, &p, &ie) || !GetBlob(s, &p, &it) || !GetBlob(s, &p, &ito) || !GetBlob(s, &p, &irle) || !GetBlob(s, &p, &be) || !GetBlob(s, &p, &bt) || !GetBlob(s, &p, &brle) || presence.size() != (ni + 7) / 8 || operations.size() != (nb + 7) / 8) return Status::Corruption("projection", "invalid column stream");
+  if ((ni % 8 != 0 && (uint8_t(presence.back()) & ~uint8_t((1u << (ni % 8)) - 1))) ||
+      (nb % 8 != 0 && (uint8_t(operations.back()) & ~uint8_t((1u << (nb % 8)) - 1))))
+    return Status::Corruption("projection", "non-zero bitset padding");
   std::vector<uint32_t> ii, bi; if (!DecodeRle(irle, ni, &ii) || !DecodeRle(brle, nb, &bi)) return Status::Corruption("projection", "invalid value run");
   if (ie.size() != ni * 8 || it.size() != ni * 8 || ito.size() != ni * 8 || be.size() != nb * 8 || bt.size() != nb * 8) return Status::Corruption("projection", "invalid delta column");
   size_t ie_at = 0, it_at = 0, ito_at = 0, be_at = 0, bt_at = 0; uint64_t prev = 0, prev_entity = 0;
@@ -127,6 +140,20 @@ StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, Compression
   if (uint8_t(c.header.kind) < 1 || uint8_t(c.header.kind) > 4) return Status::InvalidArgument("projection", "invalid projection kind");
   if (codec != CompressionCodec::kNone && codec != CompressionCodec::kLz4) return Status::NotSupported("projection", "column codec is not a file codec");
   auto hr = ValidRange(c.header.entity_min, c.header.entity_max_exclusive, c.header.valid_from_min.value, c.header.valid_to_max); if (!hr.ok()) return hr;
+  uint64_t previous_time = 0, previous_entity = 0;
+  for (const auto& interval : c.intervals) {
+    if (interval.effective.from.value < previous_time || interval.entity_id < previous_entity)
+      return Status::InvalidArgument("projection", "non-monotonic interval columns");
+    previous_time = interval.effective.from.value; previous_entity = interval.entity_id;
+  }
+  previous_time = previous_entity = 0;
+  for (const auto& boundary : c.boundaries) {
+    if (boundary.time.value < previous_time || boundary.entity_id < previous_entity)
+      return Status::InvalidArgument("projection", "non-monotonic boundary columns");
+    if (boundary.operation != FactOperation::kPut && boundary.operation != FactOperation::kDelete)
+      return Status::InvalidArgument("projection", "unknown fact operation");
+    previous_time = boundary.time.value; previous_entity = boundary.entity_id;
+  }
   auto pages = Pages(c); if (pages.size() > UINT32_MAX) return Status::ResourceExhausted("projection", "too many pages");
   std::string out("CDRPRJ1\0", 8); P32(&out, 1); out.push_back(char(c.header.kind)); out.push_back(char(codec));
   P64(&out, c.header.generation_id); P64(&out, c.header.base_seq.value); P32(&out, c.header.part_id.value); P16(&out, c.header.property_id.value); P32(&out, c.header.schema_epoch);
@@ -144,11 +171,12 @@ StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, Compression
       d.valid_to_max = c.header.valid_to_max;
     }
     auto vd = ValidPage(d); if (!vd.ok()) return vd; d.offset = offset; d.compressed_bytes = uint32_t(cp.ValueOrDie().size()); d.uncompressed_bytes = uint32_t(raw.size()); d.row_count = uint32_t(pages[i].intervals.size() + pages[i].boundaries.size()); d.payload_crc32c = crc32c::Value(cp.ValueOrDie().data(), cp.ValueOrDie().size()); dirs.push_back(d); offset += cp.ValueOrDie().size(); payloads.push_back(cp.ConsumeValueOrDie()); }
-  for (const auto& d : dirs) { P64(&out, d.offset); P32(&out, d.compressed_bytes); P32(&out, d.uncompressed_bytes); P32(&out, d.row_count); P64(&out, d.entity_min); P64(&out, d.entity_max_exclusive); P64(&out, d.valid_from_min.value); out.push_back(char(d.valid_to_max ? 1 : 0)); P64(&out, d.valid_to_max ? d.valid_to_max->value : 0); out.push_back(char(d.edge_type_min ? 1 : 0)); P64(&out, d.edge_type_min.value_or(0)); P64(&out, d.edge_type_max.value_or(0)); P32(&out, d.payload_crc32c); P64(&out, d.bloom_bits); out.push_back(char(d.bloom_hashes)); }
+  for (const auto& d : dirs) { P64(&out, d.offset); P32(&out, d.compressed_bytes); P32(&out, d.uncompressed_bytes); P32(&out, d.row_count); P64(&out, d.entity_min); P64(&out, d.entity_max_exclusive); P64(&out, d.valid_from_min.value); out.push_back(char(d.valid_to_max ? 1 : 0)); P64(&out, d.valid_to_max ? d.valid_to_max->value : 0); out.push_back(char(d.edge_type_min ? 1 : 0)); P64(&out, d.edge_type_min.value_or(0)); P64(&out, d.edge_type_max.value_or(0)); P32(&out, d.payload_crc32c); P64(&out, d.bloom_bits); out.push_back(char(d.bloom_hashes)); P64(&out, d.bloom_mask); }
   for (const auto& p : payloads) out.append(p); P32(&out, crc32c::Value(out.data(), out.size())); return out;
 }
 
-StatusOr<ProjectionChain> DecodeProjectionPage(const std::string& b, size_t limit) {
+StatusOr<ProjectionChain> DecodeProjectionPageImpl(const std::string& b, size_t limit,
+                                                   std::optional<size_t> only_page) {
   if (b.size() < kHeaderBytes + 4 || b.compare(0, 8, "CDRPRJ1\0", 8) != 0) return Status::Corruption("projection", "bad magic or truncated file");
   size_t p = 8; uint32_t version = 0; if (!G32(b, &p, &version)) return Status::Corruption("projection", "truncated version"); if (version != 1) return Status::NotSupported("projection", "unknown format version"); if (p + 2 > b.size()) return Status::Corruption("projection", "truncated header");
   auto kind = ProjectionKind(uint8_t(b[p++])); auto codec = CompressionCodec(uint8_t(b[p++])); if (uint8_t(kind) < 1 || uint8_t(kind) > 4) return Status::Corruption("projection", "invalid projection kind"); if (codec != CompressionCodec::kNone && codec != CompressionCodec::kLz4) return Status::NotSupported("projection", "column codec is not a file codec");
@@ -157,26 +185,42 @@ StatusOr<ProjectionChain> DecodeProjectionPage(const std::string& b, size_t limi
   uint8_t has = uint8_t(b[p++]); if (has > 1 || !G64(b, &p, &to) || !G32(b, &p, &count)) return Status::Corruption("projection", "invalid header flag"); auto hr = ValidRange(emin, emax, from, has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt); if (!hr.ok()) return hr;
   if (count > limit / kDirectoryBytes || count > (b.size() - kHeaderBytes) / kDirectoryBytes) return Status::ResourceExhausted("projection", "directory exceeds budget"); uint32_t hc = 0; if (!G32(b, &p, &hc) || p != kHeaderBytes || hc != crc32c::Value(b.data(), kHeaderBytes - 4)) return Status::Corruption("projection", "header CRC32C mismatch");
   c.header.generation_id = gen; c.header.base_seq = {base}; c.header.part_id = {part}; c.header.property_id = {prop}; c.header.schema_epoch = schema; c.header.entity_min = emin; c.header.entity_max_exclusive = emax; c.header.valid_from_min = {from}; c.header.valid_to_max = has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt; c.page_directory.reserve(count);
-  for (uint32_t i = 0; i < count; ++i) { ProjectionPageDirectoryEntry d; uint8_t hp = 0, he = 0; uint64_t vf = 0, vt = 0, mn = 0, mx = 0; if (!G64(b, &p, &d.offset) || !G32(b, &p, &d.compressed_bytes) || !G32(b, &p, &d.uncompressed_bytes) || !G32(b, &p, &d.row_count) || !G64(b, &p, &d.entity_min) || !G64(b, &p, &d.entity_max_exclusive) || !G64(b, &p, &vf) || p >= b.size()) return Status::Corruption("projection", "truncated directory"); d.valid_from_min = {vf}; hp = uint8_t(b[p++]); if (hp > 1 || !G64(b, &p, &vt) || p >= b.size()) return Status::Corruption("projection", "invalid page flag"); he = uint8_t(b[p++]); if (he > 1 || !G64(b, &p, &mn) || !G64(b, &p, &mx) || !G32(b, &p, &d.payload_crc32c) || !G64(b, &p, &d.bloom_bits) || p >= b.size()) return Status::Corruption("projection", "truncated page metadata"); d.bloom_hashes = uint8_t(b[p++]); d.valid_to_max = hp ? std::optional<ValidTime>(ValidTime{vt}) : std::nullopt; if (he) { d.edge_type_min = mn; d.edge_type_max = mx; } auto vd = ValidPage(d); if (!vd.ok()) return vd; c.page_directory.push_back(d); }
+  for (uint32_t i = 0; i < count; ++i) { ProjectionPageDirectoryEntry d; uint8_t hp = 0, he = 0; uint64_t vf = 0, vt = 0, mn = 0, mx = 0; if (!G64(b, &p, &d.offset) || !G32(b, &p, &d.compressed_bytes) || !G32(b, &p, &d.uncompressed_bytes) || !G32(b, &p, &d.row_count) || !G64(b, &p, &d.entity_min) || !G64(b, &p, &d.entity_max_exclusive) || !G64(b, &p, &vf) || p >= b.size()) return Status::Corruption("projection", "truncated directory"); d.valid_from_min = {vf}; hp = uint8_t(b[p++]); if (hp > 1 || !G64(b, &p, &vt) || p >= b.size()) return Status::Corruption("projection", "invalid page flag"); he = uint8_t(b[p++]); if (he > 1 || !G64(b, &p, &mn) || !G64(b, &p, &mx) || !G32(b, &p, &d.payload_crc32c) || !G64(b, &p, &d.bloom_bits) || p >= b.size()) return Status::Corruption("projection", "truncated page metadata"); d.bloom_hashes = uint8_t(b[p++]); if (!G64(b, &p, &d.bloom_mask)) return Status::Corruption("projection", "truncated bloom metadata"); d.valid_to_max = hp ? std::optional<ValidTime>(ValidTime{vt}) : std::nullopt; if (he) { d.edge_type_min = mn; d.edge_type_max = mx; } auto vd = ValidPage(d); if (!vd.ok()) return vd; c.page_directory.push_back(d); }
   size_t start = kHeaderBytes + size_t(count) * kDirectoryBytes; auto valid = ValidDirectory(c.page_directory, start, b.size()); if (!valid.ok()) return valid; size_t fc_at = b.size() - 4; uint32_t fc = 0; if (!G32(b, &fc_at, &fc) || fc != crc32c::Value(b.data(), b.size() - 4)) return Status::Corruption("projection", "file CRC32C mismatch");
-  size_t used_bytes = 0, rows = 0; for (const auto& d : c.page_directory) { size_t offset = size_t(d.offset); if (d.payload_crc32c != crc32c::Value(b.data() + offset, d.compressed_bytes)) return Status::Corruption("projection", "page payload CRC32C mismatch"); if (d.uncompressed_bytes > limit - std::min(limit, used_bytes)) return Status::ResourceExhausted("projection", "decoded bytes exceed remaining budget"); size_t remaining = limit - used_bytes; auto raw = DecompressProjectionPayload(codec, b.substr(offset, d.compressed_bytes), std::min<size_t>(d.uncompressed_bytes, remaining)); if (!raw.ok()) return raw.status(); if (raw.ValueOrDie().size() != d.uncompressed_bytes) return Status::Corruption("projection", "decoded length mismatch"); size_t before = rows; auto ds = DecodePayload(raw.ValueOrDie(), limit - std::min(limit, rows), &c); if (!ds.ok()) return ds; rows = c.intervals.size() + c.boundaries.size(); if (rows - before != d.row_count) return Status::Corruption("projection", "directory row count mismatch"); used_bytes += d.uncompressed_bytes; }
+  size_t used_bytes = 0, rows = 0; for (size_t page_index = 0; page_index < c.page_directory.size(); ++page_index) { if (only_page && page_index != *only_page) continue; const auto& d = c.page_directory[page_index]; size_t offset = size_t(d.offset); if (d.payload_crc32c != crc32c::Value(b.data() + offset, d.compressed_bytes)) return Status::Corruption("projection", "page payload CRC32C mismatch"); if (d.uncompressed_bytes > limit - std::min(limit, used_bytes)) return Status::ResourceExhausted("projection", "decoded bytes exceed remaining budget"); size_t remaining = limit - used_bytes; if (d.compressed_bytes > remaining) return Status::ResourceExhausted("projection", "compressed payload exceeds remaining budget"); auto raw = DecompressProjectionPayload(codec, b.substr(offset, d.compressed_bytes), std::min<size_t>(d.uncompressed_bytes, remaining)); if (!raw.ok()) return raw.status(); if (raw.ValueOrDie().size() != d.uncompressed_bytes) return Status::Corruption("projection", "decoded length mismatch"); size_t before = rows; auto ds = DecodePayload(raw.ValueOrDie(), limit - std::min(limit, rows), &c); if (!ds.ok()) return ds; rows = c.intervals.size() + c.boundaries.size(); if (rows - before != d.row_count) return Status::Corruption("projection", "directory row count mismatch"); used_bytes += d.uncompressed_bytes; }
   return c;
+}
+
+StatusOr<ProjectionChain> DecodeProjectionPage(const std::string& bytes, size_t limit) {
+  return DecodeProjectionPageImpl(bytes, limit, std::nullopt);
 }
 
 StatusOr<ProjectionChain> ReadProjectionPage(const std::string& bytes,
                                               size_t page_index,
                                               size_t limit) {
-  auto decoded = DecodeProjectionPage(bytes, limit);
+  auto decoded = DecodeProjectionPageImpl(bytes, limit, page_index);
   if (!decoded.ok()) return decoded.status();
   ProjectionChain all = decoded.ConsumeValueOrDie();
   if (page_index >= all.page_directory.size())
     return Status::InvalidArgument("projection", "page index out of range");
-  auto pages = Pages(all);
   ProjectionChain result;
   result.header = all.header;
   result.page_directory.push_back(all.page_directory[page_index]);
-  result.intervals = std::move(pages[page_index].intervals);
-  result.boundaries = std::move(pages[page_index].boundaries);
+  result.intervals = std::move(all.intervals);
+  result.boundaries = std::move(all.boundaries);
   return result;
+}
+
+bool PageMayContainEntity(const ProjectionPageDirectoryEntry& page,
+                          uint64_t entity_id) {
+  if (page.bloom_bits == 0 || page.bloom_mask == 0) return true;
+  const uint64_t bits = std::min<uint64_t>(page.bloom_bits, 64);
+  uint64_t hash = entity_id * 0x9e3779b97f4a7c15ULL;
+  for (uint8_t i = 0; i < std::max<uint8_t>(page.bloom_hashes, 1); ++i) {
+    const uint64_t bit = (i == 0) ? (entity_id % bits) : ((hash >> (i * 7 % 63)) % bits);
+    if ((page.bloom_mask & (1ULL << bit)) == 0) return false;
+    hash ^= hash >> 29;
+  }
+  return true;
 }
 }  // namespace cedar::internal

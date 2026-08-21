@@ -30,7 +30,8 @@ ProjectionChain Fixture() {
   page.edge_type_min = 100;
   page.edge_type_max = 200;
   page.bloom_bits = 64;
-  page.bloom_hashes = 2;
+  page.bloom_hashes = 1;
+  page.bloom_mask = (1ULL << (42 % 64)) | (1ULL << (43 % 64));
   chain.page_directory = {page};
   chain.intervals[0].entity_id = 42;
   chain.boundaries[0].entity_id = 42;
@@ -77,7 +78,11 @@ TEST(ProjectionFormatTest, RoundTripsIntervalsAndLatentBoundaries) {
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().edge_type_min, 100U);
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().edge_type_max, 200U);
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().bloom_bits, 64U);
-  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().bloom_hashes, 2U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().bloom_hashes, 1U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().bloom_mask,
+            (1ULL << (42 % 64)) | (1ULL << (43 % 64)));
+  EXPECT_TRUE(PageMayContainEntity(decoded.ValueOrDie().page_directory.front(), 42));
+  EXPECT_FALSE(PageMayContainEntity(decoded.ValueOrDie().page_directory.front(), 7));
   EXPECT_EQ(decoded.ValueOrDie().intervals.front().entity_id, 42U);
   EXPECT_EQ(decoded.ValueOrDie().boundaries.back().entity_id, 43U);
 }
@@ -236,11 +241,69 @@ TEST(ProjectionFormatTest, ReadsOnePageWithoutDecodingOtherPages) {
   EXPECT_EQ(page.ValueOrDie().intervals.front().entity_id, 42U);
 }
 
+TEST(ProjectionFormatTest, PageReaderSkipsCorruptNonTargetPayload) {
+  ProjectionChain chain = Fixture();
+  chain.page_directory.resize(2);
+  auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok());
+  std::string bytes = encoded.ValueOrDie();
+  uint64_t second_offset = 0;
+  for (unsigned i = 0; i < 8; ++i) second_offset |= uint64_t(uint8_t(bytes[81 + 91 + i])) << (8 * i);
+  bytes[size_t(second_offset)] ^= 0x40;
+  RefreshFileCrc(&bytes);
+  auto page = ReadProjectionPage(bytes, 0);
+  ASSERT_TRUE(page.ok()) << page.status().ToString();
+}
+
+TEST(ProjectionFormatTest, RejectsNonMonotonicRowsAndUnknownOperation) {
+  ProjectionChain non_monotonic = Fixture();
+  non_monotonic.intervals.push_back({{ValidTime{29}, ValidTime{40}}, Value::Int64(8), 1});
+  auto interval_result = EncodeProjectionPage(non_monotonic, CompressionCodec::kNone);
+  ASSERT_FALSE(interval_result.ok());
+  EXPECT_TRUE(interval_result.status().IsInvalidArgument());
+
+  ProjectionChain unknown_operation = Fixture();
+  unknown_operation.boundaries.front().operation = FactOperation(9);
+  auto operation_result = EncodeProjectionPage(unknown_operation, CompressionCodec::kNone);
+  ASSERT_FALSE(operation_result.ok());
+  EXPECT_TRUE(operation_result.status().IsInvalidArgument());
+}
+
+TEST(ProjectionFormatTest, RoundTripsMaximumEntityDelta) {
+  ProjectionChain chain = Fixture();
+  chain.intervals.front().entity_id = UINT64_MAX;
+  chain.intervals.back().entity_id = UINT64_MAX;
+  chain.boundaries.front().entity_id = UINT64_MAX;
+  chain.boundaries.back().entity_id = UINT64_MAX;
+  auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  auto decoded = DecodeProjectionPage(encoded.ValueOrDie());
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  EXPECT_EQ(decoded.ValueOrDie().intervals.front().entity_id, UINT64_MAX);
+}
+
+TEST(ProjectionFormatTest, RejectsNonZeroColumnPaddingBits) {
+  auto encoded = EncodeProjectionPage(Fixture(), CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok());
+  std::string bytes = encoded.ValueOrDie();
+  const size_t directory_start = 81;
+  uint64_t payload_offset = 0;
+  for (unsigned i = 0; i < 8; ++i) payload_offset |= uint64_t(uint8_t(bytes[directory_start + i])) << (8 * i);
+  bytes[size_t(payload_offset) + 33] |= static_cast<char>(0x80);
+  Put32At(&bytes, directory_start + 70,
+          crc32c::Value(bytes.data() + payload_offset,
+                        bytes.size() - 4 - payload_offset));
+  RefreshFileCrc(&bytes);
+  auto decoded = DecodeProjectionPage(bytes);
+  ASSERT_FALSE(decoded.ok());
+  EXPECT_TRUE(decoded.status().IsCorruption());
+}
+
 TEST(ProjectionFormatTest, EncodesMultiplePagesAndRejectsTruncatedDirectory) {
   ProjectionChain chain = Fixture();
   chain.page_directory.resize(2);
   chain.intervals.push_back(
-      {{ValidTime{30}, ValidTime{40}}, Value::Int64(8)});
+      {{ValidTime{30}, ValidTime{40}}, Value::Int64(8), 44});
   auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
   ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
   auto decoded = DecodeProjectionPage(encoded.ValueOrDie(), 1 << 20);

@@ -14,6 +14,7 @@
 
 namespace cedar {
 struct PathValue;
+struct JourneyValue;
 namespace internal {
 class LogicalPlanInspector;
 class LogicalPlanNode;
@@ -66,6 +67,15 @@ class Query {
   StatusOr<Query> CoexistingShortestPath(const ExpandSpec& spec,
                                          uint32_t max_hops,
                                          Slot<PathValue> path) const;
+  StatusOr<Query> EarliestArrival(const ExpandSpec& spec, uint32_t max_hops,
+                                  PropertyId duration_property,
+                                  Slot<JourneyValue> journey) const;
+  StatusOr<Query> LatestDeparture(const ExpandSpec& spec, uint32_t max_hops,
+                                  PropertyId duration_property,
+                                  Slot<JourneyValue> journey) const;
+  StatusOr<Query> FastestDuration(const ExpandSpec& spec, uint32_t max_hops,
+                                  PropertyId duration_property,
+                                  Slot<JourneyValue> journey) const;
   template <typename T>
   StatusOr<Query> BindVertexProperty(Slot<VertexRef> vertex,
                                      PropertyId property,

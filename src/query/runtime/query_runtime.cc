@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <set>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -16,6 +18,7 @@
 #include "query/runtime/property_binding.h"
 #include "query/runtime/temporal_source.h"
 #include "query/runtime/graph_frontier.h"
+#include "query/runtime/journey.h"
 #include "query/resource/query_scratch.h"
 
 namespace cedar {
@@ -34,6 +37,7 @@ struct RuntimeRow {
   uint64_t graph_edge_type = 0;
   std::map<uint32_t, std::optional<Value>> property_values;
   std::optional<PathValue> path;
+  std::optional<JourneyValue> journey;
 };
 
 using EvaluatedLiteral = detail::ExpressionLiteral;
@@ -575,7 +579,47 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     internal::GraphExpansionRequest request{{vertex}, interval.ValueOrDie(),
                                             plan.graph_expand->direction,
                                             plan.graph_expand->edge_type};
-    if (plan.graph_coexisting) {
+    if (plan.graph_journey != 0) {
+      internal::JourneyRequest journey_request;
+      journey_request.source = vertex;
+      journey_request.interval = interval.ValueOrDie();
+      journey_request.duration_property = plan.graph_duration_property;
+      journey_request.max_hops = plan.graph_k_hops;
+      journey_request.objective = static_cast<internal::JourneyObjective>(plan.graph_journey - 1);
+      auto discovered = internal::ExpandTemporal(snapshot,
+          internal::GraphExpansionRequest{{vertex}, interval.ValueOrDie(),
+                                           ExpandDirection::kOut, std::nullopt},
+          internal::GraphFrontierOptions{nullptr, delta, plan.graph_k_hops,
+                                         {}, snapshot.adjacency_index(),
+                                         options.projection_generation,
+                                         check_abort});
+      if (!discovered.ok()) return discovered.status();
+      std::set<VertexRef, std::function<bool(const VertexRef&, const VertexRef&)>> targets(
+          [](const VertexRef& a, const VertexRef& b) { return std::tie(a.part_id.value, a.vertex_id.value) < std::tie(b.part_id.value, b.vertex_id.value); });
+      for (const auto& traversal : discovered.ValueOrDie()) targets.insert(traversal.target);
+      for (const VertexRef& target : targets) {
+        journey_request.target = target;
+        auto journey = internal::FindJourney(snapshot, journey_request,
+                                             internal::JourneyOptions{reservation, delta,
+                                                                      snapshot.adjacency_index(),
+                                                                      options.projection_generation,
+                                                                      check_abort,
+                                                                      0});
+        if (!journey.ok()) {
+          if (journey.status().IsNotFound()) continue;
+          return journey.status();
+        }
+        RuntimeRow row{FactRef{vertex.part_id, FactFamily::kVertexState, PropertyId{}, vertex.vertex_id.value},
+                       std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                       std::nullopt, std::nullopt, 0, {}, std::nullopt, journey.ValueOrDie()};
+        row.graph_source = vertex;
+        row.graph_destination = target;
+        if (!journey.ValueOrDie().edges.empty())
+          row.graph_edge = journey.ValueOrDie().edges.back();
+        row.journey = journey.ValueOrDie();
+        result.push_back(std::move(row));
+      }
+    } else if (plan.graph_coexisting) {
       // Candidate discovery must not consume the live label/fragment
       // reservation. CoexistingShortestPath charges only its surviving
       // labels, so charging raw traversals here would count each edge twice.
@@ -773,6 +817,10 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
         path_values.push_back(*row.path);
         continue;
       }
+      if (plan.graph_journey_slot && output.slot == *plan.graph_journey_slot) {
+        if (!row.journey) return Status::Corruption("query", "graph journey is unavailable");
+        continue;
+      }
       if (plan.graph_source_slot && output.slot == *plan.graph_source_slot) {
         if (!row.graph_source) return Status::Corruption("query", "graph source is unavailable");
         Append(column, *row.graph_source, true);
@@ -832,6 +880,20 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
     if (it != columns.end()) {
       it->path_values = std::make_shared<const PathColumn>(
           PathColumn::FromValues(path_values));
+    }
+  }
+  if (plan.graph_journey_slot) {
+    auto it = std::find_if(columns.begin(), columns.end(), [&](const QueryColumn& column) {
+      return column.slot == *plan.graph_journey_slot;
+    });
+    if (it != columns.end()) {
+      std::vector<JourneyValue> journeys;
+      journeys.reserve(count);
+      for (size_t index = offset; index < offset + count; ++index) {
+        if (!rows[index].journey) return Status::Corruption("query", "graph journey is unavailable");
+        journeys.push_back(*rows[index].journey);
+      }
+      it->journey_values = std::make_shared<const JourneyColumn>(JourneyColumn::FromValues(journeys));
     }
   }
   return columns;
@@ -1450,7 +1512,10 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
             node->kind() == LogicalOpKind::kExpandIn ||
             node->kind() == LogicalOpKind::kExpandBoth ||
             node->kind() == LogicalOpKind::kKHopExpand ||
-            node->kind() == LogicalOpKind::kCoexistingShortestPath) {
+            node->kind() == LogicalOpKind::kCoexistingShortestPath ||
+            node->kind() == LogicalOpKind::kEarliestArrival ||
+            node->kind() == LogicalOpKind::kLatestDeparture ||
+            node->kind() == LogicalOpKind::kFastestDuration) {
           graph = node;
           return;
         }
@@ -1466,6 +1531,13 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
     plan.graph_destination_slot = spec.destination.id();
     plan.graph_k_hops = graph->max_hops();
     plan.graph_coexisting = graph->kind() == LogicalOpKind::kCoexistingShortestPath;
+    if (graph->kind() == LogicalOpKind::kEarliestArrival ||
+        graph->kind() == LogicalOpKind::kLatestDeparture ||
+        graph->kind() == LogicalOpKind::kFastestDuration) {
+      plan.graph_journey = graph->journey_objective() + 1;
+      plan.graph_journey_slot = graph->journey_slot();
+      plan.graph_duration_property = graph->journey_duration_property();
+    }
     if (plan.graph_coexisting) {
       for (const RowColumn& column : plan.output_columns) {
         if (column.type == QueryType::kPath) {

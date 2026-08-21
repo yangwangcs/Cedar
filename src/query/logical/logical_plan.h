@@ -37,6 +37,9 @@ struct LogicalPlanPayload {
   std::optional<PropertyBinding> property_binding;
   std::shared_ptr<const ExpressionNode> predicate;
   uint32_t max_hops = 1;
+  std::optional<PropertyId> journey_duration_property;
+  std::optional<SlotId> journey_slot;
+  uint8_t journey_objective = 0;
 };
 
 class LogicalPlanNode {
@@ -60,6 +63,9 @@ class LogicalPlanNode {
     return payload_.predicate;
   }
   uint32_t max_hops() const { return payload_.max_hops; }
+  const std::optional<PropertyId>& journey_duration_property() const { return payload_.journey_duration_property; }
+  const std::optional<SlotId>& journey_slot() const { return payload_.journey_slot; }
+  uint8_t journey_objective() const { return payload_.journey_objective; }
  private:
   const LogicalOpKind kind_;
   const RowSchema schema_;

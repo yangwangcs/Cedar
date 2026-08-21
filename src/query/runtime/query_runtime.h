@@ -77,7 +77,10 @@ struct PreparedQueryPlan {
         graph_destination_slot(other.graph_destination_slot),
         graph_k_hops(other.graph_k_hops),
         graph_coexisting(other.graph_coexisting),
-        graph_path_slot(other.graph_path_slot) {}
+        graph_path_slot(other.graph_path_slot),
+        graph_journey(other.graph_journey),
+        graph_journey_slot(other.graph_journey_slot),
+        graph_duration_property(other.graph_duration_property) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
@@ -103,6 +106,9 @@ struct PreparedQueryPlan {
     graph_k_hops = other.graph_k_hops;
     graph_coexisting = other.graph_coexisting;
     graph_path_slot = other.graph_path_slot;
+    graph_journey = other.graph_journey;
+    graph_journey_slot = other.graph_journey_slot;
+    graph_duration_property = other.graph_duration_property;
     return *this;
   }
   PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;
@@ -132,6 +138,9 @@ struct PreparedQueryPlan {
   uint32_t graph_k_hops = 1;
   bool graph_coexisting = false;
   std::optional<SlotId> graph_path_slot;
+  uint8_t graph_journey = 0;
+  std::optional<SlotId> graph_journey_slot;
+  std::optional<PropertyId> graph_duration_property;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

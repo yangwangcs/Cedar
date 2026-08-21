@@ -17,6 +17,7 @@
 
 namespace cedar {
 struct PathValue;
+struct JourneyValue;
 namespace internal {
 class ExpressionFactory;
 class ExpressionInspector;
@@ -46,6 +47,7 @@ template <> constexpr QueryType QueryTypeOf<ValidDuration>() { return QueryType:
 template <> constexpr QueryType QueryTypeOf<CommitSeq>() { return QueryType::kCommitSeq; }
 template <> constexpr QueryType QueryTypeOf<ValidTimeInterval>() { return QueryType::kValidTimeInterval; }
 template <> constexpr QueryType QueryTypeOf<PathValue>() { return QueryType::kPath; }
+template <> constexpr QueryType QueryTypeOf<JourneyValue>() { return QueryType::kJourney; }
 
 template <typename T>
 class Expr;

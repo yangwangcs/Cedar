@@ -72,6 +72,11 @@ target_include_directories(test_coexisting_path PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_coexisting_path PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_coexisting_path TEST_PREFIX "CoexistingPath.")
 
+add_executable(test_temporal_journey query/test_temporal_journey.cc)
+target_include_directories(test_temporal_journey PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_temporal_journey PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_temporal_journey TEST_PREFIX "TemporalJourney.")
+
 set(CEDAR_TEST_LIBS
     cedar_core
     ${GTEST_MAIN_TARGET}

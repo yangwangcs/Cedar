@@ -90,6 +90,76 @@ struct PathColumn {
   }
 };
 
+struct JourneyValue {
+  std::vector<VertexRef> vertices;
+  std::vector<EdgeRef> edges;
+  std::vector<ValidTime> departures;
+  std::vector<ValidTime> arrivals;
+  ValidTime initial_departure;
+  ValidTime final_arrival;
+  ValidTime departure;
+  ValidTime arrival;
+  ValidDuration duration;
+  bool operator==(const JourneyValue&) const = default;
+};
+
+struct JourneyColumn {
+  std::vector<uint32_t> row_offsets;
+  std::vector<uint32_t> vertex_offsets;
+  std::vector<uint32_t> edge_offsets;
+  std::vector<uint32_t> departure_offsets;
+  std::vector<uint32_t> arrival_offsets;
+  std::vector<VertexRef> vertices;
+  std::vector<EdgeRef> edges;
+  std::vector<ValidTime> departures;
+  std::vector<ValidTime> arrivals;
+  std::vector<ValidTime> initial_departures;
+  std::vector<ValidTime> final_arrivals;
+  std::vector<ValidDuration> durations;
+
+  static JourneyColumn FromValues(const std::vector<JourneyValue>& values) {
+    JourneyColumn column;
+    column.row_offsets.push_back(0);
+    column.vertex_offsets.push_back(0);
+    column.edge_offsets.push_back(0);
+    column.departure_offsets.push_back(0);
+    column.arrival_offsets.push_back(0);
+    for (const auto& value : values) {
+      column.vertices.insert(column.vertices.end(), value.vertices.begin(), value.vertices.end());
+      column.edges.insert(column.edges.end(), value.edges.begin(), value.edges.end());
+      column.departures.insert(column.departures.end(), value.departures.begin(), value.departures.end());
+      column.arrivals.insert(column.arrivals.end(), value.arrivals.begin(), value.arrivals.end());
+      column.initial_departures.push_back(value.initial_departure);
+      column.final_arrivals.push_back(value.final_arrival);
+      column.durations.push_back(value.duration);
+      column.vertex_offsets.push_back(static_cast<uint32_t>(column.vertices.size()));
+      column.edge_offsets.push_back(static_cast<uint32_t>(column.edges.size()));
+      column.departure_offsets.push_back(static_cast<uint32_t>(column.departures.size()));
+      column.arrival_offsets.push_back(static_cast<uint32_t>(column.arrivals.size()));
+      column.row_offsets.push_back(column.vertex_offsets.back());
+    }
+    return column;
+  }
+
+  JourneyValue Value(size_t row) const {
+    if (row + 1 >= vertex_offsets.size() || row + 1 >= edge_offsets.size() ||
+        row + 1 >= departure_offsets.size() || row + 1 >= arrival_offsets.size() ||
+        row >= initial_departures.size() || row >= final_arrivals.size() ||
+        row >= durations.size()) throw std::out_of_range("journey row");
+    JourneyValue value;
+    value.vertices.assign(vertices.begin() + vertex_offsets[row], vertices.begin() + vertex_offsets[row + 1]);
+    value.edges.assign(edges.begin() + edge_offsets[row], edges.begin() + edge_offsets[row + 1]);
+    value.departures.assign(departures.begin() + departure_offsets[row], departures.begin() + departure_offsets[row + 1]);
+    value.arrivals.assign(arrivals.begin() + arrival_offsets[row], arrivals.begin() + arrival_offsets[row + 1]);
+    value.initial_departure = initial_departures[row];
+    value.final_arrival = final_arrivals[row];
+    value.departure = value.initial_departure;
+    value.arrival = value.final_arrival;
+    value.duration = durations[row];
+    return value;
+  }
+};
+
 using QueryColumnVector = std::variant<
     std::vector<uint8_t>, std::vector<int32_t>, std::vector<int64_t>,
     std::vector<float>, std::vector<double>, std::vector<uint64_t>,
@@ -103,6 +173,7 @@ struct QueryColumn {
   QueryColumnVector values;
   std::vector<uint8_t> present;
   std::shared_ptr<const PathColumn> path_values;
+  std::shared_ptr<const JourneyColumn> journey_values;
 };
 
 class QueryBatch {
@@ -131,6 +202,9 @@ class QueryBatch {
       } else if constexpr (std::is_same_v<T, PathValue>) {
         if (!column.path_values) throw std::out_of_range("path column");
         return column.path_values->Value(row);
+      } else if constexpr (std::is_same_v<T, JourneyValue>) {
+        if (!column.journey_values) throw std::out_of_range("journey column");
+        return column.journey_values->Value(row);
       } else {
         return std::get<std::vector<T>>(column.values).at(row);
       }

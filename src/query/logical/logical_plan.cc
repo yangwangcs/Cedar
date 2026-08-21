@@ -234,6 +234,62 @@ StatusOr<Query> Query::CoexistingShortestPath(const ExpandSpec& spec,
                       RowSchema(std::move(columns)), std::move(payload)));
 }
 
+namespace {
+StatusOr<std::shared_ptr<const internal::LogicalPlanNode>> AppendJourney(const Query& query, const ExpandSpec& spec,
+                              uint32_t max_hops, PropertyId duration_property,
+                              Slot<JourneyValue> journey,
+                              internal::LogicalOpKind kind, uint8_t objective) {
+  if (max_hops == 0 || !duration_property.valid() || journey.id().value == 0 ||
+      !internal::LogicalPlanInspector::Inspect(query) ||
+      !Contains(query.schema(), spec.source.id(), QueryType::kVertexRef, false) ||
+      spec.edge.id().value == 0 || spec.destination.id().value == 0 ||
+      HasSlotId(query.schema(), spec.edge.id()) ||
+      HasSlotId(query.schema(), spec.destination.id()) ||
+      HasSlotId(query.schema(), journey.id())) {
+    return Status::InvalidArgument("temporal journey", "slots or duration are invalid");
+  }
+  std::vector<RowColumn> columns = query.schema().columns();
+  columns.push_back({spec.edge.id(), spec.edge.name(), spec.edge.type(), false});
+  columns.push_back({spec.destination.id(), spec.destination.name(), spec.destination.type(), false});
+  columns.push_back({journey.id(), journey.name(), journey.type(), false});
+  internal::LogicalPlanPayload payload;
+  payload.expand_spec = spec;
+  payload.max_hops = max_hops;
+  payload.journey_duration_property = duration_property;
+  payload.journey_slot = journey.id();
+  payload.journey_objective = objective;
+  return Append(kind, internal::LogicalPlanInspector::InspectShared(query),
+                RowSchema(std::move(columns)), std::move(payload));
+}
+}  // namespace
+
+StatusOr<Query> Query::EarliestArrival(const ExpandSpec& spec, uint32_t max_hops,
+                                       PropertyId duration_property,
+                                       Slot<JourneyValue> journey) const {
+  auto root = AppendJourney(*this, spec, max_hops, duration_property, journey,
+                            internal::LogicalOpKind::kEarliestArrival, 0);
+  if (!root.ok()) return root.status();
+  return Query(root.ValueOrDie());
+}
+
+StatusOr<Query> Query::LatestDeparture(const ExpandSpec& spec, uint32_t max_hops,
+                                       PropertyId duration_property,
+                                       Slot<JourneyValue> journey) const {
+  auto root = AppendJourney(*this, spec, max_hops, duration_property, journey,
+                            internal::LogicalOpKind::kLatestDeparture, 1);
+  if (!root.ok()) return root.status();
+  return Query(root.ValueOrDie());
+}
+
+StatusOr<Query> Query::FastestDuration(const ExpandSpec& spec, uint32_t max_hops,
+                                       PropertyId duration_property,
+                                       Slot<JourneyValue> journey) const {
+  auto root = AppendJourney(*this, spec, max_hops, duration_property, journey,
+                            internal::LogicalOpKind::kFastestDuration, 2);
+  if (!root.ok()) return root.status();
+  return Query(root.ValueOrDie());
+}
+
 StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex,
                                                PropertyId property,
                                                RowColumn output) const {

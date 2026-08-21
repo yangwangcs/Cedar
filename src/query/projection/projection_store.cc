@@ -1,0 +1,164 @@
+#include "query/projection/projection_store.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <filesystem>
+#include <fstream>
+#include <set>
+
+#include "cedar/core/crc32c.h"
+
+namespace cedar::internal {
+namespace {
+namespace fs = std::filesystem;
+
+Status SyncFile(const fs::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return Status::IOError("projection store", "open for sync failed");
+  const int result = ::fsync(fd);
+  ::close(fd);
+  return result == 0 ? Status::OK() : Status::IOError("projection store", "file sync failed");
+}
+Status SyncDirectory(const fs::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) return Status::IOError("projection store", "open directory failed");
+  const int result = ::fsync(fd);
+  ::close(fd);
+  return result == 0 ? Status::OK() : Status::IOError("projection store", "directory sync failed");
+}
+Status WriteFile(const fs::path& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) return Status::IOError("projection store", "cannot create file");
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  out.flush();
+  return out ? Status::OK() : Status::IOError("projection store", "write failed");
+}
+StatusOr<std::string> ReadFile(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return Status::NotFound("projection store", "file not found");
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+bool SafeName(const std::string& name) {
+  return !name.empty() && name.front() != '/' && name.find("..") == std::string::npos && name.find('/') == std::string::npos && name.find('\\') == std::string::npos;
+}
+std::string CurrentBytes(uint64_t generation) {
+  std::string out("CPC1", 4);
+  for (int i=0;i<8;++i) out.push_back(char(generation >> (i*8)));
+  const uint32_t crc = crc32c::Value(out.data(), out.size());
+  for (int i=0;i<4;++i) out.push_back(char(crc >> (i*8)));
+  return out;
+}
+bool ParseCurrent(const std::string& in, uint64_t* generation) {
+  if (in.size() != 16 || in.compare(0,4,"CPC1") != 0) return false;
+  *generation = 0; for (int i=0;i<8;++i) *generation |= uint64_t(uint8_t(in[4+i])) << (i*8);
+  uint32_t crc = 0; for (int i=0;i<4;++i) crc |= uint32_t(uint8_t(in[12+i])) << (i*8);
+  return crc32c::Value(in.data(), 12) == crc && *generation != 0;
+}
+}  // namespace
+
+struct ProjectionGeneration::State {
+  ProjectionManifest manifest;
+  std::string directory;
+  std::vector<std::string> segment_files;
+  std::string manifest_file;
+  std::atomic<uint64_t> pins{0};
+  std::atomic<bool> present{true};
+  std::atomic<bool> retired{false};
+};
+
+ProjectionGeneration::ProjectionGeneration(std::shared_ptr<State> state, bool pin)
+    : state_(std::move(state)), pin_(pin) { if (pin_ && state_) ++state_->pins; }
+ProjectionGeneration::~ProjectionGeneration() { if (pin_ && state_) --state_->pins; }
+ProjectionGeneration::ProjectionGeneration(const ProjectionGeneration& other) : state_(other.state_), pin_(other.pin_) { if (pin_ && state_) ++state_->pins; }
+ProjectionGeneration& ProjectionGeneration::operator=(const ProjectionGeneration& other) { if (this != &other) { if (pin_ && state_) --state_->pins; state_=other.state_; pin_=other.pin_; if (pin_ && state_) ++state_->pins; } return *this; }
+ProjectionGeneration::ProjectionGeneration(ProjectionGeneration&& other) noexcept : state_(std::move(other.state_)), pin_(other.pin_) { other.pin_=false; }
+ProjectionGeneration& ProjectionGeneration::operator=(ProjectionGeneration&& other) noexcept { if (this != &other) { if (pin_ && state_) --state_->pins; state_=std::move(other.state_); pin_=other.pin_; other.pin_=false; } return *this; }
+bool ProjectionGeneration::exists() const { return state_ && state_->present.load(); }
+uint64_t ProjectionGeneration::generation_id() const { return state_ ? state_->manifest.generation_id : 0; }
+const ProjectionManifest* ProjectionGeneration::manifest() const { return state_ ? &state_->manifest : nullptr; }
+
+QueryProjectionStore::QueryProjectionStore(ProjectionStoreOptions options)
+    : options_(std::move(options)), projections_path_(options_.path), manifests_path_(fs::path(options_.path) / "manifests") {}
+QueryProjectionStore::~QueryProjectionStore() { std::lock_guard<std::mutex> lock(mutex_); closed_ = true; current_.reset(); retired_.clear(); }
+
+StatusOr<std::unique_ptr<QueryProjectionStore>> QueryProjectionStore::Open(ProjectionStoreOptions options) {
+  if (options.path.empty() || options.database_identity.empty()) return Status::InvalidArgument("projection store", "path and database identity are required");
+  auto store = std::unique_ptr<QueryProjectionStore>(new QueryProjectionStore(std::move(options)));
+  std::error_code ec; fs::create_directories(store->manifests_path_, ec); if (ec) return Status::IOError("projection store", ec.message());
+  const Status loaded = store->LoadCurrent();
+  if (!loaded.ok() && !loaded.IsNotFound()) { store->enabled_ = false; }
+  return store;
+}
+
+Status QueryProjectionStore::LoadCurrent() {
+  auto current = ReadFile(fs::path(projections_path_) / "PROJECTION-CURRENT");
+  if (!current.ok()) return current.status();
+  uint64_t generation = 0; if (!ParseCurrent(current.ValueOrDie(), &generation)) return Status::Corruption("projection store", "bad PROJECTION-CURRENT");
+  const fs::path manifest_path = fs::path(manifests_path_) / (std::to_string(generation) + ".cmanifest");
+  auto bytes = ReadFile(manifest_path); if (!bytes.ok()) return bytes.status();
+  auto manifest = DecodeProjectionManifest(bytes.ValueOrDie(), options_.database_identity); if (!manifest.ok()) return manifest.status();
+  if (manifest.ValueOrDie().generation_id != generation) return Status::Corruption("projection store", "manifest generation mismatch");
+  for (const auto& r : manifest.ValueOrDie().regions) for (const auto& seg : r.segments) {
+    const fs::path segment_path = fs::path(projections_path_) / seg.filename;
+    std::error_code ec; if (!fs::exists(segment_path, ec) || ec || fs::file_size(segment_path, ec) != seg.file_bytes || ec) return Status::Corruption("projection store", "referenced segment is missing or sized differently");
+    auto segment = ReadFile(segment_path); if (!segment.ok() || crc32c::Value(segment.ValueOrDie().data(), segment.ValueOrDie().size()) != seg.checksum) return Status::Corruption("projection store", "referenced segment checksum mismatch");
+  }
+  auto state = std::make_shared<ProjectionGeneration::State>(); state->manifest = manifest.ConsumeValueOrDie(); state->directory = projections_path_; state->manifest_file = manifest_path.string(); for (const auto& r : state->manifest.regions) for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename); current_ = std::move(state); enabled_ = true; return Status::OK();
+}
+
+Status QueryProjectionStore::PublishCurrent(uint64_t generation) {
+  const fs::path temp = fs::path(projections_path_) / "PROJECTION-CURRENT.tmp";
+  const Status written = WriteFile(temp, CurrentBytes(generation)); if (!written.ok()) return written;
+  if (options_.fault_injector) { auto s=options_.fault_injector(ProjectionStoreFaultPoint::kCurrentTemporaryWrite); if (!s.ok()) return s; }
+  auto sync = SyncFile(temp); if (!sync.ok()) return sync;
+  if (::rename(temp.c_str(), (fs::path(projections_path_) / "PROJECTION-CURRENT").c_str()) != 0) return Status::IOError("projection store", "CURRENT rename failed");
+  if (options_.fault_injector) { auto s=options_.fault_injector(ProjectionStoreFaultPoint::kCurrentRename); if (!s.ok()) return s; }
+  return SyncDirectory(projections_path_);
+}
+
+Status QueryProjectionStore::Build(const ProjectionBuild& build) {
+  if (!ValidateProjectionManifest(build.manifest, options_.database_identity).ok()) return ValidateProjectionManifest(build.manifest, options_.database_identity);
+  std::set<std::string> seen;
+  for (const auto& input : build.segments) {
+    if (!seen.insert(input.descriptor.segment_id).second || !SafeName(input.descriptor.filename)) return Status::InvalidArgument("projection store", "invalid segment input");
+    if (crc32c::Value(input.bytes.data(), input.bytes.size()) != input.descriptor.checksum) return Status::Corruption("projection store", "segment checksum mismatch");
+    const fs::path temp = fs::path(projections_path_) / (input.descriptor.filename + ".tmp");
+    auto s=WriteFile(temp,input.bytes); if (!s.ok()) return s; s=SyncFile(temp); if (!s.ok()) return s;
+    if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kAfterSegmentSync); if (!s.ok()) return s; }
+    if (::rename(temp.c_str(), (fs::path(projections_path_) / input.descriptor.filename).c_str()) != 0) return Status::IOError("projection store", "segment rename failed");
+  }
+  auto encoded = EncodeProjectionManifest(build.manifest); if (!encoded.ok()) return encoded.status();
+  const fs::path manifest = fs::path(manifests_path_) / (std::to_string(build.manifest.generation_id) + ".cmanifest");
+  const fs::path temp_manifest = manifest.string() + ".tmp";
+  auto s=WriteFile(temp_manifest, encoded.ValueOrDie()); if (!s.ok()) return s; s=SyncFile(temp_manifest); if (!s.ok()) return s;
+  if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kAfterManifestSync); if (!s.ok()) return s; }
+  if (::rename(temp_manifest.c_str(), manifest.c_str()) != 0) return Status::IOError("projection store", "manifest rename failed");
+  s=SyncDirectory(manifests_path_); if (!s.ok()) return s;
+  if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kDirectorySync); if (!s.ok()) return s; }
+  s=PublishCurrent(build.manifest.generation_id); if (!s.ok()) return s;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (current_) { current_->retired = true; retired_.push_back(current_); }
+    auto state=std::make_shared<ProjectionGeneration::State>(); state->manifest=build.manifest; state->directory=projections_path_; state->manifest_file=(fs::path(manifests_path_) / (std::to_string(build.manifest.generation_id) + ".cmanifest")).string(); for (const auto& r : build.manifest.regions) for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename); current_=std::move(state); enabled_=true;
+    for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { (*it)->present=false; it=retired_.erase(it); } else ++it; }
+  }
+  return Status::OK();
+}
+
+std::optional<ProjectionGeneration> QueryProjectionStore::Acquire(const CoverageRequest& request) const {
+  std::lock_guard<std::mutex> lock(mutex_); if (!enabled_ || !current_ || current_->retired || request.snapshot_seq.value < current_->manifest.base_seq.value) return std::nullopt;
+  for (const auto& r : current_->manifest.regions) {
+    if (r.kind != request.kind || r.part_id != request.part_id || r.schema_epoch != request.schema_epoch || r.entity_min > request.entity_min || r.entity_max_exclusive < request.entity_max_exclusive || (r.property_id != request.property_id)) continue;
+    if (r.valid_time.from.value > request.valid_time.from.value || (r.valid_time.to && (!request.valid_time.to || r.valid_time.to->value < request.valid_time.to->value))) continue;
+    return ProjectionGeneration(current_, true);
+  }
+  return std::nullopt;
+}
+Status QueryProjectionStore::RetireBefore(CommitSeq seq) { std::lock_guard<std::mutex> lock(mutex_); if (current_ && current_->manifest.base_seq.value < seq.value) { current_->retired=true; retired_.push_back(current_); current_.reset(); enabled_=false; } for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; fs::remove(fs::path((*it)->directory) / file, ec); } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } return Status::OK(); }
+void QueryProjectionStore::CollectRetired() { std::lock_guard<std::mutex> lock(mutex_); for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; fs::remove(fs::path((*it)->directory) / file, ec); } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } }
+Status QueryProjectionStore::Quarantine(const std::string& filename) { if (!SafeName(filename)) return Status::InvalidArgument("projection store", "invalid quarantine filename"); std::error_code ec; fs::create_directories(fs::path(projections_path_) / "quarantine", ec); if (ec) return Status::IOError("projection store", ec.message()); fs::rename(fs::path(projections_path_) / filename, fs::path(projections_path_) / "quarantine" / filename, ec); return ec ? Status::IOError("projection store", ec.message()) : Status::OK(); }
+bool QueryProjectionStore::projections_enabled() const { std::lock_guard<std::mutex> lock(mutex_); return enabled_; }
+std::optional<uint64_t> QueryProjectionStore::current_generation_id() const { std::lock_guard<std::mutex> lock(mutex_); return current_ ? std::optional<uint64_t>(current_->manifest.generation_id) : std::nullopt; }
+}  // namespace cedar::internal

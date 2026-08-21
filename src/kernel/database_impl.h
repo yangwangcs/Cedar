@@ -28,6 +28,7 @@
 #include "kernel/async_submission_executor.h"
 #include "kernel/maintenance_controller.h"
 #include "kernel/maintenance_policy.h"
+#include "query/projection/projection_store.h"
 
 namespace cedar {
 
@@ -229,6 +230,7 @@ class Database::Impl {
   mutable std::mutex mutex;
   std::condition_variable commits_drained;
   FactStore store;
+  std::unique_ptr<internal::QueryProjectionStore> projection_store;
   AsyncSubmissionExecutor async_executor;
   uint64_t next_vertex_id = 0;
   uint64_t vertex_lease_limit = 0;

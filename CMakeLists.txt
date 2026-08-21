@@ -67,6 +67,8 @@ add_library(cedar_core STATIC
     src/query/runtime/relational.cc
     src/query/projection/projection_compression.cc
     src/query/projection/projection_format.cc
+    src/query/projection/projection_manifest.cc
+    src/query/projection/projection_store.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

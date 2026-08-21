@@ -1431,6 +1431,7 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       options.async_executor.max_mailbox_bytes < options.group_commit_max_batch_bytes) {
     return Status::InvalidArgument("database", "async executor bounds are invalid");
   }
+  const std::string database_path = options.path;
   auto impl = std::make_shared<Impl>(std::move(options));
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
@@ -1446,6 +1447,13 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       return finalized.status();
     }
   }
+  auto projections = internal::QueryProjectionStore::Open(
+      internal::ProjectionStoreOptions{database_path + "/projections", database_path, {}});
+  if (!projections.ok()) {
+    impl->store.Close().IgnoreError();
+    return projections.status();
+  }
+  impl->projection_store = projections.ConsumeValueOrDie();
   const Status pipeline_started = impl->StartAppendCommitPipeline();
   if (!pipeline_started.ok()) {
     impl->store.Close().IgnoreError();
@@ -1484,6 +1492,7 @@ Status Database::Close() {
   impl_->StopAppendCommitPipeline();
   impl_->RefreshRuntimeSnapshot().IgnoreError();
   impl_->ObserveShutdownStage("final_runtime_snapshot");
+  impl_->projection_store.reset();
   impl_->ObserveShutdownStage("rocksdb_close");
   lock.lock();
   const Status closed = impl_->store.Close();

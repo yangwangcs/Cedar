@@ -398,6 +398,97 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
   return columns;
 }
 
+Status AppendRelationalCell(QueryColumn* column,
+                            const internal::RelationalCell& cell) {
+  if (column->type != cell.type) {
+    return Status::InvalidArgument("query runtime",
+                                   "relational output types differ");
+  }
+  const bool present = cell.present;
+  switch (column->type) {
+    case QueryType::kBool:
+      Append(column, static_cast<uint8_t>(present && std::get<bool>(cell.value)),
+             present);
+      return Status::OK();
+    case QueryType::kInt32:
+      Append(column, present ? std::get<int32_t>(cell.value) : int32_t{}, present);
+      return Status::OK();
+    case QueryType::kInt64:
+      Append(column, present ? std::get<int64_t>(cell.value) : int64_t{}, present);
+      return Status::OK();
+    case QueryType::kFloat32:
+      Append(column, present ? std::get<float>(cell.value) : float{}, present);
+      return Status::OK();
+    case QueryType::kFloat64:
+      Append(column, present ? std::get<double>(cell.value) : double{}, present);
+      return Status::OK();
+    case QueryType::kTimestamp64:
+      Append(column,
+             present ? std::get<Timestamp64>(cell.value).value : uint64_t{},
+             present);
+      return Status::OK();
+    case QueryType::kString:
+      Append(column, present ? std::get<std::string>(cell.value) : std::string{},
+             present);
+      return Status::OK();
+    case QueryType::kBinary:
+      Append(column,
+             present ? std::get<Binary>(cell.value).value : std::string{}, present);
+      return Status::OK();
+    case QueryType::kVertexRef:
+      Append(column, present ? std::get<VertexRef>(cell.value) : VertexRef{}, present);
+      return Status::OK();
+    case QueryType::kEdgeRef:
+      Append(column, present ? std::get<EdgeRef>(cell.value) : EdgeRef{}, present);
+      return Status::OK();
+    case QueryType::kValidTime:
+      Append(column, present ? std::get<ValidTime>(cell.value) : ValidTime{}, present);
+      return Status::OK();
+    case QueryType::kValidDuration:
+      Append(column,
+             present ? std::get<ValidDuration>(cell.value) : ValidDuration{}, present);
+      return Status::OK();
+    case QueryType::kCommitSeq:
+      Append(column, present ? std::get<CommitSeq>(cell.value) : CommitSeq{}, present);
+      return Status::OK();
+    case QueryType::kValidTimeInterval:
+      Append(column,
+             present ? std::get<ValidTimeInterval>(cell.value)
+                     : ValidTimeInterval{},
+             present);
+      return Status::OK();
+    default:
+      return Status::NotSupported("query runtime",
+                                  "relational output type is unsupported");
+  }
+}
+
+StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
+    const internal::BatchStream& stream, size_t offset, size_t count,
+    const std::vector<RowColumn>& output_columns) {
+  std::vector<QueryColumn> columns;
+  columns.reserve(output_columns.size());
+  for (const RowColumn& output : output_columns) {
+    columns.push_back(
+        QueryColumn{output.slot, output.type, EmptyColumn(output.type), {}});
+  }
+  for (size_t row_index = offset; row_index < offset + count; ++row_index) {
+    const internal::RelationalRow& row = stream.rows[row_index];
+    if (row.cells.size() != columns.size()) {
+      return Status::InvalidArgument("query runtime",
+                                     "relational output schema differs");
+    }
+    for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
+      if (Status status =
+              AppendRelationalCell(&columns[column_index], row.cells[column_index]);
+          !status.ok()) {
+        return status;
+      }
+    }
+  }
+  return columns;
+}
+
 }  // namespace
 
 class QueryCursor::State {
@@ -432,6 +523,46 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
 
   if (!state_->initialized) {
     state_->initialized = true;
+    if (state_->plan.relational_kind.has_value()) {
+      if (!state_->plan.relational_input.has_value()) {
+        state_->terminal_error = Status::InvalidArgument(
+            "query runtime", "relational logical node has no input");
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      internal::QueryReservation reservation(state_->options.budget.memory_bytes);
+      internal::FragmentBudget fragments(
+          state_->options.budget.interval_fragments);
+      auto relational = internal::ExecuteRelationalPlanNode(
+          *state_->plan.relational_kind,
+          std::move(*state_->plan.relational_input),
+          &reservation, &fragments);
+      if (!relational.ok()) {
+        state_->terminal_error = relational.status();
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      const internal::BatchStream& stream = relational.ValueOrDie().stream;
+      if (stream.rows.size() > state_->options.budget.output_rows) {
+        state_->terminal_error = Status::ResourceExhausted(
+            "query", "output row budget exceeded");
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      constexpr size_t kBatchRows = 1024;
+      for (size_t offset = 0; offset < stream.rows.size(); offset += kBatchRows) {
+        const size_t count = std::min(kBatchRows, stream.rows.size() - offset);
+        auto columns = BuildRelationalColumns(
+            stream, offset, count, state_->plan.output_columns);
+        if (!columns.ok()) {
+          state_->terminal_error = columns.status();
+          state_->snapshot.reset();
+          return *state_->terminal_error;
+        }
+        state_->batches.emplace_back(
+            QueryBatch(count, std::move(columns).ConsumeValueOrDie()));
+      }
+    } else {
     auto rows = MaterializeRows(*state_->snapshot, state_->plan);
     if (!rows.ok()) {
       state_->terminal_error = rows.status();
@@ -464,6 +595,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       }
       state_->batches.emplace_back(
           QueryBatch(count, std::move(columns).ConsumeValueOrDie()));
+    }
     }
   }
 
@@ -593,6 +725,23 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
 StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,
     QueryReservation* reservation, FragmentBudget* fragment_budget) {
+  if (kind == LogicalOpKind::kUnionAll) {
+    return RuntimeRelationalResult{
+        UnionAll(std::move(input.left), std::move(input.right)), std::nullopt};
+  }
+  if (kind == LogicalOpKind::kDistinct) {
+    return RuntimeRelationalResult{Distinct(input.left), std::nullopt};
+  }
+  if (kind == LogicalOpKind::kSort) {
+    auto result = Sort(input.left, input.sort_keys, reservation);
+    if (!result.ok()) return result.status();
+    return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                   std::nullopt};
+  }
+  if (kind == LogicalOpKind::kLimit) {
+    return RuntimeRelationalResult{
+        Limit(input.left, input.offset, input.count), std::nullopt};
+  }
   if (kind == LogicalOpKind::kAggregateRows) {
     auto result = AggregateRows(
         {std::move(input.left), std::move(input.group_by),

@@ -8,15 +8,12 @@
 #include <functional>
 #include <limits>
 #include <numeric>
-#include <unordered_map>
 #include <utility>
 
 #include "query/temporal/interval.h"
 
 namespace cedar::internal {
 namespace {
-
-constexpr size_t kEstimatedCellBytes = 32;
 
 Status ValidateKey(const BatchStream& stream, size_t key) {
   for (const RelationalRow& row : stream.rows) {
@@ -151,19 +148,99 @@ size_t HashCell(const RelationalCell& cell) {
   return hash;
 }
 
-size_t EstimateBytes(const BatchStream& stream) {
-  size_t cells = 0;
-  for (const RelationalRow& row : stream.rows) {
-    if (row.cells.size() >
-        (std::numeric_limits<size_t>::max() - cells)) {
+bool AddBytes(size_t bytes, size_t* total) {
+  if (bytes > std::numeric_limits<size_t>::max() - *total) return false;
+  *total += bytes;
+  return true;
+}
+
+size_t EstimateCellBytes(const RelationalCell& cell) {
+  size_t bytes = sizeof(RelationalCell);
+  if (!cell.present) return bytes;
+  std::visit(
+      [&bytes](const auto& value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, std::string>) {
+          if (!AddBytes(value.size(), &bytes)) {
+            bytes = std::numeric_limits<size_t>::max();
+          }
+        } else if constexpr (std::is_same_v<T, Binary>) {
+          if (!AddBytes(value.value.size(), &bytes)) {
+            bytes = std::numeric_limits<size_t>::max();
+          }
+        }
+      },
+      cell.value);
+  return bytes;
+}
+
+size_t EstimateRowBytes(const RelationalRow& row) {
+  size_t bytes = sizeof(RelationalRow);
+  for (const RelationalCell& cell : row.cells) {
+    if (!AddBytes(EstimateCellBytes(cell), &bytes)) {
       return std::numeric_limits<size_t>::max();
     }
-    cells += row.cells.size();
   }
-  if (cells > std::numeric_limits<size_t>::max() / kEstimatedCellBytes) {
-    return std::numeric_limits<size_t>::max();
+  return bytes;
+}
+
+size_t EstimateCombinedRowBytes(const RelationalRow& left,
+                                const RelationalRow& right) {
+  size_t bytes = sizeof(RelationalRow);
+  for (const RelationalCell& cell : left.cells) {
+    if (!AddBytes(EstimateCellBytes(cell), &bytes)) {
+      return std::numeric_limits<size_t>::max();
+    }
   }
-  return cells * kEstimatedCellBytes;
+  for (const RelationalCell& cell : right.cells) {
+    if (!AddBytes(EstimateCellBytes(cell), &bytes)) {
+      return std::numeric_limits<size_t>::max();
+    }
+  }
+  return bytes;
+}
+
+size_t EstimateBytes(const BatchStream& stream) {
+  size_t bytes = sizeof(BatchStream);
+  for (const RelationalRow& row : stream.rows) {
+    if (!AddBytes(EstimateRowBytes(row), &bytes)) {
+      return std::numeric_limits<size_t>::max();
+    }
+  }
+  return bytes;
+}
+
+struct JoinOutputEstimate {
+  size_t rows = 0;
+  size_t bytes = sizeof(BatchStream);
+};
+
+std::optional<JoinOutputEstimate> EstimateJoinOutput(const JoinInput& input) {
+  JoinOutputEstimate estimate;
+  for (const RelationalRow& left : input.left.rows) {
+    bool matched = false;
+    for (const RelationalRow& right : input.right.rows) {
+      if (!KeysEqual(left.cells[input.left_key], right.cells[input.right_key])) {
+        continue;
+      }
+      matched = true;
+      if (input.kind != JoinKind::kInner) break;
+      if (!AddBytes(EstimateCombinedRowBytes(left, right), &estimate.bytes) ||
+          estimate.rows == std::numeric_limits<size_t>::max()) {
+        return std::nullopt;
+      }
+      ++estimate.rows;
+    }
+    if ((input.kind == JoinKind::kSemi && matched) ||
+        (input.kind == JoinKind::kAnti && !matched)) {
+      if (!AddBytes(EstimateRowBytes(left), &estimate.bytes) ||
+          estimate.rows == std::numeric_limits<size_t>::max()) {
+        return std::nullopt;
+      }
+      ++estimate.rows;
+    }
+  }
+  return estimate;
 }
 
 class ReservationGuard {
@@ -235,10 +312,6 @@ bool IntervalValid(const ValidTimeInterval& interval) {
 }
 
 Status Publish(RelationalRow row, FragmentBudget* budget, BatchStream* output) {
-  if (budget == nullptr || !budget->TryConsume()) {
-    return Status::ResourceExhausted("query",
-                                     "interval fragment budget exceeded");
-  }
   if (!output->rows.empty() &&
       output->rows.back().cells == row.cells &&
       output->rows.back().effective.has_value() && row.effective.has_value() &&
@@ -247,8 +320,41 @@ Status Publish(RelationalRow row, FragmentBudget* budget, BatchStream* output) {
     output->rows.back().effective->to = row.effective->to;
     return Status::OK();
   }
+  if (budget == nullptr || !budget->TryConsume()) {
+    return Status::ResourceExhausted("query",
+                                     "interval fragment budget exceeded");
+  }
   output->rows.push_back(std::move(row));
   return Status::OK();
+}
+
+std::vector<ValidTimeInterval> NormalizeIntervals(
+    std::vector<ValidTimeInterval> intervals) {
+  std::sort(intervals.begin(), intervals.end(), [](const auto& left,
+                                                   const auto& right) {
+    if (left.from.value != right.from.value) return left.from.value < right.from.value;
+    if (!left.to.has_value()) return false;
+    if (!right.to.has_value()) return true;
+    return left.to->value < right.to->value;
+  });
+  std::vector<ValidTimeInterval> normalized;
+  for (const ValidTimeInterval& interval : intervals) {
+    if (normalized.empty()) {
+      normalized.push_back(interval);
+      continue;
+    }
+    ValidTimeInterval& previous = normalized.back();
+    if (!previous.to.has_value() || interval.from.value <= previous.to->value) {
+      if (!previous.to.has_value() ||
+          (interval.to.has_value() && interval.to->value <= previous.to->value)) {
+        continue;
+      }
+      previous.to = interval.to;
+      continue;
+    }
+    normalized.push_back(interval);
+  }
+  return normalized;
 }
 
 std::vector<RelationalCell> GroupCells(const RelationalRow& row,
@@ -435,9 +541,15 @@ JoinAlgorithm ChooseJoinAlgorithm(size_t estimated_rows, bool sorted_keys,
   return sorted_keys ? JoinAlgorithm::kSortMerge : JoinAlgorithm::kHash;
 }
 
-StatusOr<BatchStream> IndexNestedLoopJoin(JoinInput input) {
+StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
+  const auto output = EstimateJoinOutput(input);
+  if (!output.has_value()) {
+    return Status::ResourceExhausted("relational join",
+                                     "output size overflows");
+  }
   BatchStream result;
+  result.rows.reserve(output->rows);
   for (const RelationalRow& left : input.left.rows) {
     bool matched = false;
     for (const RelationalRow& right : input.right.rows) {
@@ -458,25 +570,45 @@ StatusOr<BatchStream> IndexNestedLoopJoin(JoinInput input) {
   return result;
 }
 
-StatusOr<BatchStream> HashJoin(JoinInput input,
+StatusOr<BatchStream> HashJoin(const JoinInput& input,
                                QueryReservation* reservation) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
-  ReservationGuard guard(reservation, EstimateBytes(input.right));
+  const auto output = EstimateJoinOutput(input);
+  if (!output.has_value() ||
+      input.right.rows.size() >
+          std::numeric_limits<size_t>::max() / (sizeof(size_t) + sizeof(const RelationalRow*))) {
+    return NeedsSpill();
+  }
+  const size_t index_bytes = input.right.rows.size() *
+                             (sizeof(size_t) + sizeof(const RelationalRow*));
+  size_t required_bytes = EstimateBytes(input.right);
+  if (!AddBytes(index_bytes, &required_bytes) ||
+      !AddBytes(output->bytes, &required_bytes)) {
+    return NeedsSpill();
+  }
+  ReservationGuard guard(reservation, required_bytes);
   if (!guard.acquired()) return NeedsSpill();
 
-  std::unordered_map<size_t, std::vector<const RelationalRow*>> table;
+  struct HashEntry {
+    size_t hash;
+    const RelationalRow* row;
+  };
+  std::vector<HashEntry> table;
+  table.reserve(input.right.rows.size());
   for (const RelationalRow& right : input.right.rows) {
     const RelationalCell& key = right.cells[input.right_key];
-    if (key.present) table[HashCell(key)].push_back(&right);
+    if (key.present) table.push_back({HashCell(key), &right});
   }
   BatchStream result;
+  result.rows.reserve(output->rows);
   for (const RelationalRow& left : input.left.rows) {
     bool matched = false;
     const RelationalCell& key = left.cells[input.left_key];
     if (key.present) {
-      const auto bucket = table.find(HashCell(key));
-      if (bucket != table.end()) {
-        for (const RelationalRow* right : bucket->second) {
+      const size_t hash = HashCell(key);
+      for (const HashEntry& entry : table) {
+        if (entry.hash == hash) {
+          const RelationalRow* right = entry.row;
           if (!KeysEqual(key, right->cells[input.right_key])) continue;
           matched = true;
           if (input.kind == JoinKind::kInner) {
@@ -486,6 +618,7 @@ StatusOr<BatchStream> HashJoin(JoinInput input,
             break;
           }
         }
+        if (input.kind == JoinKind::kSemi && matched) break;
       }
     }
     if (!matched && input.kind == JoinKind::kAnti) result.rows.push_back(left);
@@ -493,29 +626,32 @@ StatusOr<BatchStream> HashJoin(JoinInput input,
   return result;
 }
 
-StatusOr<BatchStream> SortMergeJoin(JoinInput input,
+StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
                                     QueryReservation* reservation) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
-  const size_t left_bytes = EstimateBytes(input.left);
+  size_t required_bytes = EstimateBytes(input.left);
   const size_t right_bytes = EstimateBytes(input.right);
-  if (left_bytes > std::numeric_limits<size_t>::max() - right_bytes) {
+  const auto output = EstimateJoinOutput(input);
+  if (!output.has_value() || !AddBytes(right_bytes, &required_bytes)) {
     return NeedsSpill();
   }
-  ReservationGuard guard(reservation, left_bytes + right_bytes);
+  if (!AddBytes(output->bytes, &required_bytes)) return NeedsSpill();
+  ReservationGuard guard(reservation, required_bytes);
   if (!guard.acquired()) return NeedsSpill();
-  std::stable_sort(input.left.rows.begin(), input.left.rows.end(),
+  JoinInput sorted = input;
+  std::stable_sort(sorted.left.rows.begin(), sorted.left.rows.end(),
                    [&input](const RelationalRow& left,
                             const RelationalRow& right) {
                      return CompareCell(left.cells[input.left_key],
                                         right.cells[input.left_key]) < 0;
                    });
-  std::stable_sort(input.right.rows.begin(), input.right.rows.end(),
+  std::stable_sort(sorted.right.rows.begin(), sorted.right.rows.end(),
                    [&input](const RelationalRow& left,
                             const RelationalRow& right) {
                      return CompareCell(left.cells[input.right_key],
                                         right.cells[input.right_key]) < 0;
                    });
-  auto joined = IndexNestedLoopJoin(std::move(input));
+  auto joined = IndexNestedLoopJoin(sorted);
   if (joined.ok()) joined.ValueOrDie().order_specified = true;
   return joined;
 }
@@ -565,10 +701,7 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
       }
     }
     if (input.kind == JoinKind::kSemi) {
-      std::sort(overlaps.begin(), overlaps.end(),
-                [](const auto& a, const auto& b) {
-                  return a.from.value < b.from.value;
-                });
+      overlaps = NormalizeIntervals(std::move(overlaps));
       for (const auto& overlap : overlaps) {
         RelationalRow row = left;
         row.effective = overlap;
@@ -578,10 +711,7 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
         }
       }
     } else if (input.kind == JoinKind::kAnti) {
-      std::sort(overlaps.begin(), overlaps.end(),
-                [](const auto& a, const auto& b) {
-                  return a.from.value < b.from.value;
-                });
+      overlaps = NormalizeIntervals(std::move(overlaps));
       ValidTime cursor = left.effective->from;
       bool exhausted = false;
       for (const ValidTimeInterval& overlap : overlaps) {

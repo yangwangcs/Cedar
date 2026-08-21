@@ -26,19 +26,6 @@ struct PreparedPropertyBinding {
   std::optional<PropertyDefinition> definition;
 };
 
-struct PreparedQueryPlan {
-  bool canonical_temporal = false;
-  FactFamily entity_family = FactFamily::kVertexState;
-  SlotId entity_slot;
-  TemporalScope scope = At{ValidTime{0}};
-  std::vector<PreparedPropertyBinding> property_bindings;
-  std::shared_ptr<const ExpressionNode> predicate;
-  std::vector<RowColumn> output_columns;
-  std::vector<PropertyId> referenced_properties;
-};
-
-StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);
-
 // Private pull-runtime boundary between logical relational nodes and physical
 // vector operators. It is intentionally unavailable from the public Query API.
 struct RuntimeRelationalInput {
@@ -49,6 +36,9 @@ struct RuntimeRelationalInput {
   size_t estimated_rows = 0;
   bool sorted_keys = false;
   bool temporal = false;
+  std::vector<SortKey> sort_keys;
+  size_t offset = 0;
+  size_t count = 0;
   std::vector<size_t> group_by;
   std::vector<AggregateSpec> aggregates;
 };
@@ -57,6 +47,21 @@ struct RuntimeRelationalResult {
   BatchStream stream;
   std::optional<JoinAlgorithm> join_algorithm;
 };
+
+struct PreparedQueryPlan {
+  bool canonical_temporal = false;
+  FactFamily entity_family = FactFamily::kVertexState;
+  SlotId entity_slot;
+  TemporalScope scope = At{ValidTime{0}};
+  std::vector<PreparedPropertyBinding> property_bindings;
+  std::shared_ptr<const ExpressionNode> predicate;
+  std::vector<RowColumn> output_columns;
+  std::vector<PropertyId> referenced_properties;
+  std::optional<LogicalOpKind> relational_kind;
+  std::optional<RuntimeRelationalInput> relational_input;
+};
+
+StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);
 
 StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,

@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "cedar/database.h"
 #include "query/runtime/relational.h"
 #include "query/runtime/query_runtime.h"
 #include "query/runtime/vector_kernels.h"
@@ -148,6 +150,39 @@ TEST(RelationalTest, HashJoinReturnsNeedsSpillWithoutExceedingReservation) {
   EXPECT_LE(reservation.used_bytes(), reservation.limit_bytes());
 }
 
+TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
+  JoinInput input{{{Row(1, 10)}}, {{Row(1, 20)}}, 0, 0,
+                  JoinKind::kInner};
+  const size_t minimum_output_bytes =
+      sizeof(RelationalRow) + 4 * sizeof(RelationalCell);
+
+  QueryReservation hash_reservation(4096);
+  auto hashed = HashJoin(input, &hash_reservation);
+  ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
+  EXPECT_GE(hash_reservation.peak_bytes(), minimum_output_bytes);
+  EXPECT_LE(hash_reservation.peak_bytes(), hash_reservation.limit_bytes());
+  EXPECT_EQ(hash_reservation.used_bytes(), 0U);
+
+  QueryReservation sort_reservation(4096);
+  auto sorted = SortMergeJoin(input, &sort_reservation);
+  ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
+  EXPECT_GE(sort_reservation.peak_bytes(), minimum_output_bytes);
+  EXPECT_LE(sort_reservation.peak_bytes(), sort_reservation.limit_bytes());
+  EXPECT_EQ(sort_reservation.used_bytes(), 0U);
+
+  QueryReservation hash_spill(1);
+  auto hash_overflow = HashJoin(input, &hash_spill);
+  ASSERT_FALSE(hash_overflow.ok());
+  EXPECT_TRUE(IsNeedsSpill(hash_overflow.status()));
+  EXPECT_EQ(hash_spill.used_bytes(), 0U);
+
+  QueryReservation sort_spill(1);
+  auto sort_overflow = SortMergeJoin(input, &sort_spill);
+  ASSERT_FALSE(sort_overflow.ok());
+  EXPECT_TRUE(IsNeedsSpill(sort_overflow.status()));
+  EXPECT_EQ(sort_spill.used_bytes(), 0U);
+}
+
 TEST(RelationalTest, ChoosesAlgorithmsAtExactPlannerBoundaries) {
   EXPECT_EQ(ChooseJoinAlgorithm(4095, false, false),
             JoinAlgorithm::kIndexNestedLoop);
@@ -183,6 +218,32 @@ TEST(RelationalTest, TemporalAntiJoinDerivesMissingFragments) {
             (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
   EXPECT_EQ(result.ValueOrDie().rows[1].effective,
             (ValidTimeInterval{ValidTime{10}, ValidTime{15}}));
+}
+
+TEST(RelationalTest, CoalescedTemporalOutputConsumesOneFragment) {
+  TemporalJoinInput input{
+      {{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}},
+      {{TemporalRow(1, 0, 10)}}, 0, 0, JoinKind::kInner};
+  FragmentBudget budget(1);
+  auto result = IntervalMergeJoin(input, &budget);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(result.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+  EXPECT_EQ(budget.used_fragments(), 1U);
+}
+
+TEST(RelationalTest, TemporalSemiJoinUnionsOverlappingCoverage) {
+  TemporalJoinInput input{{{TemporalRow(1, 0, 10)}},
+                          {{TemporalRow(1, 0, 7), TemporalRow(1, 5, 10)}},
+                          0, 0, JoinKind::kSemi};
+  FragmentBudget budget(1);
+  auto result = IntervalMergeJoin(input, &budget);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(result.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+  EXPECT_EQ(budget.used_fragments(), 1U);
 }
 
 TEST(RelationalTest, TemporalAggregateProcessesExitBeforeEntry) {
@@ -279,6 +340,38 @@ TEST(QueryRuntimeRelationalTest,
   ASSERT_TRUE(temporal.ok()) << temporal.status().ToString();
   EXPECT_EQ(temporal.ValueOrDie().stream.rows.front().effective,
             (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+}
+
+TEST(QueryRuntimeRelationalTest, PullCursorExecutesRelationalPlanNode) {
+  char path[] = "/tmp/cedar_query_relational_XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  PreparedQueryPlan plan;
+  plan.relational_kind = LogicalOpKind::kLimit;
+  plan.relational_input = RuntimeRelationalInput{
+      .left = BatchStream{{Row(1, 10), Row(2, 20)}}, .offset = 1, .count = 1};
+  const Slot<int64_t> key = Slot<int64_t>::WithId(SlotId{1}, "key");
+  const Slot<int64_t> payload = Slot<int64_t>::WithId(SlotId{2}, "payload");
+  plan.output_columns = {Project(key).column, Project(payload).column};
+
+  auto cursor = QueryRuntime::Execute(
+      plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get(key, 0), 2);
+  EXPECT_EQ(batch.ValueOrDie()->Get(payload, 0), 20);
+
+  EXPECT_TRUE(database.ValueOrDie()->Close().IsSnapshotPinned());
+  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
 }
 
 }  // namespace

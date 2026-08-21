@@ -115,10 +115,10 @@ bool IsNeedsSpill(const Status& status);
 
 JoinAlgorithm ChooseJoinAlgorithm(size_t estimated_rows, bool sorted_keys,
                                   bool temporal);
-StatusOr<BatchStream> IndexNestedLoopJoin(JoinInput input);
-StatusOr<BatchStream> HashJoin(JoinInput input,
+StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input);
+StatusOr<BatchStream> HashJoin(const JoinInput& input,
                                QueryReservation* reservation);
-StatusOr<BatchStream> SortMergeJoin(JoinInput input,
+StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
                                     QueryReservation* reservation);
 StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
                                         FragmentBudget* budget);

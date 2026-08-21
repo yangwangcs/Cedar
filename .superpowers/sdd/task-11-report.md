@@ -68,3 +68,37 @@ those fixtures need explicit smaller allocations before the full Debug
 profile suite can pass. Non-cancellation terminal error branches still defer
 their first cleanup call until the next terminal `Next()` or cursor
 destruction.
+
+## Repair re-review closure (2026-08-22)
+
+Implemented the requested re-review repairs:
+
+- `DeserializeRows` now preflights and charges the total decoded cell count in
+  addition to row objects and serialized payload bytes. The lease remains owned
+  by `DecodedRows` for the complete decoded-row lifetime. Added
+  `SpilledRowsReserveEveryDecodedCellCapacity` RED/GREEN coverage.
+- Query cursor terminal errors now use an exit guard that synchronously cleans
+  analytical scratch on the first non-cancel/deadline error return.
+- `QueryScratch::WriteRun` rolls back both scratch bytes and a newly acquired
+  process-wide free-space admission on every post-admission failure. `Cleanup`
+  releases admissions even when no query directory exists. Added
+  `FailedDirectoryCreationReleasesFreeSpaceAdmission` RED/GREEN coverage.
+- Production 1 GiB lifecycle/commit/recovery/benchmark fixtures now explicitly
+  use 32 MiB each for query memory, projection cache, and query delta. The two
+  kernel-test benchmark fixtures use 128 KiB each. WBM, block cache, and all
+  query/projection/delta accounting constraints remain enforced. The benchmark
+  workload defaults were updated so `KernelBenchmarkCsvContract` opens too.
+
+Verification:
+
+```text
+cmake --build build/query-debug --clean-first -j1 --target \
+  test_query_resources test_query_relational test_query_canonical \
+  test_kernel_lifecycle test_kernel_commit test_kernel_bounded_benchmark \
+  test_recovery_crash_matrix cedar_kernel_bench
+  all targets built successfully
+
+ctest --test-dir build/query-debug --output-on-failure -j1 -R \
+  'QueryResource|QueryRelational|QueryCanonical|KernelLifecycle|KernelCommit|KernelBoundedBenchmark|RecoveryCrashMatrix|KernelBenchmarkCsvContract'
+  106 passed, 0 failed
+```

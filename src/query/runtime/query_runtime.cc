@@ -858,6 +858,15 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   if (!state_) {
     return Status::InvalidArgument("query cursor", "moved-from cursor");
   }
+  // Any terminal error produced below must release analytical scratch before
+  // returning from this first failing call. The guard is a no-op for batches
+  // and clean completion, and makes cleanup independent of a later Next/Close.
+  struct TerminalCleanup {
+    State* state;
+    ~TerminalCleanup() {
+      if (state->terminal_error.has_value()) state->CleanupScratch();
+    }
+  } terminal_cleanup{state_.get()};
   if (state_->terminal_error.has_value()) {
     state_->CleanupScratch();
     return *state_->terminal_error;

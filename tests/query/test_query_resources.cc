@@ -210,6 +210,32 @@ TEST(QueryScratchTest, RejectsPathEscape) {
   EXPECT_TRUE(scratch.Cleanup().ok());
 }
 
+TEST(QueryScratchTest, FailedDirectoryCreationReleasesFreeSpaceAdmission) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-scratch-admission-file";
+  std::filesystem::remove_all(root);
+  {
+    std::ofstream blocker(root);
+    blocker << "not a directory";
+  }
+  std::error_code ec;
+  const uint64_t available = std::filesystem::space(root, ec).available;
+  ASSERT_FALSE(ec);
+  ASSERT_GT(available, 1U);
+  const uint64_t reserve = available - 1024;
+
+  QueryScratch first(root, "instance", "first", 1024, reserve);
+  EXPECT_TRUE(first.WriteRun("run-0", "payload").status().IsIOError());
+  EXPECT_TRUE(first.Cleanup().ok());
+
+  // This succeeds only if the failed first write returned its process-wide
+  // free-space admission even though no query directory was created.
+  QueryScratch second(root, "instance", "second", 1024, reserve);
+  EXPECT_TRUE(second.WriteRun("run-0", "payload").status().IsIOError());
+  EXPECT_TRUE(second.Cleanup().ok());
+  std::filesystem::remove(root);
+}
+
 TEST(QueryScratchTest, RejectsOverwriteAndDetectsCorruption) {
   const auto root = std::filesystem::temp_directory_path() / "cedar-task11-scratch-corrupt";
   std::filesystem::remove_all(root);

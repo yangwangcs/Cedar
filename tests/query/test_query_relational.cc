@@ -220,6 +220,34 @@ TEST(RelationalTest, MalformedCellCountIsRejectedBeforeVectorAllocation) {
   EXPECT_EQ(reservation.used_bytes(), 0U);
 }
 
+TEST(RelationalTest, SpilledRowsReserveEveryDecodedCellCapacity) {
+  // The frame is valid, but its cell vector is much larger than the row
+  // header. Admission must account for the vector capacity before decoding.
+  constexpr uint32_t kCells = 128;
+  std::string frame;
+  frame.append(reinterpret_cast<const char*>(&kCells), sizeof(kCells));
+  frame.push_back('\0');
+  for (uint32_t i = 0; i < kCells; ++i) {
+    frame.push_back(static_cast<char>(QueryType::kInt64));
+    frame.push_back('\1');
+    frame.push_back(static_cast<char>(2));  // RelationalScalar int64 tag.
+    const int64_t value = static_cast<int64_t>(i);
+    frame.append(reinterpret_cast<const char*>(&value), sizeof(value));
+  }
+  std::string payload;
+  const uint32_t frame_size = static_cast<uint32_t>(frame.size());
+  payload.append(reinterpret_cast<const char*>(&frame_size), sizeof(frame_size));
+  payload.append(frame);
+
+  const size_t under_reserved = payload.size() + sizeof(RelationalRow) +
+                                 sizeof(RelationalCell);
+  QueryReservation reservation(under_reserved);
+  auto decoded = DeserializeRowsForTesting(payload, &reservation);
+  ASSERT_FALSE(decoded.ok());
+  EXPECT_TRUE(IsNeedsSpill(decoded.status()));
+  EXPECT_EQ(reservation.used_bytes(), 0U);
+}
+
 TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
   JoinInput input{{{Row(1, 10)}}, {{Row(1, 20)}}, 0, 0,
                   JoinKind::kInner};

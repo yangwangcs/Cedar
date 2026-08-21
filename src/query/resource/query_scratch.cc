@@ -164,6 +164,16 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
     if (!status.ok()) return status;
   }
   reserved_bytes_ += bytes;
+  bool admitted_here = false;
+  const auto rollback = [&] {
+    if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
+    reserved_bytes_ -= bytes;
+    if (admitted_here) {
+      g_reserved_free_space.fetch_sub(free_space_reserve_bytes_,
+                                       std::memory_order_acq_rel);
+      free_space_admitted_ = false;
+    }
+  };
   std::error_code ec;
   const auto space = std::filesystem::space(database_root_, ec);
   if (!ec && free_space_reserve_bytes_ != 0 && !free_space_admitted_) {
@@ -186,22 +196,20 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
       return Status::ResourceExhausted("query scratch", "insufficient free disk space");
     }
     free_space_admitted_ = true;
+    admitted_here = true;
   }
   if (!ec && (free_space_reserve_bytes_ > std::numeric_limits<uint64_t>::max() - bytes ||
               space.available < bytes + free_space_reserve_bytes_)) {
-    if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
-    reserved_bytes_ -= bytes;
+    rollback();
     return Status::ResourceExhausted("query scratch", "insufficient free disk space");
   }
   if (Status status = EnsureDirectory(); !status.ok()) {
-    if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
-    reserved_bytes_ -= bytes;
+    rollback();
     return status;
   }
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) {
-    if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
-    reserved_bytes_ -= bytes;
+    rollback();
     return Status::IOError("query scratch", "cannot create scratch block");
   }
   out.write(kMagic.data(), kMagic.size());
@@ -212,8 +220,7 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
   Write<uint32_t>(out, crc32c::Extend(0, payload.data(), payload.size()));
   out.close();
   if (!out) {
-    if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
-    reserved_bytes_ -= bytes;
+    rollback();
     return Status::IOError("query scratch", "cannot finalize scratch block");
   }
   written_bytes_ += bytes;
@@ -287,7 +294,18 @@ StatusOr<std::string> QueryScratch::ReadRun(const std::filesystem::path& path) c
 }
 
 Status QueryScratch::Cleanup() {
-  if (!created_ && !std::filesystem::exists(query_dir_)) return Status::OK();
+  if (!created_ && !std::filesystem::exists(query_dir_)) {
+    if (free_space_admitted_) {
+      g_reserved_free_space.fetch_sub(free_space_reserve_bytes_,
+                                       std::memory_order_acq_rel);
+      free_space_admitted_ = false;
+    }
+    if (reservation_ != nullptr && reserved_bytes_ != 0) {
+      reservation_->ReleaseScratch(reserved_bytes_);
+      reserved_bytes_ = 0;
+    }
+    return Status::OK();
+  }
   std::error_code ec;
   const auto canonical_root = std::filesystem::weakly_canonical(database_root_, ec);
   const auto canonical_query = std::filesystem::weakly_canonical(query_dir_, ec);

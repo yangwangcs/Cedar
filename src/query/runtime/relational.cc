@@ -1410,6 +1410,7 @@ StatusOr<DecodedRows> DeserializeRows(
     std::string_view payload, QueryReservation* reservation) {
   std::string_view scan = payload;
   size_t frame_count = 0;
+  size_t cell_count_total = 0;
   while (!scan.empty()) {
     uint32_t frame_size = 0;
     if (!ReadBinary(&scan, &frame_size) || frame_size > scan.size()) {
@@ -1428,6 +1429,11 @@ StatusOr<DecodedRows> DeserializeRows(
     if (frame_count == std::numeric_limits<size_t>::max()) {
       return Status::ResourceExhausted("query relational", "spilled rows reservation overflow");
     }
+    if (cell_count > std::numeric_limits<size_t>::max() - cell_count_total) {
+      return Status::ResourceExhausted("query relational",
+                                       "spilled cells reservation overflow");
+    }
+    cell_count_total += cell_count;
     ++frame_count;
     scan.remove_prefix(frame_size);
   }
@@ -1437,6 +1443,12 @@ StatusOr<DecodedRows> DeserializeRows(
     return Status::ResourceExhausted("query relational", "spilled rows reservation overflow");
   }
   decoded_bytes += frame_count * (sizeof(RelationalRow) + sizeof(RelationalCell));
+  if (cell_count_total > (std::numeric_limits<size_t>::max() - decoded_bytes) /
+                              sizeof(RelationalCell)) {
+    return Status::ResourceExhausted("query relational",
+                                     "spilled cells reservation overflow");
+  }
+  decoded_bytes += cell_count_total * sizeof(RelationalCell);
   DecodedRows decoded;
   if (reservation != nullptr) {
     decoded.lease = reservation->TryRetain(decoded_bytes);

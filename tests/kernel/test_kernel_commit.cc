@@ -678,7 +678,13 @@ TEST(KernelAdmissionControlTest, BoundsMailboxAdmissionWithoutBlockingCallers) {
         sample->free_disk_bytes = UINT64_MAX;
         sample->free_disk_percent = 100;
       },
-      .async_executor = AsyncExecutorOptions{1, 1, 4ULL * 1024ULL * 1024ULL}});
+      .async_executor = AsyncExecutorOptions{1, 1, 4ULL * 1024ULL * 1024ULL},
+      .query_runtime = QueryRuntimeOptions{
+          .query_workers = 4,
+          .reserved_interactive_workers = 1,
+          .query_memory_bytes = 32ULL * 1024ULL * 1024ULL,
+          .projection_cache_bytes = 32ULL * 1024ULL * 1024ULL,
+          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL}});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto first = database->BeginTransaction();
@@ -2285,7 +2291,13 @@ TEST(KernelGroupCommitTest, UsesOnlyCedarWriteSeam) {
       .kernel_write_observer_for_testing = [&](bool kernel) {
         EXPECT_TRUE(kernel);
         kernel_writes.fetch_add(1, std::memory_order_relaxed);
-      }});
+      },
+      .query_runtime = QueryRuntimeOptions{
+          .query_workers = 4,
+          .reserved_interactive_workers = 1,
+          .query_memory_bytes = 32ULL * 1024ULL * 1024ULL,
+          .projection_cache_bytes = 32ULL * 1024ULL * 1024ULL,
+          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL}});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto transaction = database->BeginTransaction();

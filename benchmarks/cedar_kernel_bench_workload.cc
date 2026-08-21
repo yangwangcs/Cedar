@@ -29,6 +29,9 @@ DatabaseOptions MakeBenchmarkDatabaseOptions(const KernelBenchmarkOptions& optio
   database_options.storage_profile = StorageProfile::kProductionAppend;
   database_options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
   database_options.production.kernel_mode = true;
+  database_options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
+  database_options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
+  database_options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;
   database_options.group_commit_max_batch_size = options.group_max_batch;
   database_options.group_commit_max_batch_bytes = options.group_max_bytes;
   database_options.group_commit_window_us = options.group_window_us;

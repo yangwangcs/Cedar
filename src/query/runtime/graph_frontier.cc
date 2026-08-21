@@ -738,21 +738,38 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
   });
   std::vector<uint64_t> winners;
   for (uint64_t candidate : target_labels) {
-    bool replaced = false;
-    for (uint64_t& winner : winners) {
-      const auto& a = result.labels[winner].common;
-      const auto& b = result.labels[candidate].common;
-      if (!IntervalOverlaps(a, b)) continue;
-      const uint64_t alen = IntervalLength(a), blen = IntervalLength(b);
-      const bool better = blen > alen ||
-                          (blen == alen && result.labels[candidate].depth < result.labels[winner].depth) ||
-                          (blen == alen && result.labels[candidate].depth == result.labels[winner].depth &&
-                           LabelPathLess(result.labels, candidate, winner));
-      if (better) winner = candidate;
-      replaced = true;
-      break;
+    std::vector<uint64_t> overlapping;
+    for (uint64_t winner : winners) {
+      if (IntervalOverlaps(result.labels[winner].common,
+                           result.labels[candidate].common)) {
+        overlapping.push_back(winner);
+      }
     }
-    if (!replaced) winners.push_back(candidate);
+    if (overlapping.empty()) {
+      winners.push_back(candidate);
+      continue;
+    }
+    auto better = [&](uint64_t left, uint64_t right) {
+      const uint64_t left_length = IntervalLength(result.labels[left].common);
+      const uint64_t right_length = IntervalLength(result.labels[right].common);
+      if (left_length != right_length) return left_length > right_length;
+      if (result.labels[left].depth != result.labels[right].depth)
+        return result.labels[left].depth < result.labels[right].depth;
+      return LabelPathLess(result.labels, left, right);
+    };
+    uint64_t best = candidate;
+    for (uint64_t winner : overlapping) {
+      if (better(winner, best)) best = winner;
+    }
+    if (best != candidate) continue;
+    winners.erase(std::remove_if(winners.begin(), winners.end(),
+                                 [&](uint64_t winner) {
+                                   return IntervalOverlaps(
+                                       result.labels[winner].common,
+                                       result.labels[candidate].common);
+                                 }),
+                  winners.end());
+    winners.push_back(candidate);
   }
   std::sort(winners.begin(), winners.end(), [&](uint64_t left, uint64_t right) {
     return result.labels[left].common.from.value < result.labels[right].common.from.value;

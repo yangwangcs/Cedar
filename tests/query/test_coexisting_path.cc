@@ -151,6 +151,26 @@ TEST(CoexistingPathTest, EqualHopUsesLexicographicEdgeSequence) {
   EXPECT_EQ(result.ValueOrDie().paths.front().edges.front().edge_id.value, 52U);
 }
 
+TEST(CoexistingPathTest, CandidateBeatingMultipleOverlappingWinnersReplacesAll) {
+  GraphFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.c);
+  graph.EdgePeriod({EdgeRef{PartId{0}, EdgeId{61}}, graph.a, graph.c, 1}, 0, 10);
+  graph.EdgePeriod({EdgeRef{PartId{0}, EdgeId{62}}, graph.a, graph.c, 1}, 20, 30);
+  graph.EdgePeriod({EdgeRef{PartId{0}, EdgeId{63}}, graph.a, graph.c, 1}, 5, 25);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  GraphExpansionRequest request{{graph.a}, {ValidTime{0}, ValidTime{30}},
+                                ExpandDirection::kOut, std::nullopt};
+  GraphFrontierOptions options; options.max_hops = 1;
+  auto result = CoexistingShortestPath(snapshot.ValueOrDie(), request, graph.c,
+                                       options);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().paths.size(), 1U);
+  EXPECT_EQ(result.ValueOrDie().paths.front().common,
+            (ValidTimeInterval{ValidTime{5}, ValidTime{25}}));
+  EXPECT_EQ(result.ValueOrDie().paths.front().edges.front().edge_id.value, 63U);
+}
+
 TEST(CoexistingPathTest, PathColumnOffsetsDecodeUnequalVertexAndEdgeLengths) {
   PathValue one{{VertexRef{PartId{0}, VertexId{1}}}, {},
                 ValidTimeInterval{ValidTime{0}, ValidTime{4}}};
@@ -232,6 +252,80 @@ TEST(CoexistingPathTest, PublicQueryReturnsEmptyCursorWhenTargetIsAbsent) {
   auto batch = cursor.ValueOrDie().Next();
   ASSERT_TRUE(batch.ok()) << batch.status().ToString();
   EXPECT_FALSE(batch.ValueOrDie().has_value());
+}
+
+TEST(CoexistingPathTest, PublicQueryBothFindsIncomingOnlyTarget) {
+  GraphFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b);
+  const EdgeRef edge{PartId{0}, EdgeId{91}};
+  graph.Edge({edge, graph.b, graph.a, 1}, 0, 20);
+  const auto vertex = Slot<VertexRef>::Named("vertex");
+  const auto edge_slot = Slot<EdgeRef>::Named("edge");
+  const auto destination = Slot<VertexRef>::Named("destination");
+  const auto path = Slot<PathValue>::Named("path");
+  auto source = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().CoexistingShortestPath(
+      ExpandSpec{vertex, edge_slot, destination, ExpandDirection::kBoth}, 1,
+      path);
+  ASSERT_TRUE(query.ok());
+  auto prepared = graph.database->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 2U);
+  bool found_incoming = false;
+  for (size_t index = 0; index < batch.ValueOrDie()->row_count(); ++index) {
+    const PathValue value = batch.ValueOrDie()->Get<PathValue>(path, index);
+    if (value.vertices == std::vector<VertexRef>{graph.a, graph.b}) {
+      found_incoming = value.edges == std::vector<EdgeRef>{edge};
+    }
+  }
+  EXPECT_TRUE(found_incoming);
+}
+
+TEST(CoexistingPathTest, PublicQueryDiscoversTargetsBeyondOneHop) {
+  GraphFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b); graph.Vertex(graph.c);
+  const EdgeRef first{PartId{0}, EdgeId{92}};
+  const EdgeRef second{PartId{0}, EdgeId{93}};
+  graph.Edge({first, graph.a, graph.b, 1}, 0, 20);
+  graph.Edge({second, graph.b, graph.c, 1}, 0, 20);
+  const auto vertex = Slot<VertexRef>::Named("vertex");
+  const auto edge_slot = Slot<EdgeRef>::Named("edge");
+  const auto destination = Slot<VertexRef>::Named("destination");
+  const auto path = Slot<PathValue>::Named("path");
+  auto source = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().CoexistingShortestPath(
+      ExpandSpec{vertex, edge_slot, destination, ExpandDirection::kOut}, 2,
+      path);
+  ASSERT_TRUE(query.ok());
+  auto prepared = graph.database->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 3U);
+  bool found_two_hop = false;
+  for (size_t index = 0; index < batch.ValueOrDie()->row_count(); ++index) {
+    if (batch.ValueOrDie()->Get<PathValue>(path, index).vertices ==
+        std::vector<VertexRef>{graph.a, graph.b, graph.c}) {
+      found_two_hop = true;
+    }
+  }
+  EXPECT_TRUE(found_two_hop);
 }
 
 }  // namespace cedar::internal

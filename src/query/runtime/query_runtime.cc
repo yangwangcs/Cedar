@@ -581,14 +581,39 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
       // labels, so charging raw traversals here would count each edge twice.
       internal::GraphFrontierOptions discovery_options = options;
       discovery_options.reservation = nullptr;
-      auto expanded = ExpandTemporal(snapshot, request, discovery_options);
-      if (!expanded.ok()) return expanded.status();
       std::vector<VertexRef> targets;
-      for (const auto& traversal : expanded.ValueOrDie()) {
-        VertexRef candidate = plan.graph_expand->direction == ExpandDirection::kIn
-                                  ? traversal.source : traversal.target;
+      auto add_target = [&](const VertexRef& candidate) {
         if (std::find(targets.begin(), targets.end(), candidate) == targets.end())
           targets.push_back(candidate);
+      };
+      if (plan.graph_k_hops > 1) {
+        auto hops = KHopExpand(snapshot, request, discovery_options);
+        if (!hops.ok()) return hops.status();
+        for (const auto& label : hops.ValueOrDie().labels) {
+          // KHopExpand includes the depth-zero seed label; it is not a
+          // reachable target for a path expansion.
+          if (label.depth != 0) add_target(label.vertex);
+        }
+      } else {
+        auto expanded = ExpandTemporal(snapshot, request, discovery_options);
+        if (!expanded.ok()) return expanded.status();
+        for (const auto& traversal : expanded.ValueOrDie()) {
+          VertexRef candidate;
+          if (plan.graph_expand->direction == ExpandDirection::kOut) {
+            if (traversal.source != vertex) continue;
+            candidate = traversal.target;
+          } else if (plan.graph_expand->direction == ExpandDirection::kIn) {
+            if (traversal.target != vertex) continue;
+            candidate = traversal.source;
+          } else if (traversal.source == vertex) {
+            candidate = traversal.target;
+          } else if (traversal.target == vertex) {
+            candidate = traversal.source;
+          } else {
+            continue;
+          }
+          add_target(candidate);
+        }
       }
       for (const VertexRef& candidate : targets) {
         auto paths = CoexistingShortestPath(snapshot, request, candidate, options);

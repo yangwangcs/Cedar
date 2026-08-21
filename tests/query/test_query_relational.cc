@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -36,12 +37,20 @@ RelationalCell Int64(int64_t value) {
   return RelationalCell::Present(QueryType::kInt64, value);
 }
 
+RelationalCell Float64(double value) {
+  return RelationalCell::Present(QueryType::kFloat64, value);
+}
+
 RelationalCell MissingInt64() {
   return RelationalCell::Missing(QueryType::kInt64);
 }
 
 RelationalRow Row(int64_t key, int64_t payload) {
   return {{Int64(key), Int64(payload)}, std::nullopt};
+}
+
+RelationalRow FloatRow(double key, int64_t payload) {
+  return {{Float64(key), Int64(payload)}, std::nullopt};
 }
 
 RelationalRow TemporalRow(int64_t key, uint64_t from, uint64_t to,
@@ -87,6 +96,23 @@ TEST(VectorKernelsTest, FiltersAndProjectsOnlySelectedPresentRows) {
             (std::vector<int64_t>{40}));
 }
 
+TEST(VectorKernelsTest, ProjectionCapacityDependsOnlyOnSelectedRows) {
+  constexpr size_t kRejectedRows = 64;
+  QueryColumn input{SlotId{1}, QueryType::kString,
+                    std::vector<std::string>(kRejectedRows + 1,
+                                             std::string(512, 'x')),
+                    {}};
+  const SelectionVector selected{kRejectedRows};
+
+  auto projected = ProjectColumn(input, selected);
+
+  ASSERT_TRUE(projected.ok()) << projected.status().ToString();
+  const auto& values =
+      std::get<std::vector<std::string>>(projected.ValueOrDie().values);
+  ASSERT_EQ(values.size(), 1U);
+  EXPECT_LT(values.capacity(), kRejectedRows);
+}
+
 TEST(VectorKernelsTest, DictionaryStringsCompareIdsOnlyWhenDictionaryIsShared) {
   auto first_dictionary =
       std::make_shared<const std::vector<std::string>>(
@@ -102,26 +128,33 @@ TEST(VectorKernelsTest, DictionaryStringsCompareIdsOnlyWhenDictionaryIsShared) {
 }
 
 TEST(RelationalTest, UnionDistinctStableSortAndLimitAreExact) {
-  BatchStream rows = UnionAll(BatchStream{{Row(2, 20), Row(1, 10)}},
-                              BatchStream{{Row(2, 20), Row(1, 11)}});
-  EXPECT_EQ(Distinct(rows).rows.size(), 3U);
+  QueryReservation reservation(1 << 20);
+  auto rows = UnionAll(BatchStream{{Row(2, 20), Row(1, 10)}},
+                       BatchStream{{Row(2, 20), Row(1, 11)}}, &reservation);
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  auto distinct = Distinct(rows.ValueOrDie(), &reservation);
+  ASSERT_TRUE(distinct.ok()) << distinct.status().ToString();
+  EXPECT_EQ(distinct.ValueOrDie().rows.size(), 3U);
 
   QueryReservation sort_reservation(1 << 20);
-  auto sorted = Sort(rows, {{0, SortDirection::kAscending}},
+  auto sorted = Sort(rows.ValueOrDie(), {{0, SortDirection::kAscending}},
                      &sort_reservation);
   ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
   EXPECT_EQ(sorted.ValueOrDie().rows,
             (std::vector<RelationalRow>{Row(1, 10), Row(1, 11), Row(2, 20),
                                         Row(2, 20)}));
-  EXPECT_EQ(Limit(sorted.ValueOrDie(), 1, 2).rows,
+  auto limited = Limit(sorted.ValueOrDie(), 1, 2, &reservation);
+  ASSERT_TRUE(limited.ok()) << limited.status().ToString();
+  EXPECT_EQ(limited.ValueOrDie().rows,
             (std::vector<RelationalRow>{Row(1, 11), Row(2, 20)}));
-  EXPECT_FALSE(rows.order_specified);
+  EXPECT_FALSE(rows.ValueOrDie().order_specified);
 }
 
 TEST(RelationalTest, ImplementsInnerSemiAndAntiEqualityJoins) {
   JoinInput input{{{Row(1, 10), Row(2, 20)}},
                   {{Row(2, 200), Row(3, 300)}}, 0, 0, JoinKind::kInner};
-  auto inner = IndexNestedLoopJoin(input);
+  QueryReservation reservation(1 << 20);
+  auto inner = IndexNestedLoopJoin(input, &reservation);
   ASSERT_TRUE(inner.ok()) << inner.status().ToString();
   ASSERT_EQ(inner.ValueOrDie().rows.size(), 1U);
   EXPECT_EQ(inner.ValueOrDie().rows.front().cells,
@@ -129,17 +162,19 @@ TEST(RelationalTest, ImplementsInnerSemiAndAntiEqualityJoins) {
                                          Int64(200)}));
 
   input.kind = JoinKind::kSemi;
-  EXPECT_EQ(IndexNestedLoopJoin(input).ValueOrDie().rows,
+  EXPECT_EQ(IndexNestedLoopJoin(input, &reservation).ValueOrDie().rows,
             (std::vector<RelationalRow>{Row(2, 20)}));
   input.kind = JoinKind::kAnti;
-  EXPECT_EQ(IndexNestedLoopJoin(input).ValueOrDie().rows,
+  EXPECT_EQ(IndexNestedLoopJoin(input, &reservation).ValueOrDie().rows,
             (std::vector<RelationalRow>{Row(1, 10)}));
 }
 
 TEST(RelationalTest, MissingJoinKeysNeverCompareEqual) {
   RelationalRow missing{{MissingInt64(), Int64(10)}, std::nullopt};
   JoinInput input{{{missing}}, {{missing}}, 0, 0, JoinKind::kInner};
-  EXPECT_TRUE(IndexNestedLoopJoin(input).ValueOrDie().rows.empty());
+  QueryReservation reservation(1 << 20);
+  EXPECT_TRUE(
+      IndexNestedLoopJoin(input, &reservation).ValueOrDie().rows.empty());
 }
 
 TEST(RelationalTest, HashJoinReturnsNeedsSpillWithoutExceedingReservation) {
@@ -163,14 +198,14 @@ TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
   ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
   EXPECT_GE(hash_reservation.peak_bytes(), minimum_output_bytes);
   EXPECT_LE(hash_reservation.peak_bytes(), hash_reservation.limit_bytes());
-  EXPECT_EQ(hash_reservation.used_bytes(), 0U);
+  EXPECT_GT(hash_reservation.used_bytes(), 0U);
 
   QueryReservation sort_reservation(4096);
   auto sorted = SortMergeJoin(input, &sort_reservation);
   ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
   EXPECT_GE(sort_reservation.peak_bytes(), minimum_output_bytes);
   EXPECT_LE(sort_reservation.peak_bytes(), sort_reservation.limit_bytes());
-  EXPECT_EQ(sort_reservation.used_bytes(), 0U);
+  EXPECT_GT(sort_reservation.used_bytes(), 0U);
 
   QueryReservation hash_spill(1);
   auto hash_overflow = HashJoin(input, &hash_spill);
@@ -183,6 +218,27 @@ TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
   ASSERT_FALSE(sort_overflow.ok());
   EXPECT_TRUE(IsNeedsSpill(sort_overflow.status()));
   EXPECT_EQ(sort_spill.used_bytes(), 0U);
+}
+
+TEST(RelationalTest, PublishedOutputRetainsReservationUntilStreamDestruction) {
+  JoinInput input{{{Row(1, 10)}}, {{Row(1, 20)}}, 0, 0,
+                  JoinKind::kInner};
+
+  QueryReservation hash_reservation(4096);
+  {
+    auto hashed = HashJoin(input, &hash_reservation);
+    ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
+    EXPECT_GT(hash_reservation.used_bytes(), 0U);
+  }
+  EXPECT_EQ(hash_reservation.used_bytes(), 0U);
+
+  QueryReservation sort_reservation(4096);
+  {
+    auto sorted = SortMergeJoin(input, &sort_reservation);
+    ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
+    EXPECT_GT(sort_reservation.used_bytes(), 0U);
+  }
+  EXPECT_EQ(sort_reservation.used_bytes(), 0U);
 }
 
 TEST(RelationalTest, HashAndSortOperatorsRequireReservationAndDiagnoseSpill) {
@@ -218,6 +274,25 @@ TEST(RelationalTest, HashAndSortMergeProduceAllAndOnlyMatchingRows) {
   EXPECT_TRUE(merged.ValueOrDie().order_specified);
 }
 
+TEST(RelationalTest, FloatJoinKeysUseConsistentEqualityHashingAndOrdering) {
+  JoinInput signed_zero{{{FloatRow(-0.0, 10)}}, {{FloatRow(+0.0, 20)}},
+                        0, 0, JoinKind::kInner};
+  QueryReservation hash_reservation(4096);
+  auto hashed = HashJoin(signed_zero, &hash_reservation);
+  ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
+  EXPECT_EQ(hashed.ValueOrDie().rows.size(), 1U);
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  JoinInput nan_and_number{{{FloatRow(nan, 10), FloatRow(1.0, 11)}},
+                           {{FloatRow(1.0, 20)}}, 0, 0, JoinKind::kAnti};
+  QueryReservation sort_reservation(1 << 20);
+  auto merged = SortMergeJoin(nan_and_number, &sort_reservation);
+  ASSERT_TRUE(merged.ok()) << merged.status().ToString();
+  ASSERT_EQ(merged.ValueOrDie().rows.size(), 1U);
+  EXPECT_TRUE(std::isnan(
+      std::get<double>(merged.ValueOrDie().rows.front().cells.front().value)));
+}
+
 TEST(RelationalTest, ChoosesAlgorithmsAtExactPlannerBoundaries) {
   EXPECT_EQ(ChooseJoinAlgorithm(4095, false, false),
             JoinAlgorithm::kIndexNestedLoop);
@@ -232,7 +307,8 @@ TEST(RelationalTest, IntervalJoinEmitsOnlyClippedIntersections) {
       {{TemporalRow(1, 0, 10), TemporalRow(1, 15, 30)}},
       {{TemporalRow(1, 5, 20)}}, 0, 0, JoinKind::kInner};
   FragmentBudget budget(10);
-  auto result = IntervalMergeJoin(input, &budget);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   ASSERT_EQ(result.ValueOrDie().rows.size(), 2U);
   EXPECT_EQ(result.ValueOrDie().rows[0].effective,
@@ -241,12 +317,35 @@ TEST(RelationalTest, IntervalJoinEmitsOnlyClippedIntersections) {
             (ValidTimeInterval{ValidTime{15}, ValidTime{20}}));
 }
 
+TEST(RelationalTest, IntervalMergeEstablishesKeyAndEffectiveTimeOrder) {
+  TemporalJoinInput input{
+      {{TemporalRow(2, 20, 30), TemporalRow(1, 10, 20),
+        TemporalRow(1, 0, 10)}},
+      {{TemporalRow(2, 0, 40), TemporalRow(1, 0, 40)}}, 0, 0,
+      JoinKind::kInner};
+  FragmentBudget budget(8);
+  QueryReservation reservation(1 << 20);
+
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
+
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_TRUE(result.ValueOrDie().order_specified);
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 2U);
+  EXPECT_EQ(result.ValueOrDie().rows[0].cells.front(), Int64(1));
+  EXPECT_EQ(result.ValueOrDie().rows[0].effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{20}}));
+  EXPECT_EQ(result.ValueOrDie().rows[1].cells.front(), Int64(2));
+  EXPECT_EQ(result.ValueOrDie().rows[1].effective,
+            (ValidTimeInterval{ValidTime{20}, ValidTime{30}}));
+}
+
 TEST(RelationalTest, TemporalAntiJoinDerivesMissingFragments) {
   TemporalJoinInput input{{{TemporalRow(1, 0, 20)}},
                           {{TemporalRow(1, 5, 10), TemporalRow(1, 15, 20)}},
                           0, 0, JoinKind::kAnti};
   FragmentBudget budget(10);
-  auto result = IntervalMergeJoin(input, &budget);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   ASSERT_EQ(result.ValueOrDie().rows.size(), 2U);
   EXPECT_EQ(result.ValueOrDie().rows[0].effective,
@@ -260,7 +359,8 @@ TEST(RelationalTest, CoalescedTemporalOutputConsumesOneFragment) {
       {{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}},
       {{TemporalRow(1, 0, 10)}}, 0, 0, JoinKind::kInner};
   FragmentBudget budget(1);
-  auto result = IntervalMergeJoin(input, &budget);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
   EXPECT_EQ(result.ValueOrDie().rows.front().effective,
@@ -273,7 +373,8 @@ TEST(RelationalTest, TemporalSemiJoinUnionsOverlappingCoverage) {
                           {{TemporalRow(1, 0, 7), TemporalRow(1, 5, 10)}},
                           0, 0, JoinKind::kSemi};
   FragmentBudget budget(1);
-  auto result = IntervalMergeJoin(input, &budget);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
   EXPECT_EQ(result.ValueOrDie().rows.front().effective,
@@ -285,7 +386,8 @@ TEST(RelationalTest, TemporalAggregateProcessesExitBeforeEntry) {
   TemporalAggregateInput input{
       {{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}}, {0}};
   FragmentBudget budget(10);
-  auto result = TemporalAggregate(input, &budget);
+  QueryReservation reservation(1 << 20);
+  auto result = TemporalAggregate(input, &budget, &reservation);
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
   EXPECT_EQ(result.ValueOrDie().rows.front().effective,
@@ -299,7 +401,8 @@ TEST(RelationalTest, FragmentBudgetFailsBeforePublishingExtraOutput) {
                           {{TemporalRow(1, 5, 20)}}, 0, 0,
                           JoinKind::kInner};
   FragmentBudget budget(1);
-  auto result = IntervalMergeJoin(input, &budget);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &budget, &reservation);
   ASSERT_FALSE(result.ok());
   EXPECT_TRUE(result.status().IsResourceExhausted());
   EXPECT_EQ(budget.used_fragments(), 1U);
@@ -309,7 +412,8 @@ TEST(RelationalTest, RowAggregateCountsAndSumsStrictlyTypedValues) {
   AggregateInput input{{{Row(1, 10), Row(1, 20), Row(2, 7)}},
                        {0}, {{AggregateKind::kCount, 1},
                              {AggregateKind::kSum, 1}}};
-  auto result = AggregateRows(input);
+  QueryReservation reservation(1 << 20);
+  auto result = AggregateRows(input, &reservation);
   ASSERT_TRUE(result.ok()) << result.status().ToString();
   EXPECT_EQ(result.ValueOrDie().rows,
             (std::vector<RelationalRow>{
@@ -352,8 +456,9 @@ TEST(QueryRuntimeRelationalTest,
   input.left = BatchStream{{TemporalRow(1, 0, 10)}};
   input.right = BatchStream{{TemporalRow(1, 5, 20)}};
   FragmentBudget fragments(8);
+  QueryReservation temporal_reservation(1 << 20);
   auto interval = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
-                                            nullptr, &fragments);
+                                            &temporal_reservation, &fragments);
   ASSERT_TRUE(interval.ok()) << interval.status().ToString();
   EXPECT_EQ(interval.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kIntervalMerge});
@@ -365,20 +470,90 @@ TEST(QueryRuntimeRelationalTest,
   aggregate.group_by = {0};
   aggregate.aggregates = {{AggregateKind::kCount, 1},
                           {AggregateKind::kSum, 1}};
+  QueryReservation aggregate_reservation(1 << 20);
   auto rows = ExecuteRelationalPlanNode(LogicalOpKind::kAggregateRows,
-                                        aggregate, nullptr);
+                                        aggregate, &aggregate_reservation);
   ASSERT_TRUE(rows.ok()) << rows.status().ToString();
   EXPECT_EQ(rows.ValueOrDie().stream.rows.front().cells,
             (std::vector<RelationalCell>{Int64(1), Int64(2), Int64(30)}));
 
   aggregate.left = BatchStream{{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}};
   FragmentBudget aggregate_fragments(8);
+  QueryReservation temporal_aggregate_reservation(1 << 20);
   auto temporal = ExecuteRelationalPlanNode(LogicalOpKind::kTemporalAggregate,
-                                            aggregate, nullptr,
+                                            aggregate,
+                                            &temporal_aggregate_reservation,
                                             &aggregate_fragments);
   ASSERT_TRUE(temporal.ok()) << temporal.status().ToString();
   EXPECT_EQ(temporal.ValueOrDie().stream.rows.front().effective,
             (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+}
+
+TEST(QueryRuntimeRelationalTest,
+     EveryMaterializingOperatorHonorsTheRuntimeMemoryReservation) {
+  const auto expect_memory_failure = [](LogicalOpKind kind,
+                                        RuntimeRelationalInput input,
+                                        FragmentBudget* fragments = nullptr) {
+    QueryReservation reservation(1);
+    auto result = ExecuteRelationalPlanNode(kind, std::move(input),
+                                            &reservation, fragments);
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().IsResourceExhausted());
+    EXPECT_NE(result.status().ToString().find("memory_bytes"),
+              std::string::npos);
+    EXPECT_LE(reservation.used_bytes(), reservation.limit_bytes());
+  };
+
+  RuntimeRelationalInput binary;
+  binary.left = BatchStream{{Row(1, 10)}};
+  binary.right = BatchStream{{Row(1, 20)}};
+  expect_memory_failure(LogicalOpKind::kUnionAll, binary);
+
+  RuntimeRelationalInput unary;
+  unary.left = BatchStream{{Row(1, 10)}};
+  expect_memory_failure(LogicalOpKind::kDistinct, unary);
+  unary.count = 1;
+  expect_memory_failure(LogicalOpKind::kLimit, unary);
+
+  binary.estimated_rows = 1;
+  expect_memory_failure(LogicalOpKind::kInnerJoin, binary);
+
+  unary.group_by = {0};
+  unary.aggregates = {{AggregateKind::kCount, 1}};
+  expect_memory_failure(LogicalOpKind::kAggregateRows, unary);
+
+  RuntimeRelationalInput temporal;
+  temporal.left = BatchStream{{TemporalRow(1, 0, 10)}};
+  temporal.group_by = {0};
+  FragmentBudget aggregate_fragments(8);
+  expect_memory_failure(LogicalOpKind::kTemporalAggregate, temporal,
+                        &aggregate_fragments);
+
+  temporal.right = BatchStream{{TemporalRow(1, 0, 10)}};
+  temporal.temporal = true;
+  temporal.estimated_rows = 1;
+  FragmentBudget join_fragments(8);
+  expect_memory_failure(LogicalOpKind::kInnerJoin, temporal,
+                        &join_fragments);
+}
+
+TEST(QueryRuntimeRelationalTest,
+     OutputRowBudgetFailsBeforeRelationalOutputReservation) {
+  RuntimeRelationalInput input;
+  input.left = BatchStream{{Row(1, 10)}};
+  input.right = BatchStream{{Row(1, 20)}};
+  input.estimated_rows = 1;
+  QueryReservation reservation(1 << 20);
+
+  auto result = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin,
+                                          std::move(input), &reservation,
+                                          nullptr, 0);
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsResourceExhausted());
+  EXPECT_NE(result.status().ToString().find("output row budget"),
+            std::string::npos);
+  EXPECT_EQ(reservation.peak_bytes(), 0U);
 }
 
 TEST(QueryRuntimeRelationalTest, PullCursorExecutesRelationalPlanNode) {
@@ -408,6 +583,74 @@ TEST(QueryRuntimeRelationalTest, PullCursorExecutesRelationalPlanNode) {
   EXPECT_EQ(batch.ValueOrDie()->Get(payload, 0), 20);
 
   EXPECT_TRUE(database.ValueOrDie()->Close().IsSnapshotPinned());
+  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(QueryRuntimeRelationalTest,
+     PullCursorPublishesTemporalEffectiveIntervalColumn) {
+  char path[] = "/tmp/cedar_query_relational_effective_XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  PreparedQueryPlan plan;
+  plan.relational_kind = LogicalOpKind::kTemporalAggregate;
+  plan.relational_input = RuntimeRelationalInput{
+      .left = BatchStream{{TemporalRow(1, 5, 15)}}, .group_by = {0}};
+  const Slot<int64_t> key = Slot<int64_t>::WithId(SlotId{1}, "key");
+  const Slot<int64_t> count = Slot<int64_t>::WithId(SlotId{2}, "count");
+  const Slot<ValidTimeInterval> effective =
+      Slot<ValidTimeInterval>::WithId(SlotId{3}, "effective");
+  plan.output_columns = {Project(key).column, Project(count).column,
+                         Project(effective).column};
+
+  auto cursor = QueryRuntime::Execute(
+      plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get(effective, 0),
+            (ValidTimeInterval{ValidTime{5}, ValidTime{15}}));
+
+  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(QueryRuntimeRelationalTest,
+     PullCursorAccountsForRelationalBatchMaterialization) {
+  char path[] = "/tmp/cedar_query_relational_budget_XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  PreparedQueryPlan plan;
+  plan.relational_kind = LogicalOpKind::kLimit;
+  plan.relational_input = RuntimeRelationalInput{
+      .left = BatchStream{{Row(1, 10)}}, .count = 1};
+  const Slot<int64_t> key = Slot<int64_t>::WithId(SlotId{1}, "key");
+  const Slot<int64_t> payload = Slot<int64_t>::WithId(SlotId{2}, "payload");
+  plan.output_columns = {Project(key).column, Project(payload).column};
+  QueryOptions options;
+  options.budget.memory_bytes =
+      sizeof(BatchStream) + sizeof(RelationalRow) + 2 * sizeof(RelationalCell);
+
+  auto cursor = QueryRuntime::Execute(
+      plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_FALSE(batch.ok());
+  EXPECT_TRUE(batch.status().IsResourceExhausted());
+  EXPECT_NE(batch.status().ToString().find("memory_bytes"), std::string::npos);
+
   EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
   EXPECT_TRUE(database.ValueOrDie()->Close().ok());
   std::filesystem::remove_all(path);

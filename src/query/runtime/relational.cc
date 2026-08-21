@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -13,6 +14,17 @@
 #include "query/temporal/interval.h"
 
 namespace cedar::internal {
+
+Status NeedsSpill(size_t requested_bytes, size_t available_bytes);
+
+struct QueryReservation::State {
+  explicit State(size_t limit) : limit_bytes(limit) {}
+
+  size_t limit_bytes = 0;
+  size_t used_bytes = 0;
+  size_t peak_bytes = 0;
+};
+
 namespace {
 
 Status ValidateKey(const BatchStream& stream, size_t key) {
@@ -25,23 +37,29 @@ Status ValidateKey(const BatchStream& stream, size_t key) {
   return Status::OK();
 }
 
-Status ValidateJoin(const JoinInput& input) {
-  if (Status status = ValidateKey(input.left, input.left_key); !status.ok()) {
+Status ValidateJoinStreams(const BatchStream& left_stream,
+                           const BatchStream& right_stream, size_t left_key,
+                           size_t right_key) {
+  if (Status status = ValidateKey(left_stream, left_key); !status.ok()) {
     return status;
   }
-  if (Status status = ValidateKey(input.right, input.right_key); !status.ok()) {
+  if (Status status = ValidateKey(right_stream, right_key); !status.ok()) {
     return status;
   }
-  for (const RelationalRow& left : input.left.rows) {
-    for (const RelationalRow& right : input.right.rows) {
-      if (left.cells[input.left_key].type !=
-          right.cells[input.right_key].type) {
+  for (const RelationalRow& left : left_stream.rows) {
+    for (const RelationalRow& right : right_stream.rows) {
+      if (left.cells[left_key].type != right.cells[right_key].type) {
         return Status::InvalidArgument("relational join",
                                        "join key types differ");
       }
     }
   }
   return Status::OK();
+}
+
+Status ValidateJoin(const JoinInput& input) {
+  return ValidateJoinStreams(input.left, input.right, input.left_key,
+                             input.right_key);
 }
 
 bool KeysEqual(const RelationalCell& left, const RelationalCell& right) {
@@ -51,6 +69,14 @@ bool KeysEqual(const RelationalCell& left, const RelationalCell& right) {
 
 template <typename T>
 int CompareSimple(const T& left, const T& right) {
+  if constexpr (std::is_floating_point_v<T>) {
+    const bool left_nan = std::isnan(left);
+    const bool right_nan = std::isnan(right);
+    if (left_nan || right_nan) {
+      if (left_nan && right_nan) return 0;
+      return left_nan ? 1 : -1;
+    }
+  }
   if (left < right) return -1;
   if (right < left) return 1;
   return 0;
@@ -123,9 +149,11 @@ size_t HashCell(const RelationalCell& cell) {
                       std::is_same_v<T, int64_t>) {
           combine(std::hash<T>{}(value));
         } else if constexpr (std::is_same_v<T, float>) {
-          combine(std::hash<uint32_t>{}(std::bit_cast<uint32_t>(value)));
+          const float normalized = value == 0.0F ? 0.0F : value;
+          combine(std::hash<uint32_t>{}(std::bit_cast<uint32_t>(normalized)));
         } else if constexpr (std::is_same_v<T, double>) {
-          combine(std::hash<uint64_t>{}(std::bit_cast<uint64_t>(value)));
+          const double normalized = value == 0.0 ? 0.0 : value;
+          combine(std::hash<uint64_t>{}(std::bit_cast<uint64_t>(normalized)));
         } else if constexpr (std::is_same_v<T, std::string>) {
           combine(std::hash<std::string>{}(value));
         } else if constexpr (std::is_same_v<T, Binary>) {
@@ -208,6 +236,53 @@ size_t EstimateBytes(const BatchStream& stream) {
     }
   }
   return bytes;
+}
+
+size_t EstimateRowsBytes(const std::vector<RelationalRow>& first,
+                         const std::vector<RelationalRow>* second = nullptr) {
+  size_t bytes = sizeof(BatchStream);
+  for (const RelationalRow& row : first) {
+    if (!AddBytes(EstimateRowBytes(row), &bytes)) {
+      return std::numeric_limits<size_t>::max();
+    }
+  }
+  if (second != nullptr) {
+    for (const RelationalRow& row : *second) {
+      if (!AddBytes(EstimateRowBytes(row), &bytes)) {
+        return std::numeric_limits<size_t>::max();
+      }
+    }
+  }
+  return bytes;
+}
+
+size_t AvailableBytes(const QueryReservation& reservation) {
+  return reservation.limit_bytes() - reservation.used_bytes();
+}
+
+Status MemoryExhausted(size_t requested_bytes, size_t available_bytes) {
+  return Status::ResourceExhausted(
+      "query relational", "memory_bytes=" + std::to_string(requested_bytes) +
+                              " available_bytes=" +
+                              std::to_string(available_bytes));
+}
+
+Status OutputRowsExhausted() {
+  return Status::ResourceExhausted("query", "output row budget exceeded");
+}
+
+StatusOr<std::shared_ptr<QueryReservationLease>> RetainOutput(
+    QueryReservation* reservation, size_t bytes, bool spill_capable) {
+  if (reservation == nullptr) {
+    return spill_capable ? NeedsSpill()
+                         : MemoryExhausted(bytes, size_t{0});
+  }
+  auto lease = reservation->TryRetain(bytes);
+  if (!lease) {
+    return spill_capable ? NeedsSpill(bytes, AvailableBytes(*reservation))
+                         : MemoryExhausted(bytes, AvailableBytes(*reservation));
+  }
+  return lease;
 }
 
 struct JoinOutputEstimate {
@@ -411,6 +486,37 @@ bool RowLess(const RelationalRow& left, const RelationalRow& right,
   return false;
 }
 
+bool TemporalRowLess(const RelationalRow& left, const RelationalRow& right,
+                     size_t key) {
+  const int key_order = CompareCell(left.cells[key], right.cells[key]);
+  if (key_order != 0) return key_order < 0;
+  if (left.effective->from.value != right.effective->from.value) {
+    return left.effective->from.value < right.effective->from.value;
+  }
+  if (left.effective->to.has_value() != right.effective->to.has_value()) {
+    return left.effective->to.has_value();
+  }
+  if (left.effective->to.has_value() &&
+      left.effective->to->value != right.effective->to->value) {
+    return left.effective->to->value < right.effective->to->value;
+  }
+  const size_t common = std::min(left.cells.size(), right.cells.size());
+  for (size_t column = 0; column < common; ++column) {
+    const int compared = CompareCell(left.cells[column], right.cells[column]);
+    if (compared != 0) return compared < 0;
+  }
+  return left.cells.size() < right.cells.size();
+}
+
+template <typename Less>
+void StableInsertionSort(std::vector<RelationalRow>* rows, Less less) {
+  for (size_t i = 1; i < rows->size(); ++i) {
+    for (size_t j = i; j > 0 && less((*rows)[j], (*rows)[j - 1]); --j) {
+      std::swap((*rows)[j], (*rows)[j - 1]);
+    }
+  }
+}
+
 Status ValidateSort(const BatchStream& input,
                     const std::vector<SortKey>& keys) {
   for (const RelationalRow& row : input.rows) {
@@ -444,7 +550,8 @@ bool IntervalValid(const ValidTimeInterval& interval) {
   return !interval.to.has_value() || Before(interval.from, *interval.to);
 }
 
-Status Publish(RelationalRow row, FragmentBudget* budget, BatchStream* output) {
+Status Publish(RelationalRow row, FragmentBudget* budget,
+               size_t max_output_rows, BatchStream* output) {
   if (!output->rows.empty() &&
       output->rows.back().cells == row.cells &&
       output->rows.back().effective.has_value() && row.effective.has_value() &&
@@ -453,6 +560,7 @@ Status Publish(RelationalRow row, FragmentBudget* budget, BatchStream* output) {
     output->rows.back().effective->to = row.effective->to;
     return Status::OK();
   }
+  if (output->rows.size() >= max_output_rows) return OutputRowsExhausted();
   if (budget == nullptr || !budget->TryConsume()) {
     return Status::ResourceExhausted("query",
                                      "interval fragment budget exceeded");
@@ -503,8 +611,13 @@ struct Group {
   std::vector<const RelationalRow*> rows;
 };
 
-StatusOr<std::vector<Group>> BuildGroups(const BatchStream& input,
-                                         const std::vector<size_t>& group_by) {
+struct TemporalEvent {
+  ValidTime time;
+  int delta;
+};
+
+Status ValidateGroupBy(const BatchStream& input,
+                       const std::vector<size_t>& group_by) {
   for (const RelationalRow& row : input.rows) {
     for (size_t column : group_by) {
       if (column >= row.cells.size()) {
@@ -513,7 +626,35 @@ StatusOr<std::vector<Group>> BuildGroups(const BatchStream& input,
       }
     }
   }
+  return Status::OK();
+}
+
+size_t EstimateGroupingScratch(const BatchStream& input,
+                               const std::vector<size_t>& group_by,
+                               size_t extra_bytes_per_row = 0) {
+  size_t bytes = sizeof(std::vector<Group>);
+  for (const RelationalRow& row : input.rows) {
+    if (!AddBytes(sizeof(Group) + 2 * sizeof(const RelationalRow*) +
+                      extra_bytes_per_row,
+                  &bytes)) {
+      return std::numeric_limits<size_t>::max();
+    }
+    for (size_t column : group_by) {
+      if (!AddBytes(EstimateCellBytes(row.cells[column]), &bytes)) {
+        return std::numeric_limits<size_t>::max();
+      }
+    }
+  }
+  return bytes;
+}
+
+StatusOr<std::vector<Group>> BuildGroups(const BatchStream& input,
+                                         const std::vector<size_t>& group_by) {
+  if (Status status = ValidateGroupBy(input, group_by); !status.ok()) {
+    return status;
+  }
   std::vector<Group> groups;
+  groups.reserve(std::max(size_t{1}, input.rows.size()));
   for (const RelationalRow& row : input.rows) {
     std::vector<RelationalCell> key = GroupCells(row, group_by);
     auto found = std::find_if(groups.begin(), groups.end(),
@@ -528,6 +669,64 @@ StatusOr<std::vector<Group>> BuildGroups(const BatchStream& input,
   }
   if (input.rows.empty() && group_by.empty()) groups.push_back({{}, {}});
   return groups;
+}
+
+size_t EstimateAggregateOutputBytes(
+    const std::vector<Group>& groups,
+    const std::vector<AggregateSpec>& aggregates) {
+  size_t bytes = sizeof(BatchStream);
+  for (const Group& group : groups) {
+    size_t row_bytes = sizeof(RelationalRow);
+    for (const RelationalCell& cell : group.key) {
+      if (!AddBytes(EstimateCellBytes(cell), &row_bytes)) {
+        return std::numeric_limits<size_t>::max();
+      }
+    }
+    for (const AggregateSpec& spec : aggregates) {
+      size_t cell_bytes = sizeof(RelationalCell);
+      if (spec.kind == AggregateKind::kMin ||
+          spec.kind == AggregateKind::kMax) {
+        for (const RelationalRow* row : group.rows) {
+          if (spec.input_column >= row->cells.size()) continue;
+          cell_bytes = std::max(
+              cell_bytes, EstimateCellBytes(row->cells[spec.input_column]));
+        }
+      }
+      if (!AddBytes(cell_bytes, &row_bytes)) {
+        return std::numeric_limits<size_t>::max();
+      }
+    }
+    if (!AddBytes(row_bytes, &bytes)) {
+      return std::numeric_limits<size_t>::max();
+    }
+  }
+  return bytes;
+}
+
+size_t EstimateTemporalAggregateOutputBytes(const std::vector<Group>& groups,
+                                            size_t* row_bound) {
+  size_t bytes = sizeof(BatchStream);
+  *row_bound = 0;
+  for (const Group& group : groups) {
+    const size_t group_rows = group.rows.size();
+    if (group_rows > (std::numeric_limits<size_t>::max() - *row_bound) / 2) {
+      return std::numeric_limits<size_t>::max();
+    }
+    const size_t group_bound = group_rows * 2;
+    *row_bound += group_bound;
+    size_t row_bytes = sizeof(RelationalRow) + sizeof(RelationalCell);
+    for (const RelationalCell& cell : group.key) {
+      if (!AddBytes(EstimateCellBytes(cell), &row_bytes)) {
+        return std::numeric_limits<size_t>::max();
+      }
+    }
+    if (group_bound != 0 &&
+        row_bytes > (std::numeric_limits<size_t>::max() - bytes) / group_bound) {
+      return std::numeric_limits<size_t>::max();
+    }
+    bytes += row_bytes * group_bound;
+  }
+  return bytes;
 }
 
 StatusOr<RelationalCell> AggregateOne(const Group& group,
@@ -595,15 +794,44 @@ StatusOr<RelationalCell> AggregateOne(const Group& group,
 
 }  // namespace
 
+QueryReservation::QueryReservation(size_t limit_bytes)
+    : state_(std::make_shared<State>(limit_bytes)) {}
+
 bool QueryReservation::TryGrow(size_t bytes) {
-  if (bytes > limit_bytes_ - used_bytes_) return false;
-  used_bytes_ += bytes;
-  peak_bytes_ = std::max(peak_bytes_, used_bytes_);
+  if (bytes > state_->limit_bytes - state_->used_bytes) return false;
+  state_->used_bytes += bytes;
+  state_->peak_bytes = std::max(state_->peak_bytes, state_->used_bytes);
   return true;
 }
 
 void QueryReservation::Release(size_t bytes) {
-  used_bytes_ = bytes >= used_bytes_ ? 0 : used_bytes_ - bytes;
+  state_->used_bytes =
+      bytes >= state_->used_bytes ? 0 : state_->used_bytes - bytes;
+}
+
+std::shared_ptr<QueryReservationLease> QueryReservation::TryRetain(
+    size_t bytes) {
+  if (!TryGrow(bytes)) return {};
+  try {
+    return std::shared_ptr<QueryReservationLease>(
+        new QueryReservationLease(state_, bytes));
+  } catch (...) {
+    Release(bytes);
+    throw;
+  }
+}
+
+size_t QueryReservation::limit_bytes() const { return state_->limit_bytes; }
+size_t QueryReservation::used_bytes() const { return state_->used_bytes; }
+size_t QueryReservation::peak_bytes() const { return state_->peak_bytes; }
+
+QueryReservationLease::QueryReservationLease(
+    std::shared_ptr<QueryReservation::State> state, size_t bytes)
+    : state_(std::move(state)), bytes_(bytes) {}
+
+QueryReservationLease::~QueryReservationLease() {
+  state_->used_bytes =
+      bytes_ >= state_->used_bytes ? 0 : state_->used_bytes - bytes_;
 }
 
 bool FragmentBudget::TryConsume(size_t fragments) {
@@ -630,16 +858,57 @@ bool IsNeedsSpill(const Status& status) {
          status.ToString().find("NeedsSpill") != std::string::npos;
 }
 
-BatchStream UnionAll(BatchStream left, BatchStream right) {
-  left.rows.reserve(left.rows.size() + right.rows.size());
-  std::move(right.rows.begin(), right.rows.end(),
-            std::back_inserter(left.rows));
-  left.order_specified = false;
-  return left;
+StatusOr<BatchStream> UnionAll(const BatchStream& left,
+                               const BatchStream& right,
+                               QueryReservation* reservation,
+                               size_t max_output_rows) {
+  if (right.rows.size() >
+      std::numeric_limits<size_t>::max() - left.rows.size()) {
+    return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                           reservation == nullptr ? 0
+                                                  : AvailableBytes(*reservation));
+  }
+  const size_t row_count = left.rows.size() + right.rows.size();
+  if (row_count > max_output_rows) return OutputRowsExhausted();
+  const size_t bytes = EstimateRowsBytes(left.rows, &right.rows);
+  auto lease = RetainOutput(reservation, bytes, false);
+  if (!lease.ok()) return lease.status();
+  BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  result.rows.reserve(row_count);
+  result.rows.insert(result.rows.end(), left.rows.begin(), left.rows.end());
+  result.rows.insert(result.rows.end(), right.rows.begin(), right.rows.end());
+  return result;
 }
 
-BatchStream Distinct(const BatchStream& input) {
+StatusOr<BatchStream> Distinct(const BatchStream& input,
+                               QueryReservation* reservation,
+                               size_t max_output_rows) {
+  size_t row_count = 0;
+  size_t bytes = sizeof(BatchStream);
+  for (size_t row_index = 0; row_index < input.rows.size(); ++row_index) {
+    const RelationalRow& row = input.rows[row_index];
+    bool duplicate = false;
+    for (size_t previous = 0; previous < row_index; ++previous) {
+      if (input.rows[previous] == row) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) continue;
+    if (++row_count > max_output_rows) return OutputRowsExhausted();
+    if (!AddBytes(EstimateRowBytes(row), &bytes)) {
+      return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                             reservation == nullptr
+                                 ? 0
+                                 : AvailableBytes(*reservation));
+    }
+  }
+  auto lease = RetainOutput(reservation, bytes, false);
+  if (!lease.ok()) return lease.status();
   BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  result.rows.reserve(row_count);
   for (const RelationalRow& row : input.rows) {
     if (std::find(result.rows.begin(), result.rows.end(), row) ==
         result.rows.end()) {
@@ -651,15 +920,15 @@ BatchStream Distinct(const BatchStream& input) {
 
 StatusOr<BatchStream> Sort(const BatchStream& input,
                            const std::vector<SortKey>& keys,
-                           QueryReservation* reservation) {
+                           QueryReservation* reservation,
+                           size_t max_output_rows) {
   if (Status status = ValidateSort(input, keys); !status.ok()) return status;
-  if (reservation == nullptr) return NeedsSpill();
-  ReservationGuard guard(reservation, EstimateBytes(input));
-  if (!guard.acquired()) {
-    return NeedsSpill(EstimateBytes(input), reservation->limit_bytes() -
-                                                reservation->used_bytes());
-  }
-  BatchStream result = input;
+  if (input.rows.size() > max_output_rows) return OutputRowsExhausted();
+  auto lease = RetainOutput(reservation, EstimateBytes(input), true);
+  if (!lease.ok()) return lease.status();
+  BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  result.rows = input.rows;
   // Stable insertion sort only swaps adjacent moved rows, so it needs no
   // unreserved auxiliary buffer after the copied stream has been accounted.
   for (size_t i = 1; i < result.rows.size(); ++i) {
@@ -672,14 +941,32 @@ StatusOr<BatchStream> Sort(const BatchStream& input,
   return result;
 }
 
-BatchStream Limit(const BatchStream& input, size_t offset, size_t count) {
+StatusOr<BatchStream> Limit(const BatchStream& input, size_t offset,
+                            size_t count, QueryReservation* reservation,
+                            size_t max_output_rows) {
+  const size_t available =
+      offset >= input.rows.size() ? 0 : input.rows.size() - offset;
+  const size_t emitted = std::min(count, available);
+  if (emitted > max_output_rows) return OutputRowsExhausted();
+  size_t bytes = sizeof(BatchStream);
+  for (size_t row = offset; row < offset + emitted; ++row) {
+    if (!AddBytes(EstimateRowBytes(input.rows[row]), &bytes)) {
+      return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                             reservation == nullptr
+                                 ? 0
+                                 : AvailableBytes(*reservation));
+    }
+  }
+  auto lease = RetainOutput(reservation, bytes, false);
+  if (!lease.ok()) return lease.status();
   BatchStream result;
   result.order_specified = input.order_specified;
-  if (offset >= input.rows.size()) return result;
-  const size_t available = input.rows.size() - offset;
-  const size_t emitted = std::min(count, available);
-  result.rows.insert(result.rows.end(), input.rows.begin() + offset,
-                     input.rows.begin() + offset + emitted);
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  result.rows.reserve(emitted);
+  if (emitted != 0) {
+    result.rows.insert(result.rows.end(), input.rows.begin() + offset,
+                       input.rows.begin() + offset + emitted);
+  }
   return result;
 }
 
@@ -690,14 +977,20 @@ JoinAlgorithm ChooseJoinAlgorithm(size_t estimated_rows, bool sorted_keys,
   return sorted_keys ? JoinAlgorithm::kSortMerge : JoinAlgorithm::kHash;
 }
 
-StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input) {
+StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input,
+                                          QueryReservation* reservation,
+                                          size_t max_output_rows) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   const auto output = EstimateJoinOutput(input);
   if (!output.has_value()) {
     return Status::ResourceExhausted("relational join",
                                      "output size overflows");
   }
+  if (output->rows > max_output_rows) return OutputRowsExhausted();
+  auto lease = RetainOutput(reservation, output->bytes, false);
+  if (!lease.ok()) return lease.status();
   BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
   result.rows.reserve(output->rows);
   for (const RelationalRow& left : input.left.rows) {
     bool matched = false;
@@ -720,7 +1013,8 @@ StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input) {
 }
 
 StatusOr<BatchStream> HashJoin(const JoinInput& input,
-                               QueryReservation* reservation) {
+                               QueryReservation* reservation,
+                               size_t max_output_rows) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
   const auto bucket_count = HashBucketCount(input.right.rows.size());
@@ -752,12 +1046,11 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
   }
   auto output = EstimateHashOutput(input, buckets, table);
   if (!output.ok()) return output.status();
-  ReservationGuard output_guard(reservation, output.ValueOrDie().bytes);
-  if (!output_guard.acquired()) {
-    return NeedsSpill(output.ValueOrDie().bytes,
-                      reservation->limit_bytes() - reservation->used_bytes());
-  }
+  if (output.ValueOrDie().rows > max_output_rows) return OutputRowsExhausted();
+  auto lease = RetainOutput(reservation, output.ValueOrDie().bytes, true);
+  if (!lease.ok()) return lease.status();
   BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
   result.rows.reserve(output.ValueOrDie().rows);
   for (const RelationalRow& left : input.left.rows) {
     bool matched = false;
@@ -783,7 +1076,8 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
 }
 
 StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
-                                    QueryReservation* reservation) {
+                                    QueryReservation* reservation,
+                                    size_t max_output_rows) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
   size_t input_bytes = EstimateBytes(input.left);
@@ -812,13 +1106,12 @@ StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
   std::sort(right.begin(), right.end(), right_less);
   auto output = EstimateSortedMergeOutput(left, right, input);
   if (!output.ok()) return output.status();
-  ReservationGuard output_guard(reservation, output.ValueOrDie().bytes);
-  if (!output_guard.acquired()) {
-    return NeedsSpill(output.ValueOrDie().bytes,
-                      reservation->limit_bytes() - reservation->used_bytes());
-  }
+  if (output.ValueOrDie().rows > max_output_rows) return OutputRowsExhausted();
+  auto lease = RetainOutput(reservation, output.ValueOrDie().bytes, true);
+  if (!lease.ok()) return lease.status();
 
   BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
   result.rows.reserve(output.ValueOrDie().rows);
   size_t left_index = 0;
   size_t right_index = 0;
@@ -871,11 +1164,15 @@ StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
   return result;
 }
 
-StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
-                                        FragmentBudget* budget) {
-  JoinInput validation{input.left, input.right, input.left_key,
-                       input.right_key, input.kind};
-  if (Status status = ValidateJoin(validation); !status.ok()) return status;
+StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
+                                        FragmentBudget* budget,
+                                        QueryReservation* reservation,
+                                        size_t max_output_rows) {
+  if (Status status = ValidateJoinStreams(input.left, input.right,
+                                          input.left_key, input.right_key);
+      !status.ok()) {
+    return status;
+  }
   if (budget == nullptr) {
     return Status::InvalidArgument("temporal join",
                                    "fragment budget is required");
@@ -893,11 +1190,97 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
     }
   }
 
+  size_t output_rows = 0;
+  size_t output_bytes = sizeof(BatchStream);
+  for (const RelationalRow& left : input.left.rows) {
+    size_t intersections = 0;
+    for (const RelationalRow& right : input.right.rows) {
+      if (!KeysEqual(left.cells[input.left_key],
+                     right.cells[input.right_key]) ||
+          !Intersect(*left.effective, *right.effective).has_value()) {
+        continue;
+      }
+      ++intersections;
+      if (input.kind == JoinKind::kInner) {
+        if (!AddBytes(EstimateCombinedRowBytes(left, right), &output_bytes) ||
+            output_rows == std::numeric_limits<size_t>::max()) {
+          return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                                 reservation == nullptr
+                                     ? 0
+                                     : AvailableBytes(*reservation));
+        }
+        ++output_rows;
+      }
+    }
+    if (input.kind != JoinKind::kInner) {
+      if (input.kind == JoinKind::kAnti &&
+          intersections == std::numeric_limits<size_t>::max()) {
+        return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                               reservation == nullptr
+                                   ? 0
+                                   : AvailableBytes(*reservation));
+      }
+      const size_t row_bound = input.kind == JoinKind::kSemi
+                                   ? intersections
+                                   : std::max(size_t{1}, intersections + 1);
+      for (size_t row = 0; row < row_bound; ++row) {
+        if (!AddBytes(EstimateRowBytes(left), &output_bytes) ||
+            output_rows == std::numeric_limits<size_t>::max()) {
+          return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                                 reservation == nullptr
+                                     ? 0
+                                     : AvailableBytes(*reservation));
+        }
+        ++output_rows;
+      }
+    }
+  }
+
+  size_t scratch_bytes = EstimateBytes(input.left);
+  if (!AddBytes(EstimateBytes(input.right), &scratch_bytes) ||
+      !AddBytes(sizeof(std::vector<ValidTimeInterval>) * 2,
+                &scratch_bytes)) {
+    return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                           reservation == nullptr ? 0
+                                                  : AvailableBytes(*reservation));
+  }
+  if (input.right.rows.size() >
+          std::numeric_limits<size_t>::max() /
+              (2 * sizeof(ValidTimeInterval)) ||
+      !AddBytes(input.right.rows.size() * 2 * sizeof(ValidTimeInterval),
+                &scratch_bytes)) {
+    return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                           reservation == nullptr ? 0
+                                                  : AvailableBytes(*reservation));
+  }
+  if (reservation == nullptr) return MemoryExhausted(output_bytes, 0);
+  ReservationGuard scratch_guard(reservation, scratch_bytes);
+  if (!scratch_guard.acquired()) {
+    return MemoryExhausted(scratch_bytes, AvailableBytes(*reservation));
+  }
+  std::vector<RelationalRow> left_rows = input.left.rows;
+  std::vector<RelationalRow> right_rows = input.right.rows;
+  StableInsertionSort(&left_rows,
+                      [&input](const RelationalRow& left,
+                               const RelationalRow& right) {
+                        return TemporalRowLess(left, right, input.left_key);
+                      });
+  StableInsertionSort(&right_rows,
+                      [&input](const RelationalRow& left,
+                               const RelationalRow& right) {
+                        return TemporalRowLess(left, right, input.right_key);
+                      });
+  auto output_lease = RetainOutput(reservation, output_bytes, false);
+  if (!output_lease.ok()) return output_lease.status();
+
   BatchStream result;
   result.order_specified = true;
-  for (const RelationalRow& left : input.left.rows) {
+  result.reservation_lease = std::move(output_lease).ConsumeValueOrDie();
+  result.rows.reserve(output_rows);
+  for (const RelationalRow& left : left_rows) {
     std::vector<ValidTimeInterval> overlaps;
-    for (const RelationalRow& right : input.right.rows) {
+    overlaps.reserve(input.right.rows.size());
+    for (const RelationalRow& right : right_rows) {
       if (!KeysEqual(left.cells[input.left_key],
                      right.cells[input.right_key])) {
         continue;
@@ -907,7 +1290,8 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
       if (input.kind == JoinKind::kInner) {
         RelationalRow row = Combine(left, right);
         row.effective = *intersection;
-        if (Status status = Publish(std::move(row), budget, &result);
+        if (Status status =
+                Publish(std::move(row), budget, max_output_rows, &result);
             !status.ok()) {
           return status;
         }
@@ -920,7 +1304,8 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
       for (const auto& overlap : overlaps) {
         RelationalRow row = left;
         row.effective = overlap;
-        if (Status status = Publish(std::move(row), budget, &result);
+        if (Status status =
+                Publish(std::move(row), budget, max_output_rows, &result);
             !status.ok()) {
           return status;
         }
@@ -933,7 +1318,8 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
         if (Before(cursor, overlap.from)) {
           RelationalRow row = left;
           row.effective = ValidTimeInterval{cursor, overlap.from};
-          if (Status status = Publish(std::move(row), budget, &result);
+          if (Status status =
+                  Publish(std::move(row), budget, max_output_rows, &result);
               !status.ok()) {
             return status;
           }
@@ -947,7 +1333,8 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
       if (!exhausted && EndsAfter(left.effective->to, cursor)) {
         RelationalRow row = left;
         row.effective = ValidTimeInterval{cursor, left.effective->to};
-        if (Status status = Publish(std::move(row), budget, &result);
+        if (Status status =
+                Publish(std::move(row), budget, max_output_rows, &result);
             !status.ok()) {
           return status;
         }
@@ -957,10 +1344,32 @@ StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
   return result;
 }
 
-StatusOr<BatchStream> AggregateRows(AggregateInput input) {
+StatusOr<BatchStream> AggregateRows(const AggregateInput& input,
+                                    QueryReservation* reservation,
+                                    size_t max_output_rows) {
+  if (Status status = ValidateGroupBy(input.input, input.group_by);
+      !status.ok()) {
+    return status;
+  }
+  const size_t scratch_bytes =
+      EstimateGroupingScratch(input.input, input.group_by);
+  if (reservation == nullptr) return MemoryExhausted(scratch_bytes, 0);
+  ReservationGuard scratch_guard(reservation, scratch_bytes);
+  if (!scratch_guard.acquired()) {
+    return MemoryExhausted(scratch_bytes, AvailableBytes(*reservation));
+  }
   auto groups = BuildGroups(input.input, input.group_by);
   if (!groups.ok()) return groups.status();
+  if (groups.ValueOrDie().size() > max_output_rows) {
+    return OutputRowsExhausted();
+  }
+  const size_t output_bytes =
+      EstimateAggregateOutputBytes(groups.ValueOrDie(), input.aggregates);
+  auto lease = RetainOutput(reservation, output_bytes, false);
+  if (!lease.ok()) return lease.status();
   BatchStream result;
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  result.rows.reserve(groups.ValueOrDie().size());
   for (const Group& group : groups.ValueOrDie()) {
     RelationalRow output{group.key, std::nullopt};
     for (const AggregateSpec& spec : input.aggregates) {
@@ -973,22 +1382,39 @@ StatusOr<BatchStream> AggregateRows(AggregateInput input) {
   return result;
 }
 
-StatusOr<BatchStream> TemporalAggregate(TemporalAggregateInput input,
-                                        FragmentBudget* budget) {
+StatusOr<BatchStream> TemporalAggregate(const TemporalAggregateInput& input,
+                                        FragmentBudget* budget,
+                                        QueryReservation* reservation,
+                                        size_t max_output_rows) {
   if (budget == nullptr) {
     return Status::InvalidArgument("temporal aggregate",
                                    "fragment budget is required");
   }
+  if (Status status = ValidateGroupBy(input.input, input.group_by);
+      !status.ok()) {
+    return status;
+  }
+  const size_t scratch_bytes = EstimateGroupingScratch(
+      input.input, input.group_by, 2 * sizeof(TemporalEvent));
+  if (reservation == nullptr) return MemoryExhausted(scratch_bytes, 0);
+  ReservationGuard scratch_guard(reservation, scratch_bytes);
+  if (!scratch_guard.acquired()) {
+    return MemoryExhausted(scratch_bytes, AvailableBytes(*reservation));
+  }
   auto groups = BuildGroups(input.input, input.group_by);
   if (!groups.ok()) return groups.status();
+  size_t output_rows = 0;
+  const size_t output_bytes =
+      EstimateTemporalAggregateOutputBytes(groups.ValueOrDie(), &output_rows);
+  auto lease = RetainOutput(reservation, output_bytes, false);
+  if (!lease.ok()) return lease.status();
   BatchStream result;
   result.order_specified = true;
-  struct Event {
-    ValidTime time;
-    int delta;
-  };
+  result.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  result.rows.reserve(output_rows);
   for (const Group& group : groups.ValueOrDie()) {
-    std::vector<Event> events;
+    std::vector<TemporalEvent> events;
+    events.reserve(group.rows.size() * 2);
     int unbounded = 0;
     for (const RelationalRow* row : group.rows) {
       if (!row->effective || !IntervalValid(*row->effective)) {
@@ -1002,8 +1428,8 @@ StatusOr<BatchStream> TemporalAggregate(TemporalAggregateInput input,
         ++unbounded;
       }
     }
-    std::sort(events.begin(), events.end(), [](const Event& left,
-                                               const Event& right) {
+    std::sort(events.begin(), events.end(), [](const TemporalEvent& left,
+                                               const TemporalEvent& right) {
       if (left.time.value != right.time.value) {
         return left.time.value < right.time.value;
       }
@@ -1020,7 +1446,8 @@ StatusOr<BatchStream> TemporalAggregate(TemporalAggregateInput input,
             group.key, ValidTimeInterval{previous, time}};
         row.cells.push_back(
             RelationalCell::Present(QueryType::kInt64, count));
-        if (Status status = Publish(std::move(row), budget, &result);
+        if (Status status =
+                Publish(std::move(row), budget, max_output_rows, &result);
             !status.ok()) {
           return status;
         }
@@ -1038,7 +1465,8 @@ StatusOr<BatchStream> TemporalAggregate(TemporalAggregateInput input,
       RelationalRow row{group.key,
                         ValidTimeInterval{previous, std::nullopt}};
       row.cells.push_back(RelationalCell::Present(QueryType::kInt64, count));
-      if (Status status = Publish(std::move(row), budget, &result);
+      if (Status status =
+              Publish(std::move(row), budget, max_output_rows, &result);
           !status.ok()) {
         return status;
       }

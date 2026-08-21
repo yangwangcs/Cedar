@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -40,10 +42,15 @@ struct RelationalRow {
   bool operator==(const RelationalRow&) const = default;
 };
 
+class QueryReservationLease;
+
 struct BatchStream {
   std::vector<RelationalRow> rows;
   bool order_specified = false;
-  bool operator==(const BatchStream&) const = default;
+  std::shared_ptr<QueryReservationLease> reservation_lease;
+  bool operator==(const BatchStream& other) const {
+    return rows == other.rows && order_specified == other.order_specified;
+  }
 };
 
 enum class SortDirection : uint8_t { kAscending, kDescending };
@@ -52,12 +59,22 @@ struct SortKey {
   SortDirection direction = SortDirection::kAscending;
 };
 
-BatchStream UnionAll(BatchStream left, BatchStream right);
-BatchStream Distinct(const BatchStream& input);
+StatusOr<BatchStream> UnionAll(
+    const BatchStream& left, const BatchStream& right,
+    class QueryReservation* reservation,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
+StatusOr<BatchStream> Distinct(
+    const BatchStream& input, class QueryReservation* reservation,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
 StatusOr<BatchStream> Sort(const BatchStream& input,
                            const std::vector<SortKey>& keys,
-                           class QueryReservation* reservation = nullptr);
-BatchStream Limit(const BatchStream& input, size_t offset, size_t count);
+                           class QueryReservation* reservation,
+                           size_t max_output_rows =
+                               std::numeric_limits<size_t>::max());
+StatusOr<BatchStream> Limit(
+    const BatchStream& input, size_t offset, size_t count,
+    class QueryReservation* reservation,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
 
 enum class JoinKind : uint8_t { kInner, kSemi, kAnti };
 enum class JoinAlgorithm : uint8_t {
@@ -85,17 +102,33 @@ struct TemporalJoinInput {
 
 class QueryReservation {
  public:
-  explicit QueryReservation(size_t limit_bytes) : limit_bytes_(limit_bytes) {}
+  explicit QueryReservation(size_t limit_bytes);
   bool TryGrow(size_t bytes);
   void Release(size_t bytes);
-  size_t limit_bytes() const { return limit_bytes_; }
-  size_t used_bytes() const { return used_bytes_; }
-  size_t peak_bytes() const { return peak_bytes_; }
+  std::shared_ptr<QueryReservationLease> TryRetain(size_t bytes);
+  size_t limit_bytes() const;
+  size_t used_bytes() const;
+  size_t peak_bytes() const;
 
  private:
-  size_t limit_bytes_ = 0;
-  size_t used_bytes_ = 0;
-  size_t peak_bytes_ = 0;
+  struct State;
+  std::shared_ptr<State> state_;
+
+  friend class QueryReservationLease;
+};
+
+class QueryReservationLease {
+ public:
+  ~QueryReservationLease();
+
+ private:
+  QueryReservationLease(std::shared_ptr<QueryReservation::State> state,
+                        size_t bytes);
+
+  std::shared_ptr<QueryReservation::State> state_;
+  size_t bytes_ = 0;
+
+  friend class QueryReservation;
 };
 
 class FragmentBudget {
@@ -115,13 +148,22 @@ bool IsNeedsSpill(const Status& status);
 
 JoinAlgorithm ChooseJoinAlgorithm(size_t estimated_rows, bool sorted_keys,
                                   bool temporal);
-StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input);
+StatusOr<BatchStream> IndexNestedLoopJoin(
+    const JoinInput& input, QueryReservation* reservation,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
 StatusOr<BatchStream> HashJoin(const JoinInput& input,
-                               QueryReservation* reservation);
+                               QueryReservation* reservation,
+                               size_t max_output_rows =
+                                   std::numeric_limits<size_t>::max());
 StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
-                                    QueryReservation* reservation);
-StatusOr<BatchStream> IntervalMergeJoin(TemporalJoinInput input,
-                                        FragmentBudget* budget);
+                                    QueryReservation* reservation,
+                                    size_t max_output_rows =
+                                        std::numeric_limits<size_t>::max());
+StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
+                                        FragmentBudget* budget,
+                                        QueryReservation* reservation,
+                                        size_t max_output_rows =
+                                            std::numeric_limits<size_t>::max());
 
 enum class AggregateKind : uint8_t { kCount, kSum, kMin, kMax };
 struct AggregateSpec {
@@ -138,9 +180,13 @@ struct TemporalAggregateInput {
   std::vector<size_t> group_by;
 };
 
-StatusOr<BatchStream> AggregateRows(AggregateInput input);
-StatusOr<BatchStream> TemporalAggregate(TemporalAggregateInput input,
-                                        FragmentBudget* budget);
+StatusOr<BatchStream> AggregateRows(
+    const AggregateInput& input, QueryReservation* reservation,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
+StatusOr<BatchStream> TemporalAggregate(
+    const TemporalAggregateInput& input, FragmentBudget* budget,
+    QueryReservation* reservation,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
 
 }  // namespace cedar::internal
 

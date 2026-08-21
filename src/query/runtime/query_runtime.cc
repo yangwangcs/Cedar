@@ -463,6 +463,85 @@ Status AppendRelationalCell(QueryColumn* column,
   }
 }
 
+std::optional<size_t> EffectiveOutputColumn(
+    const internal::RelationalRow& row,
+    const std::vector<RowColumn>& output_columns) {
+  if (!row.effective.has_value() ||
+      row.cells.size() + 1 != output_columns.size()) {
+    return std::nullopt;
+  }
+  std::optional<size_t> effective_column;
+  for (size_t column = 0; column < output_columns.size(); ++column) {
+    if (output_columns[column].type != QueryType::kValidTimeInterval) continue;
+    if (effective_column.has_value()) return std::nullopt;
+    effective_column = column;
+  }
+  return effective_column;
+}
+
+size_t RelationalValueBytes(const internal::RelationalCell& cell) {
+  if (!cell.present) return 1;
+  return std::visit(
+      [](const auto& value) -> size_t {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, std::string>) {
+          return sizeof(std::string) + value.size() + 1;
+        } else if constexpr (std::is_same_v<T, Binary>) {
+          return sizeof(std::string) + value.value.size() + 1;
+        } else {
+          return sizeof(T) + 1;
+        }
+      },
+      cell.value);
+}
+
+StatusOr<size_t> EstimateRelationalBatchBytes(
+    const internal::BatchStream& stream,
+    const std::vector<RowColumn>& output_columns) {
+  constexpr size_t kBatchRows = 1024;
+  const size_t batch_count =
+      stream.rows.empty() ? 0 : (stream.rows.size() - 1) / kBatchRows + 1;
+  if (batch_count >
+      std::numeric_limits<size_t>::max() / sizeof(QueryBatch)) {
+    return Status::ResourceExhausted("query runtime",
+                                     "memory_bytes estimate overflow");
+  }
+  size_t bytes = batch_count * sizeof(QueryBatch);
+  if (output_columns.size() >
+          std::numeric_limits<size_t>::max() / sizeof(QueryColumn) ||
+      (output_columns.size() != 0 &&
+       batch_count > (std::numeric_limits<size_t>::max() - bytes) /
+                         (output_columns.size() * sizeof(QueryColumn)))) {
+    return Status::ResourceExhausted("query runtime",
+                                     "memory_bytes estimate overflow");
+  }
+  bytes += batch_count * output_columns.size() * sizeof(QueryColumn);
+  for (const internal::RelationalRow& row : stream.rows) {
+    const std::optional<size_t> effective_column =
+        EffectiveOutputColumn(row, output_columns);
+    if (row.cells.size() != output_columns.size() &&
+        !effective_column.has_value()) {
+      return Status::InvalidArgument("query runtime",
+                                     "relational output schema differs");
+    }
+    size_t cell_index = 0;
+    for (size_t column = 0; column < output_columns.size(); ++column) {
+      size_t value_bytes = 0;
+      if (effective_column == column) {
+        value_bytes = sizeof(ValidTimeInterval) + 1;
+      } else {
+        value_bytes = RelationalValueBytes(row.cells[cell_index++]);
+      }
+      if (value_bytes > std::numeric_limits<size_t>::max() - bytes) {
+        return Status::ResourceExhausted("query runtime",
+                                         "memory_bytes estimate overflow");
+      }
+      bytes += value_bytes;
+    }
+  }
+  return bytes;
+}
+
 StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
     const internal::BatchStream& stream, size_t offset, size_t count,
     const std::vector<RowColumn>& output_columns) {
@@ -474,15 +553,29 @@ StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
   }
   for (size_t row_index = offset; row_index < offset + count; ++row_index) {
     const internal::RelationalRow& row = stream.rows[row_index];
-    if (row.cells.size() != columns.size()) {
+    const std::optional<size_t> effective_column =
+        EffectiveOutputColumn(row, output_columns);
+    if (row.cells.size() != columns.size() && !effective_column.has_value()) {
       return Status::InvalidArgument("query runtime",
                                      "relational output schema differs");
     }
+    size_t cell_index = 0;
     for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
-      if (Status status =
-              AppendRelationalCell(&columns[column_index], row.cells[column_index]);
-          !status.ok()) {
-        return status;
+      if (effective_column == column_index) {
+        const internal::RelationalCell effective =
+            internal::RelationalCell::Present(
+                QueryType::kValidTimeInterval, *row.effective);
+        if (Status status =
+                AppendRelationalCell(&columns[column_index], effective);
+            !status.ok()) {
+          return status;
+        }
+      } else {
+        if (Status status = AppendRelationalCell(
+                &columns[column_index], row.cells[cell_index++]);
+            !status.ok()) {
+          return status;
+        }
       }
     }
   }
@@ -496,11 +589,16 @@ class QueryCursor::State {
   State(internal::PreparedQueryPlan plan, Snapshot snapshot,
         QueryOptions options)
       : plan(std::move(plan)), snapshot(std::move(snapshot)),
-        options(std::move(options)) {}
+        options(std::move(options)),
+        reservation(this->options.budget.memory_bytes),
+        fragments(this->options.budget.interval_fragments) {}
 
   internal::PreparedQueryPlan plan;
   std::optional<Snapshot> snapshot;
   QueryOptions options;
+  internal::QueryReservation reservation;
+  internal::FragmentBudget fragments;
+  std::shared_ptr<internal::QueryReservationLease> materialized_output_lease;
   std::vector<QueryBatch> batches;
   size_t next_batch = 0;
   bool initialized = false;
@@ -530,13 +628,11 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
         state_->snapshot.reset();
         return *state_->terminal_error;
       }
-      internal::QueryReservation reservation(state_->options.budget.memory_bytes);
-      internal::FragmentBudget fragments(
-          state_->options.budget.interval_fragments);
       auto relational = internal::ExecuteRelationalPlanNode(
           *state_->plan.relational_kind,
           std::move(*state_->plan.relational_input),
-          &reservation, &fragments);
+          &state_->reservation, &state_->fragments,
+          state_->options.budget.output_rows);
       if (!relational.ok()) {
         state_->terminal_error = relational.status();
         state_->snapshot.reset();
@@ -549,7 +645,38 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
         state_->snapshot.reset();
         return *state_->terminal_error;
       }
+      auto materialized_bytes =
+          EstimateRelationalBatchBytes(stream, state_->plan.output_columns);
+      if (!materialized_bytes.ok()) {
+        state_->terminal_error = materialized_bytes.status();
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      if (materialized_bytes.ValueOrDie() >
+          state_->options.budget.output_bytes) {
+        state_->terminal_error = Status::ResourceExhausted(
+            "query", "output byte budget exceeded");
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      state_->materialized_output_lease = state_->reservation.TryRetain(
+          materialized_bytes.ValueOrDie());
+      if (!state_->materialized_output_lease) {
+        state_->terminal_error = Status::ResourceExhausted(
+            "query runtime",
+            "memory_bytes=" +
+                std::to_string(materialized_bytes.ValueOrDie()) +
+                " available_bytes=" +
+                std::to_string(state_->reservation.limit_bytes() -
+                               state_->reservation.used_bytes()));
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
       constexpr size_t kBatchRows = 1024;
+      const size_t batch_count = stream.rows.empty()
+                                     ? 0
+                                     : (stream.rows.size() - 1) / kBatchRows + 1;
+      state_->batches.reserve(batch_count);
       for (size_t offset = 0; offset < stream.rows.size(); offset += kBatchRows) {
         const size_t count = std::min(kBatchRows, stream.rows.size() - offset);
         auto columns = BuildRelationalColumns(
@@ -604,6 +731,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
         std::move(state_->batches[state_->next_batch++])};
   }
   state_->batches.clear();
+  state_->materialized_output_lease.reset();
   state_->snapshot.reset();
   state_->clean_terminal = true;
   return std::optional<QueryBatch>{};
@@ -614,6 +742,7 @@ Status QueryCursor::Close() {
     return Status::InvalidArgument("query cursor", "moved-from cursor");
   }
   state_->batches.clear();
+  state_->materialized_output_lease.reset();
   state_->snapshot.reset();
   state_->terminal_error.reset();
   state_->clean_terminal = true;
@@ -724,35 +853,47 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
 
 StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,
-    QueryReservation* reservation, FragmentBudget* fragment_budget) {
+    QueryReservation* reservation, FragmentBudget* fragment_budget,
+    size_t max_output_rows) {
   if (kind == LogicalOpKind::kUnionAll) {
-    return RuntimeRelationalResult{
-        UnionAll(std::move(input.left), std::move(input.right)), std::nullopt};
+    auto result = UnionAll(input.left, input.right, reservation, max_output_rows);
+    if (!result.ok()) return result.status();
+    return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                   std::nullopt};
   }
   if (kind == LogicalOpKind::kDistinct) {
-    return RuntimeRelationalResult{Distinct(input.left), std::nullopt};
+    auto result = Distinct(input.left, reservation, max_output_rows);
+    if (!result.ok()) return result.status();
+    return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                   std::nullopt};
   }
   if (kind == LogicalOpKind::kSort) {
-    auto result = Sort(input.left, input.sort_keys, reservation);
+    auto result =
+        Sort(input.left, input.sort_keys, reservation, max_output_rows);
     if (!result.ok()) return result.status();
     return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
                                    std::nullopt};
   }
   if (kind == LogicalOpKind::kLimit) {
-    return RuntimeRelationalResult{
-        Limit(input.left, input.offset, input.count), std::nullopt};
+    auto result = Limit(input.left, input.offset, input.count, reservation,
+                        max_output_rows);
+    if (!result.ok()) return result.status();
+    return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
+                                   std::nullopt};
   }
   if (kind == LogicalOpKind::kAggregateRows) {
     auto result = AggregateRows(
         {std::move(input.left), std::move(input.group_by),
-         std::move(input.aggregates)});
+         std::move(input.aggregates)},
+        reservation, max_output_rows);
     if (!result.ok()) return result.status();
     return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
                                    std::nullopt};
   }
   if (kind == LogicalOpKind::kTemporalAggregate) {
     auto result = TemporalAggregate(
-        {std::move(input.left), std::move(input.group_by)}, fragment_budget);
+        {std::move(input.left), std::move(input.group_by)}, fragment_budget,
+        reservation, max_output_rows);
     if (!result.ok()) return result.status();
     return RuntimeRelationalResult{std::move(result).ConsumeValueOrDie(),
                                    std::nullopt};
@@ -782,16 +923,16 @@ StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     result = IntervalMergeJoin(
         {std::move(input.left), std::move(input.right), input.left_key,
          input.right_key, join_kind},
-        fragment_budget);
+        fragment_budget, reservation, max_output_rows);
   } else {
     JoinInput join{std::move(input.left), std::move(input.right),
                    input.left_key, input.right_key, join_kind};
     if (algorithm == JoinAlgorithm::kIndexNestedLoop) {
-      result = IndexNestedLoopJoin(std::move(join));
+      result = IndexNestedLoopJoin(join, reservation, max_output_rows);
     } else if (algorithm == JoinAlgorithm::kHash) {
-      result = HashJoin(std::move(join), reservation);
+      result = HashJoin(join, reservation, max_output_rows);
     } else {
-      result = SortMergeJoin(std::move(join), reservation);
+      result = SortMergeJoin(join, reservation, max_output_rows);
     }
   }
   if (!result.ok()) return result.status();

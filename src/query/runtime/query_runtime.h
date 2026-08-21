@@ -4,6 +4,7 @@
 #ifndef CEDAR_QUERY_RUNTIME_QUERY_RUNTIME_H_
 #define CEDAR_QUERY_RUNTIME_QUERY_RUNTIME_H_
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -66,7 +67,8 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);
 StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,
     QueryReservation* reservation,
-    FragmentBudget* fragment_budget = nullptr);
+    FragmentBudget* fragment_budget = nullptr,
+    size_t max_output_rows = std::numeric_limits<size_t>::max());
 
 class QueryRuntime {
  public:

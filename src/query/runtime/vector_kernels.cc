@@ -369,7 +369,13 @@ StatusOr<QueryColumn> ProjectColumn(
   if (Status status = ValidateColumn(input); !status.ok()) return status;
   auto rows = ResolveSelection(ValueCount(input), input_selection);
   if (!rows.ok()) return rows.status();
-  QueryColumn output{input.slot, input.type, input.values, {}};
+  QueryColumnVector output_values = std::visit(
+      [](const auto& source) -> QueryColumnVector {
+        using Vector = std::decay_t<decltype(source)>;
+        return Vector{};
+      },
+      input.values);
+  QueryColumn output{input.slot, input.type, std::move(output_values), {}};
   std::visit(
       [&](auto& destination) {
         using Vector = std::decay_t<decltype(destination)>;

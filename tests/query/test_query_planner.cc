@@ -126,5 +126,23 @@ TEST(QueryPlannerTest, RejectsMismatchedProjectionIdentity) {
   EXPECT_TRUE(plan.status().IsIdentityConflict());
 }
 
+TEST(QueryPlannerTest, PartialEntityRegionFallsBackToCanonical) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 5;
+  catalog.base_seq = CommitSeq{25};
+  auto region = Region(0, 100);
+  region.entity_min = 1;
+  region.entity_max_exclusive = 9;
+  catalog.regions = {region};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{10}}});
+  ASSERT_TRUE(query.ok());
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 Context(catalog, stats));
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan.ValueOrDie().slices().size(), 1U);
+  EXPECT_EQ(plan.ValueOrDie().slices().front().source, CoverageSource::kCanonical);
+}
+
 }  // namespace
 }  // namespace cedar::internal

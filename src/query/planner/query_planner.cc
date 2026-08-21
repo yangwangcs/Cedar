@@ -140,6 +140,13 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     return a.valid_time.from.value < b.valid_time.from.value;
   });
   bool entity_partition = false;
+  bool partial_entity_coverage = false;
+  for (const auto& region : regions) {
+    if (region.entity_min != 0 || region.entity_max_exclusive != UINT64_MAX) {
+      partial_entity_coverage = true;
+      break;
+    }
+  }
   for (size_t i = 1; i < regions.size(); ++i) {
     const auto& left = regions[i - 1];
     const auto& right = regions[i];
@@ -181,7 +188,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   uint64_t cursor = requested->from.value;
   const uint64_t requested_to = requested->to ? requested->to->value
                                              : std::numeric_limits<uint64_t>::max();
-  if (entity_partition) {
+  if (entity_partition || partial_entity_coverage) {
     // CoverageSlice is intentionally one-dimensional in valid time. When
     // regions partition the entity key space, claiming a complete temporal
     // slice would omit entities; retain canonical correctness until an
@@ -189,7 +196,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     plan.coverage_slices.push_back(Canonical(*requested));
   }
   for (const auto& region : regions) {
-    if (entity_partition) break;
+    if (entity_partition || partial_entity_coverage) break;
     const uint64_t region_from = std::max(cursor, region.valid_time.from.value);
     const uint64_t region_end = region.valid_time.to
                                     ? region.valid_time.to->value
@@ -237,7 +244,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     cursor = region_to;
     if (cursor >= requested_to) break;
   }
-  if (!entity_partition && cursor < requested_to) {
+  if (!entity_partition && !partial_entity_coverage && cursor < requested_to) {
     plan.coverage_slices.push_back(Canonical(ValidTimeInterval{
         ValidTime{cursor}, requested->to}));
   }

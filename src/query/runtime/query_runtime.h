@@ -65,7 +65,8 @@ struct PreparedQueryPlan {
         effective_output_slot(other.effective_output_slot),
         referenced_properties(other.referenced_properties),
         physical_plan(other.physical_plan),
-        projection_reader(other.projection_reader) {}
+        projection_reader(other.projection_reader),
+        delta_reader(other.delta_reader) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
@@ -100,6 +101,7 @@ struct PreparedQueryPlan {
   std::shared_ptr<const PhysicalPlan> physical_plan;
   std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
       projection_reader;
+  std::function<StatusOr<QueryDeltaView>()> delta_reader;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

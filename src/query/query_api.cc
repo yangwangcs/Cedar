@@ -38,6 +38,7 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
                                     options};
   context.database_identity = catalog.database_identity;
   context.schema_epoch = 0;
+  context.allow_delta_merge = database->query_delta != nullptr;
   return internal::QueryPlanner::Bind(*root, context);
 }
 
@@ -185,6 +186,15 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         request.expected_base_seq = slice.projection_base;
         request.database_identity = slice.database_identity;
         return db->projection_store->ReadChains(request);
+      };
+      execution_plan.delta_reader =
+          [weak_database, snapshot_seq = snapshot.commit_seq()]
+          -> StatusOr<internal::QueryDeltaView> {
+        const auto db = weak_database.lock();
+        if (!db || !db->query_delta) {
+          return Status::NotFound("query", "query delta is unavailable");
+        }
+        return db->query_delta->AcquireThrough(snapshot_seq);
       };
       return internal::QueryRuntime::Execute(
           execution_plan, std::move(snapshot), bindings, options);

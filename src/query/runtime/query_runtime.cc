@@ -235,14 +235,41 @@ StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
   std::vector<RuntimeRow> rows;
   bool found = false;
   for (const auto& slice : plan.physical_plan->coverage_slices) {
-    if (slice.source != internal::CoverageSource::kProjection) {
+    if (slice.source == internal::CoverageSource::kCanonical) {
       continue;
     }
     auto chains = plan.projection_reader(slice);
     if (!chains.ok()) return chains.status();
     found = true;
+    std::optional<internal::QueryDeltaView> delta;
+    if (slice.source == internal::CoverageSource::kDeltaMerge) {
+      if (!plan.delta_reader) return Status::NotFound("query runtime", "delta reader unavailable");
+      auto acquired = plan.delta_reader();
+      if (!acquired.ok()) return acquired.status();
+      delta = std::move(acquired).ConsumeValueOrDie();
+    }
     for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
       for (const internal::ProjectionInterval& interval : chain.intervals) {
+        if (slice.source == internal::CoverageSource::kDeltaMerge) {
+          std::vector<internal::CorrectedBoundary> base{{interval.effective.from,
+                                               chain.header.base_seq,
+                                               FactOperation::kPut, 0,
+                                               interval.value, std::nullopt}};
+          if (interval.effective.to) base.push_back({*interval.effective.to,
+                                                       chain.header.base_seq,
+                                                       FactOperation::kDelete, 0,
+                                                       std::nullopt, std::nullopt});
+          const FactRef ref{chain.header.part_id, plan.entity_family,
+                            slice.property_id.value_or(PropertyId{}), interval.entity_id};
+          auto merged = internal::QueryDelta::MergeBoundaries(base,
+                                                    delta->EventsFor(ref),
+                                                    delta->through);
+          if (!merged.ok()) return merged.status();
+          for (const auto& state : internal::MaterializePresentState(merged.ValueOrDie())) {
+            rows.push_back({ref, state.interval, std::nullopt, state.value});
+          }
+          continue;
+        }
         const FactFamily family = plan.entity_family;
         rows.push_back({FactRef{chain.header.part_id, family, PropertyId{},
                                 interval.entity_id},

@@ -58,7 +58,7 @@ Verification after fixes:
 
 ```text
 cmake --build build/query-debug -j2 --target test_query_planner test_projection_store: PASS
-ctest --test-dir build/query-debug --output-on-failure -R 'QueryPlanner|QueryCanonical|QueryDelta|ProjectionStore': 41/41 PASS
+ctest --test-dir build/query-debug --output-on-failure -R 'QueryPlanner|QueryCanonical|QueryDelta|ProjectionStore': 42/42 PASS
 git diff --check: PASS
 ```
 
@@ -66,3 +66,9 @@ Delta merge is deliberately disabled in the production planning context until
 the runtime has a boundary-event adapter. The planner marks this as
 `delta-fallback` and never claims an unmerged `(base,S]` tail is executable;
 the physical executor still handles mixed projection/canonical slices.
+
+The runtime now has the per-entity synthetic-boundary adapter: each delta slice
+builds Put/Delete boundaries from projection intervals, acquires the exact
+Delta view through the snapshot, calls `MergeBoundaries`, and materializes the
+corrected state intervals before clipping and concatenation. Partial entity
+coverage remains canonical by construction.

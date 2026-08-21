@@ -36,6 +36,7 @@ struct LogicalPlanPayload {
   std::optional<ExpandSpec> expand_spec;
   std::optional<PropertyBinding> property_binding;
   std::shared_ptr<const ExpressionNode> predicate;
+  uint32_t max_hops = 1;
 };
 
 class LogicalPlanNode {
@@ -58,6 +59,7 @@ class LogicalPlanNode {
   const std::shared_ptr<const ExpressionNode>& predicate() const {
     return payload_.predicate;
   }
+  uint32_t max_hops() const { return payload_.max_hops; }
  private:
   const LogicalOpKind kind_;
   const RowSchema schema_;

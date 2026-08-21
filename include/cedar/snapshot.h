@@ -63,6 +63,7 @@ class Snapshot {
                                      ValidTime valid_time) const;
   Status Scan(FactFamily family, PropertyId property_id,
               const SnapshotFactVisitor& visitor) const;
+  Status ScanFamily(FactFamily family, const SnapshotFactVisitor& visitor) const;
   Status EventScan(const FactScanSpec& spec,
                    const FactEventBatchVisitor& visitor) const;
   Status StateScan(const FactScanSpec& spec,

@@ -376,6 +376,11 @@ class FactStore {
               const FactVisitor& visitor) const;
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactScanBounds& bounds, const FactVisitor& visitor) const;
+  // Scans one Cedar fact family across every home partition. This is used by
+  // graph adjacency fallback because PartId{0} is a real partition, not a
+  // wildcard.
+  Status ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
+                    const FactVisitor& visitor) const;
   Status ScanColumnar(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                       const FactScanBounds& bounds,
                       const FactColumnarScanOptions& options,

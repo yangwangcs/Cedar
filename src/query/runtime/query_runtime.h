@@ -70,7 +70,12 @@ struct PreparedQueryPlan {
         projection_generation(other.projection_generation),
         projection_reader(other.projection_reader),
         delta_reader(other.delta_reader),
-        bound_delta_view(other.bound_delta_view) {}
+        bound_delta_view(other.bound_delta_view),
+        graph_expand(other.graph_expand),
+        graph_source_slot(other.graph_source_slot),
+        graph_edge_slot(other.graph_edge_slot),
+        graph_destination_slot(other.graph_destination_slot),
+        graph_k_hops(other.graph_k_hops) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
@@ -89,6 +94,11 @@ struct PreparedQueryPlan {
     projection_reader = other.projection_reader;
     delta_reader = other.delta_reader;
     bound_delta_view = other.bound_delta_view;
+    graph_expand = other.graph_expand;
+    graph_source_slot = other.graph_source_slot;
+    graph_edge_slot = other.graph_edge_slot;
+    graph_destination_slot = other.graph_destination_slot;
+    graph_k_hops = other.graph_k_hops;
     return *this;
   }
   PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;
@@ -111,6 +121,11 @@ struct PreparedQueryPlan {
       projection_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;
   std::shared_ptr<const QueryDeltaView> bound_delta_view;
+  std::optional<ExpandSpec> graph_expand;
+  std::optional<SlotId> graph_source_slot;
+  std::optional<SlotId> graph_edge_slot;
+  std::optional<SlotId> graph_destination_slot;
+  uint32_t graph_k_hops = 1;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

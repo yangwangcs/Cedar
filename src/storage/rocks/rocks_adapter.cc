@@ -1509,6 +1509,36 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
   return Scan(snapshot, prefix, FactScanBounds{}, visitor);
 }
 
+Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
+                             const FactVisitor& visitor) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store)
+      return Status::InvalidArgument("fact scan", "snapshot belongs to another store");
+  }
+  if (!visitor) return Status::InvalidArgument("fact scan", "missing visitor");
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    auto decoded_key = DecodeFactKey(iterator->key().ToString());
+    if (!decoded_key.ok()) return decoded_key.status();
+    if (decoded_key.ValueOrDie().ref.family() != family ||
+        decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value)
+      continue;
+    auto decoded_value = DecodeFactValue(
+        decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
+        decoded_key.ValueOrDie().commit_seq, iterator->value().ToString());
+    if (!decoded_value.ok()) return decoded_value.status();
+    if (Status status = visitor(decoded_value.ValueOrDie()); !status.ok()) return status;
+  }
+  return iterator->status().ok() ? Status::OK()
+                                 : FromRocksDb(iterator->status(), "iterate family scan");
+}
+
 Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                        const FactScanBounds& bounds,
                        const FactVisitor& visitor) const {

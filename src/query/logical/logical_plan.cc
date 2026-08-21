@@ -187,6 +187,24 @@ StatusOr<Query> Query::Expand(const ExpandSpec& spec) const {
                       std::move(payload)));
 }
 
+StatusOr<Query> Query::KHopExpand(const ExpandSpec& spec, uint32_t max_hops) const {
+  if (max_hops == 0) {
+    return Status::InvalidArgument("k-hop expand", "max_hops must be non-zero");
+  }
+  auto expanded = Expand(spec);
+  if (!expanded.ok()) return expanded.status();
+  const auto root = expanded.ValueOrDie().root_;
+  // Preserve the expansion shape while marking the logical node as bounded
+  // k-hop work.  The runtime consumes this marker when it materializes the
+  // frontier.
+  const auto* node = root.get();
+  internal::LogicalPlanPayload payload;
+  payload.expand_spec = spec;
+  payload.max_hops = max_hops;
+  return Query(Append(internal::LogicalOpKind::kKHopExpand,
+                      node->inputs().front(), node->schema(), std::move(payload)));
+}
+
 StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex,
                                                PropertyId property,
                                                RowColumn output) const {

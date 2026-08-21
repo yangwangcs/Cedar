@@ -337,6 +337,12 @@ Status Snapshot::Scan(FactFamily family, PropertyId property_id,
                                       visitor);
 }
 
+Status Snapshot::ScanFamily(FactFamily family,
+                            const SnapshotFactVisitor& visitor) const {
+  if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
+  return state_->database->store.ScanFamily(state_->snapshot, family, visitor);
+}
+
 Status Snapshot::EventScan(const FactScanSpec& spec,
                            const FactEventBatchVisitor& visitor) const {
   if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");

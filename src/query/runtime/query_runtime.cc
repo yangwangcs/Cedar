@@ -15,6 +15,7 @@
 #include "query/logical/logical_plan.h"
 #include "query/runtime/property_binding.h"
 #include "query/runtime/temporal_source.h"
+#include "query/runtime/graph_frontier.h"
 #include "query/resource/query_scratch.h"
 
 namespace cedar {
@@ -27,6 +28,10 @@ struct RuntimeRow {
   std::optional<ValidTimeInterval> effective;
   std::optional<ValidTime> point;
   std::optional<Value> property_value;
+  std::optional<VertexRef> graph_source;
+  std::optional<EdgeRef> graph_edge;
+  std::optional<VertexRef> graph_destination;
+  uint64_t graph_edge_type = 0;
 };
 
 using EvaluatedLiteral = detail::ExpressionLiteral;
@@ -389,8 +394,11 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
                   *binding.definition);
     if (!bound.ok()) return bound.status();
     for (internal::BoundPropertyRow& property : bound.ValueOrDie()) {
-      result.push_back({property.ref, property.effective, row.point,
-                        std::move(property.value)});
+      RuntimeRow bound_row{property.ref, property.effective, row.point,
+                           std::move(property.value), row.graph_source,
+                           row.graph_edge, row.graph_destination,
+                           row.graph_edge_type};
+      result.push_back(std::move(bound_row));
     }
   }
   return result;
@@ -465,6 +473,64 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     return filtered;
   }
   return std::move(rows).ConsumeValueOrDie();
+}
+
+StatusOr<ValidTimeInterval> ScopeAsInterval(const TemporalScope& scope) {
+  return std::visit([](const auto& value) -> StatusOr<ValidTimeInterval> {
+    using T = std::decay_t<decltype(value)>;
+    if constexpr (std::is_same_v<T, At>) {
+      if (value.time.value == std::numeric_limits<uint64_t>::max())
+        return Status::InvalidArgument("graph expansion", "point time overflows interval");
+      return ValidTimeInterval{value.time, ValidTime{value.time.value + 1}};
+    } else if constexpr (std::is_same_v<T, History>) {
+      if (!value.interval) return Status::NotSupported("graph expansion", "unbounded history requires interval");
+      return *value.interval;
+    } else {
+      return value.interval;
+    }
+  }, scope);
+}
+
+StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
+    Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
+    internal::QueryReservation* reservation) {
+  if (!plan.graph_expand) {
+    return Status::InvalidArgument("graph expansion", "missing graph specification");
+  }
+  auto interval = ScopeAsInterval(plan.scope);
+  if (!interval.ok()) return interval.status();
+  auto seeds = ReadSourceRows(snapshot, plan, reservation);
+  if (!seeds.ok()) return seeds.status();
+  const internal::QueryDeltaView* delta = plan.bound_delta_view ? plan.bound_delta_view.get() : nullptr;
+  internal::GraphFrontierOptions options{reservation, delta, plan.graph_k_hops};
+  std::vector<RuntimeRow> result;
+  for (const RuntimeRow& seed : seeds.ValueOrDie()) {
+    VertexRef vertex{seed.ref.part_id(), VertexId{seed.ref.entity_id()}};
+    internal::GraphExpansionRequest request{{vertex}, interval.ValueOrDie(), plan.graph_expand->direction,
+                                  std::nullopt};
+    if (plan.graph_k_hops > 1) {
+      auto hops = KHopExpand(snapshot, request, options);
+      if (!hops.ok()) return hops.status();
+      for (const auto& traversal : hops.ValueOrDie().traversals) {
+        result.push_back({FactRef(traversal.edge.home_part_id, FactFamily::kEdgeState,
+                                  PropertyId{}, traversal.edge.edge_id.value),
+                          traversal.effective, std::nullopt, std::nullopt,
+                          traversal.source, traversal.edge, traversal.target,
+                          traversal.edge_type});
+      }
+    } else {
+      auto expanded = ExpandTemporal(snapshot, request, options);
+      if (!expanded.ok()) return expanded.status();
+      for (const auto& traversal : expanded.ValueOrDie()) {
+        result.push_back({FactRef(traversal.edge.home_part_id, FactFamily::kEdgeState,
+                                  PropertyId{}, traversal.edge.edge_id.value),
+                          traversal.effective, std::nullopt, std::nullopt,
+                          traversal.source, traversal.edge, traversal.target,
+                          traversal.edge_type});
+      }
+    }
+  }
+  return result;
 }
 
 QueryColumnVector EmptyColumn(QueryType type) {
@@ -566,6 +632,21 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
     for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
       QueryColumn* column = &columns[column_index];
       const RowColumn& output = plan.output_columns[column_index];
+      if (plan.graph_source_slot && output.slot == *plan.graph_source_slot) {
+        if (!row.graph_source) return Status::Corruption("query", "graph source is unavailable");
+        Append(column, *row.graph_source, true);
+        continue;
+      }
+      if (plan.graph_edge_slot && output.slot == *plan.graph_edge_slot) {
+        if (!row.graph_edge) return Status::Corruption("query", "graph edge is unavailable");
+        Append(column, *row.graph_edge, true);
+        continue;
+      }
+      if (plan.graph_destination_slot && output.slot == *plan.graph_destination_slot) {
+        if (!row.graph_destination) return Status::Corruption("query", "graph destination is unavailable");
+        Append(column, *row.graph_destination, true);
+        continue;
+      }
       if (output.slot == plan.entity_slot) {
         if (plan.entity_family == FactFamily::kVertexState) {
           Append(column,
@@ -983,8 +1064,11 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
-    auto rows = MaterializeRows(*state_->snapshot, state_->plan,
-                                &state_->reservation);
+    auto rows = state_->plan.graph_expand.has_value()
+                    ? MaterializeGraphRows(*state_->snapshot, state_->plan,
+                                           &state_->reservation)
+                    : MaterializeRows(*state_->snapshot, state_->plan,
+                                      &state_->reservation);
     // The lease owns the pre-materialization reservation. Reset it now that
     // MaterializeRows has completed so the reservation is released exactly
     // once, including on an error path.
@@ -1188,6 +1272,44 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   PreparedQueryPlan plan;
   plan.output_columns = root->schema().columns();
   CollectMetadata(*root, &plan);
+
+  // Graph operators retain the source temporal scope from their vertex scan;
+  // unlike the simple canonical scan shape they are executed by the frontier
+  // runtime and therefore need their three graph slots carried explicitly.
+  const LogicalPlanNode* graph = nullptr;
+  std::function<void(const LogicalPlanNode*)> find_graph =
+      [&](const LogicalPlanNode* node) {
+        if (graph != nullptr) return;
+        if (node->kind() == LogicalOpKind::kExpandOut ||
+            node->kind() == LogicalOpKind::kExpandIn ||
+            node->kind() == LogicalOpKind::kExpandBoth ||
+            node->kind() == LogicalOpKind::kKHopExpand) {
+          graph = node;
+          return;
+        }
+        for (const auto& child : node->inputs()) find_graph(child.get());
+      };
+  find_graph(root);
+  if (graph != nullptr && graph->expand_spec().has_value() &&
+      !graph->inputs().empty()) {
+    const ExpandSpec& spec = *graph->expand_spec();
+    plan.graph_expand = spec;
+    plan.graph_source_slot = spec.source.id();
+    plan.graph_edge_slot = spec.edge.id();
+    plan.graph_destination_slot = spec.destination.id();
+    plan.graph_k_hops = graph->max_hops();
+    const LogicalPlanNode* scoped = graph->inputs().front().get();
+    while (scoped != nullptr && !scoped->scope().has_value() &&
+           !scoped->inputs().empty()) {
+      scoped = scoped->inputs().front().get();
+    }
+    if (scoped != nullptr && scoped->scope().has_value()) {
+      plan.scope = *scoped->scope();
+      plan.entity_family = FactFamily::kVertexState;
+      plan.entity_slot = spec.source.id();
+    }
+    return plan;
+  }
   if (root->kind() != LogicalOpKind::kProject || root->inputs().size() != 1) {
     return plan;
   }

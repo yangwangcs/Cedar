@@ -62,6 +62,7 @@ add_library(cedar_core STATIC
     src/query/runtime/canonical_source.cc
     src/query/runtime/property_binding.cc
     src/query/runtime/query_runtime.cc
+    src/query/runtime/graph_frontier.cc
     src/query/runtime/temporal_source.cc
     src/query/runtime/vector_kernels.cc
     src/query/runtime/relational.cc

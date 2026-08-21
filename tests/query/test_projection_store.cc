@@ -80,6 +80,24 @@ TEST_F(ProjectionStoreTest, PublishesAndReopensCurrentManifest) {
   EXPECT_EQ(reopened.ValueOrDie()->current_generation_id(), std::optional<uint64_t>(10));
 }
 
+TEST_F(ProjectionStoreTest, ReadsPublishedChainsForRuntimeProjectionSlice) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  auto chains = opened.ValueOrDie()->ReadChains(request);
+  ASSERT_TRUE(chains.ok()) << chains.status().ToString();
+  ASSERT_EQ(chains.ValueOrDie().size(), 1U);
+  ASSERT_EQ(chains.ValueOrDie().front().intervals.size(), 1U);
+  EXPECT_EQ(chains.ValueOrDie().front().intervals.front().entity_id, 1U);
+}
+
 TEST_F(ProjectionStoreTest, OldReaderPinsRetiredGeneration) {
   auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
   ASSERT_TRUE(opened.ok()); auto& store = *opened.ValueOrDie();

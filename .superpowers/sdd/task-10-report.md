@@ -52,7 +52,7 @@ Verification after fixes:
 
 ```text
 cmake --build build/query-debug -j2 --target test_query_planner test_projection_store: PASS
-ctest --test-dir build/query-debug --output-on-failure -R 'QueryPlanner|QueryCanonical|QueryDelta|ProjectionStore': 40/40 PASS
+ctest --test-dir build/query-debug --output-on-failure -R 'QueryPlanner|QueryCanonical|QueryDelta|ProjectionStore': 41/41 PASS
 git diff --check: PASS
 ```
 

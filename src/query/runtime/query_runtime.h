@@ -50,6 +50,33 @@ struct RuntimeRelationalResult {
 };
 
 struct PreparedQueryPlan {
+  PreparedQueryPlan() = default;
+  PreparedQueryPlan(const PreparedQueryPlan& other)
+      : canonical_temporal(other.canonical_temporal),
+        entity_family(other.entity_family),
+        entity_slot(other.entity_slot),
+        scope(other.scope),
+        property_bindings(other.property_bindings),
+        predicate(other.predicate),
+        output_columns(other.output_columns),
+        referenced_properties(other.referenced_properties) {}
+  PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
+    if (this == &other) return *this;
+    canonical_temporal = other.canonical_temporal;
+    entity_family = other.entity_family;
+    entity_slot = other.entity_slot;
+    scope = other.scope;
+    property_bindings = other.property_bindings;
+    predicate = other.predicate;
+    output_columns = other.output_columns;
+    referenced_properties = other.referenced_properties;
+    relational_kind.reset();
+    relational_input.reset();
+    return *this;
+  }
+  PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;
+  PreparedQueryPlan& operator=(PreparedQueryPlan&&) noexcept = default;
+
   bool canonical_temporal = false;
   FactFamily entity_family = FactFamily::kVertexState;
   SlotId entity_slot;

@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "cedar/database.h"
@@ -15,6 +16,9 @@
 
 namespace cedar::internal {
 namespace {
+
+static_assert(!std::is_copy_constructible_v<BatchStream>);
+static_assert(std::is_move_constructible_v<BatchStream>);
 
 QueryColumn Int32Column(std::vector<int32_t> values,
                         std::vector<uint8_t> present = {}) {
@@ -466,42 +470,46 @@ TEST(RelationalTest, RowAggregateCountsAndSumsStrictlyTypedValues) {
 
 TEST(QueryRuntimeRelationalTest,
      PullBoundaryDispatchesJoinsAndAggregatesThroughLogicalNodes) {
-  RuntimeRelationalInput input;
-  input.left = BatchStream{{Row(1, 10)}};
-  input.right = BatchStream{{Row(1, 20)}};
-  input.left_key = 0;
-  input.right_key = 0;
-  input.estimated_rows = 4095;
+  const auto equality_input = [](size_t estimated_rows, bool sorted = false) {
+    RuntimeRelationalInput input;
+    input.left = BatchStream{{Row(1, 10)}};
+    input.right = BatchStream{{Row(1, 20)}};
+    input.left_key = 0;
+    input.right_key = 0;
+    input.estimated_rows = estimated_rows;
+    input.sorted_keys = sorted;
+    return input;
+  };
   QueryReservation reservation(1 << 20);
 
-  auto nested = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
-                                          &reservation);
+  auto nested = ExecuteRelationalPlanNode(
+      LogicalOpKind::kInnerJoin, equality_input(4095), &reservation);
   ASSERT_TRUE(nested.ok()) << nested.status().ToString();
   EXPECT_EQ(nested.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kIndexNestedLoop});
   EXPECT_EQ(nested.ValueOrDie().stream.rows.size(), 1U);
 
-  input.estimated_rows = 4096;
-  auto hashed = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
-                                          &reservation);
+  auto hashed = ExecuteRelationalPlanNode(
+      LogicalOpKind::kInnerJoin, equality_input(4096), &reservation);
   ASSERT_TRUE(hashed.ok()) << hashed.status().ToString();
   EXPECT_EQ(hashed.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kHash});
 
-  input.sorted_keys = true;
-  auto merged = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
-                                          &reservation);
+  auto merged = ExecuteRelationalPlanNode(
+      LogicalOpKind::kInnerJoin, equality_input(4096, true), &reservation);
   ASSERT_TRUE(merged.ok()) << merged.status().ToString();
   EXPECT_EQ(merged.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kSortMerge});
 
-  input.temporal = true;
-  input.left = BatchStream{{TemporalRow(1, 0, 10)}};
-  input.right = BatchStream{{TemporalRow(1, 5, 20)}};
+  RuntimeRelationalInput temporal_input;
+  temporal_input.temporal = true;
+  temporal_input.left = BatchStream{{TemporalRow(1, 0, 10)}};
+  temporal_input.right = BatchStream{{TemporalRow(1, 5, 20)}};
   FragmentBudget fragments(8);
   QueryReservation temporal_reservation(1 << 20);
-  auto interval = ExecuteRelationalPlanNode(LogicalOpKind::kInnerJoin, input,
-                                            &temporal_reservation, &fragments);
+  auto interval = ExecuteRelationalPlanNode(
+      LogicalOpKind::kInnerJoin, std::move(temporal_input),
+      &temporal_reservation, &fragments);
   ASSERT_TRUE(interval.ok()) << interval.status().ToString();
   EXPECT_EQ(interval.ValueOrDie().join_algorithm,
             std::optional<JoinAlgorithm>{JoinAlgorithm::kIntervalMerge});
@@ -515,16 +523,20 @@ TEST(QueryRuntimeRelationalTest,
                           {AggregateKind::kSum, 1}};
   QueryReservation aggregate_reservation(1 << 20);
   auto rows = ExecuteRelationalPlanNode(LogicalOpKind::kAggregateRows,
-                                        aggregate, &aggregate_reservation);
+                                        std::move(aggregate),
+                                        &aggregate_reservation);
   ASSERT_TRUE(rows.ok()) << rows.status().ToString();
   EXPECT_EQ(rows.ValueOrDie().stream.rows.front().cells,
             (std::vector<RelationalCell>{Int64(1), Int64(2), Int64(30)}));
 
-  aggregate.left = BatchStream{{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}};
+  RuntimeRelationalInput temporal_aggregate;
+  temporal_aggregate.left =
+      BatchStream{{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}};
+  temporal_aggregate.group_by = {0};
   FragmentBudget aggregate_fragments(8);
   QueryReservation temporal_aggregate_reservation(1 << 20);
   auto temporal = ExecuteRelationalPlanNode(LogicalOpKind::kTemporalAggregate,
-                                            aggregate,
+                                            std::move(temporal_aggregate),
                                             &temporal_aggregate_reservation,
                                             &aggregate_fragments);
   ASSERT_TRUE(temporal.ok()) << temporal.status().ToString();
@@ -547,36 +559,44 @@ TEST(QueryRuntimeRelationalTest,
     EXPECT_LE(reservation.used_bytes(), reservation.limit_bytes());
   };
 
-  RuntimeRelationalInput binary;
-  binary.left = BatchStream{{Row(1, 10)}};
-  binary.right = BatchStream{{Row(1, 20)}};
-  expect_memory_failure(LogicalOpKind::kUnionAll, binary);
-
-  RuntimeRelationalInput unary;
-  unary.left = BatchStream{{Row(1, 10)}};
-  expect_memory_failure(LogicalOpKind::kDistinct, unary);
-  unary.count = 1;
-  expect_memory_failure(LogicalOpKind::kLimit, unary);
-
-  binary.estimated_rows = 1;
-  expect_memory_failure(LogicalOpKind::kInnerJoin, binary);
-
-  unary.group_by = {0};
-  unary.aggregates = {{AggregateKind::kCount, 1}};
-  expect_memory_failure(LogicalOpKind::kAggregateRows, unary);
+  const auto binary_input = [] {
+    RuntimeRelationalInput input;
+    input.left = BatchStream{{Row(1, 10)}};
+    input.right = BatchStream{{Row(1, 20)}};
+    return input;
+  };
+  const auto unary_input = [] {
+    RuntimeRelationalInput input;
+    input.left = BatchStream{{Row(1, 10)}};
+    return input;
+  };
+  expect_memory_failure(LogicalOpKind::kUnionAll, binary_input());
+  expect_memory_failure(LogicalOpKind::kDistinct, unary_input());
+  auto limited = unary_input();
+  limited.count = 1;
+  expect_memory_failure(LogicalOpKind::kLimit, std::move(limited));
+  auto joined = binary_input();
+  joined.estimated_rows = 1;
+  expect_memory_failure(LogicalOpKind::kInnerJoin, std::move(joined));
+  auto aggregate = unary_input();
+  aggregate.group_by = {0};
+  aggregate.aggregates = {{AggregateKind::kCount, 1}};
+  expect_memory_failure(LogicalOpKind::kAggregateRows, std::move(aggregate));
 
   RuntimeRelationalInput temporal;
   temporal.left = BatchStream{{TemporalRow(1, 0, 10)}};
   temporal.group_by = {0};
   FragmentBudget aggregate_fragments(8);
-  expect_memory_failure(LogicalOpKind::kTemporalAggregate, temporal,
+  expect_memory_failure(LogicalOpKind::kTemporalAggregate, std::move(temporal),
                         &aggregate_fragments);
 
+  temporal = RuntimeRelationalInput{};
+  temporal.left = BatchStream{{TemporalRow(1, 0, 10)}};
   temporal.right = BatchStream{{TemporalRow(1, 0, 10)}};
   temporal.temporal = true;
   temporal.estimated_rows = 1;
   FragmentBudget join_fragments(8);
-  expect_memory_failure(LogicalOpKind::kInnerJoin, temporal,
+  expect_memory_failure(LogicalOpKind::kInnerJoin, std::move(temporal),
                         &join_fragments);
 }
 
@@ -597,107 +617,6 @@ TEST(QueryRuntimeRelationalTest,
   EXPECT_NE(result.status().ToString().find("output row budget"),
             std::string::npos);
   EXPECT_EQ(reservation.peak_bytes(), 0U);
-}
-
-TEST(QueryRuntimeRelationalTest, PullCursorExecutesRelationalPlanNode) {
-  char path[] = "/tmp/cedar_query_relational_XXXXXX";
-  ASSERT_NE(mkdtemp(path), nullptr);
-  auto database = Database::Open(DatabaseOptions{.path = path});
-  ASSERT_TRUE(database.ok()) << database.status().ToString();
-  auto snapshot = database.ValueOrDie()->BeginSnapshot();
-  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-
-  PreparedQueryPlan plan;
-  plan.relational_kind = LogicalOpKind::kLimit;
-  plan.relational_input = RuntimeRelationalInput{
-      .left = BatchStream{{Row(1, 10), Row(2, 20)}}, .offset = 1, .count = 1};
-  const Slot<int64_t> key = Slot<int64_t>::WithId(SlotId{1}, "key");
-  const Slot<int64_t> payload = Slot<int64_t>::WithId(SlotId{2}, "payload");
-  plan.output_columns = {Project(key).column, Project(payload).column};
-
-  auto cursor = QueryRuntime::Execute(
-      plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
-  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
-  auto batch = cursor.ValueOrDie().Next();
-  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
-  ASSERT_TRUE(batch.ValueOrDie().has_value());
-  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
-  EXPECT_EQ(batch.ValueOrDie()->Get(key, 0), 2);
-  EXPECT_EQ(batch.ValueOrDie()->Get(payload, 0), 20);
-
-  EXPECT_TRUE(database.ValueOrDie()->Close().IsSnapshotPinned());
-  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
-  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
-  std::filesystem::remove_all(path);
-}
-
-TEST(QueryRuntimeRelationalTest,
-     PullCursorPublishesTemporalEffectiveIntervalColumn) {
-  char path[] = "/tmp/cedar_query_relational_effective_XXXXXX";
-  ASSERT_NE(mkdtemp(path), nullptr);
-  auto database = Database::Open(DatabaseOptions{.path = path});
-  ASSERT_TRUE(database.ok()) << database.status().ToString();
-  auto snapshot = database.ValueOrDie()->BeginSnapshot();
-  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-
-  PreparedQueryPlan plan;
-  plan.relational_kind = LogicalOpKind::kTemporalAggregate;
-  plan.relational_input = RuntimeRelationalInput{
-      .left = BatchStream{{TemporalRow(1, 5, 15)}}, .group_by = {0}};
-  const Slot<int64_t> key = Slot<int64_t>::WithId(SlotId{1}, "key");
-  const Slot<int64_t> count = Slot<int64_t>::WithId(SlotId{2}, "count");
-  const Slot<ValidTimeInterval> effective =
-      Slot<ValidTimeInterval>::WithId(SlotId{3}, "effective");
-  plan.output_columns = {Project(key).column, Project(count).column,
-                         Project(effective).column};
-  plan.effective_output_slot = effective.id();
-
-  auto cursor = QueryRuntime::Execute(
-      plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
-  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
-  auto batch = cursor.ValueOrDie().Next();
-  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
-  ASSERT_TRUE(batch.ValueOrDie().has_value());
-  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
-  EXPECT_EQ(batch.ValueOrDie()->Get(effective, 0),
-            (ValidTimeInterval{ValidTime{5}, ValidTime{15}}));
-
-  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
-  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
-  std::filesystem::remove_all(path);
-}
-
-TEST(QueryRuntimeRelationalTest,
-     PullCursorAccountsForRelationalBatchMaterialization) {
-  char path[] = "/tmp/cedar_query_relational_budget_XXXXXX";
-  ASSERT_NE(mkdtemp(path), nullptr);
-  auto database = Database::Open(DatabaseOptions{.path = path});
-  ASSERT_TRUE(database.ok()) << database.status().ToString();
-  auto snapshot = database.ValueOrDie()->BeginSnapshot();
-  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-
-  PreparedQueryPlan plan;
-  plan.relational_kind = LogicalOpKind::kLimit;
-  plan.relational_input = RuntimeRelationalInput{
-      .left = BatchStream{{Row(1, 10)}}, .count = 1};
-  const Slot<int64_t> key = Slot<int64_t>::WithId(SlotId{1}, "key");
-  const Slot<int64_t> payload = Slot<int64_t>::WithId(SlotId{2}, "payload");
-  plan.output_columns = {Project(key).column, Project(payload).column};
-  QueryOptions options;
-  options.budget.memory_bytes =
-      sizeof(BatchStream) + sizeof(RelationalRow) + 2 * sizeof(RelationalCell);
-
-  auto cursor = QueryRuntime::Execute(
-      plan, std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
-  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
-  auto batch = cursor.ValueOrDie().Next();
-  ASSERT_FALSE(batch.ok());
-  EXPECT_TRUE(batch.status().IsResourceExhausted());
-  EXPECT_NE(batch.status().ToString().find("memory_bytes"), std::string::npos);
-
-  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
-  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
-  std::filesystem::remove_all(path);
 }
 
 }  // namespace

@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -45,6 +46,14 @@ struct RelationalRow {
 class QueryReservationLease;
 
 struct BatchStream {
+  BatchStream() = default;
+  BatchStream(std::vector<RelationalRow> rows, bool order_specified = false)
+      : rows(std::move(rows)), order_specified(order_specified) {}
+  BatchStream(const BatchStream&) = delete;
+  BatchStream& operator=(const BatchStream&) = delete;
+  BatchStream(BatchStream&&) noexcept = default;
+  BatchStream& operator=(BatchStream&&) noexcept = default;
+
   std::vector<RelationalRow> rows;
   bool order_specified = false;
   std::shared_ptr<QueryReservationLease> reservation_lease;

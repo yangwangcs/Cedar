@@ -23,6 +23,47 @@ TEST(RocksDbProfileTest, RejectsProductionBudgetBelowOneGiB) {
       << resolved.status().ToString();
 }
 
+TEST(RocksDbProfileTest, KernelTestProfileAcceleratesMaintenanceLifecycle) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kKernelTest;
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  EXPECT_EQ(resolved.ValueOrDie().memory_budget_bytes, 1ULL * 1024ULL * 1024ULL);
+  EXPECT_EQ(resolved.ValueOrDie().block_cache_bytes, 256ULL * 1024ULL);
+  EXPECT_EQ(resolved.ValueOrDie().facts_write_buffer_bytes,
+            32ULL * 1024ULL);
+  EXPECT_EQ(resolved.ValueOrDie().meta_write_buffer_bytes, 8ULL * 1024ULL);
+  EXPECT_EQ(resolved.ValueOrDie().default_write_buffer_bytes, 8ULL * 1024ULL);
+  EXPECT_EQ(resolved.ValueOrDie().max_background_jobs, 2U);
+
+  const rocksdb::Options db_options = MakeRocksDbOptions(
+      options, true, &resolved.ValueOrDie());
+  EXPECT_TRUE(db_options.cedar_kernel_mode);
+  EXPECT_TRUE(db_options.cedar_disable_periodic_tasks);
+  EXPECT_EQ(db_options.max_background_flushes, 2);
+  EXPECT_EQ(db_options.max_background_compactions, 2);
+  ASSERT_NE(db_options.write_buffer_manager, nullptr);
+  // Small enough to force frequent 32 KiB facts flushes, while retaining
+  // enough Cedar-owned backlog for both emergency flush workers to drain.
+  EXPECT_EQ(db_options.write_buffer_manager->buffer_size(), 1ULL * 1024ULL * 1024ULL);
+
+  const auto descriptors = MakeRocksDbColumnFamilyDescriptors(
+      options, db_options, &resolved.ValueOrDie());
+  ASSERT_EQ(descriptors.size(), 3U);
+  EXPECT_EQ(descriptors[1].options.write_buffer_size, 32ULL * 1024ULL);
+  EXPECT_EQ(descriptors[1].options.max_write_buffer_number, 6);
+  EXPECT_EQ(descriptors[1].options.min_write_buffer_number_to_merge, 1);
+  EXPECT_EQ(descriptors[1].options.level0_file_num_compaction_trigger, 2);
+  EXPECT_EQ(descriptors[1].options.level0_slowdown_writes_trigger, 12);
+  EXPECT_EQ(descriptors[1].options.level0_stop_writes_trigger, 24);
+  EXPECT_EQ(descriptors[2].options.write_buffer_size, 8ULL * 1024ULL);
+  EXPECT_EQ(descriptors[2].options.max_write_buffer_number, 6);
+  EXPECT_EQ(descriptors[2].options.min_write_buffer_number_to_merge, 1);
+  EXPECT_EQ(descriptors[2].options.level0_file_num_compaction_trigger, 2);
+  EXPECT_EQ(descriptors[2].options.level0_slowdown_writes_trigger, 12);
+  EXPECT_EQ(descriptors[2].options.level0_stop_writes_trigger, 24);
+}
+
 TEST(RocksDbProfileTest, RejectsPipelineLimitsAboveProductionProfileCap) {
   FactStoreOptions options;
   options.storage_profile = StorageProfile::kProductionAppend;
@@ -61,6 +102,8 @@ TEST(RocksDbProfileTest, ResolvesProductionBudgetSplitAndBaseline) {
   EXPECT_FALSE(db_options.two_write_queues);
   EXPECT_EQ(db_options.max_write_batch_group_size_bytes, 2ULL * 1024ULL * 1024ULL);
   EXPECT_EQ(db_options.max_background_jobs, 6);
+  EXPECT_EQ(db_options.max_background_flushes, 2);
+  EXPECT_EQ(db_options.max_background_compactions, 2);
   EXPECT_EQ(db_options.max_subcompactions, 2U);
   EXPECT_EQ(db_options.bytes_per_sync, 1ULL << 20);
   EXPECT_EQ(db_options.wal_bytes_per_sync, 0U);
@@ -195,6 +238,15 @@ TEST(RocksDbProfileTest, BuildsDistinctFactsAndMetaColumnFamilyPolicies) {
   EXPECT_STREQ(descriptors[2].options.table_factory->Name(),
                rocksdb::TableFactory::kBlockBasedTableName());
   EXPECT_EQ(descriptors[1].options.write_buffer_size, 128ULL * 1024ULL * 1024ULL);
+  EXPECT_EQ(descriptors[1].options.max_write_buffer_number, 4);
+  EXPECT_EQ(descriptors[1].options.min_write_buffer_number_to_merge, 2);
+  EXPECT_EQ(descriptors[1].options.level0_file_num_compaction_trigger, 8);
+  EXPECT_EQ(descriptors[1].options.level0_slowdown_writes_trigger, 24);
+  EXPECT_EQ(descriptors[1].options.level0_stop_writes_trigger, 36);
+  EXPECT_EQ(descriptors[1].options.soft_pending_compaction_bytes_limit,
+            8ULL * 1024ULL * 1024ULL * 1024ULL);
+  EXPECT_EQ(descriptors[1].options.hard_pending_compaction_bytes_limit,
+            32ULL * 1024ULL * 1024ULL * 1024ULL);
   EXPECT_EQ(descriptors[1].options.compression, rocksdb::kNoCompression);
   EXPECT_EQ(descriptors[1].options.bottommost_compression,
             rocksdb::kNoCompression);
@@ -204,6 +256,10 @@ TEST(RocksDbProfileTest, BuildsDistinctFactsAndMetaColumnFamilyPolicies) {
   EXPECT_EQ(descriptors[1].options.prefix_extractor, nullptr);
   EXPECT_FALSE(descriptors[1].options.enable_blob_files);
   EXPECT_EQ(descriptors[2].options.write_buffer_size, 32ULL * 1024ULL * 1024ULL);
+  EXPECT_EQ(descriptors[2].options.max_write_buffer_number, 3);
+  EXPECT_EQ(descriptors[2].options.level0_file_num_compaction_trigger, 4);
+  EXPECT_EQ(descriptors[2].options.level0_slowdown_writes_trigger, 12);
+  EXPECT_EQ(descriptors[2].options.level0_stop_writes_trigger, 20);
   EXPECT_FALSE(descriptors[2].options.enable_blob_files);
 }
 

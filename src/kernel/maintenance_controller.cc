@@ -7,6 +7,12 @@
 #include <chrono>
 
 namespace cedar {
+namespace {
+
+constexpr uint32_t kCedarFlushWorkerSlots = 2;
+constexpr uint32_t kCedarCompactionWorkerSlots = 1;
+
+}  // namespace
 
 MaintenanceController::MaintenanceController(MaintenanceAdapter* adapter)
     : adapter_(adapter) {}
@@ -21,8 +27,14 @@ Status MaintenanceController::Start() {
   if (started_) return Status::OK();
   stopping_ = false;
   started_ = true;
-  flush_worker_ = std::thread([this] { RunLane(Lane::kFlush); });
-  compaction_worker_ = std::thread([this] { RunLane(Lane::kCompaction); });
+  flush_workers_.reserve(kCedarFlushWorkerSlots);
+  for (uint32_t slot = 0; slot < kCedarFlushWorkerSlots; ++slot) {
+    flush_workers_.emplace_back([this] { RunLane(Lane::kFlush); });
+  }
+  compaction_workers_.reserve(kCedarCompactionWorkerSlots);
+  for (uint32_t slot = 0; slot < kCedarCompactionWorkerSlots; ++slot) {
+    compaction_workers_.emplace_back([this] { RunLane(Lane::kCompaction); });
+  }
   return Status::OK();
 }
 
@@ -47,8 +59,14 @@ void MaintenanceController::Stop() {
     stopping_ = true;
   }
   work_available_.notify_all();
-  if (compaction_worker_.joinable()) compaction_worker_.join();
-  if (flush_worker_.joinable()) flush_worker_.join();
+  for (std::thread& worker : compaction_workers_) {
+    if (worker.joinable()) worker.join();
+  }
+  compaction_workers_.clear();
+  for (std::thread& worker : flush_workers_) {
+    if (worker.joinable()) worker.join();
+  }
+  flush_workers_.clear();
   std::lock_guard<std::mutex> lock(mutex_);
   started_ = false;
 }
@@ -63,14 +81,23 @@ MaintenanceController::NextDecisionLocked(Lane lane) const {
   if (!snapshot_.has_value() || stopping_ || metrics_.first_error.has_value()) {
     return std::nullopt;
   }
-  const uint64_t dispatched = lane == Lane::kFlush ? flush_dispatched_sequence_
-                                                    : compaction_dispatched_sequence_;
-  if (dispatched >= published_sequence_) return std::nullopt;
   const CedarMaintenancePlan plan = SelectCedarMaintenance(
       *snapshot_, history_, wal_sync_critical_.load(std::memory_order_acquire));
   const std::optional<CedarMaintenanceDecision>& decision =
       lane == Lane::kFlush ? plan.flush : plan.compaction;
   if (!decision.has_value()) return std::nullopt;
+  if (lane == Lane::kFlush) {
+    const uint32_t dispatched = flush_dispatched_sequence_ == published_sequence_
+                                    ? flush_dispatched_credits_
+                                    : 0;
+    if (dispatched >= plan.flush_credits) return std::nullopt;
+  } else {
+    const uint32_t dispatched =
+        compaction_dispatched_sequence_ == published_sequence_
+            ? compaction_dispatched_credits_
+            : 0;
+    if (dispatched >= plan.compaction_credits) return std::nullopt;
+  }
   if (lane == Lane::kCompaction && decision->priority == CedarMaintenancePriority::kNormal &&
       wal_sync_critical_.load(std::memory_order_acquire)) {
     return std::nullopt;
@@ -79,8 +106,13 @@ MaintenanceController::NextDecisionLocked(Lane lane) const {
 }
 
 bool MaintenanceController::LaneHasWorkLocked(Lane lane) const {
-  if (lane == Lane::kFlush && flush_outstanding_) return false;
-  if (lane == Lane::kCompaction && compaction_outstanding_) return false;
+  if (lane == Lane::kFlush && flush_outstanding_ >= kCedarFlushWorkerSlots) {
+    return false;
+  }
+  if (lane == Lane::kCompaction &&
+      compaction_outstanding_ >= kCedarCompactionWorkerSlots) {
+    return false;
+  }
   return NextDecisionLocked(lane).has_value();
 }
 
@@ -93,6 +125,7 @@ void MaintenanceController::CompleteLocked(
   if (yield < metrics_.yields.size()) ++metrics_.yields[yield];
   if (completion.kind == CedarMaintenanceKind::kFlush) {
     history_.last_flush = completion;
+    metrics_.last_flush_completion = completion;
   } else {
     history_.last_compaction = completion;
   }
@@ -125,12 +158,21 @@ void MaintenanceController::RunLane(Lane lane) {
       if (!next.has_value()) continue;
       decision = *next;
       if (lane == Lane::kFlush) {
-        flush_outstanding_ = true;
+        ++flush_outstanding_;
+        if (flush_dispatched_sequence_ != published_sequence_) {
+          flush_dispatched_sequence_ = published_sequence_;
+          flush_dispatched_credits_ = 0;
+        }
         flush_dispatched_sequence_ = published_sequence_;
+        ++flush_dispatched_credits_;
         ++metrics_.flush_grants_requested;
       } else {
-        compaction_outstanding_ = true;
-        compaction_dispatched_sequence_ = published_sequence_;
+        ++compaction_outstanding_;
+        if (compaction_dispatched_sequence_ != published_sequence_) {
+          compaction_dispatched_sequence_ = published_sequence_;
+          compaction_dispatched_credits_ = 0;
+        }
+        ++compaction_dispatched_credits_;
         ++metrics_.compaction_grants_requested;
       }
     }
@@ -151,10 +193,10 @@ void MaintenanceController::RunLane(Lane lane) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (lane == Lane::kFlush) {
-        flush_outstanding_ = false;
+        --flush_outstanding_;
         if (run.ok()) ++metrics_.flush_grants_accepted;
       } else {
-        compaction_outstanding_ = false;
+        --compaction_outstanding_;
         if (run.ok()) ++metrics_.compaction_grants_accepted;
       }
       CompleteLocked(completion);

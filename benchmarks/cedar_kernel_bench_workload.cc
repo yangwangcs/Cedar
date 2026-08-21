@@ -99,4 +99,62 @@ BoundedWriterResult RunBoundedWriters(Database* database, uint32_t clients,
   return result;
 }
 
+BoundedWriterResult RunFixedWriters(Database* database, uint32_t clients,
+                                    uint32_t commits_per_client) {
+  BoundedWriterResult result;
+  if (database == nullptr) {
+    result.status = Status::InvalidArgument("fixed writers", "database is null");
+    return result;
+  }
+  if (clients == 0 || clients > 128 || commits_per_client == 0) {
+    result.status = Status::InvalidArgument("fixed writers", "bounds are invalid");
+    return result;
+  }
+
+  std::atomic<uint64_t> next_id{1};
+  std::atomic<uint64_t> attempted{0};
+  std::atomic<uint64_t> committed{0};
+  std::atomic<uint64_t> failures{0};
+  std::mutex status_mutex;
+  Status first_failure = Status::OK();
+  std::barrier start_line(static_cast<std::ptrdiff_t>(clients));
+  std::vector<std::jthread> workers;
+  workers.reserve(clients);
+  for (uint32_t index = 0; index < clients; ++index) {
+    workers.emplace_back([&] {
+      start_line.arrive_and_wait();
+      for (uint32_t commit = 0; commit < commits_per_client; ++commit) {
+        attempted.fetch_add(1, std::memory_order_relaxed);
+        auto handle = WriteVertexAsync(database, next_id.fetch_add(1));
+        Status status = handle.ok() ? Status::OK() : handle.status();
+        if (status.ok()) {
+          StatusOr<CommitResult> completed_result =
+              std::move(handle).ConsumeValueOrDie().Wait();
+          if (!completed_result.ok()) {
+            status = completed_result.status();
+          } else if (completed_result.ValueOrDie().outcome !=
+                     CommitOutcome::kCommitted) {
+            status = completed_result.ValueOrDie().status;
+          }
+        }
+        if (!status.ok()) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          std::lock_guard<std::mutex> lock(status_mutex);
+          if (first_failure.ok()) first_failure = status;
+        } else {
+          committed.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  workers.clear();
+  result.attempted = attempted.load(std::memory_order_relaxed);
+  result.committed = committed.load(std::memory_order_relaxed);
+  result.failures = failures.load(std::memory_order_relaxed);
+  result.status = first_failure.ok()
+                      ? Status::OK()
+                      : Status::IOError("fixed writers", first_failure.ToString());
+  return result;
+}
+
 }  // namespace cedar::benchmark

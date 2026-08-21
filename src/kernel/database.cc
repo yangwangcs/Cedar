@@ -119,6 +119,16 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.cache_pinned_bytes = source.block_cache_pinned_bytes;
   metrics.running_flushes = source.running_flushes;
   metrics.running_compactions = source.running_compactions;
+  metrics.flush_queue_depth = source.flush_queue_depth;
+  metrics.unscheduled_flushes = source.unscheduled_flushes;
+  metrics.scheduled_flushes = source.scheduled_flushes;
+  for (const auto& column_family : source.column_families) {
+    if (column_family.role == RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts) {
+      metrics.facts_flush_pending = column_family.flush_pending;
+      metrics.facts_compaction_pending = column_family.compaction_pending;
+      break;
+    }
+  }
   metrics.live_fact_bytes = source.live_sst_bytes;
   metrics.write_stopped = source.write_stopped;
   metrics.delayed_write_rate_bytes_per_sec =
@@ -219,6 +229,10 @@ Database::Impl::FactStoreMaintenanceAdapter::Run(
   completion.elapsed_us = result.elapsed_us;
   completion.remaining_smallest_complete_unit_bytes =
       result.remaining_smallest_complete_unit_bytes;
+  completion.flush_queue_depth = result.flush_queue_depth;
+  completion.unscheduled_flushes = result.unscheduled_flushes;
+  completion.scheduled_flushes = result.scheduled_flushes;
+  completion.running_flushes = result.running_flushes;
   completion.status = result.status;
   switch (result.yield) {
     case FactStoreMaintenanceYield::kNone:
@@ -312,50 +326,56 @@ uint64_t CommitGroupFillMetrics::ApproximatePercentile(
 }
 
 void Database::Impl::ObserveAppendPressure(const PressureSample& sample) {
-  std::lock_guard<std::mutex> lock(runtime_pressure_mutex);
-  PressureSample effective_sample = sample;
-  if (!enforce_disk_pressure) {
-    effective_sample.free_disk_bytes = UINT64_MAX;
-    effective_sample.free_disk_percent = 100;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  uint64_t sample_interval_us = 0;
-  if (!pressure_clock_initialized) {
-    pressure_last_observed_at = now;
-    pressure_clock_initialized = true;
-  } else {
-    const uint64_t elapsed = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            now - pressure_last_observed_at)
-            .count());
-    sample_interval_us = elapsed;
-    switch (append_commit_pressure_controller.state()) {
-      case PressureState::kNormal:
-        runtime_pressure_normal_us.fetch_add(elapsed, std::memory_order_relaxed);
-        break;
-      case PressureState::kSoft:
-        runtime_pressure_soft_us.fetch_add(elapsed, std::memory_order_relaxed);
-        break;
-      case PressureState::kHard:
-        runtime_pressure_hard_us.fetch_add(elapsed, std::memory_order_relaxed);
-        break;
+  bool admission_changed = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_pressure_mutex);
+    PressureSample effective_sample = sample;
+    if (!enforce_disk_pressure) {
+      effective_sample.free_disk_bytes = UINT64_MAX;
+      effective_sample.free_disk_percent = 100;
     }
-  }
-  effective_sample.sample_interval_us = sample_interval_us;
-  append_commit_pressure_controller.Observe(effective_sample);
-  runtime_pressure_state.store(append_commit_pressure_controller.state(),
+    const auto now = std::chrono::steady_clock::now();
+    uint64_t sample_interval_us = 0;
+    if (!pressure_clock_initialized) {
+      pressure_last_observed_at = now;
+      pressure_clock_initialized = true;
+    } else {
+      const uint64_t elapsed = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              now - pressure_last_observed_at)
+              .count());
+      sample_interval_us = elapsed;
+      switch (append_commit_pressure_controller.state()) {
+        case PressureState::kNormal:
+          runtime_pressure_normal_us.fetch_add(elapsed, std::memory_order_relaxed);
+          break;
+        case PressureState::kSoft:
+          runtime_pressure_soft_us.fetch_add(elapsed, std::memory_order_relaxed);
+          break;
+        case PressureState::kHard:
+          runtime_pressure_hard_us.fetch_add(elapsed, std::memory_order_relaxed);
+          break;
+      }
+    }
+    effective_sample.sample_interval_us = sample_interval_us;
+    append_commit_pressure_controller.Observe(effective_sample);
+    runtime_pressure_state.store(append_commit_pressure_controller.state(),
+                                 std::memory_order_release);
+    runtime_target_count.store(append_commit_pressure_controller.target_count(),
                                std::memory_order_release);
-  runtime_target_count.store(append_commit_pressure_controller.target_count(),
-                             std::memory_order_release);
-  runtime_target_bytes.store(append_commit_pressure_controller.target_bytes(),
-                             std::memory_order_release);
-  runtime_collection_window_us.store(
-      append_commit_pressure_controller.collection_window_us(),
-      std::memory_order_release);
-  runtime_admission_permitted.store(
-      append_commit_pressure_controller.DecideAdmission(0, 0, 1).admit,
-      std::memory_order_release);
-  pressure_last_observed_at = now;
+    runtime_target_bytes.store(append_commit_pressure_controller.target_bytes(),
+                               std::memory_order_release);
+    runtime_collection_window_us.store(
+        append_commit_pressure_controller.collection_window_us(),
+        std::memory_order_release);
+    const bool admission_permitted =
+        append_commit_pressure_controller.DecideAdmission(0, 0, 1).admit;
+    admission_changed = admission_permitted !=
+        runtime_admission_permitted.exchange(admission_permitted,
+                                             std::memory_order_acq_rel);
+    pressure_last_observed_at = now;
+  }
+  if (admission_changed) append_commit_cv.notify_all();
 }
 
 internal::EpochLimits Database::Impl::LimitsForQueueLocked() const {
@@ -1092,9 +1112,27 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
       return Status::ResourceExhausted(
           "commit", "runtime pressure snapshot is stale");
     }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::microseconds(deadline_us);
+    std::optional<std::chrono::steady_clock::time_point> admission_wait_started;
     if (!runtime_admission_permitted.load(std::memory_order_acquire)) {
-      ++append_commit_metrics.rejected;
-      return Status::ResourceExhausted("commit", "append admission is under pressure");
+      if (deadline_us == 0) {
+        ++append_commit_metrics.rejected;
+        return Status::ResourceExhausted("commit", "append admission is under pressure");
+      }
+      admission_wait_started = std::chrono::steady_clock::now();
+      while (!runtime_admission_permitted.load(std::memory_order_acquire)) {
+        if (append_commit_cv.wait_until(lock, deadline) ==
+            std::cv_status::timeout) {
+          ++append_commit_metrics.rejected;
+          return Status::ResourceExhausted(
+              "commit", "append admission deadline expired under pressure");
+        }
+        if (append_commit_stopping) {
+          ++append_commit_metrics.rejected;
+          return Status::ShutdownInProgress("commit", "append pipeline is stopping");
+        }
+      }
     }
     const auto has_capacity = [this, &request] {
       return append_commit_requests.size() < append_commit_max_queue_requests &&
@@ -1110,9 +1148,9 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
         ++append_commit_metrics.rejected;
         return Status::ResourceExhausted("commit", "append queue is full");
       }
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::microseconds(deadline_us);
-      const auto started_wait = std::chrono::steady_clock::now();
+      if (!admission_wait_started.has_value()) {
+        admission_wait_started = std::chrono::steady_clock::now();
+      }
       while (!has_capacity()) {
         if (append_commit_cv.wait_until(lock, deadline) ==
             std::cv_status::timeout) {
@@ -1126,9 +1164,11 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
                                             "append pipeline is stopping");
         }
       }
+    }
+    if (admission_wait_started.has_value()) {
       append_commit_metrics.admission_wait_us += static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - started_wait)
+              std::chrono::steady_clock::now() - *admission_wait_started)
               .count());
     }
     append_commit_requests.push_back(request);
@@ -1602,6 +1642,21 @@ StatusOr<RuntimeMetrics> Database::SampleRuntimeMetrics() const {
         maintenance.flush_grants_accepted;
     metrics.maintenance_compaction_grants_accepted =
         maintenance.compaction_grants_accepted;
+    metrics.maintenance_flush_grants_requested =
+        maintenance.flush_grants_requested;
+    metrics.maintenance_completed_grants = maintenance.completed_grants;
+    metrics.maintenance_flush_wal_sync_yields =
+        maintenance.yields[static_cast<size_t>(CedarMaintenanceYield::kWalSync)];
+    metrics.maintenance_flush_deadline_yields =
+        maintenance.yields[static_cast<size_t>(CedarMaintenanceYield::kDeadline)];
+    metrics.maintenance_last_flush_queue_depth =
+        maintenance.last_flush_completion.flush_queue_depth;
+    metrics.maintenance_last_unscheduled_flushes =
+        maintenance.last_flush_completion.unscheduled_flushes;
+    metrics.maintenance_last_scheduled_flushes =
+        maintenance.last_flush_completion.scheduled_flushes;
+    metrics.maintenance_last_running_flushes =
+        maintenance.last_flush_completion.running_flushes;
     metrics.maintenance_errors = maintenance.maintenance_errors;
   }
   return metrics;

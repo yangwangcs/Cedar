@@ -64,6 +64,10 @@ struct CedarMaintenanceResult {
   uint64_t remaining_smallest_complete_unit_bytes = 0;
   uint64_t atomic_overrun_bytes = 0;
   uint64_t elapsed_us = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
+  uint64_t running_flushes = 0;
   bool input_budget_exceeded = false;
   bool output_budget_exceeded = false;
   bool recovery_exception = false;
@@ -95,6 +99,9 @@ struct CedarMaintenanceSnapshot {
   uint64_t total_pending_compaction_bytes = 0;
   uint64_t running_flushes = 0;
   uint64_t running_compactions = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
   uint64_t background_errors = 0;
   bool write_delayed = false;
   bool write_stopped = false;

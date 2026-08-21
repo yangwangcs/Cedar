@@ -22,6 +22,7 @@ CedarRuntimeSnapshot SnapshotWithDebt(
           .immutable_memtable_bytes = immutable,
           .l0_files = l0_files,
           .pending_compaction_bytes = pending_compaction_bytes,
+          .flush_pending = immutable != 0,
       });
   snapshot.rocksdb.column_families.push_back(
       RocksDbRuntimeMetrics::ColumnFamilyMetrics{
@@ -44,11 +45,12 @@ TEST(CedarMaintenancePolicyTest, FlushGrantCoversTheWholeImmutableMemtableUnit) 
 
   ASSERT_TRUE(plan.flush.has_value());
   EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kEmergency);
+  EXPECT_EQ(plan.flush_credits, 2U);
   EXPECT_GE(plan.flush->max_input_bytes, 144ULL << 20);
 }
 
 TEST(CedarMaintenancePolicyTest,
-     WriteStoppedWithActiveMemtableRequestsEmergencyFlush) {
+     WriteStoppedActiveOnlyMemtableDoesNotIssueAnUnconsumableFlushGrant) {
   CedarRuntimeSnapshot snapshot = SnapshotWithDebt(
       RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts, 16ULL << 20, 0, 0, 0);
   snapshot.rocksdb.write_stopped = 1;
@@ -56,11 +58,8 @@ TEST(CedarMaintenancePolicyTest,
   const CedarMaintenancePlan plan =
       SelectCedarMaintenance(snapshot, CedarMaintenanceHistory{}, false);
 
-  ASSERT_TRUE(plan.flush.has_value());
+  EXPECT_FALSE(plan.flush.has_value());
   EXPECT_FALSE(plan.compaction.has_value());
-  EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kEmergency);
-  EXPECT_FALSE(plan.flush->yield_for_wal_sync);
-  EXPECT_GE(plan.flush->max_input_bytes, 16ULL << 20);
 }
 
 TEST(CedarMaintenancePolicyTest, FlushesMetaDebtWithoutFactsDebt) {
@@ -73,7 +72,23 @@ TEST(CedarMaintenancePolicyTest, FlushesMetaDebtWithoutFactsDebt) {
   ASSERT_TRUE(plan.flush.has_value());
   EXPECT_EQ(plan.flush->kind, CedarMaintenanceKind::kFlush);
   EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kNormal);
+  EXPECT_EQ(plan.flush_credits, 1U);
   EXPECT_FALSE(plan.compaction.has_value());
+}
+
+TEST(CedarMaintenancePolicyTest,
+     FlushQueueDebtIsAFlushCandidateWhenColumnFamilyFlagClears) {
+  CedarRuntimeSnapshot snapshot = SnapshotWithDebt(
+      RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts, 0, 0, 0, 0);
+  snapshot.rocksdb.flush_queue_depth = 2;
+  snapshot.rocksdb.unscheduled_flushes = 2;
+
+  const CedarMaintenancePlan plan =
+      SelectCedarMaintenance(snapshot, CedarMaintenanceHistory{}, false);
+
+  ASSERT_TRUE(plan.flush.has_value());
+  EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kNormal);
+  EXPECT_EQ(plan.flush_credits, 1U);
 }
 
 TEST(CedarMaintenancePolicyTest, EmergencyWbmFlushAndCompactionUseSeparateLanes) {
@@ -86,8 +101,10 @@ TEST(CedarMaintenancePolicyTest, EmergencyWbmFlushAndCompactionUseSeparateLanes)
 
   ASSERT_TRUE(plan.flush.has_value());
   EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kEmergency);
+  EXPECT_EQ(plan.flush_credits, 2U);
   ASSERT_TRUE(plan.compaction.has_value());
   EXPECT_EQ(plan.compaction->priority, CedarMaintenancePriority::kNormal);
+  EXPECT_EQ(plan.compaction_credits, 1U);
 }
 
 TEST(CedarMaintenancePolicyTest,
@@ -102,6 +119,18 @@ TEST(CedarMaintenancePolicyTest,
   ASSERT_TRUE(plan.flush.has_value());
   EXPECT_EQ(plan.flush->priority, CedarMaintenancePriority::kEmergency);
   EXPECT_FALSE(plan.flush->yield_for_wal_sync);
+}
+
+TEST(CedarMaintenancePolicyTest,
+     ActiveOnlyWriteBufferPressureDoesNotIssueAnUnconsumableFlushGrant) {
+  CedarRuntimeSnapshot snapshot = SnapshotWithDebt(
+      RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts, 90, 0, 0, 0);
+  snapshot.rocksdb.write_buffer_manager_limit_bytes = 100;
+
+  const CedarMaintenancePlan plan =
+      SelectCedarMaintenance(snapshot, CedarMaintenanceHistory{}, false);
+
+  EXPECT_FALSE(plan.flush.has_value());
 }
 
 TEST(CedarMaintenancePolicyTest, WalCriticalSuppressesNormalCompaction) {

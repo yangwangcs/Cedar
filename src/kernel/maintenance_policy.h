@@ -49,6 +49,10 @@ struct CedarMaintenanceCompletion {
   uint64_t output_bytes = 0;
   uint64_t elapsed_us = 0;
   uint64_t remaining_smallest_complete_unit_bytes = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
+  uint64_t running_flushes = 0;
   Status status = Status::OK();
 };
 
@@ -64,7 +68,11 @@ struct CedarMaintenanceDecision {
 
 struct CedarMaintenancePlan {
   std::optional<CedarMaintenanceDecision> flush;
+  // Number of independently authorized native flushes for this snapshot.
+  // Cedar owns this bound; the engine only executes a matching grant.
+  uint32_t flush_credits = 0;
   std::optional<CedarMaintenanceDecision> compaction;
+  uint32_t compaction_credits = 0;
 };
 
 struct CedarMaintenanceHistory {
@@ -90,6 +98,7 @@ struct CedarMaintenanceMetrics {
   uint64_t unexplained_autonomous_jobs = 0;
   uint64_t maintenance_errors = 0;
   uint64_t max_snapshot_age_us = 0;
+  CedarMaintenanceCompletion last_flush_completion;
   std::optional<Status> first_error;
   std::array<uint64_t, kCedarMaintenanceYieldCount> yields{};
 };

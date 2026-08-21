@@ -232,7 +232,25 @@ int Run(const cedar::benchmark::KernelBenchmarkOptions& options) {
                   << metrics.write_buffer_limit_bytes << " immutable_fact_bytes="
                   << metrics.immutable_fact_bytes << " running_flushes="
                   << metrics.running_flushes << " running_compactions="
-                  << metrics.running_compactions << '\n';
+                  << metrics.running_compactions
+                  << " maintenance_flush_grants_requested="
+                  << metrics.maintenance_flush_grants_requested
+                  << " maintenance_flush_grants_accepted="
+                  << metrics.maintenance_flush_grants_accepted
+                  << " maintenance_completed_grants="
+                  << metrics.maintenance_completed_grants
+                  << " maintenance_flush_wal_sync_yields="
+                  << metrics.maintenance_flush_wal_sync_yields
+                  << " maintenance_flush_deadline_yields="
+                  << metrics.maintenance_flush_deadline_yields
+                  << " maintenance_last_flush_queue_depth="
+                  << metrics.maintenance_last_flush_queue_depth
+                  << " maintenance_last_unscheduled_flushes="
+                  << metrics.maintenance_last_unscheduled_flushes
+                  << " maintenance_last_scheduled_flushes="
+                  << metrics.maintenance_last_scheduled_flushes
+                  << " maintenance_last_running_flushes="
+                  << metrics.maintenance_last_running_flushes << '\n';
       } else {
         std::cerr << "runtime at writer failure: " << runtime.status().ToString()
                   << '\n';

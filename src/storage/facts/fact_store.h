@@ -141,6 +141,9 @@ struct RocksDbRuntimeMetrics {
   uint64_t block_cache_pinned_bytes = 0;
   uint64_t running_flushes = 0;
   uint64_t running_compactions = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
   uint64_t background_errors = 0;
   uint64_t live_sst_bytes = 0;
   uint64_t blob_file_bytes = 0;
@@ -218,6 +221,10 @@ struct FactStoreMaintenanceResult {
   uint64_t elapsed_us = 0;
   uint64_t remaining_smallest_complete_unit_bytes = 0;
   uint64_t atomic_overrun_bytes = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
+  uint64_t running_flushes = 0;
   uint32_t selected_column_family_id = 0;
   FactStoreMaintenanceYield yield = FactStoreMaintenanceYield::kNone;
   Status status = Status::OK();

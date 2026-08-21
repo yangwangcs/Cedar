@@ -38,7 +38,7 @@ inline AsyncSubmissionExecutor::Options ResolveAsyncExecutorOptions(
       options.async_executor.max_mailbox_requests,
       options.async_executor.max_mailbox_bytes};
   const AsyncExecutorOptions defaults;
-  if (options.storage_profile != StorageProfile::kProductionAppend &&
+  if (!UsesCedarKernelProfile(options.storage_profile) &&
       options.async_executor.submission_workers == defaults.submission_workers &&
       options.async_executor.max_mailbox_requests == defaults.max_mailbox_requests &&
       options.async_executor.max_mailbox_bytes == defaults.max_mailbox_bytes) {
@@ -161,17 +161,17 @@ class Database::Impl {
             options.stop_pipeline_before_drain_for_testing),
         foreground_admission_concurrency(
             options.foreground_admission_concurrency != 0
-                ? (options.storage_profile == StorageProfile::kProductionAppend
+                ? (UsesCedarKernelProfile(options.storage_profile)
                        ? std::min(options.foreground_admission_concurrency,
                                   std::max(1U, std::thread::hardware_concurrency()))
                        : options.foreground_admission_concurrency)
-                : (options.storage_profile == StorageProfile::kProductionAppend
+                : (UsesCedarKernelProfile(options.storage_profile)
                        ? std::max(1U, std::thread::hardware_concurrency())
                        : 0)),
         foreground_admission_observer_for_testing(
             std::move(options.foreground_admission_observer_for_testing)),
         enforce_disk_pressure(
-            options.storage_profile == StorageProfile::kProductionAppend),
+            UsesCedarKernelProfile(options.storage_profile)),
         store(FactStoreOptions{std::move(options.path),
                                options.write_buffer_bytes,
                                options.block_cache_bytes,

@@ -1216,7 +1216,7 @@ Status FactStore::Open() {
   const auto resolved_profile = internal::ResolveStorageProfile(options_);
   if (!resolved_profile.ok()) return resolved_profile.status();
   const internal::ResolvedStorageProfile* resolved_ptr =
-      options_.storage_profile == StorageProfile::kProductionAppend
+      UsesCedarKernelProfile(options_.storage_profile)
           ? &resolved_profile.ValueOrDie()
           : nullptr;
   rocksdb::Options options = internal::MakeRocksDbOptions(
@@ -3314,6 +3314,10 @@ StatusOr<FactStoreMaintenanceResult> FactStore::RunNativeMaintenance(
   result.remaining_smallest_complete_unit_bytes =
       native.remaining_smallest_complete_unit_bytes;
   result.atomic_overrun_bytes = native.atomic_overrun_bytes;
+  result.flush_queue_depth = native.flush_queue_depth;
+  result.unscheduled_flushes = native.unscheduled_flushes;
+  result.scheduled_flushes = native.scheduled_flushes;
+  result.running_flushes = native.running_flushes;
   result.selected_column_family_id = native.selected_column_family_id;
   switch (native.yield) {
     case rocksdb::CedarMaintenanceYield::kNone:
@@ -3407,7 +3411,7 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   sample.background_error = maintenance.background_errors;
   if (maintenance.write_buffer_manager_limit_bytes != 0) {
     sample.immutable_memtable_percent = std::min<uint64_t>(
-        100, maintenance.write_buffer_manager_bytes * 100 /
+        100, maintenance.total_immutable_memtable_bytes * 100 /
                  maintenance.write_buffer_manager_limit_bytes);
   }
   metrics.l0_files = sample.l0_files;
@@ -3420,6 +3424,9 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   metrics.block_cache_pinned_bytes = maintenance.block_cache_pinned_bytes;
   metrics.running_flushes = maintenance.running_flushes;
   metrics.running_compactions = maintenance.running_compactions;
+  metrics.flush_queue_depth = maintenance.flush_queue_depth;
+  metrics.unscheduled_flushes = maintenance.unscheduled_flushes;
+  metrics.scheduled_flushes = maintenance.scheduled_flushes;
   metrics.background_errors = maintenance.background_errors;
   metrics.background_errors_total = maintenance.background_errors;
   metrics.live_sst_bytes = maintenance.live_sst_bytes;

@@ -43,6 +43,8 @@ struct PathValue {
 
 struct PathColumn {
   std::vector<uint32_t> row_offsets;
+  std::vector<uint32_t> vertex_offsets;
+  std::vector<uint32_t> edge_offsets;
   std::vector<VertexRef> vertices;
   std::vector<EdgeRef> edges;
   std::vector<ValidTimeInterval> intervals;
@@ -50,7 +52,11 @@ struct PathColumn {
   static PathColumn FromValues(const std::vector<PathValue>& values) {
     PathColumn column;
     column.row_offsets.reserve(values.size() + 1);
+    column.vertex_offsets.reserve(values.size() + 1);
+    column.edge_offsets.reserve(values.size() + 1);
     column.row_offsets.push_back(0);
+    column.vertex_offsets.push_back(0);
+    column.edge_offsets.push_back(0);
     for (const PathValue& value : values) {
       column.vertices.insert(column.vertices.end(), value.vertices.begin(),
                              value.vertices.end());
@@ -59,6 +65,9 @@ struct PathColumn {
       column.intervals.push_back(value.common);
       column.row_offsets.push_back(
           static_cast<uint32_t>(column.vertices.size()));
+      column.vertex_offsets.push_back(
+          static_cast<uint32_t>(column.vertices.size()));
+      column.edge_offsets.push_back(static_cast<uint32_t>(column.edges.size()));
     }
     return column;
   }

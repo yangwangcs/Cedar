@@ -13,6 +13,32 @@
 #include "query/runtime/query_runtime.h"
 
 namespace cedar {
+namespace {
+
+std::optional<PhysicalType> PhysicalTypeOf(QueryType type) {
+  switch (type) {
+    case QueryType::kBool:
+      return PhysicalType::kBool;
+    case QueryType::kInt32:
+      return PhysicalType::kInt32;
+    case QueryType::kInt64:
+      return PhysicalType::kInt64;
+    case QueryType::kFloat32:
+      return PhysicalType::kFloat32;
+    case QueryType::kFloat64:
+      return PhysicalType::kFloat64;
+    case QueryType::kTimestamp64:
+      return PhysicalType::kTimestamp64;
+    case QueryType::kString:
+      return PhysicalType::kString;
+    case QueryType::kBinary:
+      return PhysicalType::kBinary;
+    default:
+      return std::nullopt;
+  }
+}
+
+}  // namespace
 
 class PreparedQuery::State {
  public:
@@ -51,7 +77,24 @@ StatusOr<PreparedQuery> Database::PrepareQuery(const Query& query) const {
         return Status::SchemaMismatch(
             "query", "referenced property is not registered");
       }
-      fingerprint.push_back(*definition.ValueOrDie());
+      const PropertyDefinition resolved = *definition.ValueOrDie();
+      for (internal::PreparedPropertyBinding& binding :
+           plan.ValueOrDie().property_bindings) {
+        if (binding.property != property) continue;
+        const std::optional<PhysicalType> output_type =
+            PhysicalTypeOf(binding.output.type);
+        if (resolved.entity_kind != binding.entity_kind) {
+          return Status::SchemaMismatch(
+              "query", "property entity kind differs from binding");
+        }
+        if (!output_type.has_value() ||
+            resolved.physical_type != *output_type) {
+          return Status::SchemaMismatch(
+              "query", "property physical type differs from output slot");
+        }
+        binding.definition = resolved;
+      }
+      fingerprint.push_back(resolved);
     }
   }
   return PreparedQuery(std::make_shared<const PreparedQuery::State>(
@@ -75,9 +118,9 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
     return Status::InvalidArgument(
         "query", "snapshot belongs to a different database");
   }
-  if (!state_->plan.canonical_vertex_state_at) {
+  if (!state_->plan.canonical_temporal) {
     return Status::NotSupported(
-        "query", "only VertexScan + StateAt + Project is executable");
+        "query", "query is outside canonical temporal execution");
   }
   return internal::QueryRuntime::Execute(
       state_->plan, std::move(snapshot), bindings, options);

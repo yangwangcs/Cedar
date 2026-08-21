@@ -5,12 +5,400 @@
 
 #include <algorithm>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 #include "query/logical/logical_plan.h"
-#include "query/runtime/canonical_source.h"
+#include "query/runtime/property_binding.h"
+#include "query/runtime/temporal_source.h"
 
 namespace cedar {
+namespace {
+
+struct RuntimeRow {
+  FactRef ref;
+  std::optional<ValidTimeInterval> effective;
+  std::optional<ValidTime> point;
+  std::optional<Value> property_value;
+};
+
+using EvaluatedLiteral = detail::ExpressionLiteral;
+
+struct EvaluatedValue {
+  QueryType type;
+  bool present;
+  std::optional<EvaluatedLiteral> value;
+};
+
+StatusOr<EvaluatedValue> ValueAsLiteral(const Value& value) {
+  switch (value.type()) {
+    case PhysicalType::kBool:
+      return EvaluatedValue{QueryType::kBool, true,
+                            EvaluatedLiteral{std::get<bool>(value.data())}};
+    case PhysicalType::kInt32:
+      return EvaluatedValue{QueryType::kInt32, true,
+                            EvaluatedLiteral{std::get<int32_t>(value.data())}};
+    case PhysicalType::kInt64:
+      return EvaluatedValue{QueryType::kInt64, true,
+                            EvaluatedLiteral{std::get<int64_t>(value.data())}};
+    case PhysicalType::kFloat32:
+      return EvaluatedValue{QueryType::kFloat32, true,
+                            EvaluatedLiteral{std::get<float>(value.data())}};
+    case PhysicalType::kFloat64:
+      return EvaluatedValue{QueryType::kFloat64, true,
+                            EvaluatedLiteral{std::get<double>(value.data())}};
+    case PhysicalType::kTimestamp64:
+      return EvaluatedValue{
+          QueryType::kTimestamp64, true,
+          EvaluatedLiteral{Timestamp64{std::get<uint64_t>(value.data())}}};
+    case PhysicalType::kString:
+      return EvaluatedValue{
+          QueryType::kString, true,
+          EvaluatedLiteral{std::get<std::string>(value.data())}};
+    case PhysicalType::kBinary:
+      return EvaluatedValue{
+          QueryType::kBinary, true,
+          EvaluatedLiteral{Binary{std::get<std::string>(value.data())}}};
+  }
+  return Status::Corruption("query", "unknown property physical type");
+}
+
+StatusOr<EvaluatedValue> EvaluateExpression(
+    const internal::ExpressionNode& expression, const RuntimeRow& row,
+    const internal::PreparedQueryPlan& plan) {
+  using internal::ExpressionKind;
+  if (expression.kind() == ExpressionKind::kSlot) {
+    if (expression.slot() == plan.entity_slot) {
+      if (plan.entity_family == FactFamily::kVertexState) {
+        return EvaluatedValue{
+            QueryType::kVertexRef, true,
+            EvaluatedLiteral{VertexRef{row.ref.part_id(),
+                                       VertexId{row.ref.entity_id()}}}};
+      }
+      return EvaluatedValue{
+          QueryType::kEdgeRef, true,
+          EvaluatedLiteral{
+              EdgeRef{row.ref.part_id(), EdgeId{row.ref.entity_id()}}}};
+    }
+    const auto binding = std::find_if(
+        plan.property_bindings.begin(), plan.property_bindings.end(),
+        [&expression](const internal::PreparedPropertyBinding& candidate) {
+          return candidate.output.slot == expression.slot();
+        });
+    if (binding == plan.property_bindings.end()) {
+      return Status::InvalidArgument("query", "predicate slot is unavailable");
+    }
+    if (!row.property_value.has_value()) {
+      return EvaluatedValue{binding->output.type, false, std::nullopt};
+    }
+    return ValueAsLiteral(*row.property_value);
+  }
+  if (expression.kind() == ExpressionKind::kLiteral) {
+    if (!expression.literal().has_value()) {
+      return Status::InvalidArgument("query", "literal expression has no value");
+    }
+    return EvaluatedValue{expression.type(), true, expression.literal()};
+  }
+  if (expression.kind() == ExpressionKind::kParameter) {
+    return Status::NotSupported("query", "canonical predicates do not bind parameters");
+  }
+  if (expression.kind() == ExpressionKind::kIsPresent) {
+    auto child = EvaluateExpression(*expression.children().front(), row, plan);
+    if (!child.ok()) return child.status();
+    return EvaluatedValue{QueryType::kBool, true,
+                          EvaluatedLiteral{child.ValueOrDie().present}};
+  }
+  if (expression.kind() == ExpressionKind::kNot) {
+    auto child = EvaluateExpression(*expression.children().front(), row, plan);
+    if (!child.ok()) return child.status();
+    const bool value = child.ValueOrDie().present &&
+                       std::get<bool>(*child.ValueOrDie().value);
+    return EvaluatedValue{QueryType::kBool, true, EvaluatedLiteral{!value}};
+  }
+
+  auto left = EvaluateExpression(*expression.children()[0], row, plan);
+  if (!left.ok()) return left.status();
+  auto right = EvaluateExpression(*expression.children()[1], row, plan);
+  if (!right.ok()) return right.status();
+  if (expression.kind() == ExpressionKind::kAnd) {
+    const bool value = left.ValueOrDie().present &&
+                       right.ValueOrDie().present &&
+                       std::get<bool>(*left.ValueOrDie().value) &&
+                       std::get<bool>(*right.ValueOrDie().value);
+    return EvaluatedValue{QueryType::kBool, true, EvaluatedLiteral{value}};
+  }
+  if (!left.ValueOrDie().present || !right.ValueOrDie().present) {
+    return EvaluatedValue{QueryType::kBool, true, EvaluatedLiteral{false}};
+  }
+  if (left.ValueOrDie().type != right.ValueOrDie().type) {
+    return Status::InvalidArgument("query", "comparison operand types differ");
+  }
+
+  bool value = false;
+  if (expression.kind() == ExpressionKind::kEqual) {
+    value = *left.ValueOrDie().value == *right.ValueOrDie().value;
+  } else if (expression.kind() == ExpressionKind::kNotEqual) {
+    value = *left.ValueOrDie().value != *right.ValueOrDie().value;
+  } else if (expression.kind() == ExpressionKind::kGreaterThan) {
+    switch (left.ValueOrDie().type) {
+      case QueryType::kInt32:
+        value = std::get<int32_t>(*left.ValueOrDie().value) >
+                std::get<int32_t>(*right.ValueOrDie().value);
+        break;
+      case QueryType::kInt64:
+        value = std::get<int64_t>(*left.ValueOrDie().value) >
+                std::get<int64_t>(*right.ValueOrDie().value);
+        break;
+      case QueryType::kFloat32:
+        value = std::get<float>(*left.ValueOrDie().value) >
+                std::get<float>(*right.ValueOrDie().value);
+        break;
+      case QueryType::kFloat64:
+        value = std::get<double>(*left.ValueOrDie().value) >
+                std::get<double>(*right.ValueOrDie().value);
+        break;
+      default:
+        return Status::InvalidArgument(
+            "query", "greater-than requires an arithmetic operand");
+    }
+  } else {
+    return Status::NotSupported("query", "unsupported canonical expression");
+  }
+  return EvaluatedValue{QueryType::kBool, true, EvaluatedLiteral{value}};
+}
+
+StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
+    Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
+  std::vector<RuntimeRow> result;
+  return std::visit(
+      [&](const auto& scope) -> StatusOr<std::vector<RuntimeRow>> {
+        using T = std::decay_t<decltype(scope)>;
+        if constexpr (std::is_same_v<T, At>) {
+          auto rows = internal::TemporalSource::ReadAt(
+              snapshot, plan.entity_family, PropertyId{}, scope.time);
+          if (!rows.ok()) return rows.status();
+          for (internal::StateRow& row : rows.ValueOrDie()) {
+            result.push_back(
+                {row.ref, row.effective, scope.time, std::nullopt});
+          }
+        } else if constexpr (std::is_same_v<T, Events>) {
+          auto rows = internal::TemporalSource::ReadEvents(
+              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+          if (!rows.ok()) return rows.status();
+          for (const internal::EventRow& row : rows.ValueOrDie()) {
+            result.push_back(
+                {row.ref, std::nullopt, row.valid_from, std::nullopt});
+          }
+        } else if constexpr (std::is_same_v<T, Changes>) {
+          auto rows = internal::TemporalSource::ReadChanges(
+              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+          if (!rows.ok()) return rows.status();
+          for (const internal::ChangeRow& row : rows.ValueOrDie()) {
+            result.push_back(
+                {row.ref, std::nullopt, row.valid_from, std::nullopt});
+          }
+        } else if constexpr (std::is_same_v<T, Overlaps>) {
+          auto rows = internal::TemporalSource::ReadOverlaps(
+              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+          if (!rows.ok()) return rows.status();
+          for (internal::StateRow& row : rows.ValueOrDie()) {
+            result.push_back(
+                {row.ref, row.effective, std::nullopt, std::nullopt});
+          }
+        } else if constexpr (std::is_same_v<T, Throughout>) {
+          auto rows = internal::TemporalSource::ReadThroughout(
+              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+          if (!rows.ok()) return rows.status();
+          for (internal::StateRow& row : rows.ValueOrDie()) {
+            result.push_back(
+                {row.ref, row.effective, std::nullopt, std::nullopt});
+          }
+        } else {
+          auto rows = internal::TemporalSource::ReadHistory(
+              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+          if (!rows.ok()) return rows.status();
+          for (internal::StateRow& row : rows.ValueOrDie()) {
+            result.push_back(
+                {row.ref, row.effective, std::nullopt, std::nullopt});
+          }
+        }
+        return result;
+      },
+      plan.scope);
+}
+
+StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
+    Snapshot& snapshot, std::vector<RuntimeRow> rows,
+    const internal::PreparedPropertyBinding& binding) {
+  if (!binding.definition.has_value()) {
+    return Status::SchemaMismatch("query", "property binding was not prepared");
+  }
+  std::vector<RuntimeRow> result;
+  for (RuntimeRow& row : rows) {
+    internal::StateRow entity{row.ref,
+                              row.effective.value_or(ValidTimeInterval{
+                                  row.point.value_or(ValidTime{0}), std::nullopt}),
+                              std::nullopt};
+    StatusOr<std::vector<internal::BoundPropertyRow>> bound =
+        row.point.has_value()
+            ? internal::PropertyBinder::BindAt(
+                  snapshot, std::vector<internal::StateRow>{entity}, *row.point,
+                  *binding.definition)
+            : internal::PropertyBinder::BindIntervals(
+                  snapshot, std::vector<internal::StateRow>{entity},
+                  *binding.definition);
+    if (!bound.ok()) return bound.status();
+    for (internal::BoundPropertyRow& property : bound.ValueOrDie()) {
+      result.push_back({property.ref, property.effective, row.point,
+                        std::move(property.value)});
+    }
+  }
+  return result;
+}
+
+StatusOr<std::vector<RuntimeRow>> MaterializeRows(
+    Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
+  auto rows = ReadSourceRows(snapshot, plan);
+  if (!rows.ok()) return rows.status();
+  if (!plan.property_bindings.empty()) {
+    rows = BindPropertyRows(snapshot, std::move(rows).ConsumeValueOrDie(),
+                            plan.property_bindings.front());
+    if (!rows.ok()) return rows.status();
+  }
+  if (plan.predicate) {
+    std::vector<RuntimeRow> filtered;
+    for (RuntimeRow& row : rows.ValueOrDie()) {
+      auto selected = EvaluateExpression(*plan.predicate, row, plan);
+      if (!selected.ok()) return selected.status();
+      if (selected.ValueOrDie().present &&
+          std::get<bool>(*selected.ValueOrDie().value)) {
+        filtered.push_back(std::move(row));
+      }
+    }
+    return filtered;
+  }
+  return std::move(rows).ConsumeValueOrDie();
+}
+
+QueryColumnVector EmptyColumn(QueryType type) {
+  switch (type) {
+    case QueryType::kBool:
+      return std::vector<uint8_t>{};
+    case QueryType::kInt32:
+      return std::vector<int32_t>{};
+    case QueryType::kInt64:
+      return std::vector<int64_t>{};
+    case QueryType::kFloat32:
+      return std::vector<float>{};
+    case QueryType::kFloat64:
+      return std::vector<double>{};
+    case QueryType::kTimestamp64:
+      return std::vector<uint64_t>{};
+    case QueryType::kString:
+    case QueryType::kBinary:
+      return std::vector<std::string>{};
+    case QueryType::kVertexRef:
+      return std::vector<VertexRef>{};
+    case QueryType::kEdgeRef:
+      return std::vector<EdgeRef>{};
+    case QueryType::kValidTime:
+      return std::vector<ValidTime>{};
+    case QueryType::kValidDuration:
+      return std::vector<ValidDuration>{};
+    case QueryType::kCommitSeq:
+      return std::vector<CommitSeq>{};
+    case QueryType::kValidTimeInterval:
+      return std::vector<ValidTimeInterval>{};
+    default:
+      return std::vector<uint8_t>{};
+  }
+}
+
+template <typename T>
+void Append(QueryColumn* column, T value, bool present) {
+  std::get<std::vector<T>>(column->values).push_back(std::move(value));
+  column->present.push_back(present ? uint8_t{1} : uint8_t{0});
+}
+
+Status AppendProperty(QueryColumn* column, const std::optional<Value>& value) {
+  const bool present = value.has_value();
+  switch (column->type) {
+    case QueryType::kBool:
+      Append(column, static_cast<uint8_t>(present &&
+                                          std::get<bool>(value->data())),
+             present);
+      return Status::OK();
+    case QueryType::kInt32:
+      Append(column, present ? std::get<int32_t>(value->data()) : int32_t{},
+             present);
+      return Status::OK();
+    case QueryType::kInt64:
+      Append(column, present ? std::get<int64_t>(value->data()) : int64_t{},
+             present);
+      return Status::OK();
+    case QueryType::kFloat32:
+      Append(column, present ? std::get<float>(value->data()) : float{}, present);
+      return Status::OK();
+    case QueryType::kFloat64:
+      Append(column, present ? std::get<double>(value->data()) : double{},
+             present);
+      return Status::OK();
+    case QueryType::kTimestamp64:
+      Append(column,
+             present ? std::get<uint64_t>(value->data()) : uint64_t{}, present);
+      return Status::OK();
+    case QueryType::kString:
+    case QueryType::kBinary:
+      Append(column,
+             present ? std::get<std::string>(value->data()) : std::string{},
+             present);
+      return Status::OK();
+    default:
+      return Status::Corruption("query", "property output type is invalid");
+  }
+}
+
+StatusOr<std::vector<QueryColumn>> BuildColumns(
+    const std::vector<RuntimeRow>& rows, size_t offset, size_t count,
+    const internal::PreparedQueryPlan& plan) {
+  std::vector<QueryColumn> columns;
+  columns.reserve(plan.output_columns.size());
+  for (const RowColumn& output : plan.output_columns) {
+    columns.push_back(
+        QueryColumn{output.slot, output.type, EmptyColumn(output.type), {}});
+  }
+  for (size_t index = offset; index < offset + count; ++index) {
+    const RuntimeRow& row = rows[index];
+    for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
+      QueryColumn* column = &columns[column_index];
+      const RowColumn& output = plan.output_columns[column_index];
+      if (output.slot == plan.entity_slot) {
+        if (plan.entity_family == FactFamily::kVertexState) {
+          Append(column,
+                 VertexRef{row.ref.part_id(), VertexId{row.ref.entity_id()}},
+                 true);
+        } else {
+          Append(column, EdgeRef{row.ref.part_id(), EdgeId{row.ref.entity_id()}},
+                 true);
+        }
+        continue;
+      }
+      const auto binding = std::find_if(
+          plan.property_bindings.begin(), plan.property_bindings.end(),
+          [&output](const internal::PreparedPropertyBinding& candidate) {
+            return candidate.output.slot == output.slot;
+          });
+      if (binding == plan.property_bindings.end()) {
+        return Status::Corruption("query", "projected slot is unavailable");
+      }
+      const Status appended = AppendProperty(column, row.property_value);
+      if (!appended.ok()) return appended;
+    }
+  }
+  return columns;
+}
+
+}  // namespace
 
 class QueryCursor::State {
  public:
@@ -44,34 +432,38 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
 
   if (!state_->initialized) {
     state_->initialized = true;
-    auto vertices = internal::CanonicalSource::ReadVerticesAt(
-        *state_->snapshot, state_->plan.valid_time);
-    if (!vertices.ok()) {
-      state_->terminal_error = vertices.status();
+    auto rows = MaterializeRows(*state_->snapshot, state_->plan);
+    if (!rows.ok()) {
+      state_->terminal_error = rows.status();
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
-    if (vertices.ValueOrDie().size() > state_->options.budget.output_rows) {
+    const size_t row_count = rows.ValueOrDie().size();
+    if (row_count > state_->options.budget.output_rows) {
       state_->terminal_error = Status::ResourceExhausted(
           "query", "output row budget exceeded");
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
+    if (row_count > state_->options.budget.interval_fragments) {
+      state_->terminal_error = Status::ResourceExhausted(
+          "query", "interval fragment budget exceeded");
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
 
     constexpr size_t kBatchRows = 1024;
-    for (size_t offset = 0; offset < vertices.ValueOrDie().size();
-         offset += kBatchRows) {
-      const size_t count =
-          std::min(kBatchRows, vertices.ValueOrDie().size() - offset);
-      std::vector<VertexRef> values(
-          vertices.ValueOrDie().begin() + static_cast<ptrdiff_t>(offset),
-          vertices.ValueOrDie().begin() +
-              static_cast<ptrdiff_t>(offset + count));
-      QueryColumn column{state_->plan.vertex_slot, QueryType::kVertexRef,
-                         std::move(values),
-                         std::vector<uint8_t>(count, uint8_t{1})};
+    for (size_t offset = 0; offset < row_count; offset += kBatchRows) {
+      const size_t count = std::min(kBatchRows, row_count - offset);
+      auto columns =
+          BuildColumns(rows.ValueOrDie(), offset, count, state_->plan);
+      if (!columns.ok()) {
+        state_->terminal_error = columns.status();
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
       state_->batches.emplace_back(
-          QueryBatch(count, std::vector<QueryColumn>{std::move(column)}));
+          QueryBatch(count, std::move(columns).ConsumeValueOrDie()));
     }
   }
 
@@ -99,31 +491,48 @@ Status QueryCursor::Close() {
 namespace internal {
 namespace {
 
-void CollectReferencedProperties(const LogicalPlanNode& node,
-                                 std::vector<PropertyId>* properties) {
+void CollectMetadata(const LogicalPlanNode& node, PreparedQueryPlan* plan) {
   if (node.property_binding().has_value()) {
-    const PropertyId property = node.property_binding()->property;
-    if (std::none_of(properties->begin(), properties->end(),
-                     [property](PropertyId candidate) {
-                       return candidate == property;
+    const PropertyBinding& binding = *node.property_binding();
+    if (std::none_of(plan->referenced_properties.begin(),
+                     plan->referenced_properties.end(),
+                     [binding](PropertyId property) {
+                       return property == binding.property;
                      })) {
-      properties->push_back(property);
+      plan->referenced_properties.push_back(binding.property);
     }
+    PropertyEntityKind kind = PropertyEntityKind::kVertex;
+    if (!node.inputs().empty()) {
+      const auto source = std::find_if(
+          node.inputs().front()->schema().columns().begin(),
+          node.inputs().front()->schema().columns().end(),
+          [binding](const RowColumn& column) {
+            return column.slot == binding.source;
+          });
+      if (source != node.inputs().front()->schema().columns().end() &&
+          source->type == QueryType::kEdgeRef) {
+        kind = PropertyEntityKind::kEdge;
+      }
+    }
+    plan->property_bindings.push_back(
+        {binding.source, binding.property, binding.output, kind, std::nullopt});
   }
-  for (const auto& input : node.inputs()) {
-    CollectReferencedProperties(*input, properties);
-  }
+  for (const auto& input : node.inputs()) CollectMetadata(*input, plan);
 }
 
-bool IsVertexProjection(const LogicalPlanNode& project, SlotId vertex_slot) {
-  return !project.schema().columns().empty() &&
-         std::all_of(project.schema().columns().begin(),
-                     project.schema().columns().end(),
-                     [vertex_slot](const RowColumn& column) {
-                       return column.slot == vertex_slot &&
-                              column.type == QueryType::kVertexRef &&
-                              !column.optional;
-                     });
+bool IsProjectedCanonicalColumn(const RowColumn& column,
+                                const PreparedQueryPlan& plan) {
+  if (column.slot == plan.entity_slot) {
+    const QueryType expected = plan.entity_family == FactFamily::kVertexState
+                                   ? QueryType::kVertexRef
+                                   : QueryType::kEdgeRef;
+    return column.type == expected && !column.optional;
+  }
+  return std::any_of(
+      plan.property_bindings.begin(), plan.property_bindings.end(),
+      [&column](const PreparedPropertyBinding& binding) {
+        return binding.output == column;
+      });
 }
 
 }  // namespace
@@ -136,29 +545,48 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
 
   PreparedQueryPlan plan;
   plan.output_columns = root->schema().columns();
-  CollectReferencedProperties(*root, &plan.referenced_properties);
+  CollectMetadata(*root, &plan);
   if (root->kind() != LogicalOpKind::kProject || root->inputs().size() != 1) {
     return plan;
   }
-  const LogicalPlanNode& state_at = *root->inputs().front();
-  if (state_at.kind() != LogicalOpKind::kStateAt ||
-      state_at.inputs().size() != 1 || !state_at.scope().has_value() ||
-      !std::holds_alternative<At>(*state_at.scope())) {
+  const LogicalPlanNode* node = root->inputs().front().get();
+  if (node->kind() == LogicalOpKind::kFilter) {
+    if (node->inputs().size() != 1 || !node->predicate()) return plan;
+    plan.predicate = node->predicate();
+    node = node->inputs().front().get();
+  }
+  if (node->kind() == LogicalOpKind::kBindProperty) {
+    if (node->inputs().size() != 1 || plan.property_bindings.size() != 1) {
+      return plan;
+    }
+    node = node->inputs().front().get();
+  } else if (!plan.property_bindings.empty()) {
     return plan;
   }
-  const LogicalPlanNode& scan = *state_at.inputs().front();
-  if (scan.kind() != LogicalOpKind::kVertexScan || !scan.inputs().empty() ||
-      scan.schema().columns().size() != 1) {
+  if (node->inputs().size() != 1 || !node->scope().has_value()) return plan;
+  const LogicalPlanNode& scan = *node->inputs().front();
+  if (!scan.inputs().empty() || scan.schema().columns().size() != 1) return plan;
+  if (scan.kind() == LogicalOpKind::kVertexScan) {
+    plan.entity_family = FactFamily::kVertexState;
+  } else if (scan.kind() == LogicalOpKind::kEdgeScan) {
+    plan.entity_family = FactFamily::kEdgeState;
+  } else {
     return plan;
   }
-  const RowColumn& vertex = scan.schema().columns().front();
-  if (vertex.type != QueryType::kVertexRef || vertex.optional ||
-      !IsVertexProjection(*root, vertex.slot)) {
+  const RowColumn& entity = scan.schema().columns().front();
+  const QueryType expected = plan.entity_family == FactFamily::kVertexState
+                                 ? QueryType::kVertexRef
+                                 : QueryType::kEdgeRef;
+  if (entity.type != expected || entity.optional) return plan;
+  plan.entity_slot = entity.slot;
+  plan.scope = *node->scope();
+  if (!std::all_of(plan.output_columns.begin(), plan.output_columns.end(),
+                   [&plan](const RowColumn& column) {
+                     return IsProjectedCanonicalColumn(column, plan);
+                   })) {
     return plan;
   }
-  plan.canonical_vertex_state_at = true;
-  plan.vertex_slot = vertex.slot;
-  plan.valid_time = std::get<At>(*state_at.scope()).time;
+  plan.canonical_temporal = true;
   return plan;
 }
 
@@ -166,6 +594,12 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             Snapshot snapshot,
                                             const Bindings&,
                                             const QueryOptions& options) {
+  if (const auto* history = std::get_if<History>(&plan.scope);
+      history != nullptr && !history->interval.has_value() &&
+      options.mode != QueryExecutionMode::kAnalytical) {
+    return Status::InvalidArgument(
+        "query", "unbounded History requires an analytical budget");
+  }
   return QueryCursor(std::make_unique<QueryCursor::State>(
       plan, std::move(snapshot), options));
 }

@@ -203,6 +203,22 @@ StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex,
                       RowSchema(std::move(columns)), std::move(payload)));
 }
 
+StatusOr<Query> Query::BindEdgePropertyImpl(SlotId edge, PropertyId property,
+                                             RowColumn output) const {
+  if (!root_ || !property.valid() || output.slot.value == 0 ||
+      !Contains(schema(), edge, QueryType::kEdgeRef, false) ||
+      HasSlotId(schema(), output.slot)) {
+    return Status::InvalidArgument(
+        "property binding is invalid or duplicates a SlotId");
+  }
+  std::vector<RowColumn> columns = schema().columns();
+  columns.push_back(output);
+  internal::LogicalPlanPayload payload;
+  payload.property_binding = internal::PropertyBinding{edge, property, output};
+  return Query(Append(internal::LogicalOpKind::kBindProperty, root_,
+                      RowSchema(std::move(columns)), std::move(payload)));
+}
+
 StatusOr<Query> Query::Where(Expr<bool> predicate) const {
   if (!root_ || !predicate.valid()) {
     return Status::InvalidArgument("filter predicate is invalid");

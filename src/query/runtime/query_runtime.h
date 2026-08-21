@@ -4,18 +4,33 @@
 #ifndef CEDAR_QUERY_RUNTIME_QUERY_RUNTIME_H_
 #define CEDAR_QUERY_RUNTIME_QUERY_RUNTIME_H_
 
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include "cedar/query/query.h"
 #include "cedar/query/result.h"
+#include "cedar/schema.h"
 #include "cedar/snapshot.h"
+#include "query/logical/expression.h"
 
 namespace cedar::internal {
 
+struct PreparedPropertyBinding {
+  SlotId source;
+  PropertyId property;
+  RowColumn output;
+  PropertyEntityKind entity_kind;
+  std::optional<PropertyDefinition> definition;
+};
+
 struct PreparedQueryPlan {
-  bool canonical_vertex_state_at = false;
-  SlotId vertex_slot;
-  ValidTime valid_time;
+  bool canonical_temporal = false;
+  FactFamily entity_family = FactFamily::kVertexState;
+  SlotId entity_slot;
+  TemporalScope scope = At{ValidTime{0}};
+  std::vector<PreparedPropertyBinding> property_bindings;
+  std::shared_ptr<const ExpressionNode> predicate;
   std::vector<RowColumn> output_columns;
   std::vector<PropertyId> referenced_properties;
 };

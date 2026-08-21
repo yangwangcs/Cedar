@@ -66,6 +66,12 @@ class Query {
     return BindVertexPropertyImpl(
         vertex.id(), property, {output.id(), output.name(), output.type(), true});
   }
+  template <typename T>
+  StatusOr<Query> BindEdgeProperty(Slot<EdgeRef> edge, PropertyId property,
+                                   OptionalSlot<T> output) const {
+    return BindEdgePropertyImpl(
+        edge.id(), property, {output.id(), output.name(), output.type(), true});
+  }
   StatusOr<Query> Where(Expr<bool> predicate) const;
   StatusOr<Query> Select(std::vector<Projection> projections) const;
   const RowSchema& schema() const;
@@ -75,6 +81,8 @@ class Query {
 
   StatusOr<Query> BindVertexPropertyImpl(SlotId vertex, PropertyId property,
                                          RowColumn output) const;
+  StatusOr<Query> BindEdgePropertyImpl(SlotId edge, PropertyId property,
+                                       RowColumn output) const;
   std::shared_ptr<const internal::LogicalPlanNode> root_;
   friend class internal::LogicalPlanInspector;
 };

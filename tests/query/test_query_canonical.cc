@@ -7,10 +7,13 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "cedar/database.h"
 #include "cedar/query.h"
 #include "cedar/transaction.h"
+#include "query/runtime/property_binding.h"
+#include "query/runtime/temporal_source.h"
 
 namespace cedar {
 namespace {
@@ -22,6 +25,85 @@ static_assert(!std::is_copy_constructible_v<QueryCursor>);
 static_assert(!std::is_copy_assignable_v<QueryCursor>);
 static_assert(std::is_move_constructible_v<QueryCursor>);
 static_assert(std::is_move_assignable_v<QueryCursor>);
+
+struct ExpectedEvent {
+  uint64_t valid_from;
+  FactOperation operation;
+  uint64_t commit_seq;
+
+  bool operator==(const ExpectedEvent&) const = default;
+};
+
+struct ExpectedChange {
+  uint64_t valid_from;
+  std::optional<int64_t> before;
+  std::optional<int64_t> after;
+
+  bool operator==(const ExpectedChange&) const = default;
+};
+
+struct ExpectedState {
+  uint64_t from;
+  std::optional<uint64_t> to;
+  std::optional<int64_t> value;
+
+  bool operator==(const ExpectedState&) const = default;
+};
+
+std::optional<int64_t> Int64Of(const std::optional<Value>& value) {
+  if (!value.has_value()) return std::nullopt;
+  return std::get<int64_t>(value->data());
+}
+
+std::vector<ExpectedEvent> ObserveEvents(
+    const std::vector<internal::EventRow>& rows) {
+  std::vector<ExpectedEvent> observed;
+  observed.reserve(rows.size());
+  for (const auto& row : rows) {
+    observed.push_back(
+        {row.valid_from.value, row.operation, row.commit_seq.value});
+  }
+  return observed;
+}
+
+std::vector<ExpectedChange> ObserveChanges(
+    const std::vector<internal::ChangeRow>& rows) {
+  std::vector<ExpectedChange> observed;
+  observed.reserve(rows.size());
+  for (const auto& row : rows) {
+    observed.push_back(
+        {row.valid_from.value, Int64Of(row.before), Int64Of(row.after)});
+  }
+  return observed;
+}
+
+std::vector<ExpectedState> ObserveStates(
+    const std::vector<internal::StateRow>& rows) {
+  std::vector<ExpectedState> observed;
+  observed.reserve(rows.size());
+  for (const auto& row : rows) {
+    observed.push_back({row.effective.from.value,
+                        row.effective.to.has_value()
+                            ? std::optional<uint64_t>{row.effective.to->value}
+                            : std::nullopt,
+                        Int64Of(row.value)});
+  }
+  return observed;
+}
+
+std::vector<ExpectedState> ObserveBindings(
+    const std::vector<internal::BoundPropertyRow>& rows) {
+  std::vector<ExpectedState> observed;
+  observed.reserve(rows.size());
+  for (const auto& row : rows) {
+    observed.push_back({row.effective.from.value,
+                        row.effective.to.has_value()
+                            ? std::optional<uint64_t>{row.effective.to->value}
+                            : std::nullopt,
+                        Int64Of(row.value)});
+  }
+  return observed;
+}
 
 class QueryCanonicalTest : public ::testing::Test {
  protected:
@@ -69,6 +151,67 @@ class QueryCanonicalTest : public ::testing::Test {
     return committed.ValueOrDie().commit_seq;
   }
 
+  CommitSeq CommitPropertyMutation(ValidTime valid_from,
+                                   std::optional<int64_t> value) {
+    auto transaction = database_->BeginTransaction();
+    EXPECT_TRUE(transaction.ok()) << transaction.status().ToString();
+    const PropertyFact score = PropertyFact::Vertex(
+        VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+    const Status staged = value.has_value()
+                              ? transaction.ValueOrDie()->Set(
+                                    score, valid_from, Value::Int64(*value))
+                              : transaction.ValueOrDie()->Unset(score, valid_from);
+    EXPECT_TRUE(staged.ok()) << staged.ToString();
+    auto committed = transaction.ValueOrDie()->Commit();
+    EXPECT_TRUE(committed.ok()) << committed.status().ToString();
+    return committed.ValueOrDie().commit_seq;
+  }
+
+  std::vector<CommitSeq> SeedPropertyHistory() {
+    const auto property = database_->RegisterProperty(PropertyDefinition{
+        PropertyId{7}, 0, "score", PropertyEntityKind::kVertex,
+        PhysicalType::kInt64, 4096});
+    EXPECT_TRUE(property.ok()) << property.status().ToString();
+    if (property.ok()) score_definition_ = property.ValueOrDie();
+
+    auto first = database_->BeginTransaction();
+    EXPECT_TRUE(first.ok()) << first.status().ToString();
+    EXPECT_TRUE(first.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(
+                                 VertexRef{PartId{0}, VertexId{1}}),
+                             ValidTime{0})
+                    .ok());
+    EXPECT_TRUE(first.ValueOrDie()
+                    ->Set(PropertyFact::Vertex(
+                              VertexRef{PartId{0}, VertexId{1}}, PropertyId{7}),
+                          ValidTime{10}, Value::Int64(7))
+                    .ok());
+    auto committed = first.ValueOrDie()->Commit();
+    EXPECT_TRUE(committed.ok()) << committed.status().ToString();
+
+    return {committed.ValueOrDie().commit_seq,
+            CommitPropertyMutation(ValidTime{30}, 7),
+            CommitPropertyMutation(ValidTime{20}, std::nullopt)};
+  }
+
+  StatusOr<size_t> CountRows(const Query& query, QueryOptions options = {}) {
+    auto prepared = database_->PrepareQuery(query);
+    if (!prepared.ok()) return prepared.status();
+    auto snapshot = database_->BeginSnapshot();
+    if (!snapshot.ok()) return snapshot.status();
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+    if (!cursor.ok()) return cursor.status();
+    size_t rows = 0;
+    while (true) {
+      auto batch = cursor.ValueOrDie().Next();
+      if (!batch.ok()) return batch.status();
+      if (!batch.ValueOrDie().has_value()) break;
+      rows += batch.ValueOrDie()->row_count();
+    }
+    return rows;
+  }
+
   void SeedVertexHistory() {
     EXPECT_EQ(AssertVertex(1, 10), CommitSeq{1});
     EXPECT_EQ(RetractVertex(1, 10), CommitSeq{2});
@@ -93,6 +236,7 @@ class QueryCanonicalTest : public ::testing::Test {
   std::string path_;
   std::vector<std::string> other_paths_;
   std::unique_ptr<Database> database_;
+  std::optional<PropertyDefinition> score_definition_;
 };
 
 TEST_F(QueryCanonicalTest, StreamsStateAtFromTheConsumedSnapshot) {
@@ -357,6 +501,255 @@ TEST_F(QueryCanonicalTest, RepeatsTerminalExecutionError) {
   ASSERT_FALSE(second.ok());
   EXPECT_TRUE(first.status().IsResourceExhausted());
   EXPECT_EQ(second.status().ToString(), first.status().ToString());
+}
+
+TEST_F(QueryCanonicalTest, ReadsCorrectedTemporalSourcesAgainstIndependentRows) {
+  const std::vector<CommitSeq> commits = SeedPropertyHistory();
+  ASSERT_EQ(commits.size(), 3U);
+
+  auto before_correction =
+      database_->BeginSnapshot({.as_of = commits[1]});
+  ASSERT_TRUE(before_correction.ok())
+      << before_correction.status().ToString();
+  const ValidTimeInterval range{ValidTime{10}, ValidTime{40}};
+  auto earlier_events = internal::TemporalSource::ReadEvents(
+      before_correction.ValueOrDie(), FactFamily::kVertexProperty,
+      PropertyId{7}, range);
+  auto earlier_changes = internal::TemporalSource::ReadChanges(
+      before_correction.ValueOrDie(), FactFamily::kVertexProperty,
+      PropertyId{7}, range);
+  auto earlier_history = internal::TemporalSource::ReadHistory(
+      before_correction.ValueOrDie(), FactFamily::kVertexProperty,
+      PropertyId{7}, range);
+  ASSERT_TRUE(earlier_events.ok()) << earlier_events.status().ToString();
+  ASSERT_TRUE(earlier_changes.ok()) << earlier_changes.status().ToString();
+  ASSERT_TRUE(earlier_history.ok()) << earlier_history.status().ToString();
+  EXPECT_EQ(ObserveEvents(earlier_events.ValueOrDie()),
+            (std::vector<ExpectedEvent>{{10, FactOperation::kPut,
+                                         commits[0].value},
+                                        {30, FactOperation::kPut,
+                                         commits[1].value}}));
+  EXPECT_EQ(ObserveChanges(earlier_changes.ValueOrDie()),
+            (std::vector<ExpectedChange>{{10, std::nullopt, 7}}));
+  EXPECT_EQ(ObserveStates(earlier_history.ValueOrDie()),
+            (std::vector<ExpectedState>{{10, 40, 7}}));
+
+  auto corrected = database_->BeginSnapshot({.as_of = commits[2]});
+  ASSERT_TRUE(corrected.ok()) << corrected.status().ToString();
+  auto events = internal::TemporalSource::ReadEvents(
+      corrected.ValueOrDie(), FactFamily::kVertexProperty, PropertyId{7},
+      range);
+  auto changes = internal::TemporalSource::ReadChanges(
+      corrected.ValueOrDie(), FactFamily::kVertexProperty, PropertyId{7},
+      range);
+  auto history = internal::TemporalSource::ReadHistory(
+      corrected.ValueOrDie(), FactFamily::kVertexProperty, PropertyId{7},
+      range);
+  ASSERT_TRUE(events.ok()) << events.status().ToString();
+  ASSERT_TRUE(changes.ok()) << changes.status().ToString();
+  ASSERT_TRUE(history.ok()) << history.status().ToString();
+  EXPECT_EQ(ObserveEvents(events.ValueOrDie()),
+            (std::vector<ExpectedEvent>{{10, FactOperation::kPut,
+                                         commits[0].value},
+                                        {20, FactOperation::kDelete,
+                                         commits[2].value},
+                                        {30, FactOperation::kPut,
+                                         commits[1].value}}));
+  EXPECT_EQ(ObserveChanges(changes.ValueOrDie()),
+            (std::vector<ExpectedChange>{{10, std::nullopt, 7},
+                                         {20, 7, std::nullopt},
+                                         {30, std::nullopt, 7}}));
+  EXPECT_EQ(ObserveStates(history.ValueOrDie()),
+            (std::vector<ExpectedState>{{10, 20, 7}, {30, 40, 7}}));
+}
+
+TEST_F(QueryCanonicalTest, AppliesExactHalfOpenStateScopes) {
+  SeedPropertyHistory();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  auto overlaps = internal::TemporalSource::ReadOverlaps(
+      snapshot.ValueOrDie(), FactFamily::kVertexProperty, PropertyId{7},
+      ValidTimeInterval{ValidTime{20}, ValidTime{30}});
+  auto throughout = internal::TemporalSource::ReadThroughout(
+      snapshot.ValueOrDie(), FactFamily::kVertexProperty, PropertyId{7},
+      ValidTimeInterval{ValidTime{10}, ValidTime{20}});
+  auto crosses_gap = internal::TemporalSource::ReadThroughout(
+      snapshot.ValueOrDie(), FactFamily::kVertexProperty, PropertyId{7},
+      ValidTimeInterval{ValidTime{10}, ValidTime{21}});
+  ASSERT_TRUE(overlaps.ok()) << overlaps.status().ToString();
+  ASSERT_TRUE(throughout.ok()) << throughout.status().ToString();
+  ASSERT_TRUE(crosses_gap.ok()) << crosses_gap.status().ToString();
+  EXPECT_TRUE(overlaps.ValueOrDie().empty());
+  EXPECT_EQ(ObserveStates(throughout.ValueOrDie()),
+            (std::vector<ExpectedState>{{10, 20, 7}}));
+  EXPECT_TRUE(crosses_gap.ValueOrDie().empty());
+}
+
+TEST_F(QueryCanonicalTest, DerivesMissingOnlyInsideEntityIntervals) {
+  SeedPropertyHistory();
+  ASSERT_TRUE(score_definition_.has_value());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const ValidTimeInterval range{ValidTime{0}, ValidTime{40}};
+  auto entities = internal::TemporalSource::ReadHistory(
+      snapshot.ValueOrDie(), FactFamily::kVertexState, PropertyId{}, range);
+  ASSERT_TRUE(entities.ok()) << entities.status().ToString();
+  auto bound = internal::PropertyBinder::BindIntervals(
+      snapshot.ValueOrDie(), entities.ValueOrDie(), *score_definition_);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  EXPECT_EQ(ObserveBindings(bound.ValueOrDie()),
+            (std::vector<ExpectedState>{{0, 10, std::nullopt},
+                                        {10, 20, 7},
+                                        {20, 30, std::nullopt},
+                                        {30, 40, 7}}));
+}
+
+TEST_F(QueryCanonicalTest, ClipsPredicatesAndKeepsTwoValuedMissing) {
+  SeedPropertyHistory();
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score");
+
+  auto source = Query::Vertices(
+      vertex, History{ValidTimeInterval{ValidTime{0}, ValidTime{30}}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto bound = source.ValueOrDie().BindVertexProperty(vertex, PropertyId{7}, score);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  auto missing = bound.ValueOrDie().Where(IsMissing(score));
+  ASSERT_TRUE(missing.ok()) << missing.status().ToString();
+  auto missing_query = missing.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(missing_query.ok()) << missing_query.status().ToString();
+  auto missing_rows = CountRows(missing_query.ValueOrDie());
+  ASSERT_TRUE(missing_rows.ok()) << missing_rows.status().ToString();
+  EXPECT_EQ(missing_rows.ValueOrDie(), 2U);
+
+  auto at = Query::Vertices(vertex, At{ValidTime{5}});
+  ASSERT_TRUE(at.ok()) << at.status().ToString();
+  auto at_bound = at.ValueOrDie().BindVertexProperty(vertex, PropertyId{7}, score);
+  ASSERT_TRUE(at_bound.ok()) << at_bound.status().ToString();
+  auto not_equal_by_not = at_bound.ValueOrDie().Where(
+      Not(Equal(ValueOf(score), Literal<int64_t>(7))));
+  auto ordinary_not_equal = at_bound.ValueOrDie().Where(
+      NotEqual(ValueOf(score), Literal<int64_t>(7)));
+  ASSERT_TRUE(not_equal_by_not.ok()) << not_equal_by_not.status().ToString();
+  ASSERT_TRUE(ordinary_not_equal.ok())
+      << ordinary_not_equal.status().ToString();
+  auto not_query = not_equal_by_not.ValueOrDie().Select({Project(vertex)});
+  auto not_equal_query =
+      ordinary_not_equal.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(not_query.ok()) << not_query.status().ToString();
+  ASSERT_TRUE(not_equal_query.ok()) << not_equal_query.status().ToString();
+  EXPECT_EQ(CountRows(not_query.ValueOrDie()).ValueOrDie(), 1U);
+  EXPECT_EQ(CountRows(not_equal_query.ValueOrDie()).ValueOrDie(), 0U);
+}
+
+TEST_F(QueryCanonicalTest, BindsTypedEdgeProperties) {
+  const auto property = database_->RegisterProperty(PropertyDefinition{
+      PropertyId{8}, 0, "weight", PropertyEntityKind::kEdge,
+      PhysicalType::kInt64, 4096});
+  ASSERT_TRUE(property.ok()) << property.status().ToString();
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  const VertexRef source{PartId{0}, VertexId{1}};
+  const VertexRef target{PartId{0}, VertexId{2}};
+  const EdgeRef edge_ref{PartId{0}, EdgeId{9}};
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(source), ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(target), ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EdgeIdentity{edge_ref, source, target, 5},
+                           ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Edge(edge_ref, PropertyId{8}),
+                        ValidTime{0}, Value::Int64(11))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+
+  Slot<EdgeRef> edge = Slot<EdgeRef>::Named("e");
+  OptionalSlot<int64_t> weight = OptionalSlot<int64_t>::Named("weight");
+  auto source_query = Query::Edges(edge, At{ValidTime{5}});
+  ASSERT_TRUE(source_query.ok()) << source_query.status().ToString();
+  auto bound = source_query.ValueOrDie().BindEdgeProperty(
+      edge, PropertyId{8}, weight);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  auto query = bound.ValueOrDie().Select({Project(edge), Project(weight)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<EdgeRef>(edge, 0), edge_ref);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(weight, 0), 11);
+}
+
+TEST_F(QueryCanonicalTest, RejectsPropertyKindAndPhysicalTypeAtPrepare) {
+  SeedPropertyHistory();
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  OptionalSlot<std::string> wrong_type =
+      OptionalSlot<std::string>::Named("wrong_type");
+  auto vertices = Query::Vertices(vertex, At{ValidTime{5}});
+  ASSERT_TRUE(vertices.ok()) << vertices.status().ToString();
+  auto typed_wrong = vertices.ValueOrDie().BindVertexProperty(
+      vertex, PropertyId{7}, wrong_type);
+  ASSERT_TRUE(typed_wrong.ok()) << typed_wrong.status().ToString();
+  EXPECT_TRUE(database_->PrepareQuery(typed_wrong.ValueOrDie())
+                  .status()
+                  .IsSchemaMismatch());
+
+  Slot<EdgeRef> edge = Slot<EdgeRef>::Named("e");
+  OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score");
+  auto edges = Query::Edges(edge, At{ValidTime{5}});
+  ASSERT_TRUE(edges.ok()) << edges.status().ToString();
+  auto kind_wrong = edges.ValueOrDie().BindEdgeProperty(
+      edge, PropertyId{7}, score);
+  ASSERT_TRUE(kind_wrong.ok()) << kind_wrong.status().ToString();
+  EXPECT_TRUE(database_->PrepareQuery(kind_wrong.ValueOrDie())
+                  .status()
+                  .IsSchemaMismatch());
+}
+
+TEST_F(QueryCanonicalTest, RequiresAnAnalyticalBudgetForUnboundedHistory) {
+  ASSERT_EQ(AssertVertex(1, 10), CommitSeq{1});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, History{std::nullopt});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+
+  auto default_snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(default_snapshot.ok()) << default_snapshot.status().ToString();
+  EXPECT_TRUE(prepared.ValueOrDie()
+                  .Execute(std::move(default_snapshot).ConsumeValueOrDie(),
+                           Bindings{}, QueryOptions{})
+                  .status()
+                  .IsInvalidArgument());
+
+  QueryOptions analytical;
+  analytical.mode = QueryExecutionMode::kAnalytical;
+  auto analytical_snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(analytical_snapshot.ok())
+      << analytical_snapshot.status().ToString();
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(analytical_snapshot).ConsumeValueOrDie(), Bindings{},
+      analytical);
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
 }
 
 }  // namespace

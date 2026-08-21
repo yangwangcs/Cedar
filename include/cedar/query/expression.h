@@ -220,6 +220,18 @@ Expr<bool> IsPresent(OptionalExpr<T> expression) {
 }
 
 template <typename T>
+Expr<bool> IsMissing(const OptionalSlot<T>& slot) {
+  return IsMissing(ValueOf(slot));
+}
+
+template <typename T>
+Expr<bool> IsMissing(OptionalExpr<T> expression) {
+  return internal::ExpressionInspector::Make<bool>(detail::MakeNotExpression(
+      detail::MakeIsPresentExpression(
+          internal::ExpressionInspector::Share(expression))));
+}
+
+template <typename T>
 Expr<T> Literal(T value) {
   return internal::ExpressionInspector::Make<T>(
       detail::MakeLiteralExpression(QueryTypeOf<T>(), std::move(value)));

@@ -16,7 +16,7 @@ Implementation summary:
   candidate counter for a bounded adjacency seek.
 - Added cross-partition, public expansion, and K-hop fixture coverage.
 
-Commit: `e12d1c633b1481c86d42a63003476ad936a3d358`
+Commit: `d73c6150cbb61340f4fa4fcda3bd6d34112d6de3`
 
 Verification:
 

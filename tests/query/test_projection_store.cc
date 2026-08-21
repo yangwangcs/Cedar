@@ -159,6 +159,21 @@ TEST_F(ProjectionStoreTest, PinnedReaderFailsAfterStoreClose) {
   EXPECT_FALSE(pin->exists());
 }
 
+TEST_F(ProjectionStoreTest, InvalidPinnedReaderReturnsNotFound) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  ProjectionGeneration invalid;
+  EXPECT_TRUE(opened.ValueOrDie()->ReadChains(request, invalid).status().IsNotFound());
+}
+
 TEST_F(ProjectionStoreTest, BadCurrentDisablesProjections) {
   std::filesystem::create_directories(path_ + "/manifests");
   std::ofstream(path_ + "/PROJECTION-CURRENT") << "bad";

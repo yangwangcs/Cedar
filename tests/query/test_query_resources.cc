@@ -169,9 +169,11 @@ TEST(QueryScratchTest, AcquiresAnalyticalIoAtRunBoundaries) {
   options.wal_sync_critical = &critical;
   QueryResourcePool pool(options);
   QueryScratch scratch(root, "instance", "query", 4096);
-  scratch.SetIoAdmission([&pool](uint64_t bytes) {
+  scratch.SetIoAdmission([&pool](uint64_t bytes)
+                             -> StatusOr<std::shared_ptr<IoPermit>> {
     auto permit = pool.AcquireIo(QueryWorkClass::kAnalytical, bytes);
-    return permit.ok() ? Status::OK() : permit.status();
+    if (!permit.ok()) return permit.status();
+    return std::make_shared<IoPermit>(std::move(permit).ConsumeValueOrDie());
   });
   EXPECT_TRUE(scratch.WriteRun("run-0", "payload").status().IsResourceExhausted());
   critical.store(false);
@@ -220,7 +222,12 @@ TEST(QueryScratchTest, RejectsOverwriteAndDetectsCorruption) {
   char byte = 0;
   file.write(&byte, 1);
   file.close();
-  EXPECT_TRUE(scratch.ReadRun(run.ValueOrDie()).status().IsCorruption());
+  std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> limits;
+  limits.fill(UINT64_MAX);
+  QueryReservation reservation(limits);
+  QueryScratch reader(root, "instance", "query", 1024, &reservation);
+  EXPECT_TRUE(reader.ReadRun(run.ValueOrDie()).status().IsCorruption());
+  EXPECT_EQ(reservation.used(ResourceDimension::kReadBytes), 0U);
   EXPECT_TRUE(scratch.Cleanup().ok());
 }
 

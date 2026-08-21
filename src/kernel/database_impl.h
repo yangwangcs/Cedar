@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <chrono>
 #include <atomic>
+#include <limits>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -209,7 +210,16 @@ class Database::Impl {
     pool_options.scratch_root = query_database_path;
     pool_options.scratch_instance = "active";
     pool_options.read_bytes = UINT64_MAX;
-    pool_options.prefetch_bytes = query_runtime_options.max_prefetch_bytes;
+    // Prefetch is a per-query reservation. Size the pool cap for all admitted
+    // workers so independent default queries do not reject one another merely
+    // because each consumes the full per-query allowance.
+    pool_options.prefetch_bytes =
+        query_runtime_options.max_prefetch_bytes >
+                std::numeric_limits<uint64_t>::max() /
+                    query_runtime_options.query_workers
+            ? std::numeric_limits<uint64_t>::max()
+            : query_runtime_options.max_prefetch_bytes *
+                  query_runtime_options.query_workers;
     pool_options.decoded_rows = UINT64_MAX;
     pool_options.output_rows = UINT64_MAX;
     pool_options.output_bytes = UINT64_MAX;

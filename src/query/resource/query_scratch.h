@@ -9,6 +9,7 @@
 #include <functional>
 
 #include "cedar/core/status.h"
+#include "query/resource/query_resource_pool.h"
 #include "query/runtime/relational.h"
 
 namespace cedar::internal {
@@ -34,8 +35,10 @@ class QueryScratch {
   void SetReservation(QueryReservation* reservation) { reservation_ = reservation; }
   void SetRateLimits(uint64_t read_bytes_per_second,
                      uint64_t scratch_bytes_per_second);
-  // Called immediately before each physical spill read/write.
-  void SetIoAdmission(std::function<Status(uint64_t)> check);
+  // Acquires a permit held through the complete physical spill read/write.
+  // The returned token must release the underlying admission in its destructor.
+  void SetIoAdmission(
+      std::function<StatusOr<std::shared_ptr<IoPermit>>(uint64_t)> acquire);
   void SetAbortCheck(std::function<Status()> check);
   static Status CleanupOldInstances(const std::filesystem::path& database_root,
                                     const std::string& active_instance);
@@ -59,7 +62,7 @@ class QueryScratch {
   mutable std::chrono::steady_clock::time_point rate_window_start_;
   mutable uint64_t rate_read_bytes_ = 0;
   mutable uint64_t rate_scratch_bytes_ = 0;
-  std::function<Status(uint64_t)> io_admission_;
+  std::function<StatusOr<std::shared_ptr<IoPermit>>(uint64_t)> io_admission_;
   std::function<Status()> abort_check_;
   mutable bool created_ = false;
 };

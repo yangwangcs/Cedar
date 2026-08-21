@@ -965,7 +965,10 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     }
     auto rows = MaterializeRows(*state_->snapshot, state_->plan,
                                 &state_->reservation);
-    state_->reservation.ReleaseMemory(pre_materialize);
+    // The lease owns the pre-materialization reservation. Reset it now that
+    // MaterializeRows has completed so the reservation is released exactly
+    // once, including on an error path.
+    pre_materialize_lease.reset();
     if (!rows.ok()) {
       state_->terminal_error = rows.status();
       state_->snapshot.reset();
@@ -999,11 +1002,13 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
-    if (Status status = state_->reservation.ReserveCpuMicros(estimated_cpu);
-        !status.ok()) {
-      state_->terminal_error = status;
-      state_->snapshot.reset();
-      return *state_->terminal_error;
+    if (state_->options.budget.cpu_us != 0) {
+      if (Status status = state_->reservation.ReserveCpuMicros(estimated_cpu);
+          !status.ok()) {
+        state_->terminal_error = status;
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
     }
     if (Status status = state_->reservation.ReserveOutputRows(row_count);
         !status.ok()) {
@@ -1331,9 +1336,11 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                       : resource_pool->options().scratch_bytes_per_second;
     scratch->SetRateLimits(read_rate, scratch_rate);
     if (resource_pool != nullptr) {
-      scratch->SetIoAdmission([resource_pool](uint64_t bytes) {
+      scratch->SetIoAdmission([resource_pool](uint64_t bytes)
+                                  -> StatusOr<std::shared_ptr<IoPermit>> {
         auto permit = resource_pool->AcquireIo(QueryWorkClass::kAnalytical, bytes);
-        return permit.ok() ? Status::OK() : permit.status();
+        if (!permit.ok()) return permit.status();
+        return std::make_shared<IoPermit>(std::move(permit).ConsumeValueOrDie());
       });
     }
   }

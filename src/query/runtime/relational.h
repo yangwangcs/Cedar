@@ -149,6 +149,7 @@ class QueryReservation {
   Status ReserveCpuMicros(uint64_t micros);
   void ReleaseMemory(uint64_t bytes);
   void ReleaseScratch(uint64_t bytes);
+  void ReleaseReadBytes(uint64_t bytes);
   uint64_t used(ResourceDimension dimension) const;
   uint64_t limit(ResourceDimension dimension) const;
   void AttachPoolAdmission(

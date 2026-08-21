@@ -1180,6 +1180,10 @@ void QueryReservation::ReleaseScratch(uint64_t bytes) {
   const size_t index = static_cast<size_t>(ResourceDimension::kScratch);
   state_->used[index] = bytes >= state_->used[index] ? 0 : state_->used[index] - bytes;
 }
+void QueryReservation::ReleaseReadBytes(uint64_t bytes) {
+  const size_t index = static_cast<size_t>(ResourceDimension::kReadBytes);
+  state_->used[index] = bytes >= state_->used[index] ? 0 : state_->used[index] - bytes;
+}
 uint64_t QueryReservation::used(ResourceDimension dimension) const {
   return state_->used[static_cast<size_t>(dimension)];
 }

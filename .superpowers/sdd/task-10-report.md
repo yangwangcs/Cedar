@@ -126,7 +126,7 @@ cmake --build build -j2 --target cedar_core test_query_planner test_query_canoni
 ./build/tests/test_query_planner: 10/10 PASS
 ./build/tests/test_query_canonical: 18/18 PASS
 ./build/tests/test_query_delta: 10/10 PASS
-./build/tests/test_projection_store: 11/11 PASS
+./build/tests/test_projection_store: 12/12 PASS
 ./build/tests/test_query_relational: 41/41 PASS
 git diff --check: PASS
 ```

@@ -63,6 +63,12 @@ RelationalRow TemporalRow(int64_t key, uint64_t from, uint64_t to,
           ValidTimeInterval{ValidTime{from}, ValidTime{to}}};
 }
 
+RelationalRow TemporalRowUnbounded(int64_t key, uint64_t from,
+                                   int64_t payload = 0) {
+  return {{Int64(key), Int64(payload)},
+          ValidTimeInterval{ValidTime{from}, std::nullopt}};
+}
+
 TEST(VectorKernelsTest, ComparisonAgainstMissingIsFalse) {
   QueryColumn left = Int64Column({7, 0, 9}, {1, 0, 1});
   QueryColumn right = Int64Column({7, 7, 7}, {1, 1, 1});
@@ -443,6 +449,32 @@ TEST(RelationalTest, TemporalSemiJoinPreflightsCoalescedOutputRows) {
   ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
   EXPECT_EQ(result.ValueOrDie().rows.front().effective,
             (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+}
+
+TEST(RelationalTest, TemporalCoveragePreflightHandlesUnboundedIntervals) {
+  TemporalJoinInput semi_input{
+      {{TemporalRow(1, 0, 20)}},
+      {{TemporalRowUnbounded(1, 5)}}, 0, 0, JoinKind::kSemi};
+  FragmentBudget semi_fragments(1);
+  QueryReservation semi_reservation(1 << 20);
+  auto semi = IntervalMergeJoin(semi_input, &semi_fragments,
+                                &semi_reservation, 1);
+  ASSERT_TRUE(semi.ok()) << semi.status().ToString();
+  ASSERT_EQ(semi.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(semi.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{5}, ValidTime{20}}));
+
+  TemporalJoinInput anti_input{
+      {{TemporalRowUnbounded(1, 0)}},
+      {{TemporalRowUnbounded(1, 5)}}, 0, 0, JoinKind::kAnti};
+  FragmentBudget anti_fragments(1);
+  QueryReservation anti_reservation(1 << 20);
+  auto anti = IntervalMergeJoin(anti_input, &anti_fragments,
+                                &anti_reservation, 1);
+  ASSERT_TRUE(anti.ok()) << anti.status().ToString();
+  ASSERT_EQ(anti.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(anti.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
 }
 
 TEST(RelationalTest,

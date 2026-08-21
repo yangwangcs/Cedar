@@ -648,6 +648,7 @@ StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
   size_t fragments = 0;
   ValidTime cursor = left.effective->from;
   while (true) {
+    bool coverage_found = false;
     std::optional<ValidTime> coverage_end;
     std::optional<ValidTime> next_start;
     for (const RelationalRow& candidate : right.rows) {
@@ -659,6 +660,7 @@ StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
       if (!intersection) continue;
       if (!Before(cursor, intersection->from) &&
           EndsAfter(intersection->to, cursor)) {
+        coverage_found = true;
         if (!coverage_end.has_value() || !intersection->to.has_value() ||
             Before(*coverage_end, *intersection->to)) {
           coverage_end = intersection->to;
@@ -669,7 +671,7 @@ StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
         next_start = intersection->from;
       }
     }
-    if (!coverage_end.has_value() && next_start.has_value()) {
+    if (!coverage_found && next_start.has_value()) {
       if (kind == JoinKind::kAnti && Before(cursor, *next_start)) {
         if (fragments == std::numeric_limits<size_t>::max()) {
           return Status::ResourceExhausted("query",
@@ -680,7 +682,7 @@ StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
       cursor = *next_start;
       continue;
     }
-    if (coverage_end.has_value()) {
+    if (coverage_found) {
       // Extend through every interval that overlaps the current covered
       // region; this is the allocation-free equivalent of NormalizeIntervals.
       while (coverage_end.has_value()) {

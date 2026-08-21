@@ -63,6 +63,11 @@ struct RelationalRow {
 class QueryReservationLease;
 class QueryScratch;
 
+// Test seam for validating framed spill decoding without requiring a full
+// physical join to manufacture a malformed run.
+StatusOr<std::vector<RelationalRow>> DeserializeRowsForTesting(
+    std::string_view payload, class QueryReservation* reservation);
+
 struct BatchStream {
   BatchStream() = default;
   BatchStream(std::vector<RelationalRow> rows, bool order_specified = false)

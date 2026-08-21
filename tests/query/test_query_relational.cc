@@ -199,6 +199,27 @@ TEST(RelationalTest, HashJoinReturnsNeedsSpillWithoutExceedingReservation) {
   EXPECT_LE(reservation.used_bytes(), reservation.limit_bytes());
 }
 
+TEST(RelationalTest, MalformedCellCountIsRejectedBeforeVectorAllocation) {
+  // One framed row declares UINT32_MAX cells but contains no cell bytes. The
+  // decoder must reject the frame based on remaining bytes rather than trying
+  // to reserve the attacker-controlled count.
+  std::string payload;
+  const uint32_t frame_size = 5;
+  payload.append(reinterpret_cast<const char*>(&frame_size), sizeof(frame_size));
+  const uint32_t cell_count = std::numeric_limits<uint32_t>::max();
+  payload.append(reinterpret_cast<const char*>(&cell_count), sizeof(cell_count));
+  payload.push_back('\0');
+
+  // Keep the budget below the current implementation's per-frame guard. A
+  // valid decoder must reject the malformed count before attempting any
+  // reservation or allocation, so this remains a corruption result.
+  QueryReservation reservation(64);
+  auto decoded = DeserializeRowsForTesting(payload, &reservation);
+  ASSERT_FALSE(decoded.ok());
+  EXPECT_TRUE(decoded.status().IsCorruption());
+  EXPECT_EQ(reservation.used_bytes(), 0U);
+}
+
 TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
   JoinInput input{{{Row(1, 10)}}, {{Row(1, 20)}}, 0, 0,
                   JoinKind::kInner};
@@ -855,7 +876,12 @@ TEST(QueryRuntimeRelationalTest,
   char pattern[] = "/tmp/cedar_query_runtime_fixture_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
-  auto database = Database::Open(DatabaseOptions{.path = path});
+  DatabaseOptions database_options;
+  database_options.path = path;
+  database_options.query_runtime.query_memory_bytes = 32ULL << 20;
+  database_options.query_runtime.projection_cache_bytes = 32ULL << 20;
+  database_options.query_runtime.query_delta_bytes = 32ULL << 20;
+  auto database = Database::Open(std::move(database_options));
   ASSERT_TRUE(database.ok()) << database.status().ToString();
   auto property = database.ValueOrDie()->RegisterProperty(PropertyDefinition{
       PropertyId{7}, 0, "score", PropertyEntityKind::kVertex,

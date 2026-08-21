@@ -93,12 +93,10 @@ void BindCommitHandleToEpoch(
     const std::shared_ptr<internal::EpochCompletion>& completion,
     size_t ordinal, bool waits_for_durability) {
   if (!handle) return;
-  {
-    std::lock_guard<std::mutex> lock(handle->mutex);
-    handle->epoch_completion = completion;
-    handle->epoch_result_ordinal = ordinal;
-    handle->waits_for_epoch_durability = waits_for_durability;
-  }
+  std::lock_guard<std::mutex> lock(handle->mutex);
+  handle->epoch_completion = completion;
+  handle->epoch_result_ordinal = ordinal;
+  handle->waits_for_epoch_durability = waits_for_durability;
   handle->completed.notify_all();
 }
 
@@ -1476,7 +1474,8 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       options.query_runtime.max_prefetch_bytes == 0) {
     return Status::InvalidArgument("database", "query runtime bounds are invalid");
   }
-  if (options.storage_profile == StorageProfile::kProductionAppend) {
+  if (options.storage_profile == StorageProfile::kProductionAppend ||
+      options.storage_profile == StorageProfile::kKernelTest) {
     FactStoreOptions storage_options;
     storage_options.path = options.path;
     storage_options.write_buffer_bytes = options.write_buffer_bytes;
@@ -1488,21 +1487,21 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
     auto resolved = internal::ResolveStorageProfile(storage_options);
     if (!resolved.ok()) return resolved.status();
     const uint64_t max = std::numeric_limits<uint64_t>::max();
-    const uint64_t storage = resolved.ValueOrDie().facts_write_buffer_bytes >
-                                     max - resolved.ValueOrDie().meta_write_buffer_bytes
-                                 ? max
-                                 : resolved.ValueOrDie().facts_write_buffer_bytes +
-                                       resolved.ValueOrDie().meta_write_buffer_bytes;
-    const uint64_t first = storage > max - options.query_runtime.query_memory_bytes
-                               ? max
-                               : storage + options.query_runtime.query_memory_bytes;
-    const bool overflow = first == max ||
-        options.query_runtime.projection_cache_bytes > max - first;
-    const uint64_t second = overflow ? max : first + options.query_runtime.projection_cache_bytes;
-    const uint64_t budget = resolved.ValueOrDie().memory_budget_bytes;
-    if (overflow || second > budget ||
-        options.query_runtime.query_delta_bytes > budget - second) {
-      return Status::InvalidArgument("database", "query allocations exceed production memory budget");
+    const auto add = [max](uint64_t left, uint64_t right, uint64_t* out) {
+      if (right > max - left) return false;
+      *out = left + right;
+      return true;
+    };
+    uint64_t allocations = 0;
+    const auto& profile = resolved.ValueOrDie();
+    if (!add(profile.facts_write_buffer_bytes, profile.meta_write_buffer_bytes,
+             &allocations) ||
+        !add(allocations, profile.block_cache_bytes, &allocations) ||
+        !add(allocations, options.query_runtime.query_memory_bytes, &allocations) ||
+        !add(allocations, options.query_runtime.projection_cache_bytes, &allocations) ||
+        !add(allocations, options.query_runtime.query_delta_bytes, &allocations) ||
+        allocations > profile.memory_budget_bytes) {
+      return Status::InvalidArgument("database", "query allocations exceed storage memory budget");
     }
   }
   const std::string database_path = options.path;

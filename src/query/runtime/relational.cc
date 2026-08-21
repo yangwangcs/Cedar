@@ -1379,6 +1379,9 @@ StatusOr<RelationalRow> DeserializeRow(std::string_view payload) {
     }
     row.effective = ValidTimeInterval{ValidTime{from}, has_to ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt};
   }
+  if (cell_count > payload.size() / (sizeof(uint8_t) * 2)) {
+    return Status::Corruption("query relational", "spilled cell count exceeds frame");
+  }
   row.cells.reserve(cell_count);
   for (uint32_t index = 0; index < cell_count; ++index) {
     uint8_t type = 0, present = 0;
@@ -1397,36 +1400,69 @@ StatusOr<RelationalRow> DeserializeRow(std::string_view payload) {
   return row;
 }
 
-StatusOr<std::vector<RelationalRow>> DeserializeRows(
-    std::string_view payload, QueryReservation* reservation) {
+struct DecodedRows {
   std::vector<RelationalRow> rows;
+  std::shared_ptr<QueryReservationLease> lease;
+  std::vector<std::shared_ptr<QueryReservationLease>> extra_leases;
+};
+
+StatusOr<DecodedRows> DeserializeRows(
+    std::string_view payload, QueryReservation* reservation) {
+  std::string_view scan = payload;
+  size_t frame_count = 0;
+  while (!scan.empty()) {
+    uint32_t frame_size = 0;
+    if (!ReadBinary(&scan, &frame_size) || frame_size > scan.size()) {
+      return Status::Corruption("query relational", "invalid spilled row framing");
+    }
+    if (frame_size < sizeof(uint32_t) + sizeof(uint8_t)) {
+      return Status::Corruption("query relational", "invalid spilled row frame");
+    }
+    std::string_view frame = scan.substr(0, frame_size);
+    uint32_t cell_count = 0;
+    uint8_t has_effective = 0;
+    if (!ReadBinary(&frame, &cell_count) || !ReadBinary(&frame, &has_effective) ||
+        cell_count > frame.size() / (sizeof(uint8_t) * 2)) {
+      return Status::Corruption("query relational", "spilled cell count exceeds frame");
+    }
+    if (frame_count == std::numeric_limits<size_t>::max()) {
+      return Status::ResourceExhausted("query relational", "spilled rows reservation overflow");
+    }
+    ++frame_count;
+    scan.remove_prefix(frame_size);
+  }
+  size_t decoded_bytes = payload.size();
+  if (frame_count > (std::numeric_limits<size_t>::max() - decoded_bytes) /
+                        (sizeof(RelationalRow) + sizeof(RelationalCell))) {
+    return Status::ResourceExhausted("query relational", "spilled rows reservation overflow");
+  }
+  decoded_bytes += frame_count * (sizeof(RelationalRow) + sizeof(RelationalCell));
+  DecodedRows decoded;
+  if (reservation != nullptr) {
+    decoded.lease = reservation->TryRetain(decoded_bytes);
+    if (!decoded.lease) {
+      return NeedsSpill(decoded_bytes, AvailableBytes(*reservation));
+    }
+  }
+  decoded.rows.reserve(frame_count);
   while (!payload.empty()) {
     uint32_t frame_size = 0;
     if (!ReadBinary(&payload, &frame_size) || frame_size > payload.size()) {
       return Status::Corruption("query relational", "invalid spilled row framing");
     }
-    // Bound each row's transient decode allocations before DeserializeRow
-    // reserves its cell vector and any variable-length scalar payloads. The
-    // guard is intentionally scoped to decode plus insertion; persistent
-    // output accounting is handled by the caller's output lease.
-    const size_t frame_bytes = static_cast<size_t>(frame_size);
-    if (frame_bytes > std::numeric_limits<size_t>::max() -
-                          sizeof(RelationalRow) - 64) {
-      return Status::ResourceExhausted("query relational",
-                                       "spilled row reservation overflow");
-    }
-    ReservationGuard frame_guard(
-        reservation, frame_bytes + sizeof(RelationalRow) + 64);
-    if (!frame_guard.acquired()) {
-      return NeedsSpill(frame_bytes + sizeof(RelationalRow) + 64,
-                        AvailableBytes(*reservation));
-    }
     auto row = DeserializeRow(payload.substr(0, frame_size));
     if (!row.ok()) return row.status();
-    rows.push_back(std::move(row).ConsumeValueOrDie());
+    decoded.rows.push_back(std::move(row).ConsumeValueOrDie());
     payload.remove_prefix(frame_size);
   }
-  return rows;
+  return decoded;
+}
+
+StatusOr<std::vector<RelationalRow>> DeserializeRowsForTesting(
+    std::string_view payload, QueryReservation* reservation) {
+  auto decoded = DeserializeRows(payload, reservation);
+  if (!decoded.ok()) return decoded.status();
+  return std::move(decoded).ConsumeValueOrDie().rows;
 }
 
 StatusOr<BatchStream> HashJoinInMemory(const JoinInput& input,
@@ -1461,24 +1497,31 @@ Status SpillRowsByPartition(
   return Status::OK();
 }
 
-StatusOr<std::vector<RelationalRow>> ReadSpilledRows(
+StatusOr<DecodedRows> ReadSpilledRows(
     const std::vector<std::filesystem::path>& runs, QueryReservation* reservation,
     QueryScratch* scratch) {
-  std::vector<RelationalRow> rows;
+  DecodedRows combined;
   for (const auto& path : runs) {
     auto payload = scratch->ReadRun(path);
     if (!payload.ok()) return payload.status();
-    ReservationGuard payload_guard(reservation, payload.ValueOrDie().size());
-    if (!payload_guard.acquired()) {
-      return NeedsSpill(payload.ValueOrDie().size(), AvailableBytes(*reservation));
-    }
     auto decoded = DeserializeRows(payload.ValueOrDie(), reservation);
     if (!decoded.ok()) return decoded.status();
     auto decoded_rows = std::move(decoded).ConsumeValueOrDie();
-    rows.insert(rows.end(), std::make_move_iterator(decoded_rows.begin()),
-                std::make_move_iterator(decoded_rows.end()));
+    combined.rows.insert(combined.rows.end(),
+                         std::make_move_iterator(decoded_rows.rows.begin()),
+                         std::make_move_iterator(decoded_rows.rows.end()));
+    if (decoded_rows.lease) {
+      if (!combined.lease) combined.lease = std::move(decoded_rows.lease);
+      else {
+        // Keep all partition leases alive until the caller finishes using the
+        // accumulated rows. A single shared lease cannot represent multiple
+        // runs without overcharging, so use a conservative combined lease by
+        // retaining the additional bytes through its owner vector below.
+        combined.extra_leases.push_back(std::move(decoded_rows.lease));
+      }
+    }
   }
-  return rows;
+  return combined;
 }
 
 StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
@@ -1510,10 +1553,9 @@ StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
     if (!right_runs[partition].empty()) {
       auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
       if (!right.ok()) return right.status();
-      right_rows = std::move(right).ConsumeValueOrDie();
+      auto decoded_right = std::move(right).ConsumeValueOrDie();
+      right_rows = std::move(decoded_right.rows);
     }
-    ReservationGuard right_guard(reservation, EstimateRowsBytes(right_rows));
-    if (!right_guard.acquired()) return NeedsSpill();
     JoinInput part{BatchStream(std::vector<RelationalRow>{original_left}),
                    BatchStream(std::move(right_rows)), input.left_key,
                    input.right_key, input.kind};
@@ -1877,17 +1919,15 @@ StatusOr<BatchStream> ExternalSortMergeJoin(const JoinInput& input,
     if (left_runs[partition].empty()) continue;
     auto left = ReadSpilledRows(left_runs[partition], reservation, scratch);
     if (!left.ok()) return left.status();
+    auto decoded_left = std::move(left).ConsumeValueOrDie();
     std::vector<RelationalRow> right_rows;
     if (!right_runs[partition].empty()) {
       auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
       if (!right.ok()) return right.status();
-      right_rows = std::move(right).ConsumeValueOrDie();
+      auto decoded_right = std::move(right).ConsumeValueOrDie();
+      right_rows = std::move(decoded_right.rows);
     }
-    ReservationGuard left_guard(reservation, EstimateRowsBytes(left.ValueOrDie()));
-    if (!left_guard.acquired()) return NeedsSpill();
-    ReservationGuard right_guard(reservation, EstimateRowsBytes(right_rows));
-    if (!right_guard.acquired()) return NeedsSpill();
-    std::vector<RelationalRow> left_rows = std::move(left).ConsumeValueOrDie();
+    std::vector<RelationalRow> left_rows = std::move(decoded_left.rows);
     std::sort(left_rows.begin(), left_rows.end(), [&input](const RelationalRow& a,
                                                             const RelationalRow& b) {
       return CompareCell(a.cells[input.left_key], b.cells[input.left_key]) < 0;

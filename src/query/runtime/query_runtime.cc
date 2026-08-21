@@ -20,6 +20,8 @@
 namespace cedar {
 namespace {
 
+std::atomic<uint64_t> g_next_query_id{1};
+
 struct RuntimeRow {
   FactRef ref;
   std::optional<ValidTimeInterval> effective;
@@ -816,6 +818,10 @@ class QueryCursor::State {
     }
   }
 
+  void CleanupScratch() {
+    if (scratch) scratch->Cleanup().IgnoreError();
+  }
+
   internal::PreparedQueryPlan plan;
   std::optional<Snapshot> snapshot;
   QueryOptions options;
@@ -852,10 +858,14 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   if (!state_) {
     return Status::InvalidArgument("query cursor", "moved-from cursor");
   }
-  if (state_->terminal_error.has_value()) return *state_->terminal_error;
+  if (state_->terminal_error.has_value()) {
+    state_->CleanupScratch();
+    return *state_->terminal_error;
+  }
   if (state_->clean_terminal) return std::optional<QueryBatch>{};
   if (state_->cancelled.load(std::memory_order_acquire)) {
     state_->terminal_error = Status::QueryCancelled("query", "query cancelled");
+    state_->CleanupScratch();
     return *state_->terminal_error;
   }
   if (state_->options.budget.deadline_us != 0 &&
@@ -863,6 +873,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
           std::chrono::steady_clock::now() - state_->started_at).count()) >=
           state_->options.budget.deadline_us) {
     state_->terminal_error = Status::DeadlineExceeded("query", "deadline_us budget exhausted");
+    state_->CleanupScratch();
     return *state_->terminal_error;
   }
 
@@ -1086,6 +1097,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   state_->batches.clear();
   state_->materialized_output_lease.reset();
   state_->snapshot.reset();
+  state_->CleanupScratch();
   state_->clean_terminal = true;
   return std::optional<QueryBatch>{};
 }
@@ -1097,6 +1109,7 @@ Status QueryCursor::Close() {
   state_->batches.clear();
   state_->materialized_output_lease.reset();
   state_->snapshot.reset();
+  state_->CleanupScratch();
   state_->terminal_error.reset();
   state_->clean_terminal = true;
   return Status::OK();
@@ -1304,19 +1317,25 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             const Bindings&,
                                             const QueryOptions& options,
                                             QueryResourcePool* resource_pool) {
+  QueryOptions resolved_options = options;
+  if (resolved_options.mode == QueryExecutionMode::kAuto &&
+      plan.physical_plan != nullptr) {
+    resolved_options.mode = plan.physical_plan->lane;
+  }
   if (const auto* history = std::get_if<History>(&plan.scope);
       history != nullptr && !history->interval.has_value() &&
-      options.mode != QueryExecutionMode::kAnalytical) {
+      resolved_options.mode != QueryExecutionMode::kAnalytical) {
     return Status::InvalidArgument(
         "query", "unbounded History requires an analytical budget");
   }
   StatusOr<QueryReservation> admitted = resource_pool != nullptr
-      ? resource_pool->Admit(options.budget, options.mode)
-      : StatusOr<QueryReservation>(QueryReservation(static_cast<size_t>(options.budget.memory_bytes)));
+      ? resource_pool->Admit(resolved_options.budget, resolved_options.mode)
+      : StatusOr<QueryReservation>(QueryReservation(static_cast<size_t>(resolved_options.budget.memory_bytes)));
   if (!admitted.ok()) return admitted.status();
   std::unique_ptr<QueryScratch> scratch;
-  if (options.mode == QueryExecutionMode::kAnalytical) {
-    const std::string query_id = "query-" + std::to_string(reinterpret_cast<uintptr_t>(&plan));
+  if (resolved_options.mode == QueryExecutionMode::kAnalytical) {
+    const std::string query_id =
+        "query-" + std::to_string(g_next_query_id.fetch_add(1, std::memory_order_relaxed));
     std::filesystem::path scratch_root = std::filesystem::temp_directory_path() / "cedar-query-runtime";
     std::string scratch_instance = "runtime";
     uint64_t scratch_free_reserve = 0;
@@ -1345,7 +1364,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
     }
   }
   return QueryCursor(std::make_unique<QueryCursor::State>(
-      plan, std::move(snapshot), options,
+      plan, std::move(snapshot), std::move(resolved_options),
       std::move(admitted).ConsumeValueOrDie(), std::move(scratch)));
 }
 

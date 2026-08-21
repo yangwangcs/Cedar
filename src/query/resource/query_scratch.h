@@ -65,6 +65,7 @@ class QueryScratch {
   std::function<StatusOr<std::shared_ptr<IoPermit>>(uint64_t)> io_admission_;
   std::function<Status()> abort_check_;
   mutable bool created_ = false;
+  bool free_space_admitted_ = false;
 };
 
 }  // namespace cedar::internal

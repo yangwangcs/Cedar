@@ -9,6 +9,7 @@
 
 namespace cedar::internal {
 namespace {
+std::atomic<uint64_t> g_reserved_free_space{0};
 constexpr std::array<char, 8> kMagic = {'C', 'D', 'R', 'S', 'C', 'R', '1', '\0'};
 
 bool SafeName(const std::string& name) {
@@ -165,6 +166,27 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
   reserved_bytes_ += bytes;
   std::error_code ec;
   const auto space = std::filesystem::space(database_root_, ec);
+  if (!ec && free_space_reserve_bytes_ != 0 && !free_space_admitted_) {
+    bool admitted = false;
+    uint64_t current = g_reserved_free_space.load(std::memory_order_acquire);
+    if (free_space_reserve_bytes_ <= space.available) {
+      for (;;) {
+        if (current > space.available - free_space_reserve_bytes_) break;
+        if (g_reserved_free_space.compare_exchange_weak(
+                current, current + free_space_reserve_bytes_,
+                std::memory_order_acq_rel)) {
+          admitted = true;
+          break;
+        }
+      }
+    }
+    if (!admitted) {
+      if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
+      reserved_bytes_ -= bytes;
+      return Status::ResourceExhausted("query scratch", "insufficient free disk space");
+    }
+    free_space_admitted_ = true;
+  }
   if (!ec && (free_space_reserve_bytes_ > std::numeric_limits<uint64_t>::max() - bytes ||
               space.available < bytes + free_space_reserve_bytes_)) {
     if (reservation_ != nullptr) reservation_->ReleaseScratch(bytes);
@@ -285,6 +307,11 @@ Status QueryScratch::Cleanup() {
     reservation_->ReleaseScratch(reserved_bytes_);
   }
   reserved_bytes_ = 0;
+  if (free_space_admitted_) {
+    g_reserved_free_space.fetch_sub(free_space_reserve_bytes_,
+                                     std::memory_order_acq_rel);
+    free_space_admitted_ = false;
+  }
   return Status::OK();
 }
 

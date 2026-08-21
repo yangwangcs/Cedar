@@ -68,6 +68,10 @@ void QueryScratch::SetRateLimits(uint64_t read_bytes_per_second,
   rate_scratch_bytes_ = 0;
 }
 
+void QueryScratch::SetAbortCheck(std::function<Status()> check) {
+  abort_check_ = std::move(check);
+}
+
 Status QueryScratch::ConsumeRate(uint64_t bytes, bool read) const {
   const uint64_t limit = read ? read_bytes_per_second_ : scratch_bytes_per_second_;
   if (limit == 0 || bytes == 0) return Status::OK();
@@ -118,6 +122,9 @@ Status QueryScratch::EnsureDirectory() const {
 
 StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
                                                        const std::string& payload) {
+  if (abort_check_) {
+    if (Status status = abort_check_(); !status.ok()) return status;
+  }
   if (Status status = ValidateChild(name); !status.ok()) return status;
   const auto path = query_dir_ / name;
   if (std::filesystem::exists(path)) {
@@ -181,6 +188,9 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
 }
 
 StatusOr<std::string> QueryScratch::ReadRun(const std::filesystem::path& path) const {
+  if (abort_check_) {
+    if (Status status = abort_check_(); !status.ok()) return status;
+  }
   if (path.parent_path() != query_dir_ || !SafeName(path.filename().string()) ||
       std::filesystem::is_symlink(path)) {
     return Status::InvalidArgument("query scratch", "scratch path escapes query directory");

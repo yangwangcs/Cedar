@@ -140,6 +140,25 @@ TEST(QueryScratchTest, EnforcesReadAndWriteRateWindows) {
   EXPECT_TRUE(scratch.Cleanup().ok());
 }
 
+TEST(QueryScratchTest, ChecksCancellationAtRunBoundaries) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-scratch-abort";
+  std::filesystem::remove_all(root);
+  QueryScratch scratch(root, "instance", "query", 1024);
+  std::atomic<bool> cancelled{true};
+  scratch.SetAbortCheck([&cancelled] {
+    return cancelled.load() ? Status::QueryCancelled("query", "cancelled")
+                             : Status::OK();
+  });
+  EXPECT_TRUE(scratch.WriteRun("run-0", "payload").status().IsQueryCancelled());
+  cancelled.store(false);
+  auto run = scratch.WriteRun("run-0", "payload");
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  cancelled.store(true);
+  EXPECT_TRUE(scratch.ReadRun(run.ValueOrDie()).status().IsQueryCancelled());
+  EXPECT_TRUE(scratch.Cleanup().ok());
+}
+
 TEST(QueryScratchTest, RejectsPathEscape) {
   const auto root = std::filesystem::temp_directory_path() / "cedar-task11-scratch-escape";
   std::filesystem::remove_all(root);

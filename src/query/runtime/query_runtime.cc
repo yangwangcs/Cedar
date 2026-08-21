@@ -440,6 +440,14 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     rows = BindPropertyRows(snapshot, std::move(rows).ConsumeValueOrDie(),
                             plan.property_bindings.front());
     if (!rows.ok()) return rows.status();
+    // PropertyBinder materializes string/binary values from the canonical
+    // history. Charge the actual payload before any subsequent filtering or
+    // column copy can retain it.
+    if (reservation != nullptr) {
+      for (const RuntimeRow& row : rows.ValueOrDie()) {
+        if (Status status = reserve_row(row); !status.ok()) return status;
+      }
+    }
   }
   if (plan.predicate) {
     std::vector<RuntimeRow> filtered;
@@ -542,7 +550,8 @@ Status AppendProperty(QueryColumn* column, const std::optional<Value>& value) {
 
 StatusOr<std::vector<QueryColumn>> BuildColumns(
     const std::vector<RuntimeRow>& rows, size_t offset, size_t count,
-    const internal::PreparedQueryPlan& plan) {
+    const internal::PreparedQueryPlan& plan,
+    internal::QueryReservation* reservation = nullptr) {
   std::vector<QueryColumn> columns;
   columns.reserve(plan.output_columns.size());
   for (const RowColumn& output : plan.output_columns) {
@@ -573,6 +582,15 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
           });
       if (binding == plan.property_bindings.end()) {
         return Status::Corruption("query", "projected slot is unavailable");
+      }
+      if (reservation != nullptr && row.property_value.has_value() &&
+          (row.property_value->type() == PhysicalType::kString ||
+           row.property_value->type() == PhysicalType::kBinary)) {
+        const auto& value = std::get<std::string>(row.property_value->data());
+        if (Status status = reservation->ReserveMemory(value.size());
+            !status.ok()) {
+          return status;
+        }
       }
       const Status appended = AppendProperty(column, row.property_value);
       if (!appended.ok()) return appended;
@@ -782,6 +800,20 @@ class QueryCursor::State {
         fragments(this->options.budget.interval_fragments),
         started_at(std::chrono::steady_clock::now()), scratch(std::move(scratch)) {
     if (this->scratch) this->scratch->SetReservation(&this->reservation);
+    if (this->scratch) {
+      this->scratch->SetAbortCheck([this] {
+        if (cancelled.load(std::memory_order_acquire)) {
+          return Status::QueryCancelled("query", "query cancelled");
+        }
+        if (this->options.budget.deadline_us != 0 &&
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started_at).count()) >=
+                this->options.budget.deadline_us) {
+          return Status::DeadlineExceeded("query", "deadline_us budget exhausted");
+        }
+        return Status::OK();
+      });
+    }
   }
 
   internal::PreparedQueryPlan plan;
@@ -1020,7 +1052,8 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       }
       const size_t count = std::min(kBatchRows, row_count - offset);
       auto columns =
-          BuildColumns(rows.ValueOrDie(), offset, count, state_->plan);
+          BuildColumns(rows.ValueOrDie(), offset, count, state_->plan,
+                       &state_->reservation);
       if (!columns.ok()) {
         state_->terminal_error = columns.status();
         state_->snapshot.reset();

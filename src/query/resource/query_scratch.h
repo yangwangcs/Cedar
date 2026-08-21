@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <functional>
 
 #include "cedar/core/status.h"
 #include "query/runtime/relational.h"
@@ -33,6 +34,7 @@ class QueryScratch {
   void SetReservation(QueryReservation* reservation) { reservation_ = reservation; }
   void SetRateLimits(uint64_t read_bytes_per_second,
                      uint64_t scratch_bytes_per_second);
+  void SetAbortCheck(std::function<Status()> check);
   static Status CleanupOldInstances(const std::filesystem::path& database_root,
                                     const std::string& active_instance);
   const std::filesystem::path& query_directory() const { return query_dir_; }
@@ -55,6 +57,7 @@ class QueryScratch {
   mutable std::chrono::steady_clock::time_point rate_window_start_;
   mutable uint64_t rate_read_bytes_ = 0;
   mutable uint64_t rate_scratch_bytes_ = 0;
+  std::function<Status()> abort_check_;
   mutable bool created_ = false;
 };
 

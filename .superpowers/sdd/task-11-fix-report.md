@@ -22,17 +22,17 @@
   block cache, and production budget) before checking Cedar query/cache/delta
   allocations. The check applies in kernel mode as well; the kernel lifecycle
   fixture uses explicit query/cache sizes that fit its 1 GiB profile.
+- Canonical property materialization now reserves actual string/binary payload
+  bytes after binding, and canonical column construction reserves each payload
+  before copying it into output vectors.
+- `QueryScratch` accepts an abort callback and checks it at every read/write
+  run boundary. Query cursors wire cancellation and deadline checks into this
+  callback, covering external spill boundaries.
 
 ## Remaining review items
 
 The following Important findings are not fully closed in this change:
 
-- Canonical property materialization and column builders estimate string and
-  binary output, but the property binder can allocate payloads before a
-  reservation is taken; a reservation-aware binder/column append path is
-  still needed for strict allocation-before-reservation ordering.
-- Materialization and spill partition/run boundaries do not yet perform the
-  full cancellation/deadline checks requested by the review.
 
 ## Verification
 

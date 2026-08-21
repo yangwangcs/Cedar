@@ -42,6 +42,12 @@ Follow-up fixes after review:
   canonical slice. `QueryProjectionStore::ReadChains` is a Cedar-owned,
   snapshot/base-checked segment decoder.
 - Added incomplete-delta and identity mismatch safety tests.
+- Coverage slices now carry region kind/part/property/schema/entity bounds and
+  database identity. ReadChains verifies the selected generation/base and
+  returns Conflict if a generation was retired or replaced; this prevents a
+  reader from silently switching to `current_`.
+- Runtime checks canonical source status before mixing and propagates derived
+  reader errors other than an explicit unavailable/fallback status.
 - `PreparedQueryPlan` now carries a bound `PhysicalPlan` and a Cedar-owned
   projection reader. Projection slices are decoded into `RuntimeRow` intervals
   by `QueryRuntime`; canonical and delta-fallback slices are read from the

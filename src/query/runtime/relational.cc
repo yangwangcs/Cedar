@@ -1404,57 +1404,88 @@ StatusOr<BatchStream> HashJoinInMemory(const JoinInput& input,
                                        QueryReservation* reservation,
                                        size_t max_output_rows);
 
+template <size_t kPartitions>
+Status SpillRowsByPartition(
+    const BatchStream& stream, size_t key, const std::string& prefix,
+    QueryReservation* reservation, QueryScratch* scratch,
+    std::array<std::vector<std::filesystem::path>, kPartitions>* runs) {
+  static std::atomic<uint64_t> sequence{0};
+  for (const RelationalRow& row : stream.rows) {
+    const RelationalCell& cell = row.cells[key];
+    const size_t partition = cell.present ? HashCell(cell) % kPartitions : 0;
+    // Serialize one row at a time. The guard covers the temporary payload and
+    // is released immediately after the bounded scratch write completes.
+    size_t estimate = EstimateRowBytes(row);
+    if (estimate > std::numeric_limits<size_t>::max() - 128) {
+      return Status::ResourceExhausted("query relational", "spill row size overflow");
+    }
+    estimate += 128;
+    ReservationGuard payload_guard(reservation, estimate);
+    if (!payload_guard.acquired()) return NeedsSpill(estimate, AvailableBytes(*reservation));
+    std::string payload;
+    AppendFramedRow(&payload, row);
+    auto run = scratch->WritePartition(
+        prefix + "-" + std::to_string(sequence.fetch_add(1)), payload);
+    if (!run.ok()) return run.status();
+    (*runs)[partition].push_back(run.ValueOrDie());
+  }
+  return Status::OK();
+}
+
+StatusOr<std::vector<RelationalRow>> ReadSpilledRows(
+    const std::vector<std::filesystem::path>& runs, QueryReservation* reservation,
+    QueryScratch* scratch) {
+  std::vector<RelationalRow> rows;
+  for (const auto& path : runs) {
+    auto payload = scratch->ReadRun(path);
+    if (!payload.ok()) return payload.status();
+    ReservationGuard payload_guard(reservation, payload.ValueOrDie().size());
+    if (!payload_guard.acquired()) {
+      return NeedsSpill(payload.ValueOrDie().size(), AvailableBytes(*reservation));
+    }
+    auto decoded = DeserializeRows(payload.ValueOrDie());
+    if (!decoded.ok()) return decoded.status();
+    auto decoded_rows = std::move(decoded).ConsumeValueOrDie();
+    rows.insert(rows.end(), std::make_move_iterator(decoded_rows.begin()),
+                std::make_move_iterator(decoded_rows.end()));
+  }
+  return rows;
+}
+
 StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
                                        QueryReservation* reservation,
                                        size_t max_output_rows,
                                        QueryScratch* scratch) {
   if (scratch == nullptr) return NeedsSpill();
-  constexpr size_t kPartitions = 32;
-  std::array<std::string, kPartitions> left_payloads;
-  std::array<std::string, kPartitions> right_payloads;
-  for (const RelationalRow& row : input.left.rows) {
-    const RelationalCell& key = row.cells[input.left_key];
-    AppendFramedRow(&left_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
-  }
-  for (const RelationalRow& row : input.right.rows) {
-    const RelationalCell& key = row.cells[input.right_key];
-    AppendFramedRow(&right_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
-  }
-  static std::atomic<uint64_t> sequence{0};
-  std::array<std::filesystem::path, kPartitions> left_runs;
-  std::array<std::filesystem::path, kPartitions> right_runs;
-  for (size_t partition = 0; partition < kPartitions; ++partition) {
-    if (!left_payloads[partition].empty()) {
-      auto run = scratch->WritePartition(
-          "hash-left-" + std::to_string(sequence.fetch_add(1)),
-          left_payloads[partition]);
-      if (!run.ok()) return run.status();
-      left_runs[partition] = run.ValueOrDie();
-    }
-    if (!right_payloads[partition].empty()) {
-      auto run = scratch->WritePartition(
-          "hash-right-" + std::to_string(sequence.fetch_add(1)),
-          right_payloads[partition]);
-      if (!run.ok()) return run.status();
-      right_runs[partition] = run.ValueOrDie();
-    }
-  }
+  // Keep each decoded partition small enough to fit the query reservation;
+  // rows are still written one-at-a-time, so this is a bounded fan-out rather
+  // than an in-memory payload array.
+  constexpr size_t kPartitions = 256;
+  std::array<std::vector<std::filesystem::path>, kPartitions> left_runs;
+  std::array<std::vector<std::filesystem::path>, kPartitions> right_runs;
+  if (Status status = SpillRowsByPartition(input.left, input.left_key, "hash-left",
+                                            reservation, scratch, &left_runs);
+      !status.ok()) return status;
+  if (Status status = SpillRowsByPartition(input.right, input.right_key, "hash-right",
+                                            reservation, scratch, &right_runs);
+      !status.ok()) return status;
   std::vector<RelationalRow> rows;
-  for (size_t partition = 0; partition < kPartitions; ++partition) {
-    if (left_runs[partition].empty()) continue;
-    auto left_payload = scratch->ReadRun(left_runs[partition]);
-    if (!left_payload.ok()) return left_payload.status();
-    auto left = DeserializeRows(left_payload.ValueOrDie());
-    if (!left.ok()) return left.status();
+  std::vector<std::shared_ptr<QueryReservationLease>> output_leases;
+  // Probe left rows in their original order. This preserves the ordering of
+  // the in-memory hash join while only one right partition is decoded at a
+  // time; the left spill files remain available for verification/cleanup.
+  for (const RelationalRow& original_left : input.left.rows) {
+    const RelationalCell& left_key = original_left.cells[input.left_key];
+    const size_t partition = left_key.present ? HashCell(left_key) % kPartitions : 0;
     std::vector<RelationalRow> right_rows;
     if (!right_runs[partition].empty()) {
-      auto right_payload = scratch->ReadRun(right_runs[partition]);
-      if (!right_payload.ok()) return right_payload.status();
-      auto right = DeserializeRows(right_payload.ValueOrDie());
+      auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
       if (!right.ok()) return right.status();
       right_rows = std::move(right).ConsumeValueOrDie();
     }
-    JoinInput part{BatchStream(std::move(left).ConsumeValueOrDie()),
+    ReservationGuard right_guard(reservation, EstimateRowsBytes(right_rows));
+    if (!right_guard.acquired()) return NeedsSpill();
+    JoinInput part{BatchStream(std::vector<RelationalRow>{original_left}),
                    BatchStream(std::move(right_rows)), input.left_key,
                    input.right_key, input.kind};
     auto joined = HashJoinInMemory(part, reservation, max_output_rows);
@@ -1466,13 +1497,13 @@ StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
     }
     rows.insert(rows.end(), std::make_move_iterator(result.rows.begin()),
                 std::make_move_iterator(result.rows.end()));
+    if (result.reservation_lease) {
+      output_leases.push_back(std::move(result.reservation_lease));
+    }
     result.rows.clear();
-    result.reservation_lease.reset();
   }
-  auto lease = RetainOutput(reservation, EstimateRowsBytes(rows), true);
-  if (!lease.ok()) return lease.status();
   BatchStream output;
-  output.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  output.reservation_leases = std::move(output_leases);
   output.rows = std::move(rows);
   return output;
 }
@@ -1802,51 +1833,31 @@ StatusOr<BatchStream> ExternalSortMergeJoin(const JoinInput& input,
                                             size_t max_output_rows,
                                             QueryScratch* scratch) {
   if (scratch == nullptr) return NeedsSpill();
-  constexpr size_t kPartitions = 32;
-  std::array<std::string, kPartitions> left_payloads;
-  std::array<std::string, kPartitions> right_payloads;
-  for (const RelationalRow& row : input.left.rows) {
-    const RelationalCell& key = row.cells[input.left_key];
-    AppendFramedRow(&left_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
-  }
-  for (const RelationalRow& row : input.right.rows) {
-    const RelationalCell& key = row.cells[input.right_key];
-    AppendFramedRow(&right_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
-  }
-  static std::atomic<uint64_t> sequence{0};
-  std::array<std::filesystem::path, kPartitions> left_runs;
-  std::array<std::filesystem::path, kPartitions> right_runs;
-  for (size_t partition = 0; partition < kPartitions; ++partition) {
-    if (!left_payloads[partition].empty()) {
-      auto run = scratch->WritePartition(
-          "sort-left-" + std::to_string(sequence.fetch_add(1)),
-          left_payloads[partition]);
-      if (!run.ok()) return run.status();
-      left_runs[partition] = run.ValueOrDie();
-    }
-    if (!right_payloads[partition].empty()) {
-      auto run = scratch->WritePartition(
-          "sort-right-" + std::to_string(sequence.fetch_add(1)),
-          right_payloads[partition]);
-      if (!run.ok()) return run.status();
-      right_runs[partition] = run.ValueOrDie();
-    }
-  }
+  constexpr size_t kPartitions = 256;
+  std::array<std::vector<std::filesystem::path>, kPartitions> left_runs;
+  std::array<std::vector<std::filesystem::path>, kPartitions> right_runs;
+  if (Status status = SpillRowsByPartition(input.left, input.left_key, "sort-left",
+                                            reservation, scratch, &left_runs);
+      !status.ok()) return status;
+  if (Status status = SpillRowsByPartition(input.right, input.right_key, "sort-right",
+                                            reservation, scratch, &right_runs);
+      !status.ok()) return status;
   std::vector<RelationalRow> rows;
+  std::vector<std::shared_ptr<QueryReservationLease>> output_leases;
   for (size_t partition = 0; partition < kPartitions; ++partition) {
     if (left_runs[partition].empty()) continue;
-    auto left_payload = scratch->ReadRun(left_runs[partition]);
-    if (!left_payload.ok()) return left_payload.status();
-    auto left = DeserializeRows(left_payload.ValueOrDie());
+    auto left = ReadSpilledRows(left_runs[partition], reservation, scratch);
     if (!left.ok()) return left.status();
     std::vector<RelationalRow> right_rows;
     if (!right_runs[partition].empty()) {
-      auto right_payload = scratch->ReadRun(right_runs[partition]);
-      if (!right_payload.ok()) return right_payload.status();
-      auto right = DeserializeRows(right_payload.ValueOrDie());
+      auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
       if (!right.ok()) return right.status();
       right_rows = std::move(right).ConsumeValueOrDie();
     }
+    ReservationGuard left_guard(reservation, EstimateRowsBytes(left.ValueOrDie()));
+    if (!left_guard.acquired()) return NeedsSpill();
+    ReservationGuard right_guard(reservation, EstimateRowsBytes(right_rows));
+    if (!right_guard.acquired()) return NeedsSpill();
     std::vector<RelationalRow> left_rows = std::move(left).ConsumeValueOrDie();
     std::sort(left_rows.begin(), left_rows.end(), [&input](const RelationalRow& a,
                                                             const RelationalRow& b) {
@@ -1867,18 +1878,18 @@ StatusOr<BatchStream> ExternalSortMergeJoin(const JoinInput& input,
     }
     rows.insert(rows.end(), std::make_move_iterator(result.rows.begin()),
                 std::make_move_iterator(result.rows.end()));
+    if (result.reservation_lease) {
+      output_leases.push_back(std::move(result.reservation_lease));
+    }
     result.rows.clear();
-    result.reservation_lease.reset();
   }
   std::sort(rows.begin(), rows.end(), [&input](const RelationalRow& a,
                                                const RelationalRow& b) {
     return CompareCell(a.cells[input.left_key], b.cells[input.left_key]) < 0;
   });
-  auto lease = RetainOutput(reservation, EstimateRowsBytes(rows), true);
-  if (!lease.ok()) return lease.status();
   BatchStream output;
   output.order_specified = true;
-  output.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  output.reservation_leases = std::move(output_leases);
   output.rows = std::move(rows);
   return output;
 }

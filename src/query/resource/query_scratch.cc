@@ -178,6 +178,11 @@ StatusOr<std::string> QueryScratch::ReadRun(const std::filesystem::path& path) c
   if (!in || !Read(in, &checksum) || checksum != crc32c::Extend(0, payload.data(), payload.size())) return Status::Corruption("query scratch", "scratch checksum mismatch");
   char trailing = 0;
   if (in.read(&trailing, 1)) return Status::Corruption("query scratch", "scratch block has trailing bytes");
+  if (reservation_ != nullptr) {
+    if (Status status = reservation_->ReserveReadBytes(payload.size()); !status.ok()) {
+      return status;
+    }
+  }
   return payload;
 }
 

@@ -75,6 +75,9 @@ struct BatchStream {
   std::vector<RelationalRow> rows;
   bool order_specified = false;
   std::shared_ptr<QueryReservationLease> reservation_lease;
+  // External operators may produce output a partition at a time. Keep each
+  // partition lease alive while the rows are accumulated into this stream.
+  std::vector<std::shared_ptr<QueryReservationLease>> reservation_leases;
   bool operator==(const BatchStream& other) const {
     return rows == other.rows && order_specified == other.order_specified;
   }

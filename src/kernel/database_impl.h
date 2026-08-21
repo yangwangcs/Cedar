@@ -218,6 +218,7 @@ class Database::Impl {
     pool_options.visited_vertices = UINT64_MAX;
     pool_options.cpu_us = UINT64_MAX;
     pool_options.max_parallelism = query_runtime_options.query_workers;
+    pool_options.wal_sync_critical = &wal_sync_critical;
     query_resource_pool = std::make_unique<internal::QueryResourcePool>(pool_options);
   }
 

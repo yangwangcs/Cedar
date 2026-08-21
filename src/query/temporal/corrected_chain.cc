@@ -38,6 +38,8 @@ StatusOr<std::vector<CorrectedBoundary>> ResolveCorrectedBoundaries(
   visible.reserve(events.size());
   std::optional<FactRef> ref;
   for (const FactEvent& event : events) {
+    if (event.commit_seq.value > snapshot_seq.value) continue;
+
     const Status status = event.Validate();
     if (!status.ok()) return status;
     if (!ref.has_value()) {
@@ -45,7 +47,7 @@ StatusOr<std::vector<CorrectedBoundary>> ResolveCorrectedBoundaries(
     } else if (*ref != event.ref) {
       return Status::InvalidArgument("corrected fact chain", "mixed fact references");
     }
-    if (event.commit_seq.value <= snapshot_seq.value) visible.push_back(event);
+    visible.push_back(event);
   }
 
   std::sort(visible.begin(), visible.end(), [](const FactEvent& left,

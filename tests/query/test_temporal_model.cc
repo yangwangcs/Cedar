@@ -139,6 +139,53 @@ TEST(TemporalModelTest, RejectsMixedFactChains) {
                   .IsInvalidArgument());
 }
 
+TEST(TemporalModelTest,
+     IgnoresFutureInvalidAndDifferentFactEventsForOlderSnapshots) {
+  const FactRef ref =
+      PropertyFact::Vertex({PartId{0}, VertexId{1}}, PropertyId{7}).ref();
+  const FactRef different_ref =
+      PropertyFact::Vertex({PartId{0}, VertexId{2}}, PropertyId{7}).ref();
+  const std::vector<FactEvent> events = {
+      {ref, ValidTime{5}, CommitSeq{1}, FactOperation::kPut, 1,
+       Value::Int64(7)},
+      {different_ref, ValidTime{10}, CommitSeq{2}, FactOperation::kPut, 1,
+       Value::Int64(9)},
+      {ref, ValidTime{15}, CommitSeq{3}, FactOperation::kPut, 1,
+       std::nullopt},
+  };
+
+  const auto boundaries =
+      internal::ResolveCorrectedBoundaries(events, CommitSeq{1});
+
+  ASSERT_TRUE(boundaries.ok()) << boundaries.status().ToString();
+  ASSERT_EQ(boundaries.ValueOrDie().size(), 1U);
+  EXPECT_EQ(boundaries.ValueOrDie()[0].valid_from, ValidTime{5});
+  EXPECT_EQ(boundaries.ValueOrDie()[0].commit_seq, CommitSeq{1});
+  EXPECT_EQ(boundaries.ValueOrDie()[0].operation, FactOperation::kPut);
+  EXPECT_EQ(boundaries.ValueOrDie()[0].value,
+            std::optional<Value>(Value::Int64(7)));
+}
+
+TEST(TemporalModelTest, ClipsFiniteIntervalsToTheirIntersection) {
+  EXPECT_EQ(internal::Clip({ValidTime{1}, ValidTime{8}},
+                           {ValidTime{3}, ValidTime{6}}),
+            (std::optional<ValidTimeInterval>(
+                ValidTimeInterval{ValidTime{3}, ValidTime{6}})));
+}
+
+TEST(TemporalModelTest, ClipsUnboundedIntervalsWithoutSentinelArithmetic) {
+  EXPECT_EQ(internal::Clip({ValidTime{1}, std::nullopt},
+                           {ValidTime{3}, ValidTime{7}}),
+            (std::optional<ValidTimeInterval>(
+                ValidTimeInterval{ValidTime{3}, ValidTime{7}})));
+}
+
+TEST(TemporalModelTest, ClipRejectsEndpointTouchingIntervals) {
+  EXPECT_FALSE(internal::Clip({ValidTime{1}, ValidTime{2}},
+                              {ValidTime{2}, std::nullopt})
+                   .has_value());
+}
+
 TEST(TemporalModelTest, OracleKeepsItsOwnCorrectedHistorySemantics) {
   const FactRef ref =
       PropertyFact::Vertex({PartId{0}, VertexId{1}}, PropertyId{7}).ref();

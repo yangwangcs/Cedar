@@ -17,6 +17,8 @@
 namespace cedar {
 
 class Database;
+class Snapshot;
+class PreparedQuery;
 
 using SnapshotFactVisitor = std::function<Status(const FactEvent&)>;
 
@@ -75,10 +77,12 @@ class Snapshot {
  private:
   class State;
   explicit Snapshot(std::unique_ptr<State> state);
+  bool BelongsToDatabase(const void* database_identity) const;
 
   std::unique_ptr<State> state_;
 
   friend class Database;
+  friend class PreparedQuery;
 };
 
 }  // namespace cedar

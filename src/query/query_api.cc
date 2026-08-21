@@ -71,6 +71,10 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
   const Status valid = database->ValidatePreparedQuery(
       snapshot.commit_seq(), state_->schema_fingerprint);
   if (!valid.ok()) return valid;
+  if (!snapshot.BelongsToDatabase(database.get())) {
+    return Status::InvalidArgument(
+        "query", "snapshot belongs to a different database");
+  }
   if (!state_->plan.canonical_vertex_state_at) {
     return Status::NotSupported(
         "query", "only VertexScan + StateAt + Project is executable");

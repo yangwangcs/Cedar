@@ -271,6 +271,10 @@ Snapshot::~Snapshot() = default;
 Snapshot::Snapshot(Snapshot&&) noexcept = default;
 Snapshot& Snapshot::operator=(Snapshot&&) noexcept = default;
 
+bool Snapshot::BelongsToDatabase(const void* database_identity) const {
+  return state_ != nullptr && state_->database.get() == database_identity;
+}
+
 CommitSeq Snapshot::commit_seq() const {
   return state_ == nullptr ? CommitSeq{} : state_->snapshot.commit_seq();
 }

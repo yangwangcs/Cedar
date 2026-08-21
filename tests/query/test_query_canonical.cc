@@ -247,6 +247,30 @@ TEST_F(QueryCanonicalTest, ConcurrentExecutionsDoNotShareCursorState) {
   EXPECT_EQ(second.ValueOrDie()->row_count(), 2U);
 }
 
+TEST_F(QueryCanonicalTest, RejectsSnapshotFromAnotherDatabase) {
+  ASSERT_EQ(AssertVertex(1, 10), CommitSeq{1});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto query = VertexQuery(vertex);
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+
+  auto other = OpenOtherDatabase();
+  auto transaction = other->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{2}}),
+                           ValidTime{10})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  auto snapshot = other->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  const auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  EXPECT_TRUE(cursor.status().IsInvalidArgument()) << cursor.status().ToString();
+}
+
 TEST_F(QueryCanonicalTest, IgnoresUnrelatedSchemaChanges) {
   ASSERT_EQ(AssertVertex(1, 10), CommitSeq{1});
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");

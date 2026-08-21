@@ -25,6 +25,10 @@ Status ValidateProjectionManifest(const ProjectionManifest& m, const std::string
   if (m.database_identity != identity || m.database_identity.empty()) return Status::IdentityConflict("projection manifest", "database identity mismatch");
   if (m.generation_id == 0) return Status::Corruption("projection manifest", "zero generation");
   std::set<std::string> ids;
+  std::set<std::string> fingerprints;
+  for (const auto& fingerprint : m.schema_fingerprints) {
+    if (fingerprint.empty() || !fingerprints.insert(fingerprint).second) return Status::Corruption("projection manifest", "duplicate or empty schema fingerprint");
+  }
   for (const auto& r : m.regions) {
     if (uint8_t(r.kind) < 1 || uint8_t(r.kind) > 4 || r.entity_max_exclusive <= r.entity_min || !r.valid_time.Validate().ok()) return Status::Corruption("projection manifest", "invalid coverage range");
     std::vector<std::pair<uint64_t,uint64_t>> ranges;

@@ -40,8 +40,14 @@ class ProjectionStoreTest : public ::testing::Test {
     d.header.entity_max_exclusive = 100;
     d.header.valid_from_min = ValidTime{0};
     d.file_bytes = 4;
-    d.checksum = crc32c::Value("data", 4);
-    b.segments.push_back(ProjectionSegmentInput{d, "data"});
+    ProjectionChain chain;
+    chain.header = d.header;
+    chain.intervals.push_back(ProjectionInterval{ValidTimeInterval{ValidTime{0}, std::nullopt}, Value::Int64(1), 1});
+    auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+    if (!encoded.ok()) return {};
+    d.file_bytes = encoded.ValueOrDie().size();
+    d.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
+    b.segments.push_back(ProjectionSegmentInput{d, encoded.ValueOrDie()});
     r.segments.push_back(d);
     b.manifest.regions.push_back(std::move(r));
     return b;
@@ -92,6 +98,55 @@ TEST_F(ProjectionStoreTest, BadCurrentDisablesProjections) {
   auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
   ASSERT_TRUE(opened.ok());
   EXPECT_FALSE(opened.ValueOrDie()->projections_enabled());
+}
+
+TEST_F(ProjectionStoreTest, RetirePersistsDisabledStateAcrossReopen) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  ASSERT_TRUE(opened.ValueOrDie()->RetireBefore(CommitSeq{20}).ok());
+  opened.ValueOrDie().reset();
+  auto reopened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(reopened.ok());
+  EXPECT_FALSE(reopened.ValueOrDie()->projections_enabled());
+  EXPECT_FALSE(reopened.ValueOrDie()->current_generation_id().has_value());
+}
+
+TEST_F(ProjectionStoreTest, RejectsGenerationFilenameCollisionAndPinnedQuarantine) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  CoverageRequest request; request.part_id=PartId{1}; request.schema_epoch=1; request.entity_min=1; request.entity_max_exclusive=2; request.valid_time={ValidTime{0},std::nullopt}; request.snapshot_seq=CommitSeq{10};
+  auto pin = opened.ValueOrDie()->Acquire(request);
+  EXPECT_TRUE(pin.has_value());
+  EXPECT_TRUE(opened.ValueOrDie()->Quarantine("seg-a.csegment").IsConflict());
+  EXPECT_TRUE(opened.ValueOrDie()->Build(Build(20, "seg-a")).IsConflict());
+}
+
+TEST_F(ProjectionStoreTest, FaultAfterSegmentSyncLeavesCurrentUnchanged) {
+  bool fail = true;
+  auto opened = QueryProjectionStore::Open({path_, "test-db", [&](ProjectionStoreFaultPoint point) {
+    return point == ProjectionStoreFaultPoint::kAfterSegmentSync && fail
+               ? (fail = false, Status::IOError("test", "injected"))
+               : Status::OK();
+  }});
+  ASSERT_TRUE(opened.ok());
+  EXPECT_TRUE(opened.ValueOrDie()->Build(Build(10)).IsIOError());
+  EXPECT_FALSE(opened.ValueOrDie()->projections_enabled());
+}
+
+TEST_F(ProjectionStoreTest, RejectsControlNamesGenerationRollbackAndTemps) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  auto control = Build(10);
+  control.manifest.regions[0].segments[0].filename = "PROJECTION-CURRENT";
+  control.segments[0].descriptor.filename = "PROJECTION-CURRENT";
+  EXPECT_TRUE(opened.ValueOrDie()->Build(control).IsInvalidArgument());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  EXPECT_TRUE(opened.ValueOrDie()->Build(Build(9, "seg-b")).IsConflict());
+  std::ofstream(path_ + "/seg-c.csegment.tmp") << "leftover";
+  auto temporary = Build(20, "seg-c");
+  EXPECT_TRUE(opened.ValueOrDie()->Build(temporary).IsConflict());
 }
 }  // namespace
 }  // namespace cedar::internal

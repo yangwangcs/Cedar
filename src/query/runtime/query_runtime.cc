@@ -547,6 +547,7 @@ StatusOr<ValidTimeInterval> ScopeAsInterval(const TemporalScope& scope) {
 StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation,
+    QueryExecutionMode mode,
     const std::function<Status()>& check_abort = {}) {
   if (!plan.graph_expand) {
     return Status::InvalidArgument("graph expansion", "missing graph specification");
@@ -566,7 +567,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   // into an unbounded family scan. The canonical path remains available for
   // plans that do not provide a budget (for example analytical callers).
   options.fallback_candidate_limit =
-      reservation == nullptr ? 0 : 4096;
+      mode == QueryExecutionMode::kAnalytical ? 0 : 4096;
   std::vector<RuntimeRow> result;
   for (const RuntimeRow& seed : seeds.ValueOrDie()) {
     VertexRef vertex{seed.ref.part_id(), VertexId{seed.ref.entity_id()}};
@@ -1142,6 +1143,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     auto rows = state_->plan.graph_expand.has_value()
                     ? MaterializeGraphRows(*state_->snapshot, state_->plan,
                                            &state_->reservation,
+                                           state_->options.mode,
                                            [state = state_.get()]() -> Status {
                                              if (state->cancelled.load(std::memory_order_acquire))
                                                return Status::QueryCancelled("query", "query cancelled");

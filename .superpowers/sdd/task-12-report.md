@@ -33,6 +33,27 @@ build/query-debug/tests/test_temporal_expand --gtest_color=no
   4 tests passed
 ```
 
+## Final Review Important Fix: Analytical Graph Fallback Budget
+
+- `MaterializeGraphRows` now receives the resolved `QueryExecutionMode` from
+  `QueryRuntime::Next`. Interactive and auto executions retain the 4096
+  candidate cap, while analytical execution sets the canonical fallback limit
+  to zero (unlimited, subject to the analytical reservation).
+- Added `TemporalExpandTest.AnalyticalGraphFallbackAllowsLargeCanonicalFamily`,
+  which scans 4097 authoritative identities with an active reservation and
+  verifies the fallback completes without `ResourceExhausted`.
+
+Verification:
+
+```text
+cmake --build build/query-debug -j2 --target test_temporal_expand test_query_canonical
+  both targets built successfully
+
+ctest --test-dir build/query-debug --output-on-failure -R \
+  'TemporalExpand|QueryCanonical'
+  28 passed, 0 failed
+```
+
 Remaining concerns:
 
 - The current projection format exposes adjacency entity/page metadata but no

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 #include "cedar/database.h"
 #include "cedar/transaction.h"
@@ -104,6 +105,54 @@ TEST(TemporalExpandTest, PublicExpandExecutesFrontierRows) {
   EXPECT_EQ(batch.ValueOrDie()->Get(vertex, 0), source);
   EXPECT_EQ(batch.ValueOrDie()->Get(edge_slot, 0), edge);
   EXPECT_EQ(batch.ValueOrDie()->Get(destination, 0), target);
+  database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
+TEST(TemporalExpandTest, AnalyticalGraphFallbackAllowsLargeCanonicalFamily) {
+  char pattern[] = "/tmp/cedar_temporal_expand_analytical_fallback_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+
+  const VertexRef source{PartId{0}, VertexId{1}};
+  auto txn = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(txn.ok()) << txn.status().ToString();
+  ASSERT_TRUE(txn.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(source), ValidTime{0})
+                  .ok());
+  constexpr uint64_t kEdges = 4097;
+  std::vector<EdgeIdentity> identities;
+  identities.reserve(kEdges);
+  for (uint64_t i = 0; i < kEdges; ++i) {
+    const VertexRef target{PartId{0}, VertexId{i + 2}};
+    const EdgeRef edge{PartId{0}, EdgeId{i + 2}};
+    ASSERT_TRUE(txn.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(target), ValidTime{0})
+                    .ok());
+    const EdgeIdentity identity{edge, source, target, 7};
+    identities.push_back(identity);
+    ASSERT_TRUE(txn.ValueOrDie()->Assert(identity, ValidTime{0}).ok());
+  }
+  ASSERT_TRUE(txn.ValueOrDie()->Commit().ok());
+
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  QueryDeltaView delta{CommitSeq{0}, snapshot.ValueOrDie().commit_seq(),
+                       {}, identities, {}, CommitSeq{}};
+  GraphExpansionRequest request{{source}, ValidTimeInterval{ValidTime{0}, ValidTime{10}},
+                                ExpandDirection::kOut, 7};
+  QueryReservation reservation(64ULL << 20);
+  GraphFrontierOptions analytical{&reservation, &delta, 1};
+  // Analytical graph execution leaves the canonical fallback unlimited even
+  // when it has an active resource reservation.
+  analytical.fallback_candidate_limit = 0;
+  uint64_t candidates_examined = 0;
+  analytical.candidates_examined = &candidates_examined;
+  auto rows = ExpandTemporal(snapshot.ValueOrDie(), request, analytical);
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_GE(candidates_examined, kEdges);
   database.ValueOrDie()->Close().IgnoreError();
   std::filesystem::remove_all(path);
 }

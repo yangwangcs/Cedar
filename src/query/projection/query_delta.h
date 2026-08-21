@@ -67,6 +67,7 @@ struct QueryDeltaView {
   std::vector<FactEvent> facts;
   std::vector<EdgeIdentity> edge_identities;
   std::vector<std::pair<CommitSeq, EdgeIdentity>> edge_identity_records;
+  CommitSeq first_missing;
 
   std::vector<FactEvent> EventsFor(const FactRef& ref) const;
   std::vector<EdgeIdentity> EdgeIdentitiesThrough(CommitSeq snapshot) const;

@@ -359,7 +359,7 @@ StatusOr<QueryDeltaView> QueryDelta::AcquireThrough(CommitSeq snapshot) const {
       hard_limit_reached_) {
     return Status::ResourceExhausted("query delta", "delta is not contiguous through snapshot");
   }
-  QueryDeltaView view{options_.base_seq, snapshot, {}, {}, {}};
+  QueryDeltaView view{options_.base_seq, snapshot, {}, {}, {}, first_missing_};
   for (const QueryDeltaCommit& commit : commits_) {
     if (commit.commit_seq.value > options_.base_seq.value &&
         commit.commit_seq.value <= snapshot.value) {

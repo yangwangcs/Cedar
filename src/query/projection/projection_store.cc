@@ -199,4 +199,32 @@ std::optional<CommitSeq> QueryProjectionStore::current_base_seq() const {
   return current_ ? std::optional<CommitSeq>(current_->manifest.base_seq)
                   : std::nullopt;
 }
+std::optional<ProjectionManifest> QueryProjectionStore::current_manifest() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return current_ ? std::optional<ProjectionManifest>(current_->manifest)
+                  : std::nullopt;
+}
+StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
+    const CoverageRequest& request) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!enabled_ || !current_ || request.snapshot_seq.value < current_->manifest.base_seq.value) {
+    return Status::NotFound("projection store", "coverage is unavailable");
+  }
+  std::vector<ProjectionChain> result;
+  for (const auto& region : current_->manifest.regions) {
+    if (region.kind != request.kind || region.part_id != request.part_id ||
+        region.property_id != request.property_id || region.schema_epoch != request.schema_epoch ||
+        region.entity_min > request.entity_min || region.entity_max_exclusive < request.entity_max_exclusive) continue;
+    for (const auto& segment : region.segments) {
+      std::ifstream in(fs::path(projections_path_) / segment.filename, std::ios::binary);
+      if (!in) return Status::IOError("projection store", "segment read failed");
+      std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto decoded = DecodeProjectionPage(bytes);
+      if (!decoded.ok()) return decoded.status();
+      result.push_back(std::move(decoded).ConsumeValueOrDie());
+    }
+  }
+  if (result.empty()) return Status::NotFound("projection store", "coverage is unavailable");
+  return result;
+}
 }  // namespace cedar::internal

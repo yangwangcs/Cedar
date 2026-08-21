@@ -123,6 +123,8 @@ struct PlanningContext {
   const QueryDeltaView& delta;
   const QueryStatisticsView& statistics;
   QueryOptions options;
+  std::string database_identity;
+  uint32_t schema_epoch = 0;
 };
 
 class QueryPlanner {

@@ -86,6 +86,9 @@ class QueryProjectionStore {
   bool projections_enabled() const;
   std::optional<uint64_t> current_generation_id() const;
   std::optional<CommitSeq> current_base_seq() const;
+  std::optional<ProjectionManifest> current_manifest() const;
+  StatusOr<std::vector<ProjectionChain>> ReadChains(
+      const CoverageRequest& request) const;
 
  private:
   explicit QueryProjectionStore(ProjectionStoreOptions options);

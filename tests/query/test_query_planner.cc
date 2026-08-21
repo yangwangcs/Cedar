@@ -93,5 +93,37 @@ TEST(QueryPlannerTest, SelectsAnalyticalForBroadRowsAndExposesExplain) {
             std::string::npos);
 }
 
+TEST(QueryPlannerTest, IncompleteDeltaFallsBackToCanonical) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 3;
+  catalog.base_seq = CommitSeq{10};
+  catalog.regions = {Region(0, 100)};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{10}}});
+  ASSERT_TRUE(query.ok());
+  QueryDeltaView delta{CommitSeq{10}, CommitSeq{11}, {}, {}, {}, CommitSeq{11}};
+  const auto context = PlanningContext{CommitSeq{25}, catalog, delta, stats,
+                                       QueryOptions{}};
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 context);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan.ValueOrDie().slices().size(), 1U);
+  EXPECT_EQ(plan.ValueOrDie().slices().front().source, CoverageSource::kCanonical);
+}
+
+TEST(QueryPlannerTest, RejectsMismatchedProjectionIdentity) {
+  ProjectionCatalogView catalog;
+  catalog.database_identity = "db-a";
+  catalog.base_seq = CommitSeq{1};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{10}}});
+  ASSERT_TRUE(query.ok());
+  PlanningContext context{CommitSeq{2}, catalog, Context(catalog, stats).delta,
+                           stats, QueryOptions{}, "db-b", 0};
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 context);
+  EXPECT_TRUE(plan.status().IsIdentityConflict());
+}
+
 }  // namespace
 }  // namespace cedar::internal

@@ -17,6 +17,28 @@
 namespace cedar {
 namespace {
 
+template <typename ImplT>
+StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
+    const std::shared_ptr<ImplT>& database,
+    const std::shared_ptr<const internal::LogicalPlanNode>& root,
+    CommitSeq snapshot_seq, const QueryOptions& options) {
+  internal::ProjectionCatalogView catalog;
+  if (database->projection_store) {
+    const auto manifest = database->projection_store->current_manifest();
+    if (manifest) catalog = internal::ProjectionCatalogView(*manifest);
+  }
+  internal::QueryDeltaView empty_delta{catalog.base_seq, snapshot_seq, {}, {}, {}, {}};
+  internal::QueryDeltaView delta = empty_delta;
+  if (database->query_delta) {
+    auto acquired = database->query_delta->AcquireThrough(snapshot_seq);
+    if (acquired.ok()) delta = std::move(acquired).ConsumeValueOrDie();
+  }
+  internal::QueryStatisticsView statistics;
+  return internal::QueryPlanner::Bind(
+      *root, internal::PlanningContext{snapshot_seq, catalog, delta, statistics,
+                                       options});
+}
+
 std::optional<PhysicalType> PhysicalTypeOf(QueryType type) {
   switch (type) {
     case QueryType::kBool:
@@ -124,6 +146,17 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
     return Status::InvalidArgument(
         "query", "snapshot belongs to a different database");
   }
+  if (snapshot.commit_seq().value != 0) {
+    auto physical = BindPhysicalForSnapshot(database, state_->logical_root,
+                                            snapshot.commit_seq(), options);
+    // The canonical runtime retains the established handling for unbounded
+    // History and synthetic zero-sequence test snapshots. A planner refusal
+    // for those shapes must not change their existing execution contract.
+    if (!physical.ok() && !physical.status().IsNotSupportedError() &&
+        !physical.status().IsInvalidArgument()) {
+      return physical.status();
+    }
+  }
   if (!state_->plan.canonical_temporal) {
     return Status::NotSupported(
         "query", "query is outside canonical temporal execution");
@@ -144,15 +177,10 @@ StatusOr<std::string> PreparedQuery::ExplainPhysical(
   if (!state_ || !state_->logical_root) {
     return Status::InvalidArgument("prepared query", "moved-from query");
   }
-  // Database-owned projection and delta views are intentionally not exposed
-  // through the public API yet. The explain path therefore binds an explicit
-  // empty derived catalog, making canonical fallback visible and truthful.
-  internal::ProjectionCatalogView catalog;
-  internal::QueryDeltaView delta{CommitSeq{0}, snapshot.commit_seq(), {}, {}, {}};
-  internal::QueryStatisticsView statistics;
-  const internal::PlanningContext context{snapshot.commit_seq(), catalog, delta,
-                                          statistics, options};
-  auto plan = internal::QueryPlanner::Bind(*state_->logical_root, context);
+  const auto database = state_->database.lock();
+  if (!database) return Status::ShutdownInProgress("query", "database no longer exists");
+  auto plan = BindPhysicalForSnapshot(database, state_->logical_root,
+                                      snapshot.commit_seq(), options);
   if (!plan.ok()) return plan.status();
   return internal::QueryPlanner::ExplainPhysical(plan.ValueOrDie());
 }

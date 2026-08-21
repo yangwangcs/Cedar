@@ -22,6 +22,11 @@ bool Overlap(const ValidTimeInterval& a, const ValidTimeInterval& b) {
   return a.from.value < b_to && b.from.value < a_to;
 }
 
+bool EntityOverlap(const CoverageRegion& a, const CoverageRegion& b) {
+  return a.entity_min < b.entity_max_exclusive &&
+         b.entity_min < a.entity_max_exclusive;
+}
+
 std::optional<ValidTimeInterval> ScopeInterval(const TemporalScope& scope) {
   return std::visit([](const auto& value) -> std::optional<ValidTimeInterval> {
     using T = std::decay_t<decltype(value)>;
@@ -131,7 +136,13 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     return a.valid_time.from.value < b.valid_time.from.value;
   });
   for (size_t i = 1; i < regions.size(); ++i) {
-    if (Overlap(regions[i - 1].valid_time, regions[i].valid_time)) {
+    const auto& left = regions[i - 1];
+    const auto& right = regions[i];
+    const bool same_key = left.kind == right.kind && left.part_id == right.part_id &&
+                          left.property_id == right.property_id &&
+                          left.schema_epoch == right.schema_epoch;
+    if (same_key && EntityOverlap(left, right) &&
+        Overlap(left.valid_time, right.valid_time)) {
       return Status::Corruption("query planner", "overlapping projection coverage");
     }
   }

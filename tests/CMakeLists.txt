@@ -37,6 +37,11 @@ target_include_directories(test_query_relational PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_link_libraries(test_query_relational PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_relational TEST_PREFIX "QueryRelational.")
 
+add_executable(test_projection_format query/test_projection_format.cc)
+target_include_directories(test_projection_format PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_projection_format PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_projection_format)
+
 set(CEDAR_TEST_LIBS
     cedar_core
     ${GTEST_MAIN_TARGET}

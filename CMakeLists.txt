@@ -65,6 +65,8 @@ add_library(cedar_core STATIC
     src/query/runtime/temporal_source.cc
     src/query/runtime/vector_kernels.cc
     src/query/runtime/relational.cc
+    src/query/projection/projection_compression.cc
+    src/query/projection/projection_format.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc
@@ -95,7 +97,8 @@ target_include_directories(cedar_core
            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_SOURCE_DIR}/src
             ${CEDAR_ENGINE_SOURCE_DIR})
-target_link_libraries(cedar_core PRIVATE cedar_rocksdb)
+target_include_directories(cedar_core PRIVATE ${CEDAR_ROCKSDB_CODEC_INCLUDE_DIR})
+target_link_libraries(cedar_core PRIVATE cedar_rocksdb "${CEDAR_ROCKSDB_LZ4_LIBRARY}")
 set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
     "$<BUILD_INTERFACE:cedar_rocksdb>")
 target_compile_features(cedar_core PUBLIC cxx_std_20)

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace cedar {
@@ -97,17 +98,32 @@ std::shared_ptr<const internal::LogicalPlanNode> MakeScopedScan(
 }
 
 Status ValidateExpressionSlots(const internal::ExpressionNode& expression,
-                               const RowSchema& schema) {
+                               const RowSchema& schema,
+                               std::unordered_map<uint32_t, QueryType>&
+                                   parameter_types) {
   if (expression.kind() == internal::ExpressionKind::kSlot &&
       !Contains(schema, expression.slot(), expression.type(),
                 expression.optional())) {
     return Status::InvalidArgument("filter references a slot outside the input schema");
   }
+  if (expression.kind() == internal::ExpressionKind::kParameter) {
+    if (expression.parameter().value == 0) {
+      return Status::InvalidArgument("filter contains an invalid ParameterId");
+    }
+    const auto [it, inserted] =
+        parameter_types.emplace(expression.parameter().value, expression.type());
+    if (!inserted && it->second != expression.type()) {
+      return Status::InvalidArgument(
+          "filter uses a ParameterId with conflicting QueryTypes");
+    }
+  }
   for (const auto& child : expression.children()) {
     if (!child) {
       return Status::InvalidArgument("filter predicate contains an invalid expression");
     }
-    if (Status status = ValidateExpressionSlots(*child, schema); !status.ok()) {
+    if (Status status =
+            ValidateExpressionSlots(*child, schema, parameter_types);
+        !status.ok()) {
       return status;
     }
   }
@@ -192,7 +208,10 @@ StatusOr<Query> Query::Where(Expr<bool> predicate) const {
     return Status::InvalidArgument("filter predicate is invalid");
   }
   const auto expression = internal::ExpressionInspector::Share(predicate);
-  if (Status status = ValidateExpressionSlots(*expression, schema()); !status.ok()) {
+  std::unordered_map<uint32_t, QueryType> parameter_types;
+  if (Status status =
+          ValidateExpressionSlots(*expression, schema(), parameter_types);
+      !status.ok()) {
     return status;
   }
   internal::LogicalPlanPayload payload;

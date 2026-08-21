@@ -311,6 +311,33 @@ TEST(LogicalPlanTest, RepresentsParametersAsTypedExpressionLeaves) {
   EXPECT_EQ(parameter->type(), QueryType::kInt64);
 }
 
+TEST(LogicalPlanTest, RejectsPredicatesWithConflictingParameterTypes) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const Parameter<int64_t> count = Parameter<int64_t>::WithId(
+      ParameterId{17}, "count");
+  const Parameter<std::string> name = Parameter<std::string>::WithId(
+      ParameterId{17}, "name");
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+
+  const auto filtered = source.ValueOrDie().Where(
+      Equal(ValueOf(count), Literal<int64_t>(1)) &&
+      Equal(ValueOf(name), Literal<std::string>("cedar")));
+  EXPECT_TRUE(filtered.status().IsInvalidArgument());
+}
+
+TEST(LogicalPlanTest, RejectsPredicatesWithZeroParameterId) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const Parameter<int64_t> invalid = Parameter<int64_t>::WithId(
+      ParameterId{}, "invalid");
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+
+  const auto filtered = source.ValueOrDie().Where(
+      Equal(ValueOf(invalid), Literal<int64_t>(1)));
+  EXPECT_TRUE(filtered.status().IsInvalidArgument());
+}
+
 TEST(LogicalPlanTest, MapsEveryScalarPhysicalTypeToADistinctPublicType) {
   static_assert(QueryTypeOf<bool>() == QueryType::kBool);
   static_assert(QueryTypeOf<int32_t>() == QueryType::kInt32);

@@ -477,6 +477,19 @@ TEST(RelationalTest, TemporalCoveragePreflightHandlesUnboundedIntervals) {
             (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
 }
 
+TEST(RelationalTest, TemporalJoinPreflightAccountsForCrossLeftCoalescing) {
+  TemporalJoinInput input{
+      {{TemporalRow(1, 0, 5), TemporalRow(1, 5, 10)}},
+      {{TemporalRow(1, 0, 10)}}, 0, 0, JoinKind::kSemi};
+  FragmentBudget fragments(1);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &fragments, &reservation, 1);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().rows.size(), 1U);
+  EXPECT_EQ(result.ValueOrDie().rows.front().effective,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{10}}));
+}
+
 TEST(RelationalTest,
      TemporalAggregatePreflightsExactOutputRowsBeforeReservation) {
   TemporalAggregateInput input{

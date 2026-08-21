@@ -609,6 +609,54 @@ void SortAndCoalesceTemporalRows(std::vector<RelationalRow>* rows,
 }
 
 std::vector<ValidTimeInterval> NormalizeIntervals(
+    std::vector<ValidTimeInterval> intervals);
+
+size_t CountCoalescedCoverageRows(const TemporalJoinInput& input) {
+  BatchStream candidates;
+  for (const RelationalRow& left : input.left.rows) {
+    std::vector<ValidTimeInterval> overlaps;
+    for (const RelationalRow& right : input.right.rows) {
+      if (!KeysEqual(left.cells[input.left_key],
+                     right.cells[input.right_key])) {
+        continue;
+      }
+      auto intersection = Intersect(*left.effective, *right.effective);
+      if (intersection) overlaps.push_back(*intersection);
+    }
+    overlaps = NormalizeIntervals(std::move(overlaps));
+    if (input.kind == JoinKind::kSemi) {
+      for (const ValidTimeInterval& interval : overlaps) {
+        RelationalRow row = left;
+        row.effective = interval;
+        candidates.rows.push_back(std::move(row));
+      }
+      continue;
+    }
+    ValidTime cursor = left.effective->from;
+    bool exhausted = false;
+    for (const ValidTimeInterval& overlap : overlaps) {
+      if (Before(cursor, overlap.from)) {
+        RelationalRow row = left;
+        row.effective = ValidTimeInterval{cursor, overlap.from};
+        candidates.rows.push_back(std::move(row));
+      }
+      if (!overlap.to.has_value()) {
+        exhausted = true;
+        break;
+      }
+      if (Before(cursor, *overlap.to)) cursor = *overlap.to;
+    }
+    if (!exhausted && EndsAfter(left.effective->to, cursor)) {
+      RelationalRow row = left;
+      row.effective = ValidTimeInterval{cursor, left.effective->to};
+      candidates.rows.push_back(std::move(row));
+    }
+  }
+  SortAndCoalesceTemporalRows(&candidates.rows, input.left_key);
+  return candidates.rows.size();
+}
+
+std::vector<ValidTimeInterval> NormalizeIntervals(
     std::vector<ValidTimeInterval> intervals) {
   std::sort(intervals.begin(), intervals.end(), [](const auto& left,
                                                    const auto& right) {
@@ -1447,6 +1495,9 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
       output_rows += fragments.ValueOrDie();
       output_bytes += EstimateRowBytes(left) * fragments.ValueOrDie();
     }
+  }
+  if (input.kind != JoinKind::kInner && output_rows > max_output_rows) {
+    output_rows = CountCoalescedCoverageRows(input);
   }
   if (output_rows > max_output_rows) {
     return TemporalBudgetExhausted(0, output_rows, output_bytes,

@@ -74,8 +74,11 @@ class Status {
   static Status QueryCancelled(const Slice& msg, const Slice& msg2 = Slice()) {
     return Status(kQueryCancelled, msg, msg2);
   }
-  static Status QueryMemoryLimit(const Slice& msg, const Slice& msg2 = Slice()) {
-    return Status(kQueryMemoryLimit, msg, msg2);
+  static Status DeadlineExceeded(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kDeadlineExceeded, msg, msg2);
+  }
+  static Status NumericOverflow(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kNumericOverflow, msg, msg2);
   }
   static Status WriteStalled(const Slice& msg, const Slice& msg2 = Slice()) {
     return Status(kWriteStalled, msg, msg2);
@@ -139,7 +142,8 @@ class Status {
   bool IsBindError() const { return code() == kBindError; }
   bool IsBlobCorruption() const { return code() == kBlobCorruption; }
   bool IsQueryCancelled() const { return code() == kQueryCancelled; }
-  bool IsQueryMemoryLimit() const { return code() == kQueryMemoryLimit; }
+  bool IsDeadlineExceeded() const { return code() == kDeadlineExceeded; }
+  bool IsNumericOverflow() const { return code() == kNumericOverflow; }
   bool IsWriteStalled() const { return code() == kWriteStalled; }
   bool IsResourceExhausted() const { return code() == kResourceExhausted; }
   bool IsIndeterminate() const { return code() == kIndeterminate; }
@@ -174,7 +178,6 @@ class Status {
     kBindError = 9,
     kBlobCorruption = 10,
     kQueryCancelled = 11,
-    kQueryMemoryLimit = 12,
     kWriteStalled = 13,
     kResourceExhausted = 14,
     kIndeterminate = 15,
@@ -184,7 +187,9 @@ class Status {
     kIdentityConflict = 19,
     kSnapshotExpired = 20,
     kSnapshotPinned = 21,
-    kUnsupportedSerializablePredicate = 22
+    kUnsupportedSerializablePredicate = 22,
+    kDeadlineExceeded = 23,
+    kNumericOverflow = 24,
   };
 
   Code code() const {

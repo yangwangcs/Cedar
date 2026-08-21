@@ -18,6 +18,10 @@ else()
     set(GTEST_MAIN_TARGET gtest_main)
 endif()
 
+add_executable(test_query_types query/test_query_types.cc)
+target_link_libraries(test_query_types PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_types)
+
 set(CEDAR_TEST_LIBS
     cedar_core
     ${GTEST_MAIN_TARGET}

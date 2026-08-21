@@ -27,6 +27,13 @@ set(CEDAR_TEST_LIBS
     ${GTEST_MAIN_TARGET}
 )
 
+add_executable(test_temporal_model query/test_temporal_model.cc)
+target_include_directories(test_temporal_model PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_temporal_model PRIVATE ${CEDAR_TEST_LIBS})
+gtest_discover_tests(test_temporal_model)
+
 function(configure_cedar_parquet_test target)
     target_include_directories(${target} PRIVATE
         ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)

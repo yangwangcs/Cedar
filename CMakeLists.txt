@@ -54,6 +54,8 @@ add_library(cedar_core STATIC
     src/core/crc32c.cc
     src/core/status.cc
     src/query/types.cc
+    src/query/temporal/interval.cc
+    src/query/temporal/corrected_chain.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

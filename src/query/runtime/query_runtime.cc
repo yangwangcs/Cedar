@@ -253,33 +253,63 @@ StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
         delta = std::move(acquired).ConsumeValueOrDie();
       }
     }
-    for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
-      if (slice.source == internal::CoverageSource::kDeltaMerge) {
-        std::map<uint64_t, std::vector<const internal::ProjectionInterval*>> by_entity;
-        for (const auto& interval : chain.intervals) by_entity[interval.entity_id].push_back(&interval);
-        for (const auto& [entity_id, intervals] : by_entity) {
-          std::vector<internal::CorrectedBoundary> base;
-          for (const auto* interval : intervals) {
-            base.push_back({interval->effective.from, chain.header.base_seq,
-                            FactOperation::kPut, 0, interval->value, std::nullopt});
-            if (interval->effective.to) base.push_back({*interval->effective.to,
-                                                         chain.header.base_seq,
-                                                         FactOperation::kDelete, 0,
-                                                         std::nullopt, std::nullopt});
-          }
-          std::sort(base.begin(), base.end(), [](const auto& a, const auto& b) {
-            return a.valid_from.value < b.valid_from.value;
-          });
-          const FactRef ref{chain.header.part_id, plan.entity_family,
-                            slice.property_id.value_or(PropertyId{}), entity_id};
-          auto merged = internal::QueryDelta::MergeBoundaries(base, delta->EventsFor(ref), delta->through);
-          if (!merged.ok()) return merged.status();
-          for (const auto& state : internal::MaterializePresentState(merged.ValueOrDie())) {
-            rows.push_back({ref, state.interval, std::nullopt, state.value});
-          }
+    if (slice.source == internal::CoverageSource::kDeltaMerge) {
+      // A projection may be split across pages/chains. Merge all boundaries
+      // for one logical fact before materializing state; merging per chain
+      // would reset state at every page and duplicate/truncate intervals.
+      struct FactKey {
+        PartId part;
+        uint64_t entity = 0;
+        PropertyId property;
+        bool operator<(const FactKey& other) const {
+          if (part.value != other.part.value) return part.value < other.part.value;
+          if (entity != other.entity) return entity < other.entity;
+          return property.value < other.property.value;
         }
-        continue;
+      };
+      std::map<FactKey, std::vector<internal::CorrectedBoundary>> base_by_fact;
+      std::map<FactKey, FactRef> refs;
+      for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
+        if (chain.header.base_seq != delta->base_seq ||
+            (slice.projection_base.has_value() &&
+             chain.header.base_seq != *slice.projection_base)) {
+          return Status::Conflict(
+              "query runtime",
+              "projection and delta base sequences must match exactly");
+        }
+        const PropertyId property = slice.property_id.value_or(chain.header.property_id);
+        for (const auto& interval : chain.intervals) {
+          const FactKey key{chain.header.part_id, interval.entity_id, property};
+          auto& base = base_by_fact[key];
+          base.push_back({interval.effective.from, chain.header.base_seq,
+                          FactOperation::kPut, 0, interval.value, std::nullopt});
+          if (interval.effective.to) {
+            base.push_back({*interval.effective.to, chain.header.base_seq,
+                            FactOperation::kDelete, 0, std::nullopt, std::nullopt});
+          }
+          refs.emplace(key, FactRef{chain.header.part_id, plan.entity_family,
+                                    property, interval.entity_id});
+        }
       }
+      for (auto& [key, base] : base_by_fact) {
+        std::sort(base.begin(), base.end(), [](const auto& a, const auto& b) {
+          if (a.valid_from != b.valid_from) {
+            return a.valid_from.value < b.valid_from.value;
+          }
+          return a.commit_seq.value < b.commit_seq.value;
+        });
+        const FactRef& ref = refs.at(key);
+        auto merged = internal::QueryDelta::MergeBoundaries(
+            base, delta->EventsFor(ref), delta->through);
+        if (!merged.ok()) return merged.status();
+        for (const auto& state : internal::MaterializePresentState(
+                 merged.ValueOrDie())) {
+          rows.push_back({ref, state.interval, std::nullopt, state.value});
+        }
+      }
+      continue;
+    }
+    for (const internal::ProjectionChain& chain : chains.ValueOrDie()) {
       for (const internal::ProjectionInterval& interval : chain.intervals) {
         const FactFamily family = plan.entity_family;
         rows.push_back({FactRef{chain.header.part_id, family, PropertyId{},
@@ -344,7 +374,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
       std::vector<RuntimeRow> combined;
       for (const auto& slice : plan.physical_plan->coverage_slices) {
         const auto& source = slice.source;
-        const auto& input = source == internal::CoverageSource::kProjection
+        const auto& input = source != internal::CoverageSource::kCanonical
                                 ? derived.ValueOrDie()
                                 : rows.ValueOrDie();
         for (const auto& row : input) {

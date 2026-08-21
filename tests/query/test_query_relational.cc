@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "cedar/database.h"
+#include "cedar/transaction.h"
 #include "query/runtime/relational.h"
 #include "query/runtime/query_runtime.h"
 #include "query/runtime/vector_kernels.h"
@@ -784,12 +785,192 @@ TEST(QueryRuntimeRelationalTest,
       {SlotId{2}, "count", QueryType::kInt64, false},
       {SlotId{3}, "effective", QueryType::kValidTimeInterval, false}};
   original.effective_output_slot = SlotId{3};
+  original.delta_reader = [] { return StatusOr<QueryDeltaView>(QueryDeltaView{}); };
+  original.bound_delta_view =
+      std::make_shared<const QueryDeltaView>(QueryDeltaView{});
   PreparedQueryPlan copied = original;
   EXPECT_EQ(copied.effective_output_slot, std::optional<SlotId>{SlotId{3}});
   PreparedQueryPlan assigned;
   assigned = original;
   EXPECT_EQ(assigned.effective_output_slot,
             std::optional<SlotId>{SlotId{3}});
+  EXPECT_TRUE(assigned.delta_reader);
+  ASSERT_TRUE(assigned.bound_delta_view);
+}
+
+TEST(QueryRuntimeRelationalTest,
+     PreparedPlanDeltaMergeMatchesCanonicalAcrossProjectionChains) {
+  char pattern[] = "/tmp/cedar_query_runtime_fixture_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  auto property = database.ValueOrDie()->RegisterProperty(PropertyDefinition{
+      PropertyId{7}, 0, "score", PropertyEntityKind::kVertex,
+      PhysicalType::kInt64, 4096});
+  ASSERT_TRUE(property.ok()) << property.status().ToString();
+
+  auto first = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  const VertexRef vertex{PartId{0}, VertexId{1}};
+  ASSERT_TRUE(first.ValueOrDie()->Assert(EntityFact::Vertex(vertex),
+                                         ValidTime{0}).ok());
+  ASSERT_TRUE(first.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(vertex, PropertyId{7}),
+                        ValidTime{0}, Value::Int64(1))
+                  .ok());
+  ASSERT_TRUE(first.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(vertex, PropertyId{7}),
+                        ValidTime{10}, Value::Int64(2))
+                  .ok());
+  const auto first_commit = first.ValueOrDie()->Commit();
+  ASSERT_TRUE(first_commit.ok()) << first_commit.status().ToString();
+
+  auto second = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  ASSERT_TRUE(second.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(vertex, PropertyId{7}),
+                        ValidTime{5}, Value::Int64(3))
+                  .ok());
+  const auto second_commit = second.ValueOrDie()->Commit();
+  ASSERT_TRUE(second_commit.ok()) << second_commit.status().ToString();
+
+  auto third = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(third.ok()) << third.status().ToString();
+  ASSERT_TRUE(third.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(vertex, PropertyId{7}),
+                        ValidTime{15}, Value::Int64(4))
+                  .ok());
+  const auto third_commit = third.ValueOrDie()->Commit();
+  ASSERT_TRUE(third_commit.ok()) << third_commit.status().ToString();
+
+  const Slot<VertexRef> vertex_slot = Slot<VertexRef>::Named("v");
+  const OptionalSlot<int64_t> score_slot = OptionalSlot<int64_t>::Named("score");
+  auto source = Query::Vertices(
+      vertex_slot, History{ValidTimeInterval{ValidTime{0}, ValidTime{20}}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto bound = source.ValueOrDie().BindVertexProperty(
+      vertex_slot, PropertyId{7}, score_slot);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  auto query = bound.ValueOrDie().Select(
+      {Project(vertex_slot), Project(score_slot)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto analyzed = AnalyzeQuery(query.ValueOrDie());
+  ASSERT_TRUE(analyzed.ok()) << analyzed.status().ToString();
+  PreparedQueryPlan canonical_plan = analyzed.ValueOrDie();
+  ASSERT_EQ(canonical_plan.property_bindings.size(), 1U);
+  canonical_plan.property_bindings.front().definition = property.ValueOrDie();
+
+  const auto base_seq = first_commit.ValueOrDie().commit_seq;
+  const auto snapshot_seq = third_commit.ValueOrDie().commit_seq;
+  QueryDeltaView delta{
+      base_seq,
+      snapshot_seq,
+      {FactEvent{FactRef{PartId{0}, FactFamily::kVertexProperty, PropertyId{7},
+                           1},
+                  ValidTime{5}, second_commit.ValueOrDie().commit_seq,
+                  FactOperation::kPut, 0, Value::Int64(3), std::nullopt},
+       FactEvent{FactRef{PartId{0}, FactFamily::kVertexProperty, PropertyId{7},
+                           1},
+                  ValidTime{15}, third_commit.ValueOrDie().commit_seq,
+                  FactOperation::kPut, 0, Value::Int64(4), std::nullopt}},
+      {},
+      {},
+      {}};
+  canonical_plan.bound_delta_view =
+      std::make_shared<const QueryDeltaView>(delta);
+
+  ProjectionChain first_chain;
+  first_chain.header.kind = ProjectionKind::kState;
+  first_chain.header.base_seq = base_seq;
+  first_chain.header.part_id = PartId{0};
+  first_chain.header.property_id = PropertyId{7};
+  first_chain.intervals = {
+      {ValidTimeInterval{ValidTime{0}, ValidTime{15}}, Value::Int64(1), 1}};
+  ProjectionChain second_chain = first_chain;
+  second_chain.intervals = {
+      {ValidTimeInterval{ValidTime{10}, ValidTime{20}}, Value::Int64(2), 1}};
+
+  auto delta_plan = canonical_plan;
+  PhysicalPlan physical;
+  physical.coverage_slices.push_back(CoverageSlice{
+      CoverageSource::kDeltaMerge,
+      ValidTimeInterval{ValidTime{0}, ValidTime{20}},
+      std::nullopt,
+      base_seq,
+      ProjectionKind::kState,
+      PartId{0},
+      PropertyId{7},
+      0,
+      0,
+      UINT64_MAX,
+      {}});
+  delta_plan.physical_plan = std::make_shared<const PhysicalPlan>(physical);
+  delta_plan.projection_reader = [first_chain, second_chain](
+                                    const CoverageSlice&) {
+    return StatusOr<std::vector<ProjectionChain>>(
+        std::vector<ProjectionChain>{first_chain, second_chain});
+  };
+
+  auto run = [&](PreparedQueryPlan plan) {
+    auto snapshot = database.ValueOrDie()->BeginSnapshot(
+        SnapshotOptions{snapshot_seq});
+    EXPECT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    return QueryRuntime::Execute(plan,
+                                 std::move(snapshot).ConsumeValueOrDie(),
+                                 Bindings{}, QueryOptions{});
+  };
+  auto canonical_cursor = run(canonical_plan);
+  ASSERT_TRUE(canonical_cursor.ok()) << canonical_cursor.status().ToString();
+  auto canonical_batch = canonical_cursor.ValueOrDie().Next();
+  ASSERT_TRUE(canonical_batch.ok()) << canonical_batch.status().ToString();
+  ASSERT_TRUE(canonical_batch.ValueOrDie().has_value());
+  auto delta_cursor = run(delta_plan);
+  ASSERT_TRUE(delta_cursor.ok()) << delta_cursor.status().ToString();
+  auto delta_batch = delta_cursor.ValueOrDie().Next();
+  ASSERT_TRUE(delta_batch.ok()) << delta_batch.status().ToString();
+  ASSERT_TRUE(delta_batch.ValueOrDie().has_value());
+
+  const auto& canonical = canonical_batch.ValueOrDie().value();
+  const auto& merged = delta_batch.ValueOrDie().value();
+  ASSERT_EQ(canonical.row_count(), 4U);
+  ASSERT_EQ(merged.row_count(), canonical.row_count());
+  for (size_t index = 0; index < merged.row_count(); ++index) {
+    EXPECT_EQ(merged.Get<int64_t>(score_slot, index),
+              canonical.Get<int64_t>(score_slot, index));
+  }
+  EXPECT_EQ(merged.Get<int64_t>(score_slot, 0), 1);
+  EXPECT_EQ(merged.Get<int64_t>(score_slot, 1), 3);
+  EXPECT_EQ(merged.Get<int64_t>(score_slot, 2), 2);
+  EXPECT_EQ(merged.Get<int64_t>(score_slot, 3), 4);
+
+  auto run_at = [&](uint64_t time, bool merged_source) {
+    PreparedQueryPlan point_plan = merged_source ? delta_plan : canonical_plan;
+    point_plan.scope = At{ValidTime{time}};
+    if (merged_source) {
+      auto point_physical = *point_plan.physical_plan;
+      point_physical.coverage_slices.front().interval =
+          ValidTimeInterval{ValidTime{time}, ValidTime{time + 1}};
+      point_plan.physical_plan =
+          std::make_shared<const PhysicalPlan>(std::move(point_physical));
+    }
+    auto cursor = run(std::move(point_plan));
+    EXPECT_TRUE(cursor.ok()) << cursor.status().ToString();
+    auto batch = cursor.ValueOrDie().Next();
+    EXPECT_TRUE(batch.ok()) << batch.status().ToString();
+    EXPECT_TRUE(batch.ValueOrDie().has_value());
+    EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+    return batch.ValueOrDie()->Get<int64_t>(score_slot, 0);
+  };
+  for (const auto& expected : std::vector<std::pair<uint64_t, int64_t>>{
+           {4, 1}, {5, 3}, {10, 2}, {15, 4}}) {
+    EXPECT_EQ(run_at(expected.first, true), expected.second);
+    EXPECT_EQ(run_at(expected.first, false), expected.second);
+  }
+  EXPECT_FALSE(canonical_cursor.ValueOrDie().Next().ValueOrDie().has_value());
+  EXPECT_FALSE(delta_cursor.ValueOrDie().Next().ValueOrDie().has_value());
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
 }
 
 }  // namespace

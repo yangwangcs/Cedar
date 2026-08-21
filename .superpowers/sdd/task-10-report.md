@@ -75,3 +75,18 @@ coverage remains canonical by construction.
 The acquired contiguous Delta view is now stored as an immutable shared view in
 the prepared execution plan; runtime does not reacquire a moving maintenance
 view during materialization.
+
+Runtime follow-up after review:
+
+- `QueryRuntime` now collects every projection interval from all returned
+  `ProjectionChain` pages by `(part, entity, property)` before one
+  `MergeBoundaries` and `MaterializePresentState` pass. This prevents duplicate
+  or truncated state when a logical fact spans chains. Delta-merge slices are
+  selected from derived rows alongside projection slices; canonical slices
+  continue to use the canonical source.
+- Added a real `PreparedQueryPlan`/`QueryRuntime::Execute` fixture with two
+  cross-chain projection segments and an immutable bound delta view. It compares
+  mixed projection+delta output with canonical-only output at valid times 4, 5,
+  10, and 15 and asserts values `1, 3, 2, 4` with no duplicate rows.
+- Plan copy-assignment now preserves both the bound delta view and delta reader,
+  so execution cannot silently reacquire a moving maintenance view.

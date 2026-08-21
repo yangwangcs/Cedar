@@ -83,6 +83,8 @@ struct PreparedQueryPlan {
     relational_input.reset();
     physical_plan = other.physical_plan;
     projection_reader = other.projection_reader;
+    delta_reader = other.delta_reader;
+    bound_delta_view = other.bound_delta_view;
     return *this;
   }
   PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;

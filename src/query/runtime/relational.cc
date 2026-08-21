@@ -611,7 +611,8 @@ void SortAndCoalesceTemporalRows(std::vector<RelationalRow>* rows,
 std::vector<ValidTimeInterval> NormalizeIntervals(
     std::vector<ValidTimeInterval> intervals);
 
-size_t CountCoalescedCoverageRows(const TemporalJoinInput& input) {
+StatusOr<std::pair<size_t, size_t>> CountCoalescedCoverageRows(
+    const TemporalJoinInput& input) {
   BatchStream candidates;
   for (const RelationalRow& left : input.left.rows) {
     std::vector<ValidTimeInterval> overlaps;
@@ -653,7 +654,8 @@ size_t CountCoalescedCoverageRows(const TemporalJoinInput& input) {
     }
   }
   SortAndCoalesceTemporalRows(&candidates.rows, input.left_key);
-  return candidates.rows.size();
+  return std::make_pair(candidates.rows.size(),
+                        EstimateRowsBytes(candidates.rows));
 }
 
 std::vector<ValidTimeInterval> NormalizeIntervals(
@@ -1455,6 +1457,8 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
   }
   size_t output_rows = 0;
   size_t output_bytes = sizeof(BatchStream);
+  std::unique_ptr<ReservationGuard> preflight_scratch_guard;
+  size_t scratch_bytes = 0;
   for (const RelationalRow& left : input.left.rows) {
     if (input.kind == JoinKind::kInner) {
       for (const RelationalRow& right : input.right.rows) {
@@ -1497,7 +1501,36 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
     }
   }
   if (input.kind != JoinKind::kInner && output_rows > max_output_rows) {
-    output_rows = CountCoalescedCoverageRows(input);
+    scratch_bytes = EstimateBytes(input.left);
+    if (!AddBytes(EstimateBytes(input.right), &scratch_bytes) ||
+        !AddBytes(sizeof(std::vector<ValidTimeInterval>) * 2,
+                  &scratch_bytes) ||
+        input.right.rows.size() >
+            std::numeric_limits<size_t>::max() /
+                (2 * sizeof(ValidTimeInterval)) ||
+        !AddBytes(input.right.rows.size() * 2 * sizeof(ValidTimeInterval),
+                  &scratch_bytes)) {
+      return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                             reservation == nullptr
+                                 ? 0
+                                 : AvailableBytes(*reservation));
+    }
+    if (reservation == nullptr) {
+      return TemporalBudgetExhausted(scratch_bytes, output_rows, output_bytes,
+                                     budget->limit_fragments(),
+                                     "memory budget exceeded");
+    }
+    preflight_scratch_guard =
+        std::make_unique<ReservationGuard>(reservation, scratch_bytes);
+    if (!preflight_scratch_guard->acquired()) {
+      return TemporalBudgetExhausted(scratch_bytes, output_rows, output_bytes,
+                                     budget->limit_fragments(),
+                                     "memory budget exceeded");
+    }
+    auto coalesced = CountCoalescedCoverageRows(input);
+    if (!coalesced.ok()) return coalesced.status();
+    output_rows = coalesced.ValueOrDie().first;
+    output_bytes = coalesced.ValueOrDie().second;
   }
   if (output_rows > max_output_rows) {
     return TemporalBudgetExhausted(0, output_rows, output_bytes,
@@ -1514,33 +1547,33 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
     return empty;
   }
 
-  size_t scratch_bytes = EstimateBytes(input.left);
-  if (!AddBytes(EstimateBytes(input.right), &scratch_bytes) ||
-      !AddBytes(sizeof(std::vector<ValidTimeInterval>) * 2,
-                &scratch_bytes)) {
-    return MemoryExhausted(std::numeric_limits<size_t>::max(),
-                           reservation == nullptr ? 0
-                                                  : AvailableBytes(*reservation));
-  }
-  if (input.right.rows.size() >
-          std::numeric_limits<size_t>::max() /
-              (2 * sizeof(ValidTimeInterval)) ||
-      !AddBytes(input.right.rows.size() * 2 * sizeof(ValidTimeInterval),
-                &scratch_bytes)) {
-    return MemoryExhausted(std::numeric_limits<size_t>::max(),
-                           reservation == nullptr ? 0
-                                                  : AvailableBytes(*reservation));
-  }
-  if (reservation == nullptr) {
-    return TemporalBudgetExhausted(output_bytes, output_rows, output_bytes,
-                                   budget->limit_fragments(),
-                                   "memory budget exceeded");
-  }
-  ReservationGuard scratch_guard(reservation, scratch_bytes);
-  if (!scratch_guard.acquired()) {
-    return TemporalBudgetExhausted(scratch_bytes, output_rows, output_bytes,
-                                   budget->limit_fragments(),
-                                   "memory budget exceeded");
+  if (preflight_scratch_guard == nullptr) {
+    scratch_bytes = EstimateBytes(input.left);
+    if (!AddBytes(EstimateBytes(input.right), &scratch_bytes) ||
+        !AddBytes(sizeof(std::vector<ValidTimeInterval>) * 2,
+                  &scratch_bytes) ||
+        input.right.rows.size() >
+            std::numeric_limits<size_t>::max() /
+                (2 * sizeof(ValidTimeInterval)) ||
+        !AddBytes(input.right.rows.size() * 2 * sizeof(ValidTimeInterval),
+                  &scratch_bytes)) {
+      return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                             reservation == nullptr
+                                 ? 0
+                                 : AvailableBytes(*reservation));
+    }
+    if (reservation == nullptr) {
+      return TemporalBudgetExhausted(output_bytes, output_rows, output_bytes,
+                                     budget->limit_fragments(),
+                                     "memory budget exceeded");
+    }
+    preflight_scratch_guard =
+        std::make_unique<ReservationGuard>(reservation, scratch_bytes);
+    if (!preflight_scratch_guard->acquired()) {
+      return TemporalBudgetExhausted(scratch_bytes, output_rows, output_bytes,
+                                     budget->limit_fragments(),
+                                     "memory budget exceeded");
+    }
   }
   std::vector<RelationalRow> left_rows = input.left.rows;
   std::vector<RelationalRow> right_rows = input.right.rows;

@@ -14,6 +14,7 @@
 #endif
 
 #include "storage/facts/group_commit_planner.h"
+#include "storage/rocks/rocksdb_config.h"
 #include "kernel/database_impl.h"
 #include "query/resource/query_scratch.h"
 
@@ -1475,23 +1476,32 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       options.query_runtime.max_prefetch_bytes == 0) {
     return Status::InvalidArgument("database", "query runtime bounds are invalid");
   }
-  if (options.storage_profile == StorageProfile::kProductionAppend &&
-      !options.production.kernel_mode &&
-      options.production.memory_budget_bytes != 0) {
+  if (options.storage_profile == StorageProfile::kProductionAppend) {
+    FactStoreOptions storage_options;
+    storage_options.path = options.path;
+    storage_options.write_buffer_bytes = options.write_buffer_bytes;
+    storage_options.block_cache_bytes = options.block_cache_bytes;
+    storage_options.group_commit_max_batch_size = options.group_commit_max_batch_size;
+    storage_options.group_commit_max_batch_bytes = options.group_commit_max_batch_bytes;
+    storage_options.storage_profile = options.storage_profile;
+    storage_options.production = options.production;
+    auto resolved = internal::ResolveStorageProfile(storage_options);
+    if (!resolved.ok()) return resolved.status();
     const uint64_t max = std::numeric_limits<uint64_t>::max();
-    const uint64_t storage = options.write_buffer_bytes > max - options.block_cache_bytes
+    const uint64_t storage = resolved.ValueOrDie().facts_write_buffer_bytes >
+                                     max - resolved.ValueOrDie().meta_write_buffer_bytes
                                  ? max
-                                 : options.write_buffer_bytes + options.block_cache_bytes;
+                                 : resolved.ValueOrDie().facts_write_buffer_bytes +
+                                       resolved.ValueOrDie().meta_write_buffer_bytes;
     const uint64_t first = storage > max - options.query_runtime.query_memory_bytes
                                ? max
                                : storage + options.query_runtime.query_memory_bytes;
     const bool overflow = first == max ||
         options.query_runtime.projection_cache_bytes > max - first;
     const uint64_t second = overflow ? max : first + options.query_runtime.projection_cache_bytes;
-    if (overflow ||
-        second > options.production.memory_budget_bytes ||
-        options.query_runtime.query_delta_bytes >
-            options.production.memory_budget_bytes - second) {
+    const uint64_t budget = resolved.ValueOrDie().memory_budget_bytes;
+    if (overflow || second > budget ||
+        options.query_runtime.query_delta_bytes > budget - second) {
       return Status::InvalidArgument("database", "query allocations exceed production memory budget");
     }
   }

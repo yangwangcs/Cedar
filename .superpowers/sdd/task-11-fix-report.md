@@ -18,6 +18,10 @@
 - `QueryScratch` now enforces one-second read and write byte windows when rate
   limits are configured; runtime analytical scratch inherits the resource-pool
   read/scratch rates.
+- Production `Database::Open` now resolves the effective storage profile (WBM,
+  block cache, and production budget) before checking Cedar query/cache/delta
+  allocations. The check applies in kernel mode as well; the kernel lifecycle
+  fixture uses explicit query/cache sizes that fit its 1 GiB profile.
 
 ## Remaining review items
 
@@ -29,8 +33,6 @@ The following Important findings are not fully closed in this change:
   still needed for strict allocation-before-reservation ordering.
 - Materialization and spill partition/run boundaries do not yet perform the
   full cancellation/deadline checks requested by the review.
-- Production `Open` storage-profile resolution and kernel-mode query-budget
-  safety were outside the touched spill path and remain for a follow-up.
 
 ## Verification
 

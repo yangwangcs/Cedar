@@ -1330,6 +1330,12 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                       ? 0
                                       : resource_pool->options().scratch_bytes_per_second;
     scratch->SetRateLimits(read_rate, scratch_rate);
+    if (resource_pool != nullptr) {
+      scratch->SetIoAdmission([resource_pool](uint64_t bytes) {
+        auto permit = resource_pool->AcquireIo(QueryWorkClass::kAnalytical, bytes);
+        return permit.ok() ? Status::OK() : permit.status();
+      });
+    }
   }
   return QueryCursor(std::make_unique<QueryCursor::State>(
       plan, std::move(snapshot), options,

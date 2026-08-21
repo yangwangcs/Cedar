@@ -68,6 +68,10 @@ void QueryScratch::SetRateLimits(uint64_t read_bytes_per_second,
   rate_scratch_bytes_ = 0;
 }
 
+void QueryScratch::SetIoAdmission(std::function<Status(uint64_t)> check) {
+  io_admission_ = std::move(check);
+}
+
 void QueryScratch::SetAbortCheck(std::function<Status()> check) {
   abort_check_ = std::move(check);
 }
@@ -143,6 +147,9 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
       !add(payload.size()) || !add(sizeof(uint32_t))) {
     return Status::ResourceExhausted("query scratch", "scratch_bytes overflow");
   }
+  if (io_admission_) {
+    if (Status status = io_admission_(bytes); !status.ok()) return status;
+  }
   if (bytes > disk_budget_bytes_ || written_bytes_ > disk_budget_bytes_ - bytes) {
     return Status::ResourceExhausted("query scratch", "scratch_bytes budget exhausted");
   }
@@ -215,6 +222,14 @@ StatusOr<std::string> QueryScratch::ReadRun(const std::filesystem::path& path) c
   if (!Read(in, &length) || file_size < fixed ||
       length > std::numeric_limits<size_t>::max() ||
       length > file_size - fixed) return Status::Corruption("query scratch", "scratch length invalid");
+  if (io_admission_) {
+    if (Status status = io_admission_(length); !status.ok()) return status;
+  }
+  if (reservation_ != nullptr) {
+    if (Status status = reservation_->ReserveReadBytes(length); !status.ok()) {
+      return status;
+    }
+  }
   if (Status status = ConsumeRate(length, true); !status.ok()) return status;
   std::string payload(static_cast<size_t>(length), '\0');
   in.read(payload.data(), payload.size());
@@ -222,11 +237,6 @@ StatusOr<std::string> QueryScratch::ReadRun(const std::filesystem::path& path) c
   if (!in || !Read(in, &checksum) || checksum != crc32c::Extend(0, payload.data(), payload.size())) return Status::Corruption("query scratch", "scratch checksum mismatch");
   char trailing = 0;
   if (in.read(&trailing, 1)) return Status::Corruption("query scratch", "scratch block has trailing bytes");
-  if (reservation_ != nullptr) {
-    if (Status status = reservation_->ReserveReadBytes(payload.size()); !status.ok()) {
-      return status;
-    }
-  }
   return payload;
 }
 

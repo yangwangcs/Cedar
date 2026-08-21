@@ -1393,12 +1393,29 @@ StatusOr<RelationalRow> DeserializeRow(std::string_view payload) {
   return row;
 }
 
-StatusOr<std::vector<RelationalRow>> DeserializeRows(std::string_view payload) {
+StatusOr<std::vector<RelationalRow>> DeserializeRows(
+    std::string_view payload, QueryReservation* reservation) {
   std::vector<RelationalRow> rows;
   while (!payload.empty()) {
     uint32_t frame_size = 0;
     if (!ReadBinary(&payload, &frame_size) || frame_size > payload.size()) {
       return Status::Corruption("query relational", "invalid spilled row framing");
+    }
+    // Bound each row's transient decode allocations before DeserializeRow
+    // reserves its cell vector and any variable-length scalar payloads. The
+    // guard is intentionally scoped to decode plus insertion; persistent
+    // output accounting is handled by the caller's output lease.
+    const size_t frame_bytes = static_cast<size_t>(frame_size);
+    if (frame_bytes > std::numeric_limits<size_t>::max() -
+                          sizeof(RelationalRow) - 64) {
+      return Status::ResourceExhausted("query relational",
+                                       "spilled row reservation overflow");
+    }
+    ReservationGuard frame_guard(
+        reservation, frame_bytes + sizeof(RelationalRow) + 64);
+    if (!frame_guard.acquired()) {
+      return NeedsSpill(frame_bytes + sizeof(RelationalRow) + 64,
+                        AvailableBytes(*reservation));
     }
     auto row = DeserializeRow(payload.substr(0, frame_size));
     if (!row.ok()) return row.status();
@@ -1451,7 +1468,7 @@ StatusOr<std::vector<RelationalRow>> ReadSpilledRows(
     if (!payload_guard.acquired()) {
       return NeedsSpill(payload.ValueOrDie().size(), AvailableBytes(*reservation));
     }
-    auto decoded = DeserializeRows(payload.ValueOrDie());
+    auto decoded = DeserializeRows(payload.ValueOrDie(), reservation);
     if (!decoded.ok()) return decoded.status();
     auto decoded_rows = std::move(decoded).ConsumeValueOrDie();
     rows.insert(rows.end(), std::make_move_iterator(decoded_rows.begin()),

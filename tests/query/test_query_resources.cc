@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -157,6 +158,46 @@ TEST(QueryScratchTest, ChecksCancellationAtRunBoundaries) {
   cancelled.store(true);
   EXPECT_TRUE(scratch.ReadRun(run.ValueOrDie()).status().IsQueryCancelled());
   EXPECT_TRUE(scratch.Cleanup().ok());
+}
+
+TEST(QueryScratchTest, AcquiresAnalyticalIoAtRunBoundaries) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-scratch-io-permit";
+  std::filesystem::remove_all(root);
+  std::atomic<bool> critical{true};
+  auto options = OptionsWithMemory(4096);
+  options.wal_sync_critical = &critical;
+  QueryResourcePool pool(options);
+  QueryScratch scratch(root, "instance", "query", 4096);
+  scratch.SetIoAdmission([&pool](uint64_t bytes) {
+    auto permit = pool.AcquireIo(QueryWorkClass::kAnalytical, bytes);
+    return permit.ok() ? Status::OK() : permit.status();
+  });
+  EXPECT_TRUE(scratch.WriteRun("run-0", "payload").status().IsResourceExhausted());
+  critical.store(false);
+  auto run = scratch.WriteRun("run-0", "payload");
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  critical.store(true);
+  EXPECT_TRUE(scratch.ReadRun(run.ValueOrDie()).status().IsResourceExhausted());
+  EXPECT_TRUE(scratch.Cleanup().ok());
+}
+
+TEST(QueryScratchTest, ReservesReadBudgetBeforePayloadAllocation) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-scratch-read-reservation";
+  std::filesystem::remove_all(root);
+  QueryScratch writer(root, "instance", "writer", 4096);
+  auto run = writer.WriteRun("run-0", "payload");
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+
+  std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> limits;
+  limits.fill(UINT64_MAX);
+  limits[static_cast<size_t>(ResourceDimension::kReadBytes)] = 1;
+  QueryReservation reservation(limits);
+  QueryScratch reader(root, "instance", "writer", 4096, &reservation);
+  EXPECT_TRUE(reader.ReadRun(run.ValueOrDie()).status().IsResourceExhausted());
+  EXPECT_EQ(reservation.used(ResourceDimension::kReadBytes), 0U);
+  EXPECT_TRUE(writer.Cleanup().ok());
 }
 
 TEST(QueryScratchTest, RejectsPathEscape) {

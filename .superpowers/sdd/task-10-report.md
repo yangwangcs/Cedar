@@ -62,10 +62,9 @@ ctest --test-dir build/query-debug --output-on-failure -R 'QueryPlanner|QueryCan
 git diff --check: PASS
 ```
 
-Delta merge is deliberately disabled in the production planning context until
-the runtime has a boundary-event adapter. The planner marks this as
-`delta-fallback` and never claims an unmerged `(base,S]` tail is executable;
-the physical executor still handles mixed projection/canonical slices.
+Delta merge is enabled only when the database owns a live QueryDelta view and
+the planner proves `(base,S]` continuity; otherwise it marks
+`delta-fallback` and the physical executor uses canonical slices.
 
 The runtime now has the per-entity synthetic-boundary adapter: each delta slice
 builds Put/Delete boundaries from projection intervals, acquires the exact

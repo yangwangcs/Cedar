@@ -14,6 +14,7 @@
 #include "query/runtime/relational.h"
 #include "query/runtime/query_runtime.h"
 #include "query/runtime/vector_kernels.h"
+#include "query/resource/query_scratch.h"
 
 namespace cedar::internal {
 namespace {
@@ -229,6 +230,57 @@ TEST(RelationalTest, HashAndSortJoinsReserveTheirPublishedOutput) {
   ASSERT_FALSE(sort_overflow.ok());
   EXPECT_TRUE(IsNeedsSpill(sort_overflow.status()));
   EXPECT_EQ(sort_spill.used_bytes(), 0U);
+}
+
+TEST(RelationalTest, ExternalSpillJoinsMatchCanonicalResults) {
+  std::vector<RelationalRow> left_rows{Row(7, 700), Row(99, 990)};
+  std::vector<RelationalRow> right_rows;
+  for (int64_t key = 0; key < 512; ++key) {
+    right_rows.push_back(Row(key, key * 10));
+  }
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-relational-spill";
+  std::filesystem::remove_all(root);
+  QueryReservation reservation(4096);
+  QueryScratch scratch(root, "instance", "external", 1 << 20, &reservation);
+  for (JoinKind kind : {JoinKind::kInner, JoinKind::kSemi, JoinKind::kAnti}) {
+    JoinInput input{{left_rows}, {right_rows}, 0, 0, kind};
+    auto expected = IndexNestedLoopJoin(input, &reservation);
+    ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+    auto actual = HashJoin(input, &reservation,
+                           std::numeric_limits<size_t>::max(), &scratch);
+    ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+    EXPECT_EQ(actual.ValueOrDie().rows, expected.ValueOrDie().rows);
+  }
+  JoinInput sort_input{{left_rows}, {right_rows}, 0, 0, JoinKind::kInner};
+  auto expected = IndexNestedLoopJoin(sort_input, &reservation);
+  ASSERT_TRUE(expected.ok());
+  auto actual = SortMergeJoin(sort_input, &reservation,
+                              std::numeric_limits<size_t>::max(), &scratch);
+  ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+  EXPECT_EQ(actual.ValueOrDie().rows, expected.ValueOrDie().rows);
+  for (JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+    sort_input.kind = kind;
+    auto sort_expected = IndexNestedLoopJoin(sort_input, &reservation);
+    ASSERT_TRUE(sort_expected.ok()) << sort_expected.status().ToString();
+    auto sort_actual = SortMergeJoin(sort_input, &reservation,
+                                     std::numeric_limits<size_t>::max(),
+                                     &scratch);
+    ASSERT_TRUE(sort_actual.ok()) << sort_actual.status().ToString();
+    EXPECT_EQ(sort_actual.ValueOrDie().rows, sort_expected.ValueOrDie().rows);
+  }
+  EXPECT_TRUE(std::filesystem::exists(scratch.query_directory()));
+  EXPECT_FALSE(std::filesystem::is_empty(scratch.query_directory()));
+  size_t verified_runs = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(
+           scratch.query_directory())) {
+    auto payload = scratch.ReadRun(entry.path());
+    ASSERT_TRUE(payload.ok()) << payload.status().ToString();
+    EXPECT_FALSE(payload.ValueOrDie().starts_with("row:"));
+    ++verified_runs;
+  }
+  EXPECT_GT(verified_runs, 2U);
+  EXPECT_TRUE(scratch.Cleanup().ok());
 }
 
 TEST(RelationalTest, PublishedOutputRetainsReservationUntilStreamDestruction) {

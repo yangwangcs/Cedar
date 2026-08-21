@@ -8,9 +8,11 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <string_view>
 #include <utility>
 
 #include "query/temporal/interval.h"
@@ -1240,62 +1242,239 @@ Status NeedsSpill(size_t requested_bytes, size_t available_bytes) {
                               std::to_string(available_bytes));
 }
 
-std::string SerializeRows(const BatchStream& stream) {
+template <typename T>
+void AppendBinary(std::string* payload, T value) {
+  const char* bytes = reinterpret_cast<const char*>(&value);
+  payload->append(bytes, sizeof(T));
+}
+
+template <typename T>
+bool ReadBinary(std::string_view* payload, T* value) {
+  if (payload->size() < sizeof(T)) return false;
+  std::memcpy(value, payload->data(), sizeof(T));
+  payload->remove_prefix(sizeof(T));
+  return true;
+}
+
+void AppendString(std::string* payload, std::string_view value) {
+  AppendBinary<uint64_t>(payload, static_cast<uint64_t>(value.size()));
+  payload->append(value.data(), value.size());
+}
+
+bool ReadString(std::string_view* payload, std::string* value) {
+  uint64_t size = 0;
+  if (!ReadBinary(payload, &size) || size > payload->size() ||
+      size > std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  value->assign(payload->data(), static_cast<size_t>(size));
+  payload->remove_prefix(static_cast<size_t>(size));
+  return true;
+}
+
+void SerializeScalar(std::string* payload, const RelationalScalar& scalar) {
+  AppendBinary<uint8_t>(payload, static_cast<uint8_t>(scalar.index()));
+  std::visit(
+      [payload](const auto& value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, bool>) {
+          AppendBinary<uint8_t>(payload, value ? 1 : 0);
+        } else if constexpr (std::is_same_v<T, int32_t> ||
+                             std::is_same_v<T, int64_t>) {
+          AppendBinary<T>(payload, value);
+        } else if constexpr (std::is_same_v<T, float> ||
+                             std::is_same_v<T, double>) {
+          AppendBinary<T>(payload, value);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+          AppendString(payload, value);
+        } else if constexpr (std::is_same_v<T, Binary>) {
+          AppendString(payload, value.value);
+        } else if constexpr (std::is_same_v<T, VertexRef>) {
+          AppendBinary<uint32_t>(payload, value.part_id.value);
+          AppendBinary<uint64_t>(payload, value.vertex_id.value);
+        } else if constexpr (std::is_same_v<T, EdgeRef>) {
+          AppendBinary<uint32_t>(payload, value.home_part_id.value);
+          AppendBinary<uint64_t>(payload, value.edge_id.value);
+        } else if constexpr (std::is_same_v<T, ValidTimeInterval>) {
+          AppendBinary<uint64_t>(payload, value.from.value);
+          AppendBinary<uint8_t>(payload, value.to.has_value() ? 1 : 0);
+          if (value.to) AppendBinary<uint64_t>(payload, value.to->value);
+        } else {
+          AppendBinary<uint64_t>(payload, value.value);
+        }
+      },
+      scalar);
+}
+
+bool DeserializeScalar(std::string_view* payload, RelationalScalar* scalar) {
+  uint8_t index = 0;
+  if (!ReadBinary(payload, &index)) return false;
+  switch (index) {
+    case 0: { uint8_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = value != 0; return true; }
+    case 1: { int32_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = value; return true; }
+    case 2: { int64_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = value; return true; }
+    case 3: { float value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = value; return true; }
+    case 4: { double value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = value; return true; }
+    case 5: { uint64_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = Timestamp64{value}; return true; }
+    case 6: { std::string value; if (!ReadString(payload, &value)) return false; *scalar = std::move(value); return true; }
+    case 7: { std::string value; if (!ReadString(payload, &value)) return false; *scalar = Binary{std::move(value)}; return true; }
+    case 8: { uint32_t part = 0; uint64_t id = 0; if (!ReadBinary(payload, &part) || !ReadBinary(payload, &id)) return false; *scalar = VertexRef{PartId{part}, VertexId{id}}; return true; }
+    case 9: { uint32_t part = 0; uint64_t id = 0; if (!ReadBinary(payload, &part) || !ReadBinary(payload, &id)) return false; *scalar = EdgeRef{PartId{part}, EdgeId{id}}; return true; }
+    case 10: { uint64_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = ValidTime{value}; return true; }
+    case 11: { uint64_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = ValidDuration{value}; return true; }
+    case 12: { uint64_t value = 0; if (!ReadBinary(payload, &value)) return false; *scalar = CommitSeq{value}; return true; }
+    case 13: { uint64_t from = 0, to = 0; uint8_t has_to = 0; if (!ReadBinary(payload, &from) || !ReadBinary(payload, &has_to) || (has_to && !ReadBinary(payload, &to))) return false; *scalar = ValidTimeInterval{ValidTime{from}, has_to ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt}; return true; }
+    default: return false;
+  }
+}
+
+std::string SerializeRow(const RelationalRow& row) {
   std::string payload;
-  for (const auto& row : stream.rows) {
-    payload.append("row:");
-    for (const auto& cell : row.cells) {
-      payload.append(std::to_string(static_cast<int>(cell.type)));
-      payload.push_back(':');
-      payload.push_back(cell.present ? '1' : '0');
-      payload.push_back(':');
-      if (cell.present) {
-        std::visit([&payload](const auto& value) {
-          using T = std::decay_t<decltype(value)>;
-          if constexpr (std::is_same_v<T, std::string>) {
-            payload.append(value);
-          } else if constexpr (std::is_same_v<T, Binary>) {
-            payload.append(value.value);
-          } else if constexpr (std::is_same_v<T, VertexRef>) {
-            payload.append(std::to_string(value.part_id.value));
-            payload.push_back(',');
-            payload.append(std::to_string(value.vertex_id.value));
-          } else if constexpr (std::is_same_v<T, EdgeRef>) {
-            payload.append(std::to_string(value.home_part_id.value));
-            payload.push_back(',');
-            payload.append(std::to_string(value.edge_id.value));
-          } else if constexpr (std::is_same_v<T, ValidTimeInterval>) {
-            payload.append(std::to_string(value.from.value));
-            payload.push_back(',');
-            payload.append(value.to ? std::to_string(value.to->value) : "unbounded");
-          } else if constexpr (std::is_same_v<T, ValidTime> ||
-                               std::is_same_v<T, ValidDuration> ||
-                               std::is_same_v<T, Timestamp64> ||
-                               std::is_same_v<T, CommitSeq>) {
-            payload.append(std::to_string(value.value));
-          } else {
-            payload.append(std::to_string(value));
-          }
-        }, cell.value);
-      }
-      payload.push_back(';');
-    }
-    payload.push_back('\n');
+  AppendBinary<uint32_t>(&payload, static_cast<uint32_t>(row.cells.size()));
+  AppendBinary<uint8_t>(&payload, row.effective.has_value() ? 1 : 0);
+  if (row.effective) {
+    AppendBinary<uint64_t>(&payload, row.effective->from.value);
+    AppendBinary<uint8_t>(&payload, row.effective->to.has_value() ? 1 : 0);
+    if (row.effective->to) AppendBinary<uint64_t>(&payload, row.effective->to->value);
+  }
+  for (const RelationalCell& cell : row.cells) {
+    AppendBinary<uint8_t>(&payload, static_cast<uint8_t>(cell.type));
+    AppendBinary<uint8_t>(&payload, cell.present ? 1 : 0);
+    if (cell.present) SerializeScalar(&payload, cell.value);
   }
   return payload;
 }
 
-Status SpillInput(QueryScratch* scratch, const char* name,
-                  std::string payload) {
+void AppendFramedRow(std::string* payload, const RelationalRow& row) {
+  const std::string encoded = SerializeRow(row);
+  AppendBinary<uint32_t>(payload, static_cast<uint32_t>(encoded.size()));
+  payload->append(encoded);
+}
+
+StatusOr<RelationalRow> DeserializeRow(std::string_view payload) {
+  uint32_t cell_count = 0;
+  uint8_t has_effective = 0;
+  if (!ReadBinary(&payload, &cell_count) || !ReadBinary(&payload, &has_effective)) {
+    return Status::Corruption("query relational", "invalid spilled row frame");
+  }
+  RelationalRow row;
+  if (has_effective) {
+    uint64_t from = 0, to = 0;
+    uint8_t has_to = 0;
+    if (!ReadBinary(&payload, &from) || !ReadBinary(&payload, &has_to) ||
+        (has_to && !ReadBinary(&payload, &to))) {
+      return Status::Corruption("query relational", "invalid spilled interval");
+    }
+    row.effective = ValidTimeInterval{ValidTime{from}, has_to ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt};
+  }
+  row.cells.reserve(cell_count);
+  for (uint32_t index = 0; index < cell_count; ++index) {
+    uint8_t type = 0, present = 0;
+    if (!ReadBinary(&payload, &type) || !ReadBinary(&payload, &present)) {
+      return Status::Corruption("query relational", "invalid spilled cell frame");
+    }
+    RelationalCell cell;
+    cell.type = static_cast<QueryType>(type);
+    cell.present = present != 0;
+    if (cell.present && !DeserializeScalar(&payload, &cell.value)) {
+      return Status::Corruption("query relational", "invalid spilled scalar");
+    }
+    row.cells.push_back(std::move(cell));
+  }
+  if (!payload.empty()) return Status::Corruption("query relational", "spilled row trailing bytes");
+  return row;
+}
+
+StatusOr<std::vector<RelationalRow>> DeserializeRows(std::string_view payload) {
+  std::vector<RelationalRow> rows;
+  while (!payload.empty()) {
+    uint32_t frame_size = 0;
+    if (!ReadBinary(&payload, &frame_size) || frame_size > payload.size()) {
+      return Status::Corruption("query relational", "invalid spilled row framing");
+    }
+    auto row = DeserializeRow(payload.substr(0, frame_size));
+    if (!row.ok()) return row.status();
+    rows.push_back(std::move(row).ConsumeValueOrDie());
+    payload.remove_prefix(frame_size);
+  }
+  return rows;
+}
+
+StatusOr<BatchStream> HashJoinInMemory(const JoinInput& input,
+                                       QueryReservation* reservation,
+                                       size_t max_output_rows);
+
+StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
+                                       QueryReservation* reservation,
+                                       size_t max_output_rows,
+                                       QueryScratch* scratch) {
   if (scratch == nullptr) return NeedsSpill();
+  constexpr size_t kPartitions = 32;
+  std::array<std::string, kPartitions> left_payloads;
+  std::array<std::string, kPartitions> right_payloads;
+  for (const RelationalRow& row : input.left.rows) {
+    const RelationalCell& key = row.cells[input.left_key];
+    AppendFramedRow(&left_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
+  }
+  for (const RelationalRow& row : input.right.rows) {
+    const RelationalCell& key = row.cells[input.right_key];
+    AppendFramedRow(&right_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
+  }
   static std::atomic<uint64_t> sequence{0};
-  const std::string unique_name = std::string(name) + "-" +
-      std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
-  auto run = scratch->WriteRun(unique_name, payload);
-  if (!run.ok()) return run.status();
-  auto read_payload = scratch->ReadRun(run.ValueOrDie());
-  if (!read_payload.ok()) return read_payload.status();
-  return Status::OK();
+  std::array<std::filesystem::path, kPartitions> left_runs;
+  std::array<std::filesystem::path, kPartitions> right_runs;
+  for (size_t partition = 0; partition < kPartitions; ++partition) {
+    if (!left_payloads[partition].empty()) {
+      auto run = scratch->WritePartition(
+          "hash-left-" + std::to_string(sequence.fetch_add(1)),
+          left_payloads[partition]);
+      if (!run.ok()) return run.status();
+      left_runs[partition] = run.ValueOrDie();
+    }
+    if (!right_payloads[partition].empty()) {
+      auto run = scratch->WritePartition(
+          "hash-right-" + std::to_string(sequence.fetch_add(1)),
+          right_payloads[partition]);
+      if (!run.ok()) return run.status();
+      right_runs[partition] = run.ValueOrDie();
+    }
+  }
+  std::vector<RelationalRow> rows;
+  for (size_t partition = 0; partition < kPartitions; ++partition) {
+    if (left_runs[partition].empty()) continue;
+    auto left_payload = scratch->ReadRun(left_runs[partition]);
+    if (!left_payload.ok()) return left_payload.status();
+    auto left = DeserializeRows(left_payload.ValueOrDie());
+    if (!left.ok()) return left.status();
+    std::vector<RelationalRow> right_rows;
+    if (!right_runs[partition].empty()) {
+      auto right_payload = scratch->ReadRun(right_runs[partition]);
+      if (!right_payload.ok()) return right_payload.status();
+      auto right = DeserializeRows(right_payload.ValueOrDie());
+      if (!right.ok()) return right.status();
+      right_rows = std::move(right).ConsumeValueOrDie();
+    }
+    JoinInput part{BatchStream(std::move(left).ConsumeValueOrDie()),
+                   BatchStream(std::move(right_rows)), input.left_key,
+                   input.right_key, input.kind};
+    auto joined = HashJoinInMemory(part, reservation, max_output_rows);
+    if (!joined.ok()) return joined.status();
+    BatchStream result = std::move(joined).ConsumeValueOrDie();
+    if (rows.size() > max_output_rows ||
+        result.rows.size() > max_output_rows - rows.size()) {
+      return OutputRowsExhausted();
+    }
+    rows.insert(rows.end(), std::make_move_iterator(result.rows.begin()),
+                std::make_move_iterator(result.rows.end()));
+    result.rows.clear();
+    result.reservation_lease.reset();
+  }
+  auto lease = RetainOutput(reservation, EstimateRowsBytes(rows), true);
+  if (!lease.ok()) return lease.status();
+  BatchStream output;
+  output.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  output.rows = std::move(rows);
+  return output;
 }
 
 bool IsNeedsSpill(const Status& status) {
@@ -1457,32 +1636,25 @@ StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input,
   return result;
 }
 
-StatusOr<BatchStream> HashJoin(const JoinInput& input,
-                               QueryReservation* reservation,
-                               size_t max_output_rows,
-                               QueryScratch* scratch) {
+StatusOr<BatchStream> HashJoinInMemory(const JoinInput& input,
+                                       QueryReservation* reservation,
+                                       size_t max_output_rows) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
   const auto bucket_count = HashBucketCount(input.right.rows.size());
   if (!bucket_count.has_value() ||
       input.right.rows.size() >
           std::numeric_limits<size_t>::max() / sizeof(HashEntry)) {
-    Status spill = SpillInput(scratch, "hash-spill", SerializeRows(input.right));
-    if (!spill.ok()) return spill;
-    return IndexNestedLoopJoin(input, reservation, max_output_rows);
+    return NeedsSpill();
   }
   size_t index_bytes = input.right.rows.size() * sizeof(HashEntry);
   if (*bucket_count > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
       !AddBytes(*bucket_count * sizeof(size_t), &index_bytes)) {
-    Status spill = SpillInput(scratch, "hash-spill", SerializeRows(input.right));
-    if (!spill.ok()) return spill;
-    return IndexNestedLoopJoin(input, reservation, max_output_rows);
+    return NeedsSpill();
   }
   ReservationGuard index_guard(reservation, index_bytes);
   if (!index_guard.acquired()) {
-    Status spill = SpillInput(scratch, "hash-spill", SerializeRows(input.right));
-    if (!spill.ok()) return spill;
-    return IndexNestedLoopJoin(input, reservation, max_output_rows);
+    return NeedsSpill();
   }
 
   std::vector<size_t> buckets(*bucket_count, kNoHashEntry);
@@ -1526,24 +1698,30 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
   return result;
 }
 
-StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
-                                    QueryReservation* reservation,
-                                    size_t max_output_rows,
-                                    QueryScratch* scratch) {
+StatusOr<BatchStream> HashJoin(const JoinInput& input,
+                               QueryReservation* reservation,
+                               size_t max_output_rows,
+                               QueryScratch* scratch) {
+  auto in_memory = HashJoinInMemory(input, reservation, max_output_rows);
+  if (in_memory.ok() || scratch == nullptr || !IsNeedsSpill(in_memory.status())) {
+    return in_memory;
+  }
+  return ExternalHashJoin(input, reservation, max_output_rows, scratch);
+}
+
+StatusOr<BatchStream> SortMergeJoinInMemory(const JoinInput& input,
+                                            QueryReservation* reservation,
+                                            size_t max_output_rows) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
   size_t input_bytes = EstimateBytes(input.left);
   const size_t right_bytes = EstimateBytes(input.right);
   if (!AddBytes(right_bytes, &input_bytes)) {
-    Status spill = SpillInput(scratch, "sort-spill", SerializeRows(input.left) + SerializeRows(input.right));
-    if (!spill.ok()) return spill;
-    return IndexNestedLoopJoin(input, reservation, max_output_rows);
+    return NeedsSpill();
   }
   ReservationGuard input_guard(reservation, input_bytes);
   if (!input_guard.acquired()) {
-    Status spill = SpillInput(scratch, "sort-spill", SerializeRows(input.left) + SerializeRows(input.right));
-    if (!spill.ok()) return spill;
-    return IndexNestedLoopJoin(input, reservation, max_output_rows);
+    return NeedsSpill();
   }
   std::vector<RelationalRow> left = input.left.rows;
   std::vector<RelationalRow> right = input.right.rows;
@@ -1617,6 +1795,103 @@ StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
   }
   result.order_specified = true;
   return result;
+}
+
+StatusOr<BatchStream> ExternalSortMergeJoin(const JoinInput& input,
+                                            QueryReservation* reservation,
+                                            size_t max_output_rows,
+                                            QueryScratch* scratch) {
+  if (scratch == nullptr) return NeedsSpill();
+  constexpr size_t kPartitions = 32;
+  std::array<std::string, kPartitions> left_payloads;
+  std::array<std::string, kPartitions> right_payloads;
+  for (const RelationalRow& row : input.left.rows) {
+    const RelationalCell& key = row.cells[input.left_key];
+    AppendFramedRow(&left_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
+  }
+  for (const RelationalRow& row : input.right.rows) {
+    const RelationalCell& key = row.cells[input.right_key];
+    AppendFramedRow(&right_payloads[key.present ? HashCell(key) % kPartitions : 0], row);
+  }
+  static std::atomic<uint64_t> sequence{0};
+  std::array<std::filesystem::path, kPartitions> left_runs;
+  std::array<std::filesystem::path, kPartitions> right_runs;
+  for (size_t partition = 0; partition < kPartitions; ++partition) {
+    if (!left_payloads[partition].empty()) {
+      auto run = scratch->WritePartition(
+          "sort-left-" + std::to_string(sequence.fetch_add(1)),
+          left_payloads[partition]);
+      if (!run.ok()) return run.status();
+      left_runs[partition] = run.ValueOrDie();
+    }
+    if (!right_payloads[partition].empty()) {
+      auto run = scratch->WritePartition(
+          "sort-right-" + std::to_string(sequence.fetch_add(1)),
+          right_payloads[partition]);
+      if (!run.ok()) return run.status();
+      right_runs[partition] = run.ValueOrDie();
+    }
+  }
+  std::vector<RelationalRow> rows;
+  for (size_t partition = 0; partition < kPartitions; ++partition) {
+    if (left_runs[partition].empty()) continue;
+    auto left_payload = scratch->ReadRun(left_runs[partition]);
+    if (!left_payload.ok()) return left_payload.status();
+    auto left = DeserializeRows(left_payload.ValueOrDie());
+    if (!left.ok()) return left.status();
+    std::vector<RelationalRow> right_rows;
+    if (!right_runs[partition].empty()) {
+      auto right_payload = scratch->ReadRun(right_runs[partition]);
+      if (!right_payload.ok()) return right_payload.status();
+      auto right = DeserializeRows(right_payload.ValueOrDie());
+      if (!right.ok()) return right.status();
+      right_rows = std::move(right).ConsumeValueOrDie();
+    }
+    std::vector<RelationalRow> left_rows = std::move(left).ConsumeValueOrDie();
+    std::sort(left_rows.begin(), left_rows.end(), [&input](const RelationalRow& a,
+                                                            const RelationalRow& b) {
+      return CompareCell(a.cells[input.left_key], b.cells[input.left_key]) < 0;
+    });
+    std::sort(right_rows.begin(), right_rows.end(), [&input](const RelationalRow& a,
+                                                              const RelationalRow& b) {
+      return CompareCell(a.cells[input.right_key], b.cells[input.right_key]) < 0;
+    });
+    JoinInput part{BatchStream(std::move(left_rows)), BatchStream(std::move(right_rows)),
+                   input.left_key, input.right_key, input.kind};
+    auto joined = SortMergeJoinInMemory(part, reservation, max_output_rows);
+    if (!joined.ok()) return joined.status();
+    BatchStream result = std::move(joined).ConsumeValueOrDie();
+    if (rows.size() > max_output_rows ||
+        result.rows.size() > max_output_rows - rows.size()) {
+      return OutputRowsExhausted();
+    }
+    rows.insert(rows.end(), std::make_move_iterator(result.rows.begin()),
+                std::make_move_iterator(result.rows.end()));
+    result.rows.clear();
+    result.reservation_lease.reset();
+  }
+  std::sort(rows.begin(), rows.end(), [&input](const RelationalRow& a,
+                                               const RelationalRow& b) {
+    return CompareCell(a.cells[input.left_key], b.cells[input.left_key]) < 0;
+  });
+  auto lease = RetainOutput(reservation, EstimateRowsBytes(rows), true);
+  if (!lease.ok()) return lease.status();
+  BatchStream output;
+  output.order_specified = true;
+  output.reservation_lease = std::move(lease).ConsumeValueOrDie();
+  output.rows = std::move(rows);
+  return output;
+}
+
+StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
+                                    QueryReservation* reservation,
+                                    size_t max_output_rows,
+                                    QueryScratch* scratch) {
+  auto in_memory = SortMergeJoinInMemory(input, reservation, max_output_rows);
+  if (in_memory.ok() || scratch == nullptr || !IsNeedsSpill(in_memory.status())) {
+    return in_memory;
+  }
+  return ExternalSortMergeJoin(input, reservation, max_output_rows, scratch);
 }
 
 StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,

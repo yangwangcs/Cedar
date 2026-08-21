@@ -271,6 +271,18 @@ Status OutputRowsExhausted() {
   return Status::ResourceExhausted("query", "output row budget exceeded");
 }
 
+Status TemporalBudgetExhausted(size_t memory_bytes, size_t output_rows,
+                               size_t output_bytes, size_t interval_fragments,
+                               const char* reason = "budget exceeded") {
+  return Status::ResourceExhausted(
+      "query", std::string(reason) + " memory_bytes=" +
+                   std::to_string(memory_bytes) +
+                   " output_rows=" + std::to_string(output_rows) +
+                   " output_bytes=" + std::to_string(output_bytes) +
+                   " interval_fragments=" +
+                   std::to_string(interval_fragments));
+}
+
 StatusOr<std::shared_ptr<QueryReservationLease>> RetainOutput(
     QueryReservation* reservation, size_t bytes, bool spill_capable) {
   if (reservation == nullptr) {
@@ -560,10 +572,17 @@ Status Publish(RelationalRow row, FragmentBudget* budget,
     output->rows.back().effective->to = row.effective->to;
     return Status::OK();
   }
-  if (output->rows.size() >= max_output_rows) return OutputRowsExhausted();
+  if (output->rows.size() >= max_output_rows) {
+    return TemporalBudgetExhausted(0, output->rows.size() + 1, 0,
+                                   budget == nullptr ? 0
+                                                      : budget->used_fragments(),
+                                   "output row budget exceeded");
+  }
   if (budget == nullptr || !budget->TryConsume()) {
-    return Status::ResourceExhausted("query",
-                                     "interval fragment budget exceeded");
+    return TemporalBudgetExhausted(0, output->rows.size(), 0,
+                                   budget == nullptr ? 0
+                                                      : budget->limit_fragments(),
+                                   "interval fragment budget exceeded");
   }
   output->rows.push_back(std::move(row));
   return Status::OK();
@@ -1210,7 +1229,10 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
     }
   }
   if (!input.left.rows.empty() && budget->limit_fragments() == 0) {
-    return Status::ResourceExhausted("query", "interval_fragments=0");
+    return TemporalBudgetExhausted(0, 0, 0, 0);
+  }
+  if (max_output_rows == 0 && !input.left.rows.empty()) {
+    return TemporalBudgetExhausted(0, 1, 0, budget->limit_fragments());
   }
 
   size_t output_rows = 0;
@@ -1258,6 +1280,11 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
       }
     }
   }
+  if (output_rows > max_output_rows) {
+    return TemporalBudgetExhausted(0, output_rows, output_bytes,
+                                   budget->limit_fragments(),
+                                   "output row budget exceeded");
+  }
 
   size_t scratch_bytes = EstimateBytes(input.left);
   if (!AddBytes(EstimateBytes(input.right), &scratch_bytes) ||
@@ -1276,10 +1303,16 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
                            reservation == nullptr ? 0
                                                   : AvailableBytes(*reservation));
   }
-  if (reservation == nullptr) return MemoryExhausted(output_bytes, 0);
+  if (reservation == nullptr) {
+    return TemporalBudgetExhausted(output_bytes, output_rows, output_bytes,
+                                   budget->limit_fragments(),
+                                   "memory budget exceeded");
+  }
   ReservationGuard scratch_guard(reservation, scratch_bytes);
   if (!scratch_guard.acquired()) {
-    return MemoryExhausted(scratch_bytes, AvailableBytes(*reservation));
+    return TemporalBudgetExhausted(scratch_bytes, output_rows, output_bytes,
+                                   budget->limit_fragments(),
+                                   "memory budget exceeded");
   }
   std::vector<RelationalRow> left_rows = input.left.rows;
   std::vector<RelationalRow> right_rows = input.right.rows;
@@ -1377,10 +1410,16 @@ StatusOr<BatchStream> AggregateRows(const AggregateInput& input,
   }
   const size_t scratch_bytes =
       EstimateGroupingScratch(input.input, input.group_by);
-  if (reservation == nullptr) return MemoryExhausted(scratch_bytes, 0);
+  if (reservation == nullptr) {
+    return TemporalBudgetExhausted(scratch_bytes, 0, 0,
+                                   0,
+                                   "memory budget exceeded");
+  }
   ReservationGuard scratch_guard(reservation, scratch_bytes);
   if (!scratch_guard.acquired()) {
-    return MemoryExhausted(scratch_bytes, AvailableBytes(*reservation));
+    return TemporalBudgetExhausted(scratch_bytes, 0, 0,
+                                   0,
+                                   "memory budget exceeded");
   }
   auto groups = BuildGroups(input.input, input.group_by);
   if (!groups.ok()) return groups.status();
@@ -1390,7 +1429,11 @@ StatusOr<BatchStream> AggregateRows(const AggregateInput& input,
   const size_t output_bytes =
       EstimateAggregateOutputBytes(groups.ValueOrDie(), input.aggregates);
   auto lease = RetainOutput(reservation, output_bytes, false);
-  if (!lease.ok()) return lease.status();
+  if (!lease.ok()) {
+    return TemporalBudgetExhausted(output_bytes, groups.ValueOrDie().size(),
+                                   output_bytes, 0,
+                                   "memory budget exceeded");
+  }
   BatchStream result;
   result.reservation_lease = std::move(lease).ConsumeValueOrDie();
   result.rows.reserve(groups.ValueOrDie().size());
@@ -1419,7 +1462,17 @@ StatusOr<BatchStream> TemporalAggregate(const TemporalAggregateInput& input,
     return status;
   }
   if (!input.input.rows.empty() && budget->limit_fragments() == 0) {
-    return Status::ResourceExhausted("query", "interval_fragments=0");
+    return TemporalBudgetExhausted(0, 0, 0, 0);
+  }
+  if (max_output_rows == 0 && !input.input.rows.empty()) {
+    return TemporalBudgetExhausted(0, 1, 0, budget->limit_fragments());
+  }
+  if (input.input.rows.size() >
+          std::numeric_limits<size_t>::max() / 2 ||
+      input.input.rows.size() * 2 > max_output_rows) {
+    return TemporalBudgetExhausted(
+        0, input.input.rows.size() * 2, 0, budget->limit_fragments(),
+        "output row budget exceeded");
   }
   const size_t scratch_bytes = EstimateGroupingScratch(
       input.input, input.group_by, 2 * sizeof(TemporalEvent));

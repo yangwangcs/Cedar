@@ -386,6 +386,68 @@ TEST(RelationalTest, TemporalOperatorsRejectZeroFragmentsBeforeOutputReserve) {
   EXPECT_EQ(aggregate_reservation.peak_bytes(), 0U);
 }
 
+TEST(RelationalTest, TemporalOperatorsRejectZeroOutputRowsBeforeReservation) {
+  TemporalJoinInput join_input{{{TemporalRow(1, 0, 10)}},
+                               {{TemporalRow(1, 0, 10)}}, 0, 0,
+                               JoinKind::kInner};
+  FragmentBudget join_fragments(8);
+  QueryReservation join_reservation(1 << 20);
+  auto join = IntervalMergeJoin(join_input, &join_fragments,
+                                &join_reservation, 0);
+  ASSERT_FALSE(join.ok());
+  EXPECT_TRUE(join.status().IsResourceExhausted());
+  EXPECT_EQ(join_reservation.peak_bytes(), 0U);
+
+  TemporalAggregateInput aggregate_input{
+      BatchStream{{TemporalRow(1, 0, 10)}}, {0}};
+  FragmentBudget aggregate_fragments(8);
+  QueryReservation aggregate_reservation(1 << 20);
+  auto aggregate = TemporalAggregate(aggregate_input, &aggregate_fragments,
+                                     &aggregate_reservation, 0);
+  ASSERT_FALSE(aggregate.ok());
+  EXPECT_TRUE(aggregate.status().IsResourceExhausted());
+  EXPECT_EQ(aggregate_reservation.peak_bytes(), 0U);
+}
+
+TEST(RelationalTest, TemporalJoinPreflightsExactOutputRowsBeforeReservation) {
+  TemporalJoinInput input{
+      {{TemporalRow(1, 0, 10), TemporalRow(1, 15, 30)}},
+      {{TemporalRow(1, 5, 20)}}, 0, 0, JoinKind::kInner};
+  FragmentBudget fragments(8);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &fragments, &reservation, 1);
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsResourceExhausted());
+  EXPECT_EQ(reservation.peak_bytes(), 0U);
+}
+
+TEST(RelationalTest,
+     TemporalAggregatePreflightsExactOutputRowsBeforeReservation) {
+  TemporalAggregateInput input{
+      BatchStream{{TemporalRow(1, 0, 5), TemporalRow(1, 10, 15)}}, {0}};
+  FragmentBudget fragments(8);
+  QueryReservation reservation(1 << 20);
+  auto result = TemporalAggregate(input, &fragments, &reservation, 1);
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsResourceExhausted());
+  EXPECT_EQ(reservation.peak_bytes(), 0U);
+}
+
+TEST(RelationalTest, TemporalBudgetFailuresDiagnoseAllDimensions) {
+  TemporalJoinInput input{{{TemporalRow(1, 0, 10)}},
+                          {{TemporalRow(1, 0, 10)}}, 0, 0,
+                          JoinKind::kInner};
+  FragmentBudget fragments(0);
+  QueryReservation reservation(1 << 20);
+  auto result = IntervalMergeJoin(input, &fragments, &reservation);
+  ASSERT_FALSE(result.ok());
+  const std::string diagnostic = result.status().ToString();
+  EXPECT_NE(diagnostic.find("memory_bytes=", 0), std::string::npos);
+  EXPECT_NE(diagnostic.find("output_rows=", 0), std::string::npos);
+  EXPECT_NE(diagnostic.find("output_bytes=", 0), std::string::npos);
+  EXPECT_NE(diagnostic.find("interval_fragments=", 0), std::string::npos);
+}
+
 TEST(RelationalTest, TemporalAntiJoinDerivesMissingFragments) {
   TemporalJoinInput input{{{TemporalRow(1, 0, 20)}},
                           {{TemporalRow(1, 5, 10), TemporalRow(1, 15, 20)}},

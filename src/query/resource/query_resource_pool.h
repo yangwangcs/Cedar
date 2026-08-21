@@ -2,6 +2,7 @@
 #define CEDAR_QUERY_RESOURCE_QUERY_RESOURCE_POOL_H_
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -64,14 +65,18 @@ class IoPermit {
 class QueryResourcePool {
  public:
   explicit QueryResourcePool(QueryResourcePoolOptions options);
-  StatusOr<QueryReservation> Admit(const QueryBudget& budget);
+  StatusOr<QueryReservation> Admit(
+      const QueryBudget& budget,
+      QueryExecutionMode mode = QueryExecutionMode::kAuto);
   StatusOr<IoPermit> AcquireIo(QueryWorkClass work_class, uint64_t bytes);
   const QueryResourcePoolOptions& options() const { return options_; }
 
  private:
   QueryResourcePoolOptions options_;
   std::shared_ptr<std::atomic<uint64_t>> io_bytes_;
-  std::shared_ptr<std::atomic<uint64_t>> admitted_memory_;
+  std::array<std::shared_ptr<std::atomic<uint64_t>>,
+             static_cast<size_t>(ResourceDimension::kCount)>
+      admitted_dimensions_;
   std::shared_ptr<std::atomic<uint32_t>> admitted_workers_;
 };
 

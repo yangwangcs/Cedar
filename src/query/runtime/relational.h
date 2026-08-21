@@ -151,9 +151,13 @@ class QueryReservation {
   void ReleaseScratch(uint64_t bytes);
   uint64_t used(ResourceDimension dimension) const;
   uint64_t limit(ResourceDimension dimension) const;
-  void AttachPoolAdmission(std::shared_ptr<std::atomic<uint64_t>> memory,
+  void AttachPoolAdmission(
+      std::array<std::shared_ptr<std::atomic<uint64_t>>,
+                 static_cast<size_t>(ResourceDimension::kCount)> dimensions,
                            std::shared_ptr<std::atomic<uint32_t>> workers,
-                           uint64_t admitted_memory,
+                           std::array<uint64_t,
+                                      static_cast<size_t>(ResourceDimension::kCount)>
+                               admitted_dimensions,
                            uint32_t admitted_workers);
   void Release(size_t bytes);
   std::shared_ptr<QueryReservationLease> TryRetain(size_t bytes);

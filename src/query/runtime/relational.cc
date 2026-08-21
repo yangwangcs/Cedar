@@ -25,8 +25,11 @@ Status NeedsSpill(size_t requested_bytes, size_t available_bytes);
 struct QueryReservation::State {
   explicit State(size_t limit) : limit_bytes(limit) {}
   ~State() {
-    if (pool_memory && admitted_memory) {
-      pool_memory->fetch_sub(admitted_memory, std::memory_order_acq_rel);
+    for (size_t i = 0; i < pool_dimensions.size(); ++i) {
+      if (pool_dimensions[i] && admitted_dimensions[i]) {
+        pool_dimensions[i]->fetch_sub(admitted_dimensions[i],
+                                      std::memory_order_acq_rel);
+      }
     }
     if (pool_workers && admitted_workers) {
       pool_workers->fetch_sub(admitted_workers, std::memory_order_acq_rel);
@@ -38,9 +41,11 @@ struct QueryReservation::State {
   size_t peak_bytes = 0;
   std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> limits{};
   std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> used{};
-  std::shared_ptr<std::atomic<uint64_t>> pool_memory;
+  std::array<std::shared_ptr<std::atomic<uint64_t>>,
+             static_cast<size_t>(ResourceDimension::kCount)> pool_dimensions;
   std::shared_ptr<std::atomic<uint32_t>> pool_workers;
-  uint64_t admitted_memory = 0;
+  std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)>
+      admitted_dimensions{};
   uint32_t admitted_workers = 0;
 };
 
@@ -1182,12 +1187,15 @@ uint64_t QueryReservation::limit(ResourceDimension dimension) const {
   return state_->limits[static_cast<size_t>(dimension)];
 }
 void QueryReservation::AttachPoolAdmission(
-    std::shared_ptr<std::atomic<uint64_t>> memory,
+    std::array<std::shared_ptr<std::atomic<uint64_t>>,
+               static_cast<size_t>(ResourceDimension::kCount)> dimensions,
     std::shared_ptr<std::atomic<uint32_t>> workers,
-    uint64_t admitted_memory, uint32_t admitted_workers) {
-  state_->pool_memory = std::move(memory);
+    std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)>
+        admitted_dimensions,
+    uint32_t admitted_workers) {
+  state_->pool_dimensions = std::move(dimensions);
   state_->pool_workers = std::move(workers);
-  state_->admitted_memory = admitted_memory;
+  state_->admitted_dimensions = admitted_dimensions;
   state_->admitted_workers = admitted_workers;
 }
 

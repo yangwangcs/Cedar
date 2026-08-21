@@ -1273,7 +1273,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
         "query", "unbounded History requires an analytical budget");
   }
   StatusOr<QueryReservation> admitted = resource_pool != nullptr
-      ? resource_pool->Admit(options.budget)
+      ? resource_pool->Admit(options.budget, options.mode)
       : StatusOr<QueryReservation>(QueryReservation(static_cast<size_t>(options.budget.memory_bytes)));
   if (!admitted.ok()) return admitted.status();
   std::unique_ptr<QueryScratch> scratch;

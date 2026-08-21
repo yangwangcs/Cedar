@@ -72,6 +72,34 @@ TEST(QueryResourcePoolTest, PoolAdmissionReleasesOnReservationDestruction) {
   EXPECT_TRUE(third.ok());
 }
 
+TEST(QueryResourcePoolTest, AdmissionAggregatesEveryBudgetDimension) {
+  auto options = OptionsWithMemory(100);
+  options.max_parallelism = 4;
+  options.reserved_interactive_workers = 1;
+  QueryResourcePool pool(options);
+  auto first = pool.Admit(InteractiveBudget(60));
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  auto second = pool.Admit(InteractiveBudget(41));
+  ASSERT_FALSE(second.ok());
+  EXPECT_NE(second.status().ToString().find("memory_bytes"), std::string::npos);
+  first = StatusOr<QueryReservation>(QueryReservation(1));
+  EXPECT_TRUE(pool.Admit(InteractiveBudget(100)).ok());
+}
+
+TEST(QueryResourcePoolTest, AnalyticalAdmissionLeavesReservedInteractiveWorkers) {
+  auto options = OptionsWithMemory(1024);
+  options.max_parallelism = 4;
+  options.reserved_interactive_workers = 1;
+  QueryResourcePool pool(options);
+  auto analytical = InteractiveBudget(128);
+  analytical.max_parallelism = 4;
+  EXPECT_TRUE(pool.Admit(analytical, QueryExecutionMode::kAnalytical)
+                  .status()
+                  .IsResourceExhausted());
+  analytical.max_parallelism = 3;
+  EXPECT_TRUE(pool.Admit(analytical, QueryExecutionMode::kAnalytical).ok());
+}
+
 TEST(QueryResourcePoolTest, WalCriticalBlocksAnalyticalIo) {
   std::atomic<bool> critical{true};
   auto options = OptionsWithMemory(1024);

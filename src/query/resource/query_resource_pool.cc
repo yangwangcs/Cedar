@@ -54,8 +54,11 @@ const char* Name(ResourceDimension d) {
 QueryResourcePool::QueryResourcePool(QueryResourcePoolOptions options)
     : options_(std::move(options)),
       io_bytes_(std::make_shared<std::atomic<uint64_t>>(0)),
-      admitted_memory_(std::make_shared<std::atomic<uint64_t>>(0)),
-      admitted_workers_(std::make_shared<std::atomic<uint32_t>>(0)) {}
+      admitted_workers_(std::make_shared<std::atomic<uint32_t>>(0)) {
+  for (auto& dimension : admitted_dimensions_) {
+    dimension = std::make_shared<std::atomic<uint64_t>>(0);
+  }
+}
 
 IoPermit::IoPermit(IoPermit&& other) noexcept
     : bytes_(other.bytes_), aggregate_(std::move(other.aggregate_)) {
@@ -107,25 +110,58 @@ StatusOr<IoPermit> QueryResourcePool::AcquireIo(QueryWorkClass work_class,
   return permit;
 }
 
-StatusOr<QueryReservation> QueryResourcePool::Admit(const QueryBudget& budget) {
-  if (budget.max_parallelism == 0 || budget.max_parallelism > options_.max_parallelism) {
+StatusOr<QueryReservation> QueryResourcePool::Admit(const QueryBudget& budget,
+                                                    QueryExecutionMode mode) {
+  const uint32_t worker_limit =
+      mode == QueryExecutionMode::kAnalytical
+          ? options_.max_parallelism -
+                std::min(options_.max_parallelism,
+                         options_.reserved_interactive_workers)
+          : options_.max_parallelism;
+  if (budget.max_parallelism == 0 || budget.max_parallelism > worker_limit) {
     return Status::ResourceExhausted("query", "max_parallelism budget exhausted");
   }
-  uint64_t current_memory = admitted_memory_->load(std::memory_order_acquire);
-  for (;;) {
-    if (budget.memory_bytes > options_.memory_bytes -
-                             std::min(options_.memory_bytes, current_memory)) {
-      return Status::ResourceExhausted("query", "memory_bytes pool admission exhausted");
+  std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)>
+      admitted_dimensions{};
+  for (size_t i = 0; i < admitted_dimensions.size(); ++i) {
+    const auto dimension = static_cast<ResourceDimension>(i);
+    const uint64_t requested = BudgetDim(budget, dimension);
+    if (requested == 0) continue;
+    auto& aggregate = admitted_dimensions_[i];
+    uint64_t current = aggregate->load(std::memory_order_acquire);
+    bool acquired = false;
+    for (;;) {
+      const uint64_t limit = PoolDim(options_, dimension);
+      if (requested > limit || current > limit - requested) break;
+      if (aggregate->compare_exchange_weak(current, current + requested,
+                                            std::memory_order_acq_rel)) {
+        acquired = true;
+        break;
+      }
     }
-    if (admitted_memory_->compare_exchange_weak(
-            current_memory, current_memory + budget.memory_bytes,
-            std::memory_order_acq_rel)) break;
+    if (!acquired) {
+      for (size_t rollback = 0; rollback < i; ++rollback) {
+        if (admitted_dimensions[rollback] != 0) {
+          admitted_dimensions_[rollback]->fetch_sub(
+              admitted_dimensions[rollback], std::memory_order_acq_rel);
+        }
+      }
+      return Status::ResourceExhausted("query",
+                                      std::string(Name(dimension)) +
+                                          " pool admission exhausted");
+    }
+    admitted_dimensions[i] = requested;
   }
   uint32_t current_workers = admitted_workers_->load(std::memory_order_acquire);
   for (;;) {
-    if (budget.max_parallelism > options_.max_parallelism -
-                                  std::min(options_.max_parallelism, current_workers)) {
-      admitted_memory_->fetch_sub(budget.memory_bytes, std::memory_order_acq_rel);
+    if (budget.max_parallelism > worker_limit -
+                                  std::min(worker_limit, current_workers)) {
+      for (size_t rollback = 0; rollback < admitted_dimensions.size(); ++rollback) {
+        if (admitted_dimensions[rollback] != 0) {
+          admitted_dimensions_[rollback]->fetch_sub(
+              admitted_dimensions[rollback], std::memory_order_acq_rel);
+        }
+      }
       return Status::ResourceExhausted("query", "parallelism pool admission exhausted");
     }
     if (admitted_workers_->compare_exchange_weak(
@@ -136,16 +172,11 @@ StatusOr<QueryReservation> QueryResourcePool::Admit(const QueryBudget& budget) {
   for (size_t i = 0; i < static_cast<size_t>(ResourceDimension::kCount); ++i) {
     const auto dimension = static_cast<ResourceDimension>(i);
     const uint64_t requested = BudgetDim(budget, dimension);
-    if (requested > PoolDim(options_, dimension)) {
-      admitted_workers_->fetch_sub(budget.max_parallelism, std::memory_order_acq_rel);
-      admitted_memory_->fetch_sub(budget.memory_bytes, std::memory_order_acq_rel);
-      return Status::ResourceExhausted("query", std::string(Name(dimension)) + " budget exhausted");
-    }
     limits[i] = requested;
   }
   QueryReservation reservation(limits);
-  reservation.AttachPoolAdmission(admitted_memory_, admitted_workers_,
-                                  budget.memory_bytes, budget.max_parallelism);
+  reservation.AttachPoolAdmission(admitted_dimensions_, admitted_workers_,
+                                  admitted_dimensions, budget.max_parallelism);
   return reservation;
 }
 }  // namespace cedar::internal

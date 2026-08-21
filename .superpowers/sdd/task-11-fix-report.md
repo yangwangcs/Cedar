@@ -11,15 +11,15 @@
   preserves inner, semi, and anti join semantics.
 - `Database::Impl` now wires `wal_sync_critical` into query resource-pool
   options. Scratch reads aggregate `read_bytes` through the query reservation.
+- Pool admission now atomically aggregates all `ResourceDimension` limits and
+  releases every dimension through reservation RAII. Analytical admissions
+  honor `reserved_interactive_workers` while interactive/auto admissions retain
+  the full worker pool.
 
 ## Remaining review items
 
 The following Important findings are not fully closed in this change:
 
-- `QueryResourcePool` admission still aggregates memory and workers only;
-  scratch/read/prefetch/decoded/output/interval/graph/visited/cpu pool-wide
-  admission counters and a usable `reserved_interactive_workers` partition
-  remain to be implemented.
 - Scratch I/O rate limits are still configured but are not enforced through a
   time-window token bucket for `QueryScratch` writes/reads.
 - Canonical property materialization and column builders estimate string and

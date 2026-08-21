@@ -149,4 +149,20 @@ TEST(CoexistingPathTest, EqualHopUsesLexicographicEdgeSequence) {
   EXPECT_EQ(result.ValueOrDie().paths.front().edges.front().edge_id.value, 52U);
 }
 
+TEST(CoexistingPathTest, PathColumnOffsetsDecodeUnequalVertexAndEdgeLengths) {
+  PathValue one{{VertexRef{PartId{0}, VertexId{1}}}, {},
+                ValidTimeInterval{ValidTime{0}, ValidTime{4}}};
+  PathValue two{{VertexRef{PartId{0}, VertexId{1}},
+                 VertexRef{PartId{0}, VertexId{2}},
+                 VertexRef{PartId{0}, VertexId{3}}},
+                {EdgeRef{PartId{0}, EdgeId{71}}, EdgeRef{PartId{0}, EdgeId{72}}},
+                ValidTimeInterval{ValidTime{8}, ValidTime{12}}};
+  const PathColumn column = PathColumn::FromValues({one, two});
+  ASSERT_EQ(column.vertex_offsets, (std::vector<uint32_t>{0, 1, 4}));
+  ASSERT_EQ(column.edge_offsets, (std::vector<uint32_t>{0, 0, 2}));
+  EXPECT_EQ(column.row_offsets, column.vertex_offsets);
+  EXPECT_EQ(column.Value(0), one);
+  EXPECT_EQ(column.Value(1), two);
+}
+
 }  // namespace cedar::internal

@@ -16,6 +16,7 @@
 #include "cedar/query/types.h"
 
 namespace cedar {
+struct PathValue;
 namespace internal {
 class ExpressionFactory;
 class ExpressionInspector;
@@ -44,6 +45,7 @@ template <> constexpr QueryType QueryTypeOf<ValidTime>() { return QueryType::kVa
 template <> constexpr QueryType QueryTypeOf<ValidDuration>() { return QueryType::kValidDuration; }
 template <> constexpr QueryType QueryTypeOf<CommitSeq>() { return QueryType::kCommitSeq; }
 template <> constexpr QueryType QueryTypeOf<ValidTimeInterval>() { return QueryType::kValidTimeInterval; }
+template <> constexpr QueryType QueryTypeOf<PathValue>() { return QueryType::kPath; }
 
 template <typename T>
 class Expr;

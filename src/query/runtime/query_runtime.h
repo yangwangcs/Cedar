@@ -75,7 +75,9 @@ struct PreparedQueryPlan {
         graph_source_slot(other.graph_source_slot),
         graph_edge_slot(other.graph_edge_slot),
         graph_destination_slot(other.graph_destination_slot),
-        graph_k_hops(other.graph_k_hops) {}
+        graph_k_hops(other.graph_k_hops),
+        graph_coexisting(other.graph_coexisting),
+        graph_path_slot(other.graph_path_slot) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
@@ -99,6 +101,8 @@ struct PreparedQueryPlan {
     graph_edge_slot = other.graph_edge_slot;
     graph_destination_slot = other.graph_destination_slot;
     graph_k_hops = other.graph_k_hops;
+    graph_coexisting = other.graph_coexisting;
+    graph_path_slot = other.graph_path_slot;
     return *this;
   }
   PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;
@@ -126,6 +130,8 @@ struct PreparedQueryPlan {
   std::optional<SlotId> graph_edge_slot;
   std::optional<SlotId> graph_destination_slot;
   uint32_t graph_k_hops = 1;
+  bool graph_coexisting = false;
+  std::optional<SlotId> graph_path_slot;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

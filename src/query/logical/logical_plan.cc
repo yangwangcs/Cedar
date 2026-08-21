@@ -205,6 +205,35 @@ StatusOr<Query> Query::KHopExpand(const ExpandSpec& spec, uint32_t max_hops) con
                       node->inputs().front(), node->schema(), std::move(payload)));
 }
 
+StatusOr<Query> Query::CoexistingShortestPath(const ExpandSpec& spec,
+                                             uint32_t max_hops,
+                                             Slot<PathValue> path) const {
+  if (max_hops == 0) {
+    return Status::InvalidArgument("coexisting shortest path",
+                                   "max_hops must be non-zero");
+  }
+  if (!root_ || !Contains(schema(), spec.source.id(), QueryType::kVertexRef,
+                          false) || spec.edge.id().value == 0 ||
+      spec.destination.id().value == 0 || path.id().value == 0 ||
+      HasSlotId(schema(), spec.edge.id()) ||
+      HasSlotId(schema(), spec.destination.id()) || HasSlotId(schema(), path.id()) ||
+      spec.source.id() == spec.edge.id() || spec.source.id() == spec.destination.id() ||
+      spec.edge.id() == spec.destination.id()) {
+    return Status::InvalidArgument("coexisting shortest path",
+                                   "slots are invalid or duplicate");
+  }
+  std::vector<RowColumn> columns = schema().columns();
+  columns.push_back({spec.edge.id(), spec.edge.name(), spec.edge.type(), false});
+  columns.push_back({spec.destination.id(), spec.destination.name(),
+                     spec.destination.type(), false});
+  columns.push_back({path.id(), path.name(), path.type(), false});
+  internal::LogicalPlanPayload payload;
+  payload.expand_spec = spec;
+  payload.max_hops = max_hops;
+  return Query(Append(internal::LogicalOpKind::kCoexistingShortestPath, root_,
+                      RowSchema(std::move(columns)), std::move(payload)));
+}
+
 StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex,
                                                PropertyId property,
                                                RowColumn output) const {

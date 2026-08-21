@@ -33,6 +33,7 @@ struct RuntimeRow {
   std::optional<VertexRef> graph_destination;
   uint64_t graph_edge_type = 0;
   std::map<uint32_t, std::optional<Value>> property_values;
+  std::optional<PathValue> path;
 };
 
 using EvaluatedLiteral = detail::ExpressionLiteral;
@@ -574,7 +575,37 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     internal::GraphExpansionRequest request{{vertex}, interval.ValueOrDie(),
                                             plan.graph_expand->direction,
                                             plan.graph_expand->edge_type};
-    if (plan.graph_k_hops > 1) {
+    if (plan.graph_coexisting) {
+      auto expanded = ExpandTemporal(snapshot, request, options);
+      if (!expanded.ok()) return expanded.status();
+      std::vector<VertexRef> targets;
+      for (const auto& traversal : expanded.ValueOrDie()) {
+        VertexRef candidate = plan.graph_expand->direction == ExpandDirection::kIn
+                                  ? traversal.source : traversal.target;
+        if (std::find(targets.begin(), targets.end(), candidate) == targets.end())
+          targets.push_back(candidate);
+      }
+      for (const VertexRef& candidate : targets) {
+        auto paths = CoexistingShortestPath(snapshot, request, candidate, options);
+        if (!paths.ok()) return paths.status();
+        for (const PathValue& path : paths.ValueOrDie().paths) {
+          RuntimeRow row{FactRef{PartId{}, FactFamily::kVertexState, PropertyId{}, 0},
+                         std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                         std::nullopt, std::nullopt, 0, {}, std::nullopt};
+          row.ref = FactRef{path.edges.empty() ? path.vertices.front().part_id
+                                               : path.edges.back().home_part_id,
+                            FactFamily::kEdgeState, PropertyId{},
+                            path.edges.empty() ? path.vertices.front().vertex_id.value
+                                               : path.edges.back().edge_id.value};
+          row.effective = path.common;
+          row.graph_source = path.vertices.front();
+          row.graph_destination = path.vertices.back();
+          if (!path.edges.empty()) row.graph_edge = path.edges.back();
+          row.path = path;
+          result.push_back(std::move(row));
+        }
+      }
+    } else if (plan.graph_k_hops > 1) {
       auto hops = KHopExpand(snapshot, request, options);
       if (!hops.ok()) return hops.status();
       for (const auto& traversal : hops.ValueOrDie().traversals) {
@@ -633,6 +664,8 @@ QueryColumnVector EmptyColumn(QueryType type) {
       return std::vector<CommitSeq>{};
     case QueryType::kValidTimeInterval:
       return std::vector<ValidTimeInterval>{};
+    case QueryType::kPath:
+      return std::vector<uint8_t>{};
     default:
       return std::vector<uint8_t>{};
   }
@@ -698,11 +731,18 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
         QueryColumn{output.slot, output.type, EmptyColumn(output.type), {}});
     ReserveColumn(&columns.back(), count);
   }
+  std::vector<PathValue> path_values;
+  if (plan.graph_path_slot.has_value()) path_values.reserve(count);
   for (size_t index = offset; index < offset + count; ++index) {
     const RuntimeRow& row = rows[index];
     for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
       QueryColumn* column = &columns[column_index];
       const RowColumn& output = plan.output_columns[column_index];
+      if (plan.graph_path_slot && output.slot == *plan.graph_path_slot) {
+        if (!row.path) return Status::Corruption("query", "graph path is unavailable");
+        path_values.push_back(*row.path);
+        continue;
+      }
       if (plan.graph_source_slot && output.slot == *plan.graph_source_slot) {
         if (!row.graph_source) return Status::Corruption("query", "graph source is unavailable");
         Append(column, *row.graph_source, true);
@@ -753,6 +793,15 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
       }
       const Status appended = AppendProperty(column, property_value);
       if (!appended.ok()) return appended;
+    }
+  }
+  if (plan.graph_path_slot) {
+    auto it = std::find_if(columns.begin(), columns.end(), [&](const QueryColumn& column) {
+      return column.slot == *plan.graph_path_slot;
+    });
+    if (it != columns.end()) {
+      it->path_values = std::make_shared<const PathColumn>(
+          PathColumn::FromValues(path_values));
     }
   }
   return columns;
@@ -1386,6 +1435,15 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
     plan.graph_edge_slot = spec.edge.id();
     plan.graph_destination_slot = spec.destination.id();
     plan.graph_k_hops = graph->max_hops();
+    plan.graph_coexisting = graph->kind() == LogicalOpKind::kCoexistingShortestPath;
+    if (plan.graph_coexisting) {
+      for (const RowColumn& column : plan.output_columns) {
+        if (column.type == QueryType::kPath) {
+          plan.graph_path_slot = column.slot;
+          break;
+        }
+      }
+    }
     const LogicalPlanNode* scoped = graph->inputs().front().get();
     while (scoped != nullptr && !scoped->scope().has_value() &&
            !scoped->inputs().empty()) {

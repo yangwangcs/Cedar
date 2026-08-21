@@ -42,6 +42,10 @@ struct PathValue {
 };
 
 struct PathColumn {
+  // vertex_offsets[i..i+1] and edge_offsets[i..i+1] delimit row i.
+  // intervals[i] is the common witness for row i. row_offsets is retained
+  // as a compatibility alias for vertex_offsets and is never used to decode
+  // edges.
   std::vector<uint32_t> row_offsets;
   std::vector<uint32_t> vertex_offsets;
   std::vector<uint32_t> edge_offsets;
@@ -63,13 +67,26 @@ struct PathColumn {
       column.edges.insert(column.edges.end(), value.edges.begin(),
                           value.edges.end());
       column.intervals.push_back(value.common);
-      column.row_offsets.push_back(
-          static_cast<uint32_t>(column.vertices.size()));
       column.vertex_offsets.push_back(
           static_cast<uint32_t>(column.vertices.size()));
       column.edge_offsets.push_back(static_cast<uint32_t>(column.edges.size()));
+      column.row_offsets.push_back(column.vertex_offsets.back());
     }
     return column;
+  }
+
+  PathValue Value(size_t row) const {
+    if (row + 1 >= vertex_offsets.size() || row + 1 >= edge_offsets.size() ||
+        row >= intervals.size()) {
+      throw std::out_of_range("path row");
+    }
+    PathValue value;
+    value.vertices.assign(vertices.begin() + vertex_offsets[row],
+                          vertices.begin() + vertex_offsets[row + 1]);
+    value.edges.assign(edges.begin() + edge_offsets[row],
+                       edges.begin() + edge_offsets[row + 1]);
+    value.common = intervals[row];
+    return value;
   }
 };
 
@@ -85,6 +102,7 @@ struct QueryColumn {
   QueryType type;
   QueryColumnVector values;
   std::vector<uint8_t> present;
+  std::shared_ptr<const PathColumn> path_values;
 };
 
 class QueryBatch {
@@ -110,6 +128,9 @@ class QueryBatch {
             std::get<std::vector<uint64_t>>(column.values).at(row)};
       } else if constexpr (std::is_same_v<T, Binary>) {
         return Binary{std::get<std::vector<std::string>>(column.values).at(row)};
+      } else if constexpr (std::is_same_v<T, PathValue>) {
+        if (!column.path_values) throw std::out_of_range("path column");
+        return column.path_values->Value(row);
       } else {
         return std::get<std::vector<T>>(column.values).at(row);
       }

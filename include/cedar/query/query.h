@@ -13,6 +13,7 @@
 #include "cedar/query/expression.h"
 
 namespace cedar {
+struct PathValue;
 namespace internal {
 class LogicalPlanInspector;
 class LogicalPlanNode;
@@ -62,6 +63,9 @@ class Query {
   static StatusOr<Query> Edges(Slot<EdgeRef> edge, TemporalScope scope);
   StatusOr<Query> Expand(const ExpandSpec& spec) const;
   StatusOr<Query> KHopExpand(const ExpandSpec& spec, uint32_t max_hops) const;
+  StatusOr<Query> CoexistingShortestPath(const ExpandSpec& spec,
+                                         uint32_t max_hops,
+                                         Slot<PathValue> path) const;
   template <typename T>
   StatusOr<Query> BindVertexProperty(Slot<VertexRef> vertex,
                                      PropertyId property,

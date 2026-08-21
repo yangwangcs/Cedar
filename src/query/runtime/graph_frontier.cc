@@ -474,7 +474,6 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
       auto expanded = ExpandTemporal(snapshot, layer, options);
       if (!expanded.ok()) return expanded.status();
       for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
-        // debug
         if (options.check_abort) {
           if (Status status = options.check_abort(); !status.ok()) return status;
         }
@@ -565,6 +564,20 @@ bool LabelPathLess(const std::vector<CoexistingLabel>& labels, uint64_t left,
                                        EdgeRefLess);
 }
 
+bool IntervalOverlaps(const ValidTimeInterval& left,
+                      const ValidTimeInterval& right) {
+  const uint64_t left_to = left.to ? left.to->value
+                                   : std::numeric_limits<uint64_t>::max();
+  const uint64_t right_to = right.to ? right.to->value
+                                     : std::numeric_limits<uint64_t>::max();
+  return left.from.value < right_to && right.from.value < left_to;
+}
+
+uint64_t IntervalLength(const ValidTimeInterval& interval) {
+  if (!interval.to) return std::numeric_limits<uint64_t>::max();
+  return interval.to->value - interval.from.value;
+}
+
 PathValue ReconstructPath(const std::vector<CoexistingLabel>& labels,
                           uint64_t id) {
   PathValue path;
@@ -591,6 +604,14 @@ Status ChargeCoexistingLabel(const GraphFrontierOptions& options) {
     if (Status status = options.check_abort(); !status.ok()) return status;
   }
   if (options.reservation == nullptr) return Status::OK();
+  // Preflight both dimensions so a failed second reservation cannot leave a
+  // partially charged label.
+  const auto labels = ResourceDimension::kGraphLabels;
+  const auto fragments = ResourceDimension::kIntervalFragments;
+  if (options.reservation->used(labels) >= options.reservation->limit(labels) ||
+      options.reservation->used(fragments) >= options.reservation->limit(fragments)) {
+    return Status::ResourceExhausted("query", "coexisting label budget exhausted");
+  }
   if (Status status = options.reservation->ReserveGraphLabels(1);
       !status.ok())
     return status;
@@ -614,6 +635,7 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
   // dominance never invalidates predecessor references.
   std::map<VertexKey, std::vector<uint64_t>> by_vertex;
   std::vector<uint64_t> frontier;
+  std::vector<bool> active;
   for (const VertexRef& source : request.frontier) {
     const uint64_t id = result.labels.size();
     if (Status status = ChargeCoexistingLabel(options); !status.ok())
@@ -621,6 +643,7 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
     result.labels.push_back(
         CoexistingLabel{source, *interval, 0,
                         std::numeric_limits<uint64_t>::max(), EdgeRef{}});
+    active.push_back(true);
     by_vertex[VertexKey{source}].push_back(id);
     frontier.push_back(id);
   }
@@ -636,6 +659,7 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
     if (target_depth.has_value() && depth > *target_depth) break;
     std::vector<uint64_t> next;
     for (uint64_t prior_id : frontier) {
+      if (prior_id >= active.size() || !active[prior_id]) continue;
       if (options.check_abort) {
         if (Status status = options.check_abort(); !status.ok()) return status;
       }
@@ -684,6 +708,7 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
                                             target_labels.end(), existing_id),
                                 target_labels.end());
           }
+          if (remove && existing_id < active.size()) active[existing_id] = false;
           return remove;
         }), existing.end());
         if (Status status = ChargeCoexistingLabel(options); !status.ok())
@@ -691,6 +716,7 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
         const uint64_t id = result.labels.size();
         result.labels.push_back(CoexistingLabel{destination, common, depth,
                                                 prior_id, traversal.edge});
+        active.push_back(true);
         existing.push_back(id);
         if (destination == target) {
           if (!target_depth.has_value()) target_depth = depth;
@@ -705,16 +731,33 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
     frontier = std::move(next);
   }
 
-  // A shortest witness can have several disjoint maximal intervals. Keep the
-  // deterministic edge-sequence winner when equal-hop labels overlap.
-  std::sort(target_labels.begin(), target_labels.end(),
-            [&](uint64_t left, uint64_t right) {
-    const auto& a = result.labels[left].common;
-    const auto& b = result.labels[right].common;
-    if (a.from.value != b.from.value) return a.from.value < b.from.value;
-    return LabelPathLess(result.labels, left, right);
+  // Keep one deterministic winner for each overlapping maximal witness while
+  // retaining independent disjoint intervals.
+  std::sort(target_labels.begin(), target_labels.end(), [&](uint64_t left, uint64_t right) {
+    return result.labels[left].common.from.value < result.labels[right].common.from.value;
   });
-  for (uint64_t id : target_labels) result.paths.push_back(ReconstructPath(result.labels, id));
+  std::vector<uint64_t> winners;
+  for (uint64_t candidate : target_labels) {
+    bool replaced = false;
+    for (uint64_t& winner : winners) {
+      const auto& a = result.labels[winner].common;
+      const auto& b = result.labels[candidate].common;
+      if (!IntervalOverlaps(a, b)) continue;
+      const uint64_t alen = IntervalLength(a), blen = IntervalLength(b);
+      const bool better = blen > alen ||
+                          (blen == alen && result.labels[candidate].depth < result.labels[winner].depth) ||
+                          (blen == alen && result.labels[candidate].depth == result.labels[winner].depth &&
+                           LabelPathLess(result.labels, candidate, winner));
+      if (better) winner = candidate;
+      replaced = true;
+      break;
+    }
+    if (!replaced) winners.push_back(candidate);
+  }
+  std::sort(winners.begin(), winners.end(), [&](uint64_t left, uint64_t right) {
+    return result.labels[left].common.from.value < result.labels[right].common.from.value;
+  });
+  for (uint64_t id : winners) result.paths.push_back(ReconstructPath(result.labels, id));
   return result;
 }
 

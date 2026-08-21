@@ -81,6 +81,19 @@ struct AsyncExecutorOptions {
   uint64_t max_mailbox_bytes = 4ULL * 1024ULL * 1024ULL;
 };
 
+struct QueryRuntimeOptions {
+  uint32_t query_workers = 4;
+  uint32_t reserved_interactive_workers = 1;
+  uint64_t query_memory_bytes = 256ULL << 20;
+  uint64_t projection_cache_bytes = 256ULL << 20;
+  uint64_t query_delta_bytes = 256ULL << 20;
+  uint64_t scratch_disk_bytes = 4ULL << 30;
+  uint64_t scratch_free_space_reserve_bytes = 2ULL << 30;
+  uint64_t read_bytes_per_second = 0;
+  uint64_t scratch_bytes_per_second = 0;
+  uint64_t max_prefetch_bytes = 8ULL << 20;
+};
+
 enum class NPlusOneDiscardReason : uint8_t {
   kPredecessorFailure = 0,
   kIndeterminate,
@@ -136,6 +149,7 @@ struct DatabaseOptions {
   uint32_t foreground_admission_concurrency = 0;
   std::function<void()> foreground_admission_observer_for_testing;
   AsyncExecutorOptions async_executor;
+  QueryRuntimeOptions query_runtime;
 };
 
 struct CommitPipelineMetrics {

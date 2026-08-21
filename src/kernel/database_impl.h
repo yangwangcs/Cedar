@@ -30,6 +30,7 @@
 #include "kernel/maintenance_policy.h"
 #include "query/projection/projection_store.h"
 #include "query/projection/query_delta.h"
+#include "query/resource/query_resource_pool.h"
 
 namespace cedar {
 
@@ -174,7 +175,8 @@ class Database::Impl {
             std::move(options.foreground_admission_observer_for_testing)),
         enforce_disk_pressure(
             UsesCedarKernelProfile(options.storage_profile)),
-        store(FactStoreOptions{std::move(options.path),
+        // Keep the database path available for query scratch ownership.
+        store(FactStoreOptions{options.path,
                                options.write_buffer_bytes,
                                options.block_cache_bytes,
                                options.blob_threshold_bytes,
@@ -194,7 +196,30 @@ class Database::Impl {
                                std::move(options.runtime_sample_observer_for_testing),
                                std::move(options.snapshot_open_observer_for_testing),
                                std::move(options.kernel_write_observer_for_testing)}),
-        async_executor(ResolveAsyncExecutorOptions(options)) {}
+        async_executor(ResolveAsyncExecutorOptions(options)),
+        query_runtime_options(options.query_runtime),
+        query_database_path(options.path) {
+    internal::QueryResourcePoolOptions pool_options;
+    pool_options.memory_bytes = query_runtime_options.query_memory_bytes;
+    pool_options.scratch_bytes = query_runtime_options.scratch_disk_bytes;
+    pool_options.scratch_free_space_reserve_bytes =
+        query_runtime_options.scratch_free_space_reserve_bytes;
+    pool_options.read_bytes_per_second = query_runtime_options.read_bytes_per_second;
+    pool_options.scratch_bytes_per_second = query_runtime_options.scratch_bytes_per_second;
+    pool_options.scratch_root = query_database_path;
+    pool_options.scratch_instance = "active";
+    pool_options.read_bytes = UINT64_MAX;
+    pool_options.prefetch_bytes = query_runtime_options.max_prefetch_bytes;
+    pool_options.decoded_rows = UINT64_MAX;
+    pool_options.output_rows = UINT64_MAX;
+    pool_options.output_bytes = UINT64_MAX;
+    pool_options.interval_fragments = UINT64_MAX;
+    pool_options.graph_labels = UINT64_MAX;
+    pool_options.visited_vertices = UINT64_MAX;
+    pool_options.cpu_us = UINT64_MAX;
+    pool_options.max_parallelism = query_runtime_options.query_workers;
+    query_resource_pool = std::make_unique<internal::QueryResourcePool>(pool_options);
+  }
 
   ~Impl();
 
@@ -230,6 +255,7 @@ class Database::Impl {
 
   mutable std::mutex mutex;
   std::condition_variable commits_drained;
+  std::string query_database_path;
   FactStore store;
   std::unique_ptr<internal::QueryProjectionStore> projection_store;
   // Derived, rebuildable commit tail.  It is deliberately independent from
@@ -237,6 +263,8 @@ class Database::Impl {
   // commit that RocksDB has already published.
   std::unique_ptr<internal::QueryDelta> query_delta;
   AsyncSubmissionExecutor async_executor;
+  QueryRuntimeOptions query_runtime_options;
+  std::unique_ptr<internal::QueryResourcePool> query_resource_pool;
   uint64_t next_vertex_id = 0;
   uint64_t vertex_lease_limit = 0;
   uint64_t next_edge_id = 0;

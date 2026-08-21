@@ -65,6 +65,8 @@ add_library(cedar_core STATIC
     src/query/runtime/temporal_source.cc
     src/query/runtime/vector_kernels.cc
     src/query/runtime/relational.cc
+    src/query/resource/query_resource_pool.cc
+    src/query/resource/query_scratch.cc
     src/query/projection/projection_compression.cc
     src/query/projection/projection_format.cc
     src/query/projection/projection_manifest.cc

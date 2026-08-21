@@ -99,6 +99,7 @@ class QueryCursor {
   QueryCursor& operator=(const QueryCursor&) = delete;
 
   StatusOr<std::optional<QueryBatch>> Next();
+  Status Cancel();
   Status Close();
 
  private:

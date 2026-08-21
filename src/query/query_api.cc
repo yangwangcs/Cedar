@@ -254,7 +254,8 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         return db->query_delta->AcquireThrough(snapshot_seq);
       };
       return internal::QueryRuntime::Execute(
-          execution_plan, std::move(snapshot), bindings, options);
+          execution_plan, std::move(snapshot), bindings, options,
+          database->query_resource_pool.get());
     }
   }
   if (!state_->plan.canonical_temporal) {
@@ -262,7 +263,8 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         "query", "query is outside canonical temporal execution");
   }
   return internal::QueryRuntime::Execute(
-      state_->plan, std::move(snapshot), bindings, options);
+      state_->plan, std::move(snapshot), bindings, options,
+      database->query_resource_pool.get());
 }
 
 StatusOr<std::string> PreparedQuery::ExplainLogical() const {

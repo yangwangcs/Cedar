@@ -4,6 +4,8 @@
 #include "query/runtime/relational.h"
 
 #include <algorithm>
+#include <atomic>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <functional>
@@ -12,6 +14,7 @@
 #include <utility>
 
 #include "query/temporal/interval.h"
+#include "query/resource/query_scratch.h"
 
 namespace cedar::internal {
 
@@ -19,10 +22,24 @@ Status NeedsSpill(size_t requested_bytes, size_t available_bytes);
 
 struct QueryReservation::State {
   explicit State(size_t limit) : limit_bytes(limit) {}
+  ~State() {
+    if (pool_memory && admitted_memory) {
+      pool_memory->fetch_sub(admitted_memory, std::memory_order_acq_rel);
+    }
+    if (pool_workers && admitted_workers) {
+      pool_workers->fetch_sub(admitted_workers, std::memory_order_acq_rel);
+    }
+  }
 
   size_t limit_bytes = 0;
   size_t used_bytes = 0;
   size_t peak_bytes = 0;
+  std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> limits{};
+  std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> used{};
+  std::shared_ptr<std::atomic<uint64_t>> pool_memory;
+  std::shared_ptr<std::atomic<uint32_t>> pool_workers;
+  uint64_t admitted_memory = 0;
+  uint32_t admitted_workers = 0;
 };
 
 namespace {
@@ -1061,18 +1078,121 @@ StatusOr<RelationalCell> AggregateOne(const Group& group,
 }  // namespace
 
 QueryReservation::QueryReservation(size_t limit_bytes)
-    : state_(std::make_shared<State>(limit_bytes)) {}
+    : state_(std::make_shared<State>(limit_bytes)) {
+  state_->limits[static_cast<size_t>(ResourceDimension::kMemory)] = limit_bytes;
+  for (size_t i = 1; i < static_cast<size_t>(ResourceDimension::kCount); ++i) {
+    state_->limits[i] = UINT64_MAX;
+  }
+}
+
+QueryReservation::QueryReservation(
+    std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> limits)
+    : state_(std::make_shared<State>(static_cast<size_t>(limits[static_cast<size_t>(ResourceDimension::kMemory)]))) {
+  state_->limits = limits;
+}
 
 bool QueryReservation::TryGrow(size_t bytes) {
-  if (bytes > state_->limit_bytes - state_->used_bytes) return false;
+  if (bytes > state_->limit_bytes ||
+      state_->used_bytes > state_->limit_bytes - bytes) return false;
   state_->used_bytes += bytes;
+  state_->used[static_cast<size_t>(ResourceDimension::kMemory)] = state_->used_bytes;
   state_->peak_bytes = std::max(state_->peak_bytes, state_->used_bytes);
   return true;
+}
+
+namespace {
+Status ReserveDimension(const std::shared_ptr<QueryReservation::State>& state,
+                        ResourceDimension dimension, uint64_t amount,
+                        const char* name) {
+  const size_t index = static_cast<size_t>(dimension);
+  if (amount > state->limits[index] ||
+      state->used[index] > state->limits[index] - amount) {
+    return Status::ResourceExhausted("query",
+                                     std::string(name) + " budget exhausted");
+  }
+  state->used[index] += amount;
+  if (dimension == ResourceDimension::kMemory) {
+    state->used_bytes = static_cast<size_t>(state->used[index]);
+    state->peak_bytes = std::max(state->peak_bytes, state->used_bytes);
+  }
+  return Status::OK();
+}
+}  // namespace
+
+Status QueryReservation::ReserveMemory(uint64_t bytes) {
+  return ReserveDimension(state_, ResourceDimension::kMemory, bytes,
+                          "memory_bytes");
+}
+Status QueryReservation::ReserveScratch(uint64_t bytes) {
+  return ReserveDimension(state_, ResourceDimension::kScratch, bytes,
+                          "scratch_bytes");
+}
+Status QueryReservation::ReserveReadBytes(uint64_t bytes) {
+  return ReserveDimension(state_, ResourceDimension::kReadBytes, bytes,
+                          "read_bytes");
+}
+Status QueryReservation::ReservePrefetchBytes(uint64_t bytes) {
+  return ReserveDimension(state_, ResourceDimension::kPrefetchBytes, bytes,
+                          "prefetch_bytes");
+}
+Status QueryReservation::ReserveDecodedRows(uint64_t rows) {
+  return ReserveDimension(state_, ResourceDimension::kDecodedRows, rows,
+                          "decoded_rows");
+}
+Status QueryReservation::ReserveOutputRows(uint64_t rows) {
+  return ReserveDimension(state_, ResourceDimension::kOutputRows, rows,
+                          "output_rows");
+}
+Status QueryReservation::ReserveOutputBytes(uint64_t bytes) {
+  return ReserveDimension(state_, ResourceDimension::kOutputBytes, bytes,
+                          "output_bytes");
+}
+Status QueryReservation::ReserveIntervalFragments(uint64_t count) {
+  return ReserveDimension(state_, ResourceDimension::kIntervalFragments, count,
+                          "interval_fragments");
+}
+Status QueryReservation::ReserveGraphLabels(uint64_t count) {
+  return ReserveDimension(state_, ResourceDimension::kGraphLabels, count,
+                          "graph_labels");
+}
+Status QueryReservation::ReserveVisitedVertices(uint64_t count) {
+  return ReserveDimension(state_, ResourceDimension::kVisitedVertices, count,
+                          "visited_vertices");
+}
+Status QueryReservation::ReserveCpuMicros(uint64_t micros) {
+  return ReserveDimension(state_, ResourceDimension::kCpuMicros, micros,
+                          "cpu_us");
+}
+void QueryReservation::ReleaseMemory(uint64_t bytes) {
+  const size_t index = static_cast<size_t>(ResourceDimension::kMemory);
+  const uint64_t released = std::min<uint64_t>(bytes, state_->used[index]);
+  state_->used[index] -= released;
+  state_->used_bytes = static_cast<size_t>(state_->used[index]);
+}
+void QueryReservation::ReleaseScratch(uint64_t bytes) {
+  const size_t index = static_cast<size_t>(ResourceDimension::kScratch);
+  state_->used[index] = bytes >= state_->used[index] ? 0 : state_->used[index] - bytes;
+}
+uint64_t QueryReservation::used(ResourceDimension dimension) const {
+  return state_->used[static_cast<size_t>(dimension)];
+}
+uint64_t QueryReservation::limit(ResourceDimension dimension) const {
+  return state_->limits[static_cast<size_t>(dimension)];
+}
+void QueryReservation::AttachPoolAdmission(
+    std::shared_ptr<std::atomic<uint64_t>> memory,
+    std::shared_ptr<std::atomic<uint32_t>> workers,
+    uint64_t admitted_memory, uint32_t admitted_workers) {
+  state_->pool_memory = std::move(memory);
+  state_->pool_workers = std::move(workers);
+  state_->admitted_memory = admitted_memory;
+  state_->admitted_workers = admitted_workers;
 }
 
 void QueryReservation::Release(size_t bytes) {
   state_->used_bytes =
       bytes >= state_->used_bytes ? 0 : state_->used_bytes - bytes;
+  state_->used[static_cast<size_t>(ResourceDimension::kMemory)] = state_->used_bytes;
 }
 
 std::shared_ptr<QueryReservationLease> QueryReservation::TryRetain(
@@ -1098,6 +1218,7 @@ QueryReservationLease::QueryReservationLease(
 QueryReservationLease::~QueryReservationLease() {
   state_->used_bytes =
       bytes_ >= state_->used_bytes ? 0 : state_->used_bytes - bytes_;
+  state_->used[static_cast<size_t>(ResourceDimension::kMemory)] = state_->used_bytes;
 }
 
 bool FragmentBudget::TryConsume(size_t fragments) {
@@ -1117,6 +1238,64 @@ Status NeedsSpill(size_t requested_bytes, size_t available_bytes) {
                               std::to_string(requested_bytes) +
                               " available_bytes=" +
                               std::to_string(available_bytes));
+}
+
+std::string SerializeRows(const BatchStream& stream) {
+  std::string payload;
+  for (const auto& row : stream.rows) {
+    payload.append("row:");
+    for (const auto& cell : row.cells) {
+      payload.append(std::to_string(static_cast<int>(cell.type)));
+      payload.push_back(':');
+      payload.push_back(cell.present ? '1' : '0');
+      payload.push_back(':');
+      if (cell.present) {
+        std::visit([&payload](const auto& value) {
+          using T = std::decay_t<decltype(value)>;
+          if constexpr (std::is_same_v<T, std::string>) {
+            payload.append(value);
+          } else if constexpr (std::is_same_v<T, Binary>) {
+            payload.append(value.value);
+          } else if constexpr (std::is_same_v<T, VertexRef>) {
+            payload.append(std::to_string(value.part_id.value));
+            payload.push_back(',');
+            payload.append(std::to_string(value.vertex_id.value));
+          } else if constexpr (std::is_same_v<T, EdgeRef>) {
+            payload.append(std::to_string(value.home_part_id.value));
+            payload.push_back(',');
+            payload.append(std::to_string(value.edge_id.value));
+          } else if constexpr (std::is_same_v<T, ValidTimeInterval>) {
+            payload.append(std::to_string(value.from.value));
+            payload.push_back(',');
+            payload.append(value.to ? std::to_string(value.to->value) : "unbounded");
+          } else if constexpr (std::is_same_v<T, ValidTime> ||
+                               std::is_same_v<T, ValidDuration> ||
+                               std::is_same_v<T, Timestamp64> ||
+                               std::is_same_v<T, CommitSeq>) {
+            payload.append(std::to_string(value.value));
+          } else {
+            payload.append(std::to_string(value));
+          }
+        }, cell.value);
+      }
+      payload.push_back(';');
+    }
+    payload.push_back('\n');
+  }
+  return payload;
+}
+
+Status SpillInput(QueryScratch* scratch, const char* name,
+                  std::string payload) {
+  if (scratch == nullptr) return NeedsSpill();
+  static std::atomic<uint64_t> sequence{0};
+  const std::string unique_name = std::string(name) + "-" +
+      std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+  auto run = scratch->WriteRun(unique_name, payload);
+  if (!run.ok()) return run.status();
+  auto read_payload = scratch->ReadRun(run.ValueOrDie());
+  if (!read_payload.ok()) return read_payload.status();
+  return Status::OK();
 }
 
 bool IsNeedsSpill(const Status& status) {
@@ -1280,24 +1459,30 @@ StatusOr<BatchStream> IndexNestedLoopJoin(const JoinInput& input,
 
 StatusOr<BatchStream> HashJoin(const JoinInput& input,
                                QueryReservation* reservation,
-                               size_t max_output_rows) {
+                               size_t max_output_rows,
+                               QueryScratch* scratch) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
   const auto bucket_count = HashBucketCount(input.right.rows.size());
   if (!bucket_count.has_value() ||
       input.right.rows.size() >
           std::numeric_limits<size_t>::max() / sizeof(HashEntry)) {
-    return NeedsSpill();
+    Status spill = SpillInput(scratch, "hash-spill", SerializeRows(input.right));
+    if (!spill.ok()) return spill;
+    return IndexNestedLoopJoin(input, reservation, max_output_rows);
   }
   size_t index_bytes = input.right.rows.size() * sizeof(HashEntry);
   if (*bucket_count > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
       !AddBytes(*bucket_count * sizeof(size_t), &index_bytes)) {
-    return NeedsSpill();
+    Status spill = SpillInput(scratch, "hash-spill", SerializeRows(input.right));
+    if (!spill.ok()) return spill;
+    return IndexNestedLoopJoin(input, reservation, max_output_rows);
   }
   ReservationGuard index_guard(reservation, index_bytes);
   if (!index_guard.acquired()) {
-    return NeedsSpill(index_bytes, reservation->limit_bytes() -
-                                      reservation->used_bytes());
+    Status spill = SpillInput(scratch, "hash-spill", SerializeRows(input.right));
+    if (!spill.ok()) return spill;
+    return IndexNestedLoopJoin(input, reservation, max_output_rows);
   }
 
   std::vector<size_t> buckets(*bucket_count, kNoHashEntry);
@@ -1343,18 +1528,22 @@ StatusOr<BatchStream> HashJoin(const JoinInput& input,
 
 StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
                                     QueryReservation* reservation,
-                                    size_t max_output_rows) {
+                                    size_t max_output_rows,
+                                    QueryScratch* scratch) {
   if (Status status = ValidateJoin(input); !status.ok()) return status;
   if (reservation == nullptr) return NeedsSpill();
   size_t input_bytes = EstimateBytes(input.left);
   const size_t right_bytes = EstimateBytes(input.right);
   if (!AddBytes(right_bytes, &input_bytes)) {
-    return NeedsSpill();
+    Status spill = SpillInput(scratch, "sort-spill", SerializeRows(input.left) + SerializeRows(input.right));
+    if (!spill.ok()) return spill;
+    return IndexNestedLoopJoin(input, reservation, max_output_rows);
   }
   ReservationGuard input_guard(reservation, input_bytes);
   if (!input_guard.acquired()) {
-    return NeedsSpill(input_bytes, reservation->limit_bytes() -
-                                        reservation->used_bytes());
+    Status spill = SpillInput(scratch, "sort-spill", SerializeRows(input.left) + SerializeRows(input.right));
+    if (!spill.ok()) return spill;
+    return IndexNestedLoopJoin(input, reservation, max_output_rows);
   }
   std::vector<RelationalRow> left = input.left.rows;
   std::vector<RelationalRow> right = input.right.rows;

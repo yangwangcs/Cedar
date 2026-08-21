@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -14,6 +15,7 @@
 
 #include "storage/facts/group_commit_planner.h"
 #include "kernel/database_impl.h"
+#include "query/resource/query_scratch.h"
 
 namespace cedar {
 namespace {
@@ -1467,10 +1469,42 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       options.async_executor.max_mailbox_bytes < options.group_commit_max_batch_bytes) {
     return Status::InvalidArgument("database", "async executor bounds are invalid");
   }
+  if (options.query_runtime.query_workers == 0 ||
+      options.query_runtime.reserved_interactive_workers == 0 ||
+      options.query_runtime.reserved_interactive_workers > options.query_runtime.query_workers ||
+      options.query_runtime.max_prefetch_bytes == 0) {
+    return Status::InvalidArgument("database", "query runtime bounds are invalid");
+  }
+  if (options.storage_profile == StorageProfile::kProductionAppend &&
+      !options.production.kernel_mode &&
+      options.production.memory_budget_bytes != 0) {
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    const uint64_t storage = options.write_buffer_bytes > max - options.block_cache_bytes
+                                 ? max
+                                 : options.write_buffer_bytes + options.block_cache_bytes;
+    const uint64_t first = storage > max - options.query_runtime.query_memory_bytes
+                               ? max
+                               : storage + options.query_runtime.query_memory_bytes;
+    const bool overflow = first == max ||
+        options.query_runtime.projection_cache_bytes > max - first;
+    const uint64_t second = overflow ? max : first + options.query_runtime.projection_cache_bytes;
+    if (overflow ||
+        second > options.production.memory_budget_bytes ||
+        options.query_runtime.query_delta_bytes >
+            options.production.memory_budget_bytes - second) {
+      return Status::InvalidArgument("database", "query allocations exceed production memory budget");
+    }
+  }
   const std::string database_path = options.path;
   auto impl = std::make_shared<Impl>(std::move(options));
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
+  const Status scratch_cleanup = internal::QueryScratch::CleanupOldInstances(
+      database_path, "active");
+  if (!scratch_cleanup.ok()) {
+    impl->store.Close().IgnoreError();
+    return scratch_cleanup;
+  }
   const auto prepared = impl->store.ListPreparedCommits();
   if (!prepared.ok()) {
     impl->store.Close().IgnoreError();

@@ -4,6 +4,9 @@
 #include "query/runtime/query_runtime.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <type_traits>
@@ -12,6 +15,7 @@
 #include "query/logical/logical_plan.h"
 #include "query/runtime/property_binding.h"
 #include "query/runtime/temporal_source.h"
+#include "query/resource/query_scratch.h"
 
 namespace cedar {
 namespace {
@@ -169,8 +173,17 @@ StatusOr<EvaluatedValue> EvaluateExpression(
 }
 
 StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
-    Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
+    Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
+    internal::QueryReservation* reservation = nullptr) {
   std::vector<RuntimeRow> result;
+  auto append = [&result, reservation](RuntimeRow row) -> Status {
+    if (reservation != nullptr) {
+      Status status = reservation->ReserveMemory(sizeof(RuntimeRow));
+      if (!status.ok()) return status;
+    }
+    result.push_back(std::move(row));
+    return Status::OK();
+  };
   return std::visit(
       [&](const auto& scope) -> StatusOr<std::vector<RuntimeRow>> {
         using T = std::decay_t<decltype(scope)>;
@@ -179,48 +192,42 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
               snapshot, plan.entity_family, PropertyId{}, scope.time);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
-            result.push_back(
-                {row.ref, row.effective, scope.time, std::nullopt});
+            if (Status status = append({row.ref, row.effective, scope.time, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Events>) {
           auto rows = internal::TemporalSource::ReadEvents(
               snapshot, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (const internal::EventRow& row : rows.ValueOrDie()) {
-            result.push_back(
-                {row.ref, std::nullopt, row.valid_from, std::nullopt});
+            if (Status status = append({row.ref, std::nullopt, row.valid_from, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Changes>) {
           auto rows = internal::TemporalSource::ReadChanges(
               snapshot, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (const internal::ChangeRow& row : rows.ValueOrDie()) {
-            result.push_back(
-                {row.ref, std::nullopt, row.valid_from, std::nullopt});
+            if (Status status = append({row.ref, std::nullopt, row.valid_from, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Overlaps>) {
           auto rows = internal::TemporalSource::ReadOverlaps(
               snapshot, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
-            result.push_back(
-                {row.ref, row.effective, std::nullopt, std::nullopt});
+            if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Throughout>) {
           auto rows = internal::TemporalSource::ReadThroughout(
               snapshot, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
-            result.push_back(
-                {row.ref, row.effective, std::nullopt, std::nullopt});
+            if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt}); !status.ok()) return status;
           }
         } else {
           auto rows = internal::TemporalSource::ReadHistory(
               snapshot, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
-            result.push_back(
-                {row.ref, row.effective, std::nullopt, std::nullopt});
+            if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt}); !status.ok()) return status;
           }
         }
         return result;
@@ -388,8 +395,23 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
 }
 
 StatusOr<std::vector<RuntimeRow>> MaterializeRows(
-    Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
-  StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan);
+    Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
+    internal::QueryReservation* reservation = nullptr) {
+  auto reserve_row = [reservation](const RuntimeRow& row) -> Status {
+    if (reservation == nullptr) return Status::OK();
+    size_t bytes = sizeof(RuntimeRow);
+    if (row.property_value.has_value() &&
+        (row.property_value->type() == PhysicalType::kString ||
+         row.property_value->type() == PhysicalType::kBinary)) {
+      const auto& value = std::get<std::string>(row.property_value->data());
+      if (value.size() > std::numeric_limits<size_t>::max() - bytes) {
+        return Status::ResourceExhausted("query", "memory_bytes estimate overflow");
+      }
+      bytes += value.size();
+    }
+    return reservation->ReserveMemory(bytes);
+  };
+  StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan, reservation);
   if (!rows.ok()) return rows.status();
   if (plan.physical_plan) {
     StatusOr<std::vector<RuntimeRow>> derived =
@@ -405,7 +427,10 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
                               : rows.ValueOrDie();
       for (const auto& row : input) {
         auto clipped = ClipRowToInterval(row, slice.interval);
-        if (clipped) combined.push_back(std::move(*clipped));
+        if (clipped) {
+          if (Status status = reserve_row(*clipped); !status.ok()) return status;
+          combined.push_back(std::move(*clipped));
+        }
       }
     }
     rows = std::move(combined);
@@ -423,6 +448,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
       if (!selected.ok()) return selected.status();
       if (selected.ValueOrDie().present &&
           std::get<bool>(*selected.ValueOrDie().value)) {
+        if (Status status = reserve_row(row); !status.ok()) return status;
         filtered.push_back(std::move(row));
       }
     }
@@ -748,11 +774,15 @@ StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
 class QueryCursor::State {
  public:
   State(internal::PreparedQueryPlan plan, Snapshot snapshot,
-        QueryOptions options)
+        QueryOptions options, internal::QueryReservation reservation,
+        std::unique_ptr<internal::QueryScratch> scratch)
       : plan(std::move(plan)), snapshot(std::move(snapshot)),
         options(std::move(options)),
-        reservation(this->options.budget.memory_bytes),
-        fragments(this->options.budget.interval_fragments) {}
+        reservation(std::move(reservation)),
+        fragments(this->options.budget.interval_fragments),
+        started_at(std::chrono::steady_clock::now()), scratch(std::move(scratch)) {
+    if (this->scratch) this->scratch->SetReservation(&this->reservation);
+  }
 
   internal::PreparedQueryPlan plan;
   std::optional<Snapshot> snapshot;
@@ -765,6 +795,19 @@ class QueryCursor::State {
   bool initialized = false;
   bool clean_terminal = false;
   std::optional<Status> terminal_error;
+  std::shared_ptr<std::atomic<uint32_t>> retained_batches =
+      std::make_shared<std::atomic<uint32_t>>(0);
+  std::atomic<bool> cancelled{false};
+  std::chrono::steady_clock::time_point started_at;
+  std::unique_ptr<internal::QueryScratch> scratch;
+};
+
+struct BatchLease {
+  std::shared_ptr<QueryBatch> backing;
+  std::shared_ptr<std::atomic<uint32_t>> retained;
+  ~BatchLease() {
+    retained->fetch_sub(1, std::memory_order_acq_rel);
+  }
 };
 
 QueryCursor::QueryCursor(std::unique_ptr<State> state)
@@ -779,6 +822,17 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   }
   if (state_->terminal_error.has_value()) return *state_->terminal_error;
   if (state_->clean_terminal) return std::optional<QueryBatch>{};
+  if (state_->cancelled.load(std::memory_order_acquire)) {
+    state_->terminal_error = Status::QueryCancelled("query", "query cancelled");
+    return *state_->terminal_error;
+  }
+  if (state_->options.budget.deadline_us != 0 &&
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - state_->started_at).count()) >=
+          state_->options.budget.deadline_us) {
+    state_->terminal_error = Status::DeadlineExceeded("query", "deadline_us budget exhausted");
+    return *state_->terminal_error;
+  }
 
   if (!state_->initialized) {
     state_->initialized = true;
@@ -793,7 +847,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
           *state_->plan.relational_kind,
           std::move(*state_->plan.relational_input),
           &state_->reservation, &state_->fragments,
-          state_->options.budget.output_rows);
+          state_->options.budget.output_rows, state_->scratch.get());
       if (!relational.ok()) {
         state_->terminal_error = relational.status();
         state_->snapshot.reset();
@@ -803,6 +857,12 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       if (stream.rows.size() > state_->options.budget.output_rows) {
         state_->terminal_error = Status::ResourceExhausted(
             "query", "output row budget exceeded");
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      if (Status status = state_->reservation.ReserveOutputRows(stream.rows.size());
+          !status.ok()) {
+        state_->terminal_error = status;
         state_->snapshot.reset();
         return *state_->terminal_error;
       }
@@ -821,6 +881,12 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
         state_->snapshot.reset();
         return *state_->terminal_error;
       }
+      if (Status status = state_->reservation.ReserveOutputBytes(materialized_bytes.ValueOrDie());
+          !status.ok()) {
+        state_->terminal_error = status;
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
       state_->materialized_output_lease = state_->reservation.TryRetain(
           materialized_bytes.ValueOrDie());
       if (!state_->materialized_output_lease) {
@@ -834,7 +900,9 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
         state_->snapshot.reset();
         return *state_->terminal_error;
       }
-      constexpr size_t kBatchRows = 1024;
+      const size_t kBatchRows = state_->options.mode == QueryExecutionMode::kInteractive
+                                    ? 256
+                                    : (state_->options.mode == QueryExecutionMode::kAnalytical ? 4096 : 1024);
       const size_t batch_count = stream.rows.empty()
                                      ? 0
                                      : (stream.rows.size() - 1) / kBatchRows + 1;
@@ -854,7 +922,18 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                        state_->materialized_output_lease));
       }
     } else {
-    auto rows = MaterializeRows(*state_->snapshot, state_->plan);
+    const size_t pre_materialize = std::min<size_t>(
+        state_->options.budget.memory_bytes, 1ULL << 20);
+    auto pre_materialize_lease = state_->reservation.TryRetain(pre_materialize);
+    if (!pre_materialize_lease && pre_materialize != 0) {
+      state_->terminal_error = Status::ResourceExhausted(
+          "query", "memory_bytes pre-materialization reservation exhausted");
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
+    auto rows = MaterializeRows(*state_->snapshot, state_->plan,
+                                &state_->reservation);
+    state_->reservation.ReleaseMemory(pre_materialize);
     if (!rows.ok()) {
       state_->terminal_error = rows.status();
       state_->snapshot.reset();
@@ -867,15 +946,78 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
+    if (Status status = state_->reservation.ReserveDecodedRows(row_count);
+        !status.ok()) {
+      state_->terminal_error = status;
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
+    uint64_t estimated_read = 0;
+    uint64_t estimated_cpu = row_count;
+    for (const auto& row : rows.ValueOrDie()) {
+      if (row.property_value.has_value() &&
+          (row.property_value->type() == PhysicalType::kString ||
+           row.property_value->type() == PhysicalType::kBinary)) {
+        estimated_read += std::get<std::string>(row.property_value->data()).size();
+      }
+    }
+    if (Status status = state_->reservation.ReserveReadBytes(estimated_read);
+        !status.ok()) {
+      state_->terminal_error = status;
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
+    if (Status status = state_->reservation.ReserveCpuMicros(estimated_cpu);
+        !status.ok()) {
+      state_->terminal_error = status;
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
+    if (Status status = state_->reservation.ReserveOutputRows(row_count);
+        !status.ok()) {
+      state_->terminal_error = status;
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
     if (row_count > state_->options.budget.interval_fragments) {
       state_->terminal_error = Status::ResourceExhausted(
           "query", "interval fragment budget exceeded");
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
+    const size_t estimated_materialization =
+        row_count > (std::numeric_limits<size_t>::max() - sizeof(QueryBatch)) /
+                         std::max<size_t>(1, state_->plan.output_columns.size() * sizeof(QueryColumn))
+            ? std::numeric_limits<size_t>::max()
+            : sizeof(QueryBatch) + row_count *
+                  std::max<size_t>(1, state_->plan.output_columns.size() * sizeof(QueryColumn));
+    if (estimated_materialization == std::numeric_limits<size_t>::max()) {
+      state_->terminal_error = Status::ResourceExhausted("query", "memory_bytes estimate overflow");
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
+    if (Status status = state_->reservation.ReserveMemory(estimated_materialization);
+        !status.ok()) {
+      state_->terminal_error = status;
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
+    if (Status status = state_->reservation.ReserveOutputBytes(estimated_materialization);
+        !status.ok()) {
+      state_->terminal_error = status;
+      state_->snapshot.reset();
+      return *state_->terminal_error;
+    }
 
-    constexpr size_t kBatchRows = 1024;
+    const size_t kBatchRows = state_->options.mode == QueryExecutionMode::kInteractive
+                                  ? 256
+                                  : (state_->options.mode == QueryExecutionMode::kAnalytical ? 4096 : 1024);
     for (size_t offset = 0; offset < row_count; offset += kBatchRows) {
+      if (state_->cancelled.load(std::memory_order_acquire)) {
+        state_->terminal_error = Status::QueryCancelled("query", "query cancelled");
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
       const size_t count = std::min(kBatchRows, row_count - offset);
       auto columns =
           BuildColumns(rows.ValueOrDie(), offset, count, state_->plan);
@@ -891,8 +1033,17 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   }
 
   if (state_->next_batch < state_->batches.size()) {
+    const uint32_t retained = state_->retained_batches->load(std::memory_order_acquire);
+    if (retained >= state_->options.budget.retained_output_batches) {
+      return Status::ResourceExhausted("query", "retained_output_batches budget exhausted");
+    }
+    state_->retained_batches->fetch_add(1, std::memory_order_acq_rel);
+    QueryBatch& stored = state_->batches[state_->next_batch++];
+    auto lease = std::make_shared<BatchLease>();
+    lease->backing = std::make_shared<QueryBatch>(std::move(stored));
+    lease->retained = state_->retained_batches;
     return std::optional<QueryBatch>{
-        std::move(state_->batches[state_->next_batch++])};
+        QueryBatch(lease->backing->row_count(), lease->backing->columns(), lease)};
   }
   state_->batches.clear();
   state_->materialized_output_lease.reset();
@@ -910,6 +1061,12 @@ Status QueryCursor::Close() {
   state_->snapshot.reset();
   state_->terminal_error.reset();
   state_->clean_terminal = true;
+  return Status::OK();
+}
+
+Status QueryCursor::Cancel() {
+  if (!state_) return Status::InvalidArgument("query cursor", "moved-from cursor");
+  state_->cancelled.store(true, std::memory_order_release);
   return Status::OK();
 }
 
@@ -1018,7 +1175,7 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
 StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,
     QueryReservation* reservation, FragmentBudget* fragment_budget,
-    size_t max_output_rows) {
+    size_t max_output_rows, QueryScratch* scratch) {
   if (kind == LogicalOpKind::kUnionAll) {
     auto result = UnionAll(input.left, input.right, reservation, max_output_rows);
     if (!result.ok()) return result.status();
@@ -1094,9 +1251,9 @@ StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     if (algorithm == JoinAlgorithm::kIndexNestedLoop) {
       result = IndexNestedLoopJoin(join, reservation, max_output_rows);
     } else if (algorithm == JoinAlgorithm::kHash) {
-      result = HashJoin(join, reservation, max_output_rows);
+      result = HashJoin(join, reservation, max_output_rows, scratch);
     } else {
-      result = SortMergeJoin(join, reservation, max_output_rows);
+      result = SortMergeJoin(join, reservation, max_output_rows, scratch);
     }
   }
   if (!result.ok()) return result.status();
@@ -1107,15 +1264,36 @@ StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
 StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             Snapshot snapshot,
                                             const Bindings&,
-                                            const QueryOptions& options) {
+                                            const QueryOptions& options,
+                                            QueryResourcePool* resource_pool) {
   if (const auto* history = std::get_if<History>(&plan.scope);
       history != nullptr && !history->interval.has_value() &&
       options.mode != QueryExecutionMode::kAnalytical) {
     return Status::InvalidArgument(
         "query", "unbounded History requires an analytical budget");
   }
+  StatusOr<QueryReservation> admitted = resource_pool != nullptr
+      ? resource_pool->Admit(options.budget)
+      : StatusOr<QueryReservation>(QueryReservation(static_cast<size_t>(options.budget.memory_bytes)));
+  if (!admitted.ok()) return admitted.status();
+  std::unique_ptr<QueryScratch> scratch;
+  if (options.mode == QueryExecutionMode::kAnalytical) {
+    const std::string query_id = "query-" + std::to_string(reinterpret_cast<uintptr_t>(&plan));
+    std::filesystem::path scratch_root = std::filesystem::temp_directory_path() / "cedar-query-runtime";
+    std::string scratch_instance = "runtime";
+    uint64_t scratch_free_reserve = 0;
+    if (resource_pool != nullptr && !resource_pool->options().scratch_root.empty()) {
+      scratch_root = resource_pool->options().scratch_root;
+      scratch_instance = resource_pool->options().scratch_instance;
+      scratch_free_reserve = resource_pool->options().scratch_free_space_reserve_bytes;
+    }
+    scratch = std::make_unique<QueryScratch>(
+        scratch_root, scratch_instance, query_id, options.budget.scratch_bytes,
+        scratch_free_reserve);
+  }
   return QueryCursor(std::make_unique<QueryCursor::State>(
-      plan, std::move(snapshot), options));
+      plan, std::move(snapshot), options,
+      std::move(admitted).ConsumeValueOrDie(), std::move(scratch)));
 }
 
 }  // namespace internal

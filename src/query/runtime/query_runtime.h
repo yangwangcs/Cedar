@@ -20,6 +20,7 @@
 #include "query/planner/query_planner.h"
 #include "query/projection/projection_format.h"
 #include "query/projection/projection_store.h"
+#include "query/resource/query_resource_pool.h"
 
 namespace cedar::internal {
 
@@ -118,14 +119,16 @@ StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
     LogicalOpKind kind, RuntimeRelationalInput input,
     QueryReservation* reservation,
     FragmentBudget* fragment_budget = nullptr,
-    size_t max_output_rows = std::numeric_limits<size_t>::max());
+    size_t max_output_rows = std::numeric_limits<size_t>::max(),
+    QueryScratch* scratch = nullptr);
 
 class QueryRuntime {
  public:
   static StatusOr<QueryCursor> Execute(const PreparedQueryPlan& plan,
                                        Snapshot snapshot,
                                        const Bindings& bindings,
-                                       const QueryOptions& options);
+                                       const QueryOptions& options,
+                                       QueryResourcePool* resource_pool = nullptr);
 };
 
 }  // namespace cedar::internal

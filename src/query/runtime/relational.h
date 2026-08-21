@@ -4,6 +4,8 @@
 #ifndef CEDAR_QUERY_RUNTIME_RELATIONAL_H_
 #define CEDAR_QUERY_RUNTIME_RELATIONAL_H_
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -18,6 +20,21 @@
 #include "cedar/query/types.h"
 
 namespace cedar::internal {
+
+enum class ResourceDimension : uint8_t {
+  kMemory = 0,
+  kScratch,
+  kReadBytes,
+  kPrefetchBytes,
+  kDecodedRows,
+  kOutputRows,
+  kOutputBytes,
+  kIntervalFragments,
+  kGraphLabels,
+  kVisitedVertices,
+  kCpuMicros,
+  kCount,
+};
 
 using RelationalScalar =
     std::variant<bool, int32_t, int64_t, float, double, Timestamp64,
@@ -44,6 +61,7 @@ struct RelationalRow {
 };
 
 class QueryReservationLease;
+class QueryScratch;
 
 struct BatchStream {
   BatchStream() = default;
@@ -111,8 +129,29 @@ struct TemporalJoinInput {
 
 class QueryReservation {
  public:
+  struct State;
   explicit QueryReservation(size_t limit_bytes);
+  explicit QueryReservation(std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)> limits);
   bool TryGrow(size_t bytes);
+  Status ReserveMemory(uint64_t bytes);
+  Status ReserveScratch(uint64_t bytes);
+  Status ReserveReadBytes(uint64_t bytes);
+  Status ReservePrefetchBytes(uint64_t bytes);
+  Status ReserveDecodedRows(uint64_t rows);
+  Status ReserveOutputRows(uint64_t rows);
+  Status ReserveOutputBytes(uint64_t bytes);
+  Status ReserveIntervalFragments(uint64_t count);
+  Status ReserveGraphLabels(uint64_t count);
+  Status ReserveVisitedVertices(uint64_t count);
+  Status ReserveCpuMicros(uint64_t micros);
+  void ReleaseMemory(uint64_t bytes);
+  void ReleaseScratch(uint64_t bytes);
+  uint64_t used(ResourceDimension dimension) const;
+  uint64_t limit(ResourceDimension dimension) const;
+  void AttachPoolAdmission(std::shared_ptr<std::atomic<uint64_t>> memory,
+                           std::shared_ptr<std::atomic<uint32_t>> workers,
+                           uint64_t admitted_memory,
+                           uint32_t admitted_workers);
   void Release(size_t bytes);
   std::shared_ptr<QueryReservationLease> TryRetain(size_t bytes);
   size_t limit_bytes() const;
@@ -120,10 +159,10 @@ class QueryReservation {
   size_t peak_bytes() const;
 
  private:
-  struct State;
   std::shared_ptr<State> state_;
 
   friend class QueryReservationLease;
+  friend class QueryResourcePool;
 };
 
 class QueryReservationLease {
@@ -163,11 +202,13 @@ StatusOr<BatchStream> IndexNestedLoopJoin(
 StatusOr<BatchStream> HashJoin(const JoinInput& input,
                                QueryReservation* reservation,
                                size_t max_output_rows =
-                                   std::numeric_limits<size_t>::max());
+                                   std::numeric_limits<size_t>::max(),
+                               QueryScratch* scratch = nullptr);
 StatusOr<BatchStream> SortMergeJoin(const JoinInput& input,
                                     QueryReservation* reservation,
                                     size_t max_output_rows =
-                                        std::numeric_limits<size_t>::max());
+                                        std::numeric_limits<size_t>::max(),
+                                    QueryScratch* scratch = nullptr);
 StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
                                         FragmentBudget* budget,
                                         QueryReservation* reservation,

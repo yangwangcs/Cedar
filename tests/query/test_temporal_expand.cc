@@ -160,4 +160,40 @@ TEST(TemporalExpandTest, KHopDeduplicatesAtMinimumDepthAndHonorsBound) {
   std::filesystem::remove_all(path);
 }
 
+TEST(TemporalExpandTest, AdjacencyIndexBoundsSelectedPostingAndPreservesIdentity) {
+  const VertexRef selected{PartId{7}, VertexId{42}};
+  std::vector<EdgeIdentity> identities;
+  identities.reserve(100000);
+  for (uint64_t i = 0; i < 99990; ++i) {
+    identities.emplace_back(EdgeRef{PartId{1}, EdgeId{i + 1}},
+                            VertexRef{PartId{1}, VertexId{1000 + i}},
+                            VertexRef{PartId{2}, VertexId{2000 + i}}, 7);
+  }
+  for (uint64_t i = 0; i < 10; ++i) {
+    identities.emplace_back(EdgeRef{PartId{7}, EdgeId{900000 + i}}, selected,
+                            VertexRef{PartId{8}, VertexId{100 + i}}, 7);
+  }
+  identities.emplace_back(EdgeRef{PartId{7}, EdgeId{910000}}, selected, selected,
+                          9);
+  identities.emplace_back(EdgeRef{PartId{7}, EdgeId{910001}}, selected, selected,
+                          9);
+  QueryDeltaView delta{CommitSeq{0}, CommitSeq{7}, {}, identities, {}, CommitSeq{}};
+  auto index = std::make_shared<AdjacencyIndex>();
+  ASSERT_TRUE(index->ApplyDelta(delta, 3).ok());
+
+  auto outgoing = index->Seek({selected}, ExpandDirection::kOut, 7,
+                              CommitSeq{7}, 3, nullptr);
+  ASSERT_TRUE(outgoing.ok()) << outgoing.status().ToString();
+  EXPECT_EQ(outgoing.ValueOrDie().size(), 10U);
+  auto incoming = index->Seek({selected}, ExpandDirection::kIn, 7,
+                              CommitSeq{7}, 3, nullptr);
+  ASSERT_TRUE(incoming.ok());
+  EXPECT_TRUE(incoming.ValueOrDie().empty());
+  auto both = index->Seek({selected}, ExpandDirection::kBoth, 9,
+                          CommitSeq{7}, 3, nullptr);
+  ASSERT_TRUE(both.ok());
+  ASSERT_EQ(both.ValueOrDie().size(), 2U);
+  EXPECT_NE(both.ValueOrDie()[0].edge_ref(), both.ValueOrDie()[1].edge_ref());
+}
+
 }  // namespace cedar::internal

@@ -16,6 +16,10 @@
 
 namespace cedar {
 
+namespace internal {
+class AdjacencyIndex;
+}
+
 class Database;
 class Snapshot;
 class PreparedQuery;
@@ -53,6 +57,7 @@ class Snapshot {
 
   CommitSeq commit_seq() const;
   CommitSeq oldest_readable_seq() const;
+  std::shared_ptr<const internal::AdjacencyIndex> adjacency_index() const;
   StatusOr<bool> Exists(EntityFact entity, ValidTime valid_time) const;
   // Evaluates a batch against one pinned Cedar snapshot and preserves caller
   // order. The current adapter is correctness-first; Parquet page-grouped

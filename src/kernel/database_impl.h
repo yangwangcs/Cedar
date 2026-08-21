@@ -35,6 +35,10 @@
 
 namespace cedar {
 
+namespace internal {
+class AdjacencyIndex;
+}
+
 inline AsyncSubmissionExecutor::Options ResolveAsyncExecutorOptions(
     const DatabaseOptions& options) {
   AsyncSubmissionExecutor::Options resolved{
@@ -273,6 +277,7 @@ class Database::Impl {
   // the durable commit path; queue overflow records a gap but never rejects a
   // commit that RocksDB has already published.
   std::unique_ptr<internal::QueryDelta> query_delta;
+  std::shared_ptr<internal::AdjacencyIndex> adjacency_index;
   AsyncSubmissionExecutor async_executor;
   QueryRuntimeOptions query_runtime_options;
   std::unique_ptr<internal::QueryResourcePool> query_resource_pool;

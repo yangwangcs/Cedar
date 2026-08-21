@@ -17,6 +17,7 @@
 #include "storage/rocks/rocksdb_config.h"
 #include "kernel/database_impl.h"
 #include "query/resource/query_scratch.h"
+#include "query/runtime/graph_frontier.h"
 
 namespace cedar {
 namespace {
@@ -1508,6 +1509,26 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   auto impl = std::make_shared<Impl>(std::move(options));
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
+  // Build the Cedar-owned adjacency cache from the authoritative fact lane at
+  // open. QueryDelta supplies the newer commit tail at query time.
+  {
+    auto adjacency_snapshot = impl->store.BeginSnapshot();
+    if (adjacency_snapshot.ok()) {
+      std::vector<FactEvent> events;
+      const Status scanned = impl->store.ScanFamily(
+          adjacency_snapshot.ValueOrDie(), FactFamily::kEdgeIdentity,
+          [&events](const FactEvent& event) {
+            events.push_back(event);
+            return Status::OK();
+          });
+      if (scanned.ok()) {
+        impl->adjacency_index = std::make_shared<internal::AdjacencyIndex>();
+        impl->adjacency_index
+            ->Build(events, adjacency_snapshot.ValueOrDie().commit_seq(), 0)
+            .IgnoreError();
+      }
+    }
+  }
   const Status scratch_cleanup = internal::QueryScratch::CleanupOldInstances(
       database_path, "active");
   if (!scratch_cleanup.ok()) {

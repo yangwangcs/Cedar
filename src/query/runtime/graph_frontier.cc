@@ -87,15 +87,19 @@ StatusOr<std::vector<StateInterval>> VisibleIntervals(
 }
 
 StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
-                                                const QueryDeltaView* delta) {
+                                                const QueryDeltaView* delta,
+                                                uint64_t max_candidates = 0) {
   std::map<IdentityKey, EdgeIdentity> unique;
   Status status = snapshot.ScanFamily(FactFamily::kEdgeIdentity,
-                                      [&unique](const FactEvent& event) {
+                                      [&unique, max_candidates](const FactEvent& event) {
     if (!event.edge_identity.has_value()) return Status::OK();
     const EdgeIdentity& identity = *event.edge_identity;
     const EdgeIdentity copy = identity;
     unique.emplace(IdentityKey{copy.edge_ref(), copy.source_ref(),
                                 copy.target_ref(), copy.edge_type}, copy);
+    if (max_candidates != 0 && unique.size() > max_candidates) {
+      return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
+    }
     return Status::OK();
   });
   if (!status.ok()) return status;
@@ -126,6 +130,136 @@ Status ChargeTraversal(const GraphFrontierOptions& options) {
 
 }  // namespace
 
+bool AdjacencyIndex::Key::operator<(const Key& other) const {
+  if (VertexKey{vertex} < VertexKey{other.vertex}) return true;
+  if (VertexKey{other.vertex} < VertexKey{vertex}) return false;
+  if (direction != other.direction)
+    return static_cast<uint8_t>(direction) < static_cast<uint8_t>(other.direction);
+  if (edge_type.has_value() != other.edge_type.has_value())
+    return !edge_type.has_value();
+  return edge_type.has_value() && *edge_type < *other.edge_type;
+}
+
+void AdjacencyIndex::Add(const Entry& entry) {
+  const EdgeIdentity& identity = entry.identity;
+  const Key keys[] = {
+      {identity.source_ref(), ExpandDirection::kOut, std::nullopt},
+      {identity.source_ref(), ExpandDirection::kOut, identity.edge_type},
+      {identity.target_ref(), ExpandDirection::kIn, std::nullopt},
+      {identity.target_ref(), ExpandDirection::kIn, identity.edge_type},
+  };
+  for (const Key& key : keys) {
+    auto& posting = postings_[key];
+    const auto duplicate = std::find_if(
+        posting.begin(), posting.end(), [&entry](const Entry& prior) {
+          return prior.identity.edge_ref() == entry.identity.edge_ref();
+        });
+    if (duplicate == posting.end()) posting.push_back(entry);
+  }
+}
+
+Status AdjacencyIndex::Build(Snapshot& snapshot, uint64_t generation) {
+  postings_.clear();
+  generation_ = generation;
+  Status status = snapshot.ScanFamily(
+      FactFamily::kEdgeIdentity, [this, generation](const FactEvent& event) {
+        if (!event.edge_identity.has_value()) return Status::OK();
+        Add(Entry{*event.edge_identity, event.commit_seq, generation});
+        return Status::OK();
+      });
+  if (!status.ok()) return status;
+  built_through_ = snapshot.commit_seq();
+  return Status::OK();
+}
+
+Status AdjacencyIndex::Build(const std::vector<FactEvent>& events,
+                             CommitSeq snapshot_seq, uint64_t generation) {
+  postings_.clear();
+  generation_ = generation;
+  for (const FactEvent& event : events) {
+    if (!event.edge_identity.has_value()) continue;
+    Add(Entry{*event.edge_identity, event.commit_seq, generation});
+  }
+  built_through_ = snapshot_seq;
+  return Status::OK();
+}
+
+Status AdjacencyIndex::ApplyDelta(const QueryDeltaView& delta,
+                                  uint64_t generation) {
+  generation_ = generation;
+  if (delta.edge_identity_records.empty()) {
+    for (const EdgeIdentity& identity : delta.edge_identities) {
+      Add(Entry{identity, delta.through, generation});
+    }
+  } else {
+    for (const auto& record : delta.edge_identity_records) {
+      if (record.first.value > delta.through.value) continue;
+      Add(Entry{record.second, record.first, generation});
+    }
+  }
+  if (delta.through.value > built_through_.value) built_through_ = delta.through;
+  return Status::OK();
+}
+
+StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
+    const std::vector<VertexRef>& frontier, ExpandDirection direction,
+    std::optional<uint64_t> edge_type, CommitSeq snapshot_seq,
+    std::optional<uint64_t> generation, const QueryDeltaView* delta) const {
+  const bool delta_has_identity =
+      delta != nullptr && (!delta->edge_identities.empty() ||
+                           !delta->edge_identity_records.empty());
+  const bool delta_covers = delta_has_identity &&
+                            delta->through.value >= snapshot_seq.value;
+  if (!covers(snapshot_seq) && !delta_covers) {
+    return Status::NotFound("adjacency index", "posting coverage is missing");
+  }
+  std::map<IdentityKey, EdgeIdentity> unique;
+  auto collect = [&](const VertexRef& vertex, ExpandDirection posting_direction) {
+    const Key key{vertex, posting_direction, edge_type};
+    const auto found = postings_.find(key);
+    if (found == postings_.end()) return;
+    for (const Entry& entry : found->second) {
+      if (entry.commit_seq.value > snapshot_seq.value) continue;
+      if (generation.has_value() && entry.generation != *generation) continue;
+      const EdgeIdentity& identity = entry.identity;
+      unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
+                                 identity.target_ref(), identity.edge_type},
+                     identity);
+    }
+  };
+  for (const VertexRef& vertex : frontier) {
+    if (direction == ExpandDirection::kIn || direction == ExpandDirection::kBoth)
+      collect(vertex, ExpandDirection::kIn);
+    if (direction == ExpandDirection::kOut || direction == ExpandDirection::kBoth)
+      collect(vertex, ExpandDirection::kOut);
+  }
+  if (delta != nullptr) {
+    auto add_delta = [&](CommitSeq seq, const EdgeIdentity& identity) {
+      if (seq.value > snapshot_seq.value) return;
+      const bool out = Contains(identity.source_ref(), frontier);
+      const bool in = Contains(identity.target_ref(), frontier);
+      if ((direction == ExpandDirection::kOut && !out) ||
+          (direction == ExpandDirection::kIn && !in) ||
+          (direction == ExpandDirection::kBoth && !out && !in)) return;
+      if (edge_type.has_value() && identity.edge_type != *edge_type) return;
+      unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
+                                 identity.target_ref(), identity.edge_type},
+                     identity);
+    };
+    if (delta->edge_identity_records.empty()) {
+      for (const EdgeIdentity& identity : delta->edge_identities)
+        add_delta(delta->through, identity);
+    } else {
+      for (const auto& record : delta->edge_identity_records)
+        add_delta(record.first, record.second);
+    }
+  }
+  std::vector<EdgeIdentity> result;
+  result.reserve(unique.size());
+  for (const auto& item : unique) result.push_back(item.second);
+  return result;
+}
+
 StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
     Snapshot& snapshot, const GraphExpansionRequest& request,
     const GraphFrontierOptions& options) {
@@ -134,11 +268,31 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
     return Status::InvalidArgument("graph expansion", "invalid request interval");
   }
   StatusOr<std::vector<EdgeIdentity>> identities =
-      options.adjacency_seek
+      options.adjacency_index
+          ? options.adjacency_index->Seek(request.frontier, request.direction,
+                                         request.edge_type, snapshot.commit_seq(),
+                                         std::nullopt, options.delta)
+          : options.adjacency_seek
           ? options.adjacency_seek(request.frontier, request.direction,
                                    request.edge_type)
-          : Identities(snapshot, options.delta);
+      : Identities(snapshot, options.delta, options.fallback_candidate_limit);
+  if (!identities.ok() && identities.status().IsNotFound() &&
+      options.adjacency_seek) {
+    identities = options.adjacency_seek(request.frontier, request.direction,
+                                        request.edge_type);
+  } else if (!identities.ok() && identities.status().IsNotFound() &&
+             options.adjacency_index) {
+    // Cache misses are explicit: the canonical lane is only used when the
+    // caller supplied a finite fallback bound (or left it unlimited for an
+    // analytical query).
+    identities = Identities(snapshot, options.delta,
+                            options.fallback_candidate_limit);
+  }
   if (!identities.ok()) return identities.status();
+  if (options.fallback_candidate_limit != 0 &&
+      identities.ValueOrDie().size() > options.fallback_candidate_limit) {
+    return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
+  }
   if (options.candidates_examined != nullptr) {
     *options.candidates_examined += identities.ValueOrDie().size();
   }

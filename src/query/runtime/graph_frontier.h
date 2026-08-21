@@ -8,6 +8,8 @@
 #include <optional>
 #include <vector>
 #include <functional>
+#include <memory>
+#include <map>
 
 #include "cedar/query/query.h"
 #include "cedar/query/types.h"
@@ -38,6 +40,42 @@ struct GraphExpansionRequest {
   std::optional<uint64_t> edge_type;
 };
 
+// Cedar-owned, immutable-at-read adjacency postings.  The index contains no
+// RocksDB handles: it is rebuilt from authoritative EdgeIdentity facts and
+// can then be advanced with QueryDelta records.
+class AdjacencyIndex {
+ public:
+  struct Entry {
+    EdgeIdentity identity;
+    CommitSeq commit_seq;
+    uint64_t generation = 0;
+  };
+
+  Status Build(Snapshot& snapshot, uint64_t generation = 0);
+  Status Build(const std::vector<FactEvent>& events, CommitSeq snapshot_seq,
+               uint64_t generation = 0);
+  Status ApplyDelta(const QueryDeltaView& delta, uint64_t generation = 0);
+  StatusOr<std::vector<EdgeIdentity>> Seek(
+      const std::vector<VertexRef>& frontier, ExpandDirection direction,
+      std::optional<uint64_t> edge_type, CommitSeq snapshot_seq,
+      std::optional<uint64_t> generation = std::nullopt,
+      const QueryDeltaView* delta = nullptr) const;
+  bool covers(CommitSeq snapshot_seq) const { return built_through_.value >= snapshot_seq.value; }
+  CommitSeq built_through() const { return built_through_; }
+
+ private:
+  struct Key {
+    VertexRef vertex;
+    ExpandDirection direction = ExpandDirection::kOut;
+    std::optional<uint64_t> edge_type;
+    bool operator<(const Key& other) const;
+  };
+  std::map<Key, std::vector<Entry>> postings_;
+  CommitSeq built_through_;
+  uint64_t generation_ = 0;
+  void Add(const Entry& entry);
+};
+
 struct GraphFrontierOptions {
   QueryReservation* reservation = nullptr;
   const QueryDeltaView* delta = nullptr;
@@ -48,6 +86,10 @@ struct GraphFrontierOptions {
   std::function<StatusOr<std::vector<EdgeIdentity>>(
       const std::vector<VertexRef>&, ExpandDirection,
       std::optional<uint64_t>)> adjacency_seek;
+  std::shared_ptr<const AdjacencyIndex> adjacency_index;
+  // Zero means no fallback bound. A non-zero value makes a cache miss fail
+  // explicitly once the authoritative fallback would exceed this count.
+  uint64_t fallback_candidate_limit = 0;
   uint64_t* candidates_examined = nullptr;
 };
 

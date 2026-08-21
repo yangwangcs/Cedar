@@ -503,6 +503,12 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   if (!seeds.ok()) return seeds.status();
   const internal::QueryDeltaView* delta = plan.bound_delta_view ? plan.bound_delta_view.get() : nullptr;
   internal::GraphFrontierOptions options{reservation, delta, plan.graph_k_hops};
+  options.adjacency_index = snapshot.adjacency_index();
+  // A missing/lagging cache must never silently turn an interactive expansion
+  // into an unbounded family scan. The canonical path remains available for
+  // plans that do not provide a budget (for example analytical callers).
+  options.fallback_candidate_limit =
+      reservation == nullptr ? 0 : 4096;
   std::vector<RuntimeRow> result;
   for (const RuntimeRow& seed : seeds.ValueOrDie()) {
     VertexRef vertex{seed.ref.part_id(), VertexId{seed.ref.entity_id()}};

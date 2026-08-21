@@ -8,6 +8,7 @@
 
 #include "cedar/database.h"
 #include "kernel/database_impl.h"
+#include "query/runtime/graph_frontier.h"
 
 namespace cedar {
 namespace {
@@ -281,6 +282,10 @@ CommitSeq Snapshot::commit_seq() const {
 
 CommitSeq Snapshot::oldest_readable_seq() const {
   return state_ == nullptr ? CommitSeq{} : state_->snapshot.oldest_readable_seq();
+}
+
+std::shared_ptr<const internal::AdjacencyIndex> Snapshot::adjacency_index() const {
+  return state_ == nullptr ? nullptr : state_->database->adjacency_index;
 }
 
 StatusOr<bool> Snapshot::Exists(EntityFact entity, ValidTime valid_time) const {

@@ -1561,15 +1561,17 @@ StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
   for (const RelationalRow& original_left : input.left.rows) {
     const RelationalCell& left_key = original_left.cells[input.left_key];
     const size_t partition = left_key.present ? HashCell(left_key) % kPartitions : 0;
-    std::vector<RelationalRow> right_rows;
+    BatchStream right_stream;
     if (!right_runs[partition].empty()) {
       auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
       if (!right.ok()) return right.status();
       auto decoded_right = std::move(right).ConsumeValueOrDie();
-      right_rows = std::move(decoded_right.rows);
+      right_stream.rows = std::move(decoded_right.rows);
+      right_stream.reservation_lease = std::move(decoded_right.lease);
+      right_stream.reservation_leases = std::move(decoded_right.extra_leases);
     }
     JoinInput part{BatchStream(std::vector<RelationalRow>{original_left}),
-                   BatchStream(std::move(right_rows)), input.left_key,
+                   std::move(right_stream), input.left_key,
                    input.right_key, input.kind};
     auto joined = HashJoinInMemory(part, reservation, max_output_rows);
     if (!joined.ok()) return joined.status();
@@ -1932,23 +1934,28 @@ StatusOr<BatchStream> ExternalSortMergeJoin(const JoinInput& input,
     auto left = ReadSpilledRows(left_runs[partition], reservation, scratch);
     if (!left.ok()) return left.status();
     auto decoded_left = std::move(left).ConsumeValueOrDie();
-    std::vector<RelationalRow> right_rows;
+    BatchStream left_stream;
+    left_stream.rows = std::move(decoded_left.rows);
+    left_stream.reservation_lease = std::move(decoded_left.lease);
+    left_stream.reservation_leases = std::move(decoded_left.extra_leases);
+    BatchStream right_stream;
     if (!right_runs[partition].empty()) {
       auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
       if (!right.ok()) return right.status();
       auto decoded_right = std::move(right).ConsumeValueOrDie();
-      right_rows = std::move(decoded_right.rows);
+      right_stream.rows = std::move(decoded_right.rows);
+      right_stream.reservation_lease = std::move(decoded_right.lease);
+      right_stream.reservation_leases = std::move(decoded_right.extra_leases);
     }
-    std::vector<RelationalRow> left_rows = std::move(decoded_left.rows);
-    std::sort(left_rows.begin(), left_rows.end(), [&input](const RelationalRow& a,
-                                                            const RelationalRow& b) {
+    std::sort(left_stream.rows.begin(), left_stream.rows.end(), [&input](const RelationalRow& a,
+                                                                          const RelationalRow& b) {
       return CompareCell(a.cells[input.left_key], b.cells[input.left_key]) < 0;
     });
-    std::sort(right_rows.begin(), right_rows.end(), [&input](const RelationalRow& a,
-                                                              const RelationalRow& b) {
+    std::sort(right_stream.rows.begin(), right_stream.rows.end(), [&input](const RelationalRow& a,
+                                                                             const RelationalRow& b) {
       return CompareCell(a.cells[input.right_key], b.cells[input.right_key]) < 0;
     });
-    JoinInput part{BatchStream(std::move(left_rows)), BatchStream(std::move(right_rows)),
+    JoinInput part{std::move(left_stream), std::move(right_stream),
                    input.left_key, input.right_key, input.kind};
     auto joined = SortMergeJoinInMemory(part, reservation, max_output_rows);
     if (!joined.ok()) return joined.status();

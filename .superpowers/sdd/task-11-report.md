@@ -102,3 +102,28 @@ ctest --test-dir build/query-debug --output-on-failure -j1 -R \
   'QueryResource|QueryRelational|QueryCanonical|KernelLifecycle|KernelCommit|KernelBoundedBenchmark|RecoveryCrashMatrix|KernelBenchmarkCsvContract'
   106 passed, 0 failed
 ```
+
+## Final re-review P1 lease closure (2026-08-22)
+
+- External hash and sort-merge spill joins now transfer every decoded partition
+  lease into the temporary `BatchStream` consumed by the in-memory operator.
+  The lease therefore covers partition sorting, hash/index construction, and
+  output production, then releases with the temporary stream; decoded leases
+  are not copied into final output streams, so accounting is not double-charged.
+- Added `ExternalSpillJoinRetainsDecodedReservationDuringUse`, which uses
+  deterministic reservation boundaries to reject both external joins if a
+  decoded lease would be released before the next partition's output/index
+  reservations. Both failure paths return `NeedsSpill` and release all bytes.
+
+Verification:
+
+```text
+cmake --build build/query-debug --target clean
+cmake --build build/query-debug -j1 --target \
+  test_query_relational test_query_resources test_query_canonical
+  all targets built successfully
+
+ctest --test-dir build/query-debug --output-on-failure -j1 -R \
+  'QueryRelational|QueryResource|QueryCanonical'
+  100% tests passed, 0 tests failed out of 77
+```

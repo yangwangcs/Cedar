@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -330,6 +331,46 @@ TEST(RelationalTest, ExternalSpillJoinsMatchCanonicalResults) {
   }
   EXPECT_GT(verified_runs, 2U);
   EXPECT_TRUE(scratch.Cleanup().ok());
+}
+
+TEST(RelationalTest, ExternalSpillJoinRetainsDecodedReservationDuringUse) {
+  std::vector<RelationalRow> left_rows{Row(7, 700), Row(99, 990)};
+  std::vector<RelationalRow> right_rows;
+  for (int64_t key = 0; key < 512; ++key) right_rows.push_back(Row(key, key * 10));
+  JoinInput input{{left_rows}, {right_rows}, 0, 0, JoinKind::kInner};
+
+  // Each matching spilled partition needs its decoded-cell lease while the
+  // in-memory join reserves its index and output. These limits fit the spill
+  // writes but reject the second partition if the decoded lease is retained.
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("cedar-task11-relational-lease-" +
+                     std::to_string(
+                         std::chrono::steady_clock::now().time_since_epoch().count()));
+  const auto hash_root = root.string() + "-hash";
+  const auto sort_root = root.string() + "-sort";
+  {
+    QueryReservation hash_reservation(800);
+    QueryScratch hash_scratch(hash_root, "instance", "hash", 1 << 20,
+                              &hash_reservation);
+    auto hashed = HashJoin(input, &hash_reservation,
+                           std::numeric_limits<size_t>::max(), &hash_scratch);
+    ASSERT_FALSE(hashed.ok()) << hashed.status().ToString();
+    EXPECT_TRUE(IsNeedsSpill(hashed.status()));
+    EXPECT_EQ(hash_reservation.used_bytes(), 0U);
+  }
+  {
+    QueryReservation sort_reservation(1200);
+    QueryScratch sort_scratch(sort_root, "instance", "sort", 1 << 20,
+                              &sort_reservation);
+    auto sorted = SortMergeJoin(input, &sort_reservation,
+                                std::numeric_limits<size_t>::max(),
+                                &sort_scratch);
+    ASSERT_FALSE(sorted.ok()) << sorted.status().ToString();
+    EXPECT_TRUE(IsNeedsSpill(sorted.status()));
+    EXPECT_EQ(sort_reservation.used_bytes(), 0U);
+  }
+  std::filesystem::remove_all(hash_root);
+  std::filesystem::remove_all(sort_root);
 }
 
 TEST(RelationalTest, PublishedOutputRetainsReservationUntilStreamDestruction) {

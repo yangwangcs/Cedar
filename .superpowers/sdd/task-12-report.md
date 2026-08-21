@@ -72,4 +72,35 @@ ctest --test-dir build/query-debug --output-on-failure -R \
   'TemporalExpand|QueryCanonical|QueryPlanner|KernelSnapshot'
   38 passed, 1 failed: KernelSnapshotTest.MultiExistsPreservesRequestOrder
   (multi_get_operations=5, expected 3; pre-existing/outside Task 12)
+
+## Final Re-review Fixes
+
+- K-hop frontier labels now carry their effective half-open interval. Each
+  subsequent expansion intersects the next edge and endpoint state with that
+  carried interval, preserving minimum-depth, interval subtraction/coalescing,
+  predecessor direction, cancellation, and deadline checks.
+- Adjacency postings now identify their available generation. A pinned
+  generation mismatch, and an incomplete generation rollover after applying a
+  delta, return `NotFound` so the runtime performs authoritative canonical
+  fallback instead of silently returning an empty or partial posting.
+- Graph property materialization now supports multiple bindings across source
+  vertex, edge, and destination vertex. Each binding resolves its matching
+  entity family/ref and intersects property intervals with the traversal
+  interval before storing values by output slot.
+- Added regressions for two-hop interval propagation, generation mismatch and
+  rollover fallback, and simultaneous source/edge/destination property
+  bindings.
+
+Final verification:
+
+```text
+cmake --build build/query-debug --clean-first -j1 --target \
+  test_temporal_expand test_query_canonical test_query_planner test_kernel_snapshot
+  all targets built successfully
+
+ctest --test-dir build/query-debug --output-on-failure -R \
+  'TemporalExpand|QueryPlanner|QueryCanonical|KernelSnapshot'
+  41 passed, 1 failed: KernelSnapshotTest.MultiExistsPreservesRequestOrder
+  (multi_get_operations=5, expected 3; pre-existing/outside Task 12)
+```
 ```

@@ -179,6 +179,7 @@ void AdjacencyIndex::Add(const Entry& entry) {
 Status AdjacencyIndex::Build(Snapshot& snapshot, uint64_t generation) {
   postings_.clear();
   generation_ = generation;
+  generation_complete_ = true;
   Status status = snapshot.ScanFamily(
       FactFamily::kEdgeIdentity, [this, generation](const FactEvent& event) {
         if (!event.edge_identity.has_value()) return Status::OK();
@@ -194,6 +195,7 @@ Status AdjacencyIndex::Build(const std::vector<FactEvent>& events,
                              CommitSeq snapshot_seq, uint64_t generation) {
   postings_.clear();
   generation_ = generation;
+  generation_complete_ = true;
   for (const FactEvent& event : events) {
     if (!event.edge_identity.has_value()) continue;
     Add(Entry{*event.edge_identity, event.commit_seq, generation});
@@ -204,6 +206,12 @@ Status AdjacencyIndex::Build(const std::vector<FactEvent>& events,
 
 Status AdjacencyIndex::ApplyDelta(const QueryDeltaView& delta,
                                   uint64_t generation) {
+  if (!postings_.empty() && generation != generation_) {
+    // A delta from a new projection generation cannot relabel the existing
+    // snapshot postings. Keep the data for diagnostics, but force callers to
+    // use canonical fallback until a complete rebuild publishes the rollover.
+    generation_complete_ = false;
+  }
   generation_ = generation;
   if (delta.edge_identity_records.empty()) {
     for (const EdgeIdentity& identity : delta.edge_identities) {
@@ -231,6 +239,14 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
                             delta->through.value >= snapshot_seq.value;
   if (!covers(snapshot_seq) && !delta_covers) {
     return Status::NotFound("adjacency index", "posting coverage is missing");
+  }
+  // A snapshot index is materialized for one projection generation.  Treat a
+  // pinned rollover as a cache miss so the caller can use authoritative
+  // identity fallback; filtering every posting to an incompatible generation
+  // would otherwise look like a valid empty result.
+  if (!generation_complete_ ||
+      (generation.has_value() && generation_ != *generation)) {
+    return Status::NotFound("adjacency index", "posting generation is unavailable");
   }
   std::map<IdentityKey, EdgeIdentity> unique;
   auto collect = [&](const VertexRef& vertex, ExpandDirection posting_direction) -> Status {
@@ -391,17 +407,13 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
   if (options.max_hops == 0) return KHopResult{};
   KHopResult result;
   std::map<VertexKey, std::pair<uint32_t, std::vector<ValidTimeInterval>>> visited;
-  std::vector<VertexRef> frontier = request.frontier;
-  for (const VertexRef& vertex : frontier) {
+  std::vector<GraphLabel> frontier;
+  frontier.reserve(request.frontier.size());
+  for (const VertexRef& vertex : request.frontier) {
     visited.emplace(VertexKey{vertex}, std::make_pair(0, std::vector<ValidTimeInterval>{}));
+    frontier.push_back(GraphLabel{vertex, 0, std::nullopt, request.interval});
   }
   for (uint32_t depth = 1; depth <= options.max_hops && !frontier.empty(); ++depth) {
-    GraphExpansionRequest layer = request;
-    layer.frontier = frontier;
-    auto expanded = ExpandTemporal(snapshot, layer, options);
-    if (!expanded.ok()) return expanded.status();
-    std::vector<VertexRef> next;
-    std::set<VertexKey> next_seen;
     auto interval_end = [](const ValidTimeInterval& interval) {
       return interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}).value;
     };
@@ -448,47 +460,66 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
       }
       *intervals = std::move(merged);
     };
-    for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
+    std::vector<GraphLabel> next;
+    for (const GraphLabel& prior : frontier) {
       if (options.check_abort) {
         if (Status status = options.check_abort(); !status.ok()) return status;
       }
-      std::vector<std::pair<VertexRef, VertexRef>> moves;
-      const bool out = Contains(traversal.source, layer.frontier);
-      const bool in = Contains(traversal.target, layer.frontier);
-      if ((request.direction == ExpandDirection::kOut && out) ||
-          (request.direction == ExpandDirection::kBoth && out))
-        moves.emplace_back(traversal.target, traversal.source);
-      if ((request.direction == ExpandDirection::kIn && in) ||
-          (request.direction == ExpandDirection::kBoth && in)) {
-        if (moves.empty() || moves.front().first != traversal.source)
-          moves.emplace_back(traversal.source, traversal.target);
-      }
-      for (const auto& move : moves) {
-        const VertexRef destination = move.first;
-        const VertexRef predecessor = move.second;
-        auto found = visited.find(VertexKey{destination});
-        if (found != visited.end() && found->second.first < depth) continue;
-        std::vector<ValidTimeInterval> pieces;
-        if (found == visited.end()) {
-          found = visited.emplace(VertexKey{destination},
-                                  std::make_pair(depth, std::vector<ValidTimeInterval>{})).first;
-          if (options.reservation != nullptr) {
-            if (Status status = options.reservation->ReserveVisitedVertices(1); !status.ok())
-              return status;
-          }
-          pieces.push_back(traversal.effective);
-        } else if (found->second.first == depth) {
-          pieces = subtract_covered(traversal.effective, found->second.second);
+      GraphExpansionRequest layer = request;
+      layer.frontier = {prior.vertex};
+      // Every hop is constrained by the common interval carried by its
+      // predecessor label.  Reusing request.interval here would admit time
+      // periods that were not present on the preceding path.
+      if (prior.effective.has_value()) layer.interval = *prior.effective;
+      auto expanded = ExpandTemporal(snapshot, layer, options);
+      if (!expanded.ok()) return expanded.status();
+      for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
+        if (options.check_abort) {
+          if (Status status = options.check_abort(); !status.ok()) return status;
         }
-        if (pieces.empty()) continue;
-        merge_interval(&found->second.second, traversal.effective);
-        if (next_seen.insert(VertexKey{destination}).second) next.push_back(destination);
-        for (const auto& piece : pieces) {
-          TemporalTraversal emitted = traversal;
-          emitted.effective = piece;
-          result.traversals.push_back(emitted);
-          result.labels.push_back(GraphLabel{destination, depth,
-                                             std::optional<VertexRef>{predecessor}, piece});
+        std::vector<std::pair<VertexRef, VertexRef>> moves;
+        const bool out = traversal.source == prior.vertex;
+        const bool in = traversal.target == prior.vertex;
+        if ((request.direction == ExpandDirection::kOut && out) ||
+            (request.direction == ExpandDirection::kBoth && out))
+          moves.emplace_back(traversal.target, traversal.source);
+        if ((request.direction == ExpandDirection::kIn && in) ||
+            (request.direction == ExpandDirection::kBoth && in)) {
+          if (moves.empty() || moves.front().first != traversal.source)
+            moves.emplace_back(traversal.source, traversal.target);
+        }
+        for (const auto& move : moves) {
+          const VertexRef destination = move.first;
+          const VertexRef predecessor = move.second;
+          auto found = visited.find(VertexKey{destination});
+          if (found != visited.end() && found->second.first < depth) continue;
+          std::vector<ValidTimeInterval> pieces;
+          if (found == visited.end()) {
+            found = visited.emplace(
+                VertexKey{destination},
+                std::make_pair(depth, std::vector<ValidTimeInterval>{}))
+                        .first;
+            if (options.reservation != nullptr) {
+              if (Status status = options.reservation->ReserveVisitedVertices(1);
+                  !status.ok())
+                return status;
+            }
+            pieces.push_back(traversal.effective);
+          } else if (found->second.first == depth) {
+            pieces = subtract_covered(traversal.effective,
+                                       found->second.second);
+          }
+          if (pieces.empty()) continue;
+          merge_interval(&found->second.second, traversal.effective);
+          for (const auto& piece : pieces) {
+            TemporalTraversal emitted = traversal;
+            emitted.effective = piece;
+            result.traversals.push_back(emitted);
+            result.labels.push_back(GraphLabel{
+                destination, depth, std::optional<VertexRef>{predecessor}, piece});
+            next.push_back(GraphLabel{
+                destination, depth, std::optional<VertexRef>{predecessor}, piece});
+          }
         }
       }
     }

@@ -32,6 +32,7 @@ struct RuntimeRow {
   std::optional<EdgeRef> graph_edge;
   std::optional<VertexRef> graph_destination;
   uint64_t graph_edge_type = 0;
+  std::map<uint32_t, std::optional<Value>> property_values;
 };
 
 using EvaluatedLiteral = detail::ExpressionLiteral;
@@ -100,10 +101,15 @@ StatusOr<EvaluatedValue> EvaluateExpression(
     if (binding == plan.property_bindings.end()) {
       return Status::InvalidArgument("query", "predicate slot is unavailable");
     }
-    if (!row.property_value.has_value()) {
+    std::optional<Value> property_value = row.property_value;
+    if (const auto found = row.property_values.find(binding->output.slot.value);
+        found != row.property_values.end()) {
+      property_value = found->second;
+    }
+    if (!property_value.has_value()) {
       return EvaluatedValue{binding->output.type, false, std::nullopt};
     }
-    return ValueAsLiteral(*row.property_value);
+    return ValueAsLiteral(*property_value);
   }
   if (expression.kind() == ExpressionKind::kLiteral) {
     if (!expression.literal().has_value()) {
@@ -404,6 +410,53 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
   return result;
 }
 
+StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
+    Snapshot& snapshot, std::vector<RuntimeRow> rows,
+    const internal::PreparedQueryPlan& plan) {
+  for (const internal::PreparedPropertyBinding& binding : plan.property_bindings) {
+    if (!binding.definition.has_value()) {
+      return Status::SchemaMismatch("query", "property binding was not prepared");
+    }
+    std::vector<RuntimeRow> bound_rows;
+    for (const RuntimeRow& row : rows) {
+      std::optional<FactRef> entity_ref;
+      if (plan.graph_source_slot && binding.source == *plan.graph_source_slot &&
+          row.graph_source.has_value()) {
+        entity_ref = FactRef(row.graph_source->part_id, FactFamily::kVertexState,
+                             PropertyId{}, row.graph_source->vertex_id.value);
+      } else if (plan.graph_edge_slot && binding.source == *plan.graph_edge_slot &&
+                 row.graph_edge.has_value()) {
+        entity_ref = FactRef(row.graph_edge->home_part_id, FactFamily::kEdgeState,
+                             PropertyId{}, row.graph_edge->edge_id.value);
+      } else if (plan.graph_destination_slot &&
+                 binding.source == *plan.graph_destination_slot &&
+                 row.graph_destination.has_value()) {
+        entity_ref = FactRef(row.graph_destination->part_id, FactFamily::kVertexState,
+                             PropertyId{}, row.graph_destination->vertex_id.value);
+      } else {
+        return Status::NotSupported(
+            "query", "graph property binding source is not an expansion endpoint");
+      }
+      const ValidTimeInterval entity_interval = row.effective.value_or(
+          ValidTimeInterval{row.point.value_or(ValidTime{0}), std::nullopt});
+      internal::StateRow entity{*entity_ref, entity_interval, std::nullopt};
+      auto properties = internal::PropertyBinder::BindIntervals(
+          snapshot, std::vector<internal::StateRow>{entity}, *binding.definition);
+      if (!properties.ok()) return properties.status();
+      for (const internal::BoundPropertyRow& property : properties.ValueOrDie()) {
+        auto effective = internal::Intersect(entity_interval, property.effective);
+        if (!effective.has_value()) continue;
+        RuntimeRow bound = row;
+        bound.effective = *effective;
+        bound.property_values[binding.output.slot.value] = property.value;
+        bound_rows.push_back(std::move(bound));
+      }
+    }
+    rows = std::move(bound_rows);
+  }
+  return rows;
+}
+
 StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation = nullptr) {
@@ -543,8 +596,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     }
   }
   if (!plan.property_bindings.empty()) {
-    auto bound = BindPropertyRows(snapshot, std::move(result),
-                                  plan.property_bindings.front());
+    auto bound = BindGraphPropertyRows(snapshot, std::move(result), plan);
     if (!bound.ok()) return bound.status();
     return std::move(bound).ConsumeValueOrDie();
   }
@@ -684,16 +736,21 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
       if (binding == plan.property_bindings.end()) {
         return Status::Corruption("query", "projected slot is unavailable");
       }
-      if (reservation != nullptr && row.property_value.has_value() &&
-          (row.property_value->type() == PhysicalType::kString ||
-           row.property_value->type() == PhysicalType::kBinary)) {
-        const auto& value = std::get<std::string>(row.property_value->data());
+      std::optional<Value> property_value = row.property_value;
+      if (const auto found = row.property_values.find(output.slot.value);
+          found != row.property_values.end()) {
+        property_value = found->second;
+      }
+      if (reservation != nullptr && property_value.has_value() &&
+          (property_value->type() == PhysicalType::kString ||
+           property_value->type() == PhysicalType::kBinary)) {
+        const auto& value = std::get<std::string>(property_value->data());
         if (Status status = reservation->ReserveMemory(value.size());
             !status.ok()) {
           return status;
         }
       }
-      const Status appended = AppendProperty(column, row.property_value);
+      const Status appended = AppendProperty(column, property_value);
       if (!appended.ok()) return appended;
     }
   }

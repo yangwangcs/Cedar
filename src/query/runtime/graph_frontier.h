@@ -74,6 +74,7 @@ class AdjacencyIndex {
   std::map<Key, std::vector<Entry>> postings_;
   CommitSeq built_through_;
   uint64_t generation_ = 0;
+  bool generation_complete_ = true;
   void Add(const Entry& entry);
 };
 

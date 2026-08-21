@@ -256,4 +256,144 @@ TEST(TemporalExpandTest, KHopBothUsesFrontierEndpointAndDeduplicatesDiamond) {
   std::filesystem::remove_all(path);
 }
 
+TEST(TemporalExpandTest, KHopCarriesCommonIntervalAcrossLayers) {
+  char pattern[] = "/tmp/cedar_temporal_khop_interval_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok());
+  const VertexRef one{PartId{0}, VertexId{1}};
+  const VertexRef two{PartId{0}, VertexId{2}};
+  const VertexRef three{PartId{0}, VertexId{3}};
+  const EdgeIdentity first{EdgeRef{PartId{0}, EdgeId{12}}, one, two, 1};
+  const EdgeIdentity second{EdgeRef{PartId{0}, EdgeId{23}}, two, three, 1};
+  auto txn = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(txn.ok());
+  for (const auto& vertex : {one, two, three})
+    ASSERT_TRUE(txn.ValueOrDie()->Assert(EntityFact::Vertex(vertex), ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(first, ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Retract(EntityFact::Edge(first.edge_ref()), ValidTime{10}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(second, ValidTime{5}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Retract(EntityFact::Edge(second.edge_ref()), ValidTime{15}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Commit().ok());
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  const QueryDeltaView delta{CommitSeq{0}, snapshot.ValueOrDie().commit_seq(),
+                             {}, {first, second}, {}, CommitSeq{}};
+  GraphFrontierOptions options{nullptr, &delta, 2};
+  options.adjacency_seek = [&delta](const std::vector<VertexRef>&,
+                                    ExpandDirection,
+                                    std::optional<uint64_t>) {
+    return StatusOr<std::vector<EdgeIdentity>>(delta.edge_identities);
+  };
+  GraphExpansionRequest request{{one}, ValidTimeInterval{ValidTime{0}, ValidTime{20}},
+                                ExpandDirection::kOut, std::nullopt};
+  auto result = KHopExpand(snapshot.ValueOrDie(), request, options);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().labels.size(), 2U);
+  EXPECT_EQ(result.ValueOrDie().labels[1].vertex, three);
+  EXPECT_EQ(result.ValueOrDie().labels[1].effective,
+            (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
+  database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
+TEST(TemporalExpandTest, AdjacencyGenerationMismatchFallsBackInsteadOfEmpty) {
+  const VertexRef source{PartId{0}, VertexId{1}};
+  const VertexRef target{PartId{0}, VertexId{2}};
+  const EdgeIdentity identity{EdgeRef{PartId{0}, EdgeId{12}}, source, target, 1};
+  QueryDeltaView delta{CommitSeq{0}, CommitSeq{7}, {}, {identity}, {}, CommitSeq{}};
+  auto index = std::make_shared<AdjacencyIndex>();
+  ASSERT_TRUE(index->ApplyDelta(delta, 3).ok());
+  auto result = index->Seek({source}, ExpandDirection::kOut, std::nullopt,
+                            CommitSeq{7}, 4, nullptr);
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsNotFound());
+  ASSERT_TRUE(index->ApplyDelta(delta, 4).ok());
+  result = index->Seek({source}, ExpandDirection::kOut, std::nullopt,
+                       CommitSeq{7}, 4, nullptr);
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsNotFound());
+}
+
+TEST(TemporalExpandTest, GraphMaterializesSourceEdgeAndDestinationProperties) {
+  char pattern[] = "/tmp/cedar_temporal_graph_properties_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok());
+  ASSERT_TRUE(database.ValueOrDie()
+                  ->RegisterProperty(PropertyDefinition{
+                      PropertyId{7}, 0, "source_score", PropertyEntityKind::kVertex,
+                      PhysicalType::kInt64, 4096})
+                  .ok());
+  ASSERT_TRUE(database.ValueOrDie()
+                  ->RegisterProperty(PropertyDefinition{
+                      PropertyId{8}, 0, "weight", PropertyEntityKind::kEdge,
+                      PhysicalType::kInt64, 4096})
+                  .ok());
+  ASSERT_TRUE(database.ValueOrDie()
+                  ->RegisterProperty(PropertyDefinition{
+                      PropertyId{9}, 0, "destination_score", PropertyEntityKind::kVertex,
+                      PhysicalType::kInt64, 4096})
+                  .ok());
+  const VertexRef source{PartId{0}, VertexId{1}};
+  const VertexRef target{PartId{0}, VertexId{2}};
+  const EdgeRef edge{PartId{0}, EdgeId{12}};
+  auto txn = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(EntityFact::Vertex(source), ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(EntityFact::Vertex(target), ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(EdgeIdentity{edge, source, target, 1},
+                                       ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Set(PropertyFact::Vertex(source, PropertyId{7}),
+                                    ValidTime{0}, Value::Int64(11)).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Set(PropertyFact::Edge(edge, PropertyId{8}),
+                                    ValidTime{0}, Value::Int64(22)).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Set(PropertyFact::Vertex(target, PropertyId{9}),
+                                    ValidTime{0}, Value::Int64(33)).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Commit().ok());
+  Slot<VertexRef> source_slot = Slot<VertexRef>::Named("source");
+  Slot<EdgeRef> edge_slot = Slot<EdgeRef>::Named("edge");
+  Slot<VertexRef> target_slot = Slot<VertexRef>::Named("target");
+  OptionalSlot<int64_t> source_value = OptionalSlot<int64_t>::Named("source_value");
+  OptionalSlot<int64_t> edge_value = OptionalSlot<int64_t>::Named("edge_value");
+  OptionalSlot<int64_t> target_value = OptionalSlot<int64_t>::Named("target_value");
+  auto source_query = Query::Vertices(
+      source_slot, History{ValidTimeInterval{ValidTime{0}, ValidTime{10}}});
+  ASSERT_TRUE(source_query.ok());
+  auto expanded = source_query.ValueOrDie().Expand(
+      ExpandSpec{source_slot, edge_slot, target_slot, ExpandDirection::kOut});
+  ASSERT_TRUE(expanded.ok());
+  auto with_source = expanded.ValueOrDie().BindVertexProperty(
+      source_slot, PropertyId{7}, source_value);
+  ASSERT_TRUE(with_source.ok());
+  auto with_edge = with_source.ValueOrDie().BindEdgeProperty(
+      edge_slot, PropertyId{8}, edge_value);
+  ASSERT_TRUE(with_edge.ok());
+  auto with_target = with_edge.ValueOrDie().BindVertexProperty(
+      target_slot, PropertyId{9}, target_value);
+  ASSERT_TRUE(with_target.ok());
+  auto query = with_target.ValueOrDie().Select(
+      {Project(source_slot), Project(edge_slot), Project(target_slot),
+       Project(source_value), Project(edge_value), Project(target_value)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database.ValueOrDie()->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(source_value, 0), 11);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(edge_value, 0), 22);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(target_value, 0), 33);
+  database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
 }  // namespace cedar::internal

@@ -23,6 +23,9 @@ struct CoverageRequest {
   uint64_t entity_max_exclusive = UINT64_MAX;
   ValidTimeInterval valid_time;
   CommitSeq snapshot_seq;
+  std::optional<uint64_t> generation_id;
+  std::optional<CommitSeq> expected_base_seq;
+  std::string database_identity;
 };
 
 struct ProjectionSegmentInput {

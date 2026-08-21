@@ -210,11 +210,23 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
   if (!enabled_ || !current_ || request.snapshot_seq.value < current_->manifest.base_seq.value) {
     return Status::NotFound("projection store", "coverage is unavailable");
   }
+  if (request.generation_id && *request.generation_id != current_->manifest.generation_id) {
+    return Status::Conflict("projection store", "projection generation is no longer current");
+  }
+  if (request.expected_base_seq && *request.expected_base_seq != current_->manifest.base_seq) {
+    return Status::Conflict("projection store", "projection base changed");
+  }
+  if (!request.database_identity.empty() && request.database_identity != current_->manifest.database_identity) {
+    return Status::IdentityConflict("projection store", "projection identity changed");
+  }
   std::vector<ProjectionChain> result;
   for (const auto& region : current_->manifest.regions) {
     if (region.kind != request.kind || region.part_id != request.part_id ||
         region.property_id != request.property_id || region.schema_epoch != request.schema_epoch ||
-        region.entity_min > request.entity_min || region.entity_max_exclusive < request.entity_max_exclusive) continue;
+        region.entity_min > request.entity_min || region.entity_max_exclusive < request.entity_max_exclusive ||
+        region.valid_time.from.value > request.valid_time.from.value ||
+        (region.valid_time.to && (!request.valid_time.to ||
+                                  region.valid_time.to->value < request.valid_time.to->value))) continue;
     for (const auto& segment : region.segments) {
       std::ifstream in(fs::path(projections_path_) / segment.filename, std::ios::binary);
       if (!in) return Status::IOError("projection store", "segment read failed");

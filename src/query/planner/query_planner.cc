@@ -206,6 +206,13 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
                                               : std::optional<ValidTime>(ValidTime{region_to})},
                         region.segments.empty() ? std::nullopt : std::optional<uint64_t>(context.projections.generation_id),
                         region.segments.empty() ? std::nullopt : std::optional<CommitSeq>(context.projections.base_seq)};
+    slice.kind = region.kind;
+    slice.part_id = region.part_id;
+    slice.property_id = region.property_id;
+    slice.schema_epoch = region.schema_epoch;
+    slice.entity_min = region.entity_min;
+    slice.entity_max_exclusive = region.entity_max_exclusive;
+    slice.database_identity = context.projections.database_identity;
     if (context.projections.base_seq.value > context.snapshot_seq.value) {
       return Status::Corruption("query planner", "projection base is newer than snapshot");
     }

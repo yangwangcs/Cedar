@@ -298,8 +298,10 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
 StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
   StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan);
+  if (!rows.ok()) return rows.status();
   if (plan.physical_plan && plan.projection_reader) {
     auto derived = ReadProjectionRows(plan);
+    if (!derived.ok() && !derived.status().IsNotFound()) return derived.status();
     if (derived.ok()) {
       std::vector<RuntimeRow> combined;
       for (const auto& slice : plan.physical_plan->coverage_slices) {

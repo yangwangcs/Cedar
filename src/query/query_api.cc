@@ -171,14 +171,17 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
           return Status::NotFound("query", "projection store is unavailable");
         }
         internal::CoverageRequest request;
-        request.kind = family == FactFamily::kEdgeState
-                           ? internal::ProjectionKind::kAdjacency
-                           : internal::ProjectionKind::kState;
-        request.part_id = PartId{0};
-        request.entity_min = 0;
-        request.entity_max_exclusive = UINT64_MAX;
+        request.kind = slice.kind;
+        request.part_id = slice.part_id;
+        request.property_id = slice.property_id;
+        request.schema_epoch = slice.schema_epoch;
+        request.entity_min = slice.entity_min;
+        request.entity_max_exclusive = slice.entity_max_exclusive;
         request.valid_time = slice.interval;
         request.snapshot_seq = snapshot_seq;
+        request.generation_id = slice.projection_generation;
+        request.expected_base_seq = slice.projection_base;
+        request.database_identity = slice.database_identity;
         return db->projection_store->ReadChains(request);
       };
       return internal::QueryRuntime::Execute(

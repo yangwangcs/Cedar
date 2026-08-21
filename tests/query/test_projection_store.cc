@@ -91,11 +91,16 @@ TEST_F(ProjectionStoreTest, ReadsPublishedChainsForRuntimeProjectionSlice) {
   request.entity_max_exclusive = 2;
   request.valid_time = {ValidTime{0}, std::nullopt};
   request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.expected_base_seq = CommitSeq{10};
+  request.database_identity = "test-db";
   auto chains = opened.ValueOrDie()->ReadChains(request);
   ASSERT_TRUE(chains.ok()) << chains.status().ToString();
   ASSERT_EQ(chains.ValueOrDie().size(), 1U);
   ASSERT_EQ(chains.ValueOrDie().front().intervals.size(), 1U);
   EXPECT_EQ(chains.ValueOrDie().front().intervals.front().entity_id, 1U);
+  request.generation_id = 9;
+  EXPECT_TRUE(opened.ValueOrDie()->ReadChains(request).status().IsConflict());
 }
 
 TEST_F(ProjectionStoreTest, OldReaderPinsRetiredGeneration) {

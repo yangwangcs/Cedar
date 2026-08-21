@@ -38,6 +38,13 @@ struct CoverageSlice {
   ValidTimeInterval interval;
   std::optional<uint64_t> projection_generation;
   std::optional<CommitSeq> projection_base;
+  ProjectionKind kind = ProjectionKind::kState;
+  PartId part_id;
+  std::optional<PropertyId> property_id;
+  uint32_t schema_epoch = 0;
+  uint64_t entity_min = 0;
+  uint64_t entity_max_exclusive = UINT64_MAX;
+  std::string database_identity;
   bool operator==(const CoverageSlice&) const = default;
 };
 
@@ -140,12 +147,16 @@ class QueryPlanner {
 };
 
 inline CoverageSlice Projection(ValidTimeInterval interval) {
-  return {CoverageSource::kProjection, std::move(interval), std::nullopt,
-          std::nullopt};
+  CoverageSlice slice;
+  slice.source = CoverageSource::kProjection;
+  slice.interval = std::move(interval);
+  return slice;
 }
 inline CoverageSlice Canonical(ValidTimeInterval interval) {
-  return {CoverageSource::kCanonical, std::move(interval), std::nullopt,
-          std::nullopt};
+  CoverageSlice slice;
+  slice.source = CoverageSource::kCanonical;
+  slice.interval = std::move(interval);
+  return slice;
 }
 
 }  // namespace cedar::internal

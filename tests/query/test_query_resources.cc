@@ -126,6 +126,20 @@ TEST(QueryScratchTest, WritesAndReadsVerifiedRun) {
   EXPECT_FALSE(std::filesystem::exists(scratch.query_directory()));
 }
 
+TEST(QueryScratchTest, EnforcesReadAndWriteRateWindows) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-scratch-rate";
+  std::filesystem::remove_all(root);
+  QueryScratch scratch(root, "instance", "query", 1024);
+  scratch.SetRateLimits(4, 4);
+  EXPECT_TRUE(scratch.WriteRun("too-large", "12345").status().IsResourceExhausted());
+  scratch.SetRateLimits(4, 0);
+  auto run = scratch.WriteRun("run-0", "12345");
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_TRUE(scratch.ReadRun(run.ValueOrDie()).status().IsResourceExhausted());
+  EXPECT_TRUE(scratch.Cleanup().ok());
+}
+
 TEST(QueryScratchTest, RejectsPathEscape) {
   const auto root = std::filesystem::temp_directory_path() / "cedar-task11-scratch-escape";
   std::filesystem::remove_all(root);

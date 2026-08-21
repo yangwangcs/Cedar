@@ -1290,6 +1290,13 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
     scratch = std::make_unique<QueryScratch>(
         scratch_root, scratch_instance, query_id, options.budget.scratch_bytes,
         scratch_free_reserve);
+    const uint64_t read_rate = resource_pool == nullptr
+                                   ? 0
+                                   : resource_pool->options().read_bytes_per_second;
+    const uint64_t scratch_rate = resource_pool == nullptr
+                                      ? 0
+                                      : resource_pool->options().scratch_bytes_per_second;
+    scratch->SetRateLimits(read_rate, scratch_rate);
   }
   return QueryCursor(std::make_unique<QueryCursor::State>(
       plan, std::move(snapshot), options,

@@ -15,13 +15,14 @@
   releases every dimension through reservation RAII. Analytical admissions
   honor `reserved_interactive_workers` while interactive/auto admissions retain
   the full worker pool.
+- `QueryScratch` now enforces one-second read and write byte windows when rate
+  limits are configured; runtime analytical scratch inherits the resource-pool
+  read/scratch rates.
 
 ## Remaining review items
 
 The following Important findings are not fully closed in this change:
 
-- Scratch I/O rate limits are still configured but are not enforced through a
-  time-window token bucket for `QueryScratch` writes/reads.
 - Canonical property materialization and column builders estimate string and
   binary output, but the property binder can allocate payloads before a
   reservation is taken; a reservation-aware binder/column append path is

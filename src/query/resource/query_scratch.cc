@@ -1,6 +1,7 @@
 #include "query/resource/query_scratch.h"
 
 #include <array>
+#include <chrono>
 #include <fstream>
 #include <limits>
 
@@ -34,7 +35,8 @@ QueryScratch::QueryScratch(std::filesystem::path database_root,
     : database_root_(std::move(database_root)),
       query_dir_(database_root_ / "query" / "scratch" / instance / query_id),
       query_id_(std::move(query_id)), disk_budget_bytes_(disk_budget_bytes),
-      reservation_(reservation) {}
+      reservation_(reservation),
+      rate_window_start_(std::chrono::steady_clock::now()) {}
 
 QueryScratch::QueryScratch(std::filesystem::path database_root,
                            std::string instance, std::string query_id,
@@ -53,6 +55,36 @@ Status QueryScratch::ValidateChild(const std::string& name) const {
       std::filesystem::is_symlink(query_dir_ / name)) {
     return Status::InvalidArgument("query scratch", "symlink child is not allowed");
   }
+  return Status::OK();
+}
+
+void QueryScratch::SetRateLimits(uint64_t read_bytes_per_second,
+                                 uint64_t scratch_bytes_per_second) {
+  std::lock_guard<std::mutex> lock(rate_mutex_);
+  read_bytes_per_second_ = read_bytes_per_second;
+  scratch_bytes_per_second_ = scratch_bytes_per_second;
+  rate_window_start_ = std::chrono::steady_clock::now();
+  rate_read_bytes_ = 0;
+  rate_scratch_bytes_ = 0;
+}
+
+Status QueryScratch::ConsumeRate(uint64_t bytes, bool read) const {
+  const uint64_t limit = read ? read_bytes_per_second_ : scratch_bytes_per_second_;
+  if (limit == 0 || bytes == 0) return Status::OK();
+  std::lock_guard<std::mutex> lock(rate_mutex_);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - rate_window_start_ >= std::chrono::seconds(1)) {
+    rate_window_start_ = now;
+    rate_read_bytes_ = 0;
+    rate_scratch_bytes_ = 0;
+  }
+  uint64_t* used = read ? &rate_read_bytes_ : &rate_scratch_bytes_;
+  if (bytes > limit || *used > limit - bytes) {
+    return Status::ResourceExhausted(
+        "query scratch", read ? "read_bytes_per_second rate exhausted"
+                               : "scratch_bytes_per_second rate exhausted");
+  }
+  *used += bytes;
   return Status::OK();
 }
 
@@ -107,6 +139,7 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
   if (bytes > disk_budget_bytes_ || written_bytes_ > disk_budget_bytes_ - bytes) {
     return Status::ResourceExhausted("query scratch", "scratch_bytes budget exhausted");
   }
+  if (Status status = ConsumeRate(bytes, false); !status.ok()) return status;
   if (reservation_ != nullptr) {
     Status status = reservation_->ReserveScratch(bytes);
     if (!status.ok()) return status;
@@ -172,6 +205,7 @@ StatusOr<std::string> QueryScratch::ReadRun(const std::filesystem::path& path) c
   if (!Read(in, &length) || file_size < fixed ||
       length > std::numeric_limits<size_t>::max() ||
       length > file_size - fixed) return Status::Corruption("query scratch", "scratch length invalid");
+  if (Status status = ConsumeRate(length, true); !status.ok()) return status;
   std::string payload(static_cast<size_t>(length), '\0');
   in.read(payload.data(), payload.size());
   uint32_t checksum = 0;

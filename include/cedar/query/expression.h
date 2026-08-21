@@ -33,7 +33,11 @@ template <> constexpr QueryType QueryTypeOf<int32_t>() { return QueryType::kInt3
 template <> constexpr QueryType QueryTypeOf<int64_t>() { return QueryType::kInt64; }
 template <> constexpr QueryType QueryTypeOf<float>() { return QueryType::kFloat32; }
 template <> constexpr QueryType QueryTypeOf<double>() { return QueryType::kFloat64; }
+template <> constexpr QueryType QueryTypeOf<Timestamp64>() {
+  return QueryType::kTimestamp64;
+}
 template <> constexpr QueryType QueryTypeOf<std::string>() { return QueryType::kString; }
+template <> constexpr QueryType QueryTypeOf<Binary>() { return QueryType::kBinary; }
 template <> constexpr QueryType QueryTypeOf<VertexRef>() { return QueryType::kVertexRef; }
 template <> constexpr QueryType QueryTypeOf<EdgeRef>() { return QueryType::kEdgeRef; }
 template <> constexpr QueryType QueryTypeOf<ValidTime>() { return QueryType::kValidTime; }
@@ -47,21 +51,28 @@ template <typename T>
 class OptionalExpr;
 template <typename T, bool Optional>
 class Slot;
+template <typename T>
+class Parameter;
 
 template <typename T>
 Expr<T> ValueOf(const Slot<T, false>& slot);
 template <typename T>
 OptionalExpr<T> ValueOf(const Slot<T, true>& slot);
+template <typename T>
+Expr<T> ValueOf(const Parameter<T>& parameter);
 
 namespace detail {
 
 using ExpressionLiteral = std::variant<bool, int32_t, int64_t, float, double,
-                                       std::string, VertexRef, EdgeRef,
-                                       ValidTime, ValidDuration, CommitSeq,
+                                       Timestamp64, std::string, Binary,
+                                       VertexRef, EdgeRef, ValidTime,
+                                       ValidDuration, CommitSeq,
                                        ValidTimeInterval>;
 
 std::shared_ptr<const internal::ExpressionNode> MakeSlotExpression(
-    QueryType type, SlotId slot);
+    QueryType type, SlotId slot, bool optional);
+std::shared_ptr<const internal::ExpressionNode> MakeParameterExpression(
+    QueryType type, ParameterId parameter);
 std::shared_ptr<const internal::ExpressionNode> MakeLiteralExpression(
     QueryType type, ExpressionLiteral literal);
 std::shared_ptr<const internal::ExpressionNode> MakeIsPresentExpression(
@@ -181,13 +192,19 @@ class ExpressionInspector {
 template <typename T>
 Expr<T> ValueOf(const Slot<T, false>& slot) {
   return internal::ExpressionInspector::Make<T>(
-      detail::MakeSlotExpression(slot.type(), slot.id()));
+      detail::MakeSlotExpression(slot.type(), slot.id(), false));
 }
 
 template <typename T>
 OptionalExpr<T> ValueOf(const Slot<T, true>& slot) {
   return internal::ExpressionInspector::MakeOptional<T>(
-      detail::MakeSlotExpression(slot.type(), slot.id()));
+      detail::MakeSlotExpression(slot.type(), slot.id(), true));
+}
+
+template <typename T>
+Expr<T> ValueOf(const Parameter<T>& parameter) {
+  return internal::ExpressionInspector::Make<T>(
+      detail::MakeParameterExpression(parameter.type(), parameter.id()));
 }
 
 template <typename T>

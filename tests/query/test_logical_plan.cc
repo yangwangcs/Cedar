@@ -249,5 +249,106 @@ TEST(LogicalPlanTest, StringExpressionBuildersAreLinkable) {
             std::string("cedar"));
 }
 
+TEST(LogicalPlanTest, RetainsDisplayNamesAcrossSchemaTransformations) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("vertex");
+  const Slot<EdgeRef> edge = Slot<EdgeRef>::Named("edge");
+  const Slot<VertexRef> destination = Slot<VertexRef>::Named("destination");
+  const OptionalSlot<Binary> payload = OptionalSlot<Binary>::Named("payload");
+
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  ASSERT_EQ(source.ValueOrDie().schema().columns().size(), 1U);
+  EXPECT_EQ(source.ValueOrDie().schema().columns()[0].name, "vertex");
+  const auto expanded = source.ValueOrDie().Expand(
+      ExpandSpec{vertex, edge, destination, ExpandDirection::kOut});
+  ASSERT_TRUE(expanded.ok()) << expanded.status().ToString();
+  ASSERT_EQ(expanded.ValueOrDie().schema().columns().size(), 3U);
+  EXPECT_EQ(expanded.ValueOrDie().schema().columns()[1].name, "edge");
+  EXPECT_EQ(expanded.ValueOrDie().schema().columns()[2].name, "destination");
+  const auto bound = expanded.ValueOrDie().BindVertexProperty(
+      vertex, PropertyId{7}, payload);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  ASSERT_EQ(bound.ValueOrDie().schema().columns().size(), 4U);
+  EXPECT_EQ(bound.ValueOrDie().schema().columns()[3].name, "payload");
+  const internal::LogicalPlanNode* binding =
+      internal::LogicalPlanInspector::Inspect(bound.ValueOrDie());
+  ASSERT_NE(binding, nullptr);
+  ASSERT_TRUE(binding->property_binding().has_value());
+  EXPECT_EQ(binding->property_binding()->output.name, "payload");
+  const auto projected = bound.ValueOrDie().Select(
+      {Project(vertex), Project(edge), Project(destination), Project(payload)});
+  ASSERT_TRUE(projected.ok()) << projected.status().ToString();
+
+  const std::vector<RowColumn>& columns = projected.ValueOrDie().schema().columns();
+  ASSERT_EQ(columns.size(), 4U);
+  EXPECT_EQ(columns[0].name, "vertex");
+  EXPECT_EQ(columns[1].name, "edge");
+  EXPECT_EQ(columns[2].name, "destination");
+  EXPECT_EQ(columns[3].name, "payload");
+}
+
+TEST(LogicalPlanTest, RepresentsParametersAsTypedExpressionLeaves) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const OptionalSlot<int64_t> age = OptionalSlot<int64_t>::Named("age");
+  const Parameter<int64_t> minimum = Parameter<int64_t>::Named("minimum");
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  const auto bound = source.ValueOrDie().BindVertexProperty(
+      vertex, PropertyId{7}, age);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto filtered = bound.ValueOrDie().Where(
+      Equal(ValueOf(age), ValueOf(minimum)));
+  ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+
+  const internal::ExpressionNode* predicate =
+      internal::LogicalPlanInspector::Inspect(filtered.ValueOrDie())->predicate().get();
+  ASSERT_NE(predicate, nullptr);
+  ASSERT_EQ(predicate->kind(), internal::ExpressionKind::kEqual);
+  ASSERT_EQ(predicate->children().size(), 2U);
+  const auto& parameter = predicate->children()[1];
+  EXPECT_EQ(parameter->kind(), internal::ExpressionKind::kParameter);
+  EXPECT_EQ(parameter->parameter(), minimum.id());
+  EXPECT_EQ(parameter->type(), QueryType::kInt64);
+}
+
+TEST(LogicalPlanTest, MapsEveryScalarPhysicalTypeToADistinctPublicType) {
+  static_assert(QueryTypeOf<bool>() == QueryType::kBool);
+  static_assert(QueryTypeOf<int32_t>() == QueryType::kInt32);
+  static_assert(QueryTypeOf<int64_t>() == QueryType::kInt64);
+  static_assert(QueryTypeOf<float>() == QueryType::kFloat32);
+  static_assert(QueryTypeOf<double>() == QueryType::kFloat64);
+  static_assert(QueryTypeOf<Timestamp64>() == QueryType::kTimestamp64);
+  static_assert(QueryTypeOf<std::string>() == QueryType::kString);
+  static_assert(QueryTypeOf<Binary>() == QueryType::kBinary);
+  static_assert(!std::is_convertible_v<uint64_t, Timestamp64>);
+  static_assert(!std::is_convertible_v<std::string, Binary>);
+
+  EXPECT_NE(QueryTypeOf<Timestamp64>(), QueryType::kInt64);
+  EXPECT_NE(QueryTypeOf<Binary>(), QueryType::kString);
+}
+
+TEST(LogicalPlanTest, RejectsPredicatesWithSlotsOfWrongPresenceCapability) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const OptionalSlot<VertexRef> optional_vertex =
+      OptionalSlot<VertexRef>::WithId(vertex.id());
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+
+  const auto filtered = source.ValueOrDie().Where(IsPresent(optional_vertex));
+  EXPECT_TRUE(filtered.status().IsInvalidArgument());
+}
+
+TEST(LogicalPlanTest, RejectsInvalidExpandDirection) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  const Slot<EdgeRef> edge = Slot<EdgeRef>::Named("e");
+  const Slot<VertexRef> destination = Slot<VertexRef>::Named("dst");
+  const auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+
+  const auto expanded = source.ValueOrDie().Expand(
+      ExpandSpec{vertex, edge, destination, static_cast<ExpandDirection>(99)});
+  EXPECT_TRUE(expanded.status().IsInvalidArgument());
+}
+
 }  // namespace
 }  // namespace cedar

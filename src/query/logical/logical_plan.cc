@@ -23,22 +23,26 @@ Status ValidateScope(const TemporalScope& scope) {
   }, scope);
 }
 
-bool Contains(const RowSchema& schema, const RowColumn& expected) {
-  return std::find(schema.columns().begin(), schema.columns().end(), expected) !=
-         schema.columns().end();
+const RowColumn* FindColumn(const RowSchema& schema, SlotId slot,
+                            QueryType type, bool optional) {
+  const auto found = std::find_if(
+      schema.columns().begin(), schema.columns().end(),
+      [slot, type, optional](const RowColumn& column) {
+        return column.slot == slot && column.type == type &&
+               column.optional == optional;
+      });
+  return found == schema.columns().end() ? nullptr : &*found;
+}
+
+bool Contains(const RowSchema& schema, SlotId slot, QueryType type,
+              bool optional) {
+  return FindColumn(schema, slot, type, optional) != nullptr;
 }
 
 bool HasSlotId(const RowSchema& schema, SlotId slot) {
   return std::any_of(schema.columns().begin(), schema.columns().end(),
                      [slot](const RowColumn& column) {
                        return column.slot == slot;
-                     });
-}
-
-bool ContainsSlot(const RowSchema& schema, SlotId slot, QueryType type) {
-  return std::any_of(schema.columns().begin(), schema.columns().end(),
-                     [slot, type](const RowColumn& column) {
-                       return column.slot == slot && column.type == type;
                      });
 }
 
@@ -95,7 +99,8 @@ std::shared_ptr<const internal::LogicalPlanNode> MakeScopedScan(
 Status ValidateExpressionSlots(const internal::ExpressionNode& expression,
                                const RowSchema& schema) {
   if (expression.kind() == internal::ExpressionKind::kSlot &&
-      !ContainsSlot(schema, expression.slot(), expression.type())) {
+      !Contains(schema, expression.slot(), expression.type(),
+                expression.optional())) {
     return Status::InvalidArgument("filter references a slot outside the input schema");
   }
   for (const auto& child : expression.children()) {
@@ -117,7 +122,7 @@ StatusOr<Query> Query::Vertices(Slot<VertexRef> vertex, TemporalScope scope) {
   }
   if (Status status = ValidateScope(scope); !status.ok()) return status;
   return Query(MakeScopedScan(internal::LogicalOpKind::kVertexScan,
-                              {vertex.id(), vertex.type(), false},
+                              {vertex.id(), vertex.name(), vertex.type(), false},
                               std::move(scope)));
 }
 
@@ -127,13 +132,13 @@ StatusOr<Query> Query::Edges(Slot<EdgeRef> edge, TemporalScope scope) {
   }
   if (Status status = ValidateScope(scope); !status.ok()) return status;
   return Query(MakeScopedScan(internal::LogicalOpKind::kEdgeScan,
-                              {edge.id(), edge.type(), false},
+                              {edge.id(), edge.name(), edge.type(), false},
                               std::move(scope)));
 }
 
 StatusOr<Query> Query::Expand(const ExpandSpec& spec) const {
-  if (!root_ ||
-      !Contains(schema(), {spec.source.id(), QueryType::kVertexRef, false}) ||
+  if (!root_ || !Contains(schema(), spec.source.id(), QueryType::kVertexRef,
+                          false) ||
       spec.edge.id().value == 0 || spec.destination.id().value == 0 ||
       spec.edge.id() == spec.destination.id() ||
       spec.source.id() == spec.edge.id() ||
@@ -143,13 +148,23 @@ StatusOr<Query> Query::Expand(const ExpandSpec& spec) const {
     return Status::InvalidArgument("expand slots are invalid or duplicate");
   }
   std::vector<RowColumn> columns = schema().columns();
-  columns.push_back({spec.edge.id(), spec.edge.type(), false});
-  columns.push_back({spec.destination.id(), spec.destination.type(), false});
-  const auto kind = spec.direction == ExpandDirection::kOut
-                        ? internal::LogicalOpKind::kExpandOut
-                    : spec.direction == ExpandDirection::kIn
-                        ? internal::LogicalOpKind::kExpandIn
-                        : internal::LogicalOpKind::kExpandBoth;
+  columns.push_back({spec.edge.id(), spec.edge.name(), spec.edge.type(), false});
+  columns.push_back(
+      {spec.destination.id(), spec.destination.name(), spec.destination.type(), false});
+  internal::LogicalOpKind kind;
+  switch (spec.direction) {
+    case ExpandDirection::kOut:
+      kind = internal::LogicalOpKind::kExpandOut;
+      break;
+    case ExpandDirection::kIn:
+      kind = internal::LogicalOpKind::kExpandIn;
+      break;
+    case ExpandDirection::kBoth:
+      kind = internal::LogicalOpKind::kExpandBoth;
+      break;
+    default:
+      return Status::InvalidArgument("expand direction is invalid");
+  }
   internal::LogicalPlanPayload payload;
   payload.expand_spec = spec;
   return Query(Append(kind, root_, RowSchema(std::move(columns)),
@@ -160,7 +175,7 @@ StatusOr<Query> Query::BindVertexPropertyImpl(SlotId vertex,
                                                PropertyId property,
                                                RowColumn output) const {
   if (!root_ || !property.valid() || output.slot.value == 0 ||
-      !Contains(schema(), {vertex, QueryType::kVertexRef, false}) ||
+      !Contains(schema(), vertex, QueryType::kVertexRef, false) ||
       HasSlotId(schema(), output.slot)) {
     return Status::InvalidArgument("property binding is invalid or duplicates a SlotId");
   }
@@ -191,10 +206,13 @@ StatusOr<Query> Query::Select(std::vector<Projection> projections) const {
   std::vector<RowColumn> columns;
   columns.reserve(projections.size());
   for (const Projection& projection : projections) {
-    if (!Contains(schema(), projection.column)) {
+    const RowColumn* input_column = FindColumn(
+        schema(), projection.column.slot, projection.column.type,
+        projection.column.optional);
+    if (input_column == nullptr) {
       return Status::InvalidArgument("projection is not in the input schema");
     }
-    columns.push_back(projection.column);
+    columns.push_back(*input_column);
   }
   if (Status status = ValidateColumns(columns); !status.ok()) return status;
   return Query(Append(internal::LogicalOpKind::kProject, root_,

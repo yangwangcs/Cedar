@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -24,6 +25,16 @@ struct ValidTimeInterval {
 struct ValidDuration {
   uint64_t value = 0;
   constexpr bool operator==(const ValidDuration&) const = default;
+};
+
+struct Timestamp64 {
+  uint64_t value = 0;
+  constexpr bool operator==(const Timestamp64&) const = default;
+};
+
+struct Binary {
+  std::string value;
+  bool operator==(const Binary&) const = default;
 };
 
 struct At {

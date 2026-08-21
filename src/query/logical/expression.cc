@@ -20,10 +20,19 @@ std::shared_ptr<const internal::ExpressionNode> MakeBinary(
 }  // namespace
 
 std::shared_ptr<const internal::ExpressionNode> MakeSlotExpression(
-    QueryType type, SlotId slot) {
+    QueryType type, SlotId slot, bool optional) {
   return std::make_shared<const internal::ExpressionNode>(
       internal::ExpressionKind::kSlot, type,
-      std::vector<std::shared_ptr<const internal::ExpressionNode>>{}, slot);
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{}, slot,
+      optional);
+}
+
+std::shared_ptr<const internal::ExpressionNode> MakeParameterExpression(
+    QueryType type, ParameterId parameter) {
+  return std::make_shared<const internal::ExpressionNode>(
+      internal::ExpressionKind::kParameter, type,
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{}, SlotId{},
+      false, parameter);
 }
 
 std::shared_ptr<const internal::ExpressionNode> MakeLiteralExpression(
@@ -31,7 +40,7 @@ std::shared_ptr<const internal::ExpressionNode> MakeLiteralExpression(
   return std::make_shared<const internal::ExpressionNode>(
       internal::ExpressionKind::kLiteral, type,
       std::vector<std::shared_ptr<const internal::ExpressionNode>>{}, SlotId{},
-      std::move(literal));
+      false, ParameterId{}, std::move(literal));
 }
 
 std::shared_ptr<const internal::ExpressionNode> MakeIsPresentExpression(

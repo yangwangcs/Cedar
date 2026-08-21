@@ -15,6 +15,7 @@ namespace cedar::internal {
 
 enum class ExpressionKind : uint8_t {
   kSlot,
+  kParameter,
   kLiteral,
   kIsPresent,
   kEqual,
@@ -29,13 +30,17 @@ class ExpressionNode {
   ExpressionNode(ExpressionKind kind, QueryType type,
                  std::vector<std::shared_ptr<const ExpressionNode>> children,
                  SlotId slot = {},
+                 bool optional = false,
+                 ParameterId parameter = {},
                  std::optional<detail::ExpressionLiteral> literal = std::nullopt)
       : kind_(kind), type_(type), children_(std::move(children)), slot_(slot),
-        literal_(std::move(literal)) {}
+        optional_(optional), parameter_(parameter), literal_(std::move(literal)) {}
   ExpressionKind kind() const { return kind_; }
   QueryType type() const { return type_; }
   const std::vector<std::shared_ptr<const ExpressionNode>>& children() const { return children_; }
   SlotId slot() const { return slot_; }
+  bool optional() const { return optional_; }
+  ParameterId parameter() const { return parameter_; }
   const std::optional<detail::ExpressionLiteral>& literal() const {
     return literal_;
   }
@@ -44,6 +49,8 @@ class ExpressionNode {
   const QueryType type_;
   const std::vector<std::shared_ptr<const ExpressionNode>> children_;
   const SlotId slot_;
+  const bool optional_;
+  const ParameterId parameter_;
   const std::optional<detail::ExpressionLiteral> literal_;
 };
 

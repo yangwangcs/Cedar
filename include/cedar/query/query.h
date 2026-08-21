@@ -5,6 +5,7 @@
 #define CEDAR_QUERY_QUERY_H_
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -15,21 +16,43 @@ namespace internal {
 class LogicalPlanInspector;
 class LogicalPlanNode;
 }
-struct RowColumn { SlotId slot; QueryType type; bool optional = false; bool operator==(const RowColumn&) const = default; };
+struct RowColumn {
+  SlotId slot;
+  std::string name;
+  QueryType type;
+  bool optional = false;
+
+  bool operator==(const RowColumn&) const = default;
+};
+
 class RowSchema {
  public:
   RowSchema() = default;
-  explicit RowSchema(std::vector<RowColumn> columns) : columns_(std::move(columns)) {}
+  explicit RowSchema(std::vector<RowColumn> columns)
+      : columns_(std::move(columns)) {}
+
   const std::vector<RowColumn>& columns() const { return columns_; }
+
  private:
   std::vector<RowColumn> columns_;
 };
-struct Projection { RowColumn column; };
-template <typename T, bool Optional> Projection Project(const Slot<T, Optional>& slot) {
-  return Projection{{slot.id(), slot.type(), Optional}};
+
+struct Projection {
+  RowColumn column;
+};
+
+template <typename T, bool Optional>
+Projection Project(const Slot<T, Optional>& slot) {
+  return Projection{{slot.id(), slot.name(), slot.type(), Optional}};
 }
+
 enum class ExpandDirection : uint8_t { kOut, kIn, kBoth };
-struct ExpandSpec { Slot<VertexRef> source; Slot<EdgeRef> edge; Slot<VertexRef> destination; ExpandDirection direction = ExpandDirection::kOut; };
+struct ExpandSpec {
+  Slot<VertexRef> source;
+  Slot<EdgeRef> edge;
+  Slot<VertexRef> destination;
+  ExpandDirection direction = ExpandDirection::kOut;
+};
 
 class Query {
  public:
@@ -37,15 +60,21 @@ class Query {
   static StatusOr<Query> Edges(Slot<EdgeRef> edge, TemporalScope scope);
   StatusOr<Query> Expand(const ExpandSpec& spec) const;
   template <typename T>
-  StatusOr<Query> BindVertexProperty(Slot<VertexRef> vertex, PropertyId property, OptionalSlot<T> output) const {
-    return BindVertexPropertyImpl(vertex.id(), property, {output.id(), output.type(), true});
+  StatusOr<Query> BindVertexProperty(Slot<VertexRef> vertex,
+                                     PropertyId property,
+                                     OptionalSlot<T> output) const {
+    return BindVertexPropertyImpl(
+        vertex.id(), property, {output.id(), output.name(), output.type(), true});
   }
   StatusOr<Query> Where(Expr<bool> predicate) const;
   StatusOr<Query> Select(std::vector<Projection> projections) const;
   const RowSchema& schema() const;
  private:
-  explicit Query(std::shared_ptr<const internal::LogicalPlanNode> root) : root_(std::move(root)) {}
-  StatusOr<Query> BindVertexPropertyImpl(SlotId vertex, PropertyId property, RowColumn output) const;
+  explicit Query(std::shared_ptr<const internal::LogicalPlanNode> root)
+      : root_(std::move(root)) {}
+
+  StatusOr<Query> BindVertexPropertyImpl(SlotId vertex, PropertyId property,
+                                         RowColumn output) const;
   std::shared_ptr<const internal::LogicalPlanNode> root_;
   friend class internal::LogicalPlanInspector;
 };

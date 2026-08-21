@@ -171,6 +171,32 @@ TEST(CoexistingPathTest, CandidateBeatingMultipleOverlappingWinnersReplacesAll) 
   EXPECT_EQ(result.ValueOrDie().paths.front().edges.front().edge_id.value, 63U);
 }
 
+TEST(CoexistingPathTest, GlobalWinnerFilterKeepsChainEndpointWitnesses) {
+  GraphFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.c);
+  // C is initially rejected by A. Once B replaces A, C is disjoint from the
+  // final winner and must be reconsidered by a global (rather than one-pass)
+  // filter. Intervals are half-open, so C and B only touch at 20.
+  graph.EdgePeriod({EdgeRef{PartId{0}, EdgeId{64}}, graph.a, graph.c, 1}, 0, 100);
+  graph.EdgePeriod({EdgeRef{PartId{0}, EdgeId{65}}, graph.a, graph.c, 1}, 10, 20);
+  graph.EdgePeriod({EdgeRef{PartId{0}, EdgeId{66}}, graph.a, graph.c, 1}, 20, 200);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  GraphExpansionRequest request{{graph.a}, {ValidTime{0}, ValidTime{200}},
+                                ExpandDirection::kOut, std::nullopt};
+  GraphFrontierOptions options; options.max_hops = 1;
+  auto result = CoexistingShortestPath(snapshot.ValueOrDie(), request, graph.c,
+                                       options);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().paths.size(), 2U);
+  EXPECT_EQ(result.ValueOrDie().paths[0].common,
+            (ValidTimeInterval{ValidTime{10}, ValidTime{20}}));
+  EXPECT_EQ(result.ValueOrDie().paths[1].common,
+            (ValidTimeInterval{ValidTime{20}, ValidTime{200}}));
+  EXPECT_EQ(result.ValueOrDie().paths[0].edges.front().edge_id.value, 65U);
+  EXPECT_EQ(result.ValueOrDie().paths[1].edges.front().edge_id.value, 66U);
+}
+
 TEST(CoexistingPathTest, PathColumnOffsetsDecodeUnequalVertexAndEdgeLengths) {
   PathValue one{{VertexRef{PartId{0}, VertexId{1}}}, {},
                 ValidTimeInterval{ValidTime{0}, ValidTime{4}}};

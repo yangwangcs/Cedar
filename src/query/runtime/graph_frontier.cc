@@ -4,6 +4,7 @@
 #include "query/runtime/graph_frontier.h"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <map>
 #include <set>
@@ -689,28 +690,26 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
         }
         const ValidTimeInterval common = traversal.effective;
         auto& existing = by_vertex[VertexKey{destination}];
-        bool dominated = false;
-        for (uint64_t existing_id : existing) {
-          const CoexistingLabel& label = result.labels[existing_id];
-          if (label.depth <= depth && IntervalContains(label.common, common)) {
-            dominated = true;
-            break;
+        const bool target_candidate = destination == target;
+        if (!target_candidate) {
+          bool dominated = false;
+          for (uint64_t existing_id : existing) {
+            const CoexistingLabel& label = result.labels[existing_id];
+            if (label.depth <= depth && IntervalContains(label.common, common)) {
+              dominated = true;
+              break;
+            }
           }
+          if (dominated) continue;
+          existing.erase(std::remove_if(existing.begin(), existing.end(),
+                                        [&](uint64_t existing_id) {
+            const CoexistingLabel& label = result.labels[existing_id];
+            const bool remove = depth <= label.depth &&
+                                IntervalContains(common, label.common);
+            if (remove && existing_id < active.size()) active[existing_id] = false;
+            return remove;
+          }), existing.end());
         }
-        if (dominated) continue;
-        existing.erase(std::remove_if(existing.begin(), existing.end(),
-                                      [&](uint64_t existing_id) {
-          const CoexistingLabel& label = result.labels[existing_id];
-          const bool remove = depth <= label.depth &&
-                              IntervalContains(common, label.common);
-          if (remove && destination == target) {
-            target_labels.erase(std::remove(target_labels.begin(),
-                                            target_labels.end(), existing_id),
-                                target_labels.end());
-          }
-          if (remove && existing_id < active.size()) active[existing_id] = false;
-          return remove;
-        }), existing.end());
         if (Status status = ChargeCoexistingLabel(options); !status.ok())
           return status;
         const uint64_t id = result.labels.size();
@@ -731,13 +730,32 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
     frontier = std::move(next);
   }
 
-  // Keep one deterministic winner for each overlapping maximal witness while
-  // retaining independent disjoint intervals.
+  // Select winners globally. A candidate rejected by an earlier winner may
+  // become independent after that winner is replaced, so rejected candidates
+  // are re-evaluated whenever the winner set changes. This avoids making the
+  // result depend on the order of a chain of overlapping intervals.
   std::sort(target_labels.begin(), target_labels.end(), [&](uint64_t left, uint64_t right) {
-    return result.labels[left].common.from.value < result.labels[right].common.from.value;
+    if (result.labels[left].common.from.value != result.labels[right].common.from.value)
+      return result.labels[left].common.from.value < result.labels[right].common.from.value;
+    return left < right;
   });
+  auto better = [&](uint64_t left, uint64_t right) {
+    const uint64_t left_length = IntervalLength(result.labels[left].common);
+    const uint64_t right_length = IntervalLength(result.labels[right].common);
+    if (left_length != right_length) return left_length > right_length;
+    if (result.labels[left].depth != result.labels[right].depth)
+      return result.labels[left].depth < result.labels[right].depth;
+    if (LabelPathLess(result.labels, left, right)) return true;
+    if (LabelPathLess(result.labels, right, left)) return false;
+    return left < right;
+  };
+  std::deque<uint64_t> pending(target_labels.begin(), target_labels.end());
+  std::set<uint64_t> rejected;
   std::vector<uint64_t> winners;
-  for (uint64_t candidate : target_labels) {
+  while (!pending.empty()) {
+    const uint64_t candidate = pending.front();
+    pending.pop_front();
+    if (std::find(winners.begin(), winners.end(), candidate) != winners.end()) continue;
     std::vector<uint64_t> overlapping;
     for (uint64_t winner : winners) {
       if (IntervalOverlaps(result.labels[winner].common,
@@ -745,34 +763,31 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
         overlapping.push_back(winner);
       }
     }
-    if (overlapping.empty()) {
-      winners.push_back(candidate);
+    bool beats_all = true;
+    for (uint64_t winner : overlapping) {
+      if (!better(candidate, winner)) {
+        beats_all = false;
+        break;
+      }
+    }
+    if (!beats_all) {
+      rejected.insert(candidate);
       continue;
     }
-    auto better = [&](uint64_t left, uint64_t right) {
-      const uint64_t left_length = IntervalLength(result.labels[left].common);
-      const uint64_t right_length = IntervalLength(result.labels[right].common);
-      if (left_length != right_length) return left_length > right_length;
-      if (result.labels[left].depth != result.labels[right].depth)
-        return result.labels[left].depth < result.labels[right].depth;
-      return LabelPathLess(result.labels, left, right);
-    };
-    uint64_t best = candidate;
     for (uint64_t winner : overlapping) {
-      if (better(winner, best)) best = winner;
+      winners.erase(std::remove(winners.begin(), winners.end(), winner), winners.end());
+      pending.push_back(winner);
     }
-    if (best != candidate) continue;
-    winners.erase(std::remove_if(winners.begin(), winners.end(),
-                                 [&](uint64_t winner) {
-                                   return IntervalOverlaps(
-                                       result.labels[winner].common,
-                                       result.labels[candidate].common);
-                                 }),
-                  winners.end());
     winners.push_back(candidate);
+    // Any rejected candidate may have been blocked only by a winner removed
+    // above. Requeue all of them after every winner-set change.
+    for (uint64_t id : rejected) pending.push_back(id);
+    rejected.clear();
   }
   std::sort(winners.begin(), winners.end(), [&](uint64_t left, uint64_t right) {
-    return result.labels[left].common.from.value < result.labels[right].common.from.value;
+    if (result.labels[left].common.from.value != result.labels[right].common.from.value)
+      return result.labels[left].common.from.value < result.labels[right].common.from.value;
+    return left < right;
   });
   for (uint64_t id : winners) result.paths.push_back(ReconstructPath(result.labels, id));
   return result;

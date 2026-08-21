@@ -78,14 +78,15 @@ void EncodePayload(std::string* s, const std::vector<ProjectionInterval>& is,
   std::vector<uint32_t> ii, bi; for (const auto& i : is) ii.push_back(add(i.value)); for (const auto& b : bs) bi.push_back(add(b.value));
   std::string presence((is.size() + 7) / 8, '\0'), operations((bs.size() + 7) / 8, '\0'), ie, it, ito, be, bt;
   uint64_t previous_entity = 0, previous_time = 0;
-  for (size_t n = 0; n < is.size(); ++n) { P64(&ie, EncodeSignedDelta(is[n].entity_id, previous_entity)); previous_entity = is[n].entity_id; P64(&it, is[n].effective.from.value - previous_time); previous_time = is[n].effective.from.value; if (is[n].effective.to) presence[n / 8] |= char(1u << (n % 8)); P64(&ito, is[n].effective.to ? is[n].effective.to->value : 0); }
+  for (size_t n = 0; n < is.size(); ++n) { P64(&ie, EncodeSignedDelta(is[n].entity_id, previous_entity)); if (is[n].entity_id != previous_entity) previous_time = 0; previous_entity = is[n].entity_id; P64(&it, is[n].effective.from.value - previous_time); previous_time = is[n].effective.from.value; if (is[n].effective.to) presence[n / 8] |= char(1u << (n % 8)); P64(&ito, is[n].effective.to ? is[n].effective.to->value : 0); }
   previous_entity = previous_time = 0;
-  for (size_t n = 0; n < bs.size(); ++n) { P64(&be, EncodeSignedDelta(bs[n].entity_id, previous_entity)); previous_entity = bs[n].entity_id; P64(&bt, bs[n].time.value - previous_time); previous_time = bs[n].time.value; if (bs[n].operation == FactOperation::kPut) operations[n / 8] |= char(1u << (n % 8)); }
+  for (size_t n = 0; n < bs.size(); ++n) { P64(&be, EncodeSignedDelta(bs[n].entity_id, previous_entity)); if (bs[n].entity_id != previous_entity) previous_time = 0; previous_entity = bs[n].entity_id; P64(&bt, bs[n].time.value - previous_time); previous_time = bs[n].time.value; if (bs[n].operation == FactOperation::kPut) operations[n / 8] |= char(1u << (n % 8)); }
   P32(s, kPayloadMagic); P32(s, uint32_t(is.size())); P32(s, uint32_t(bs.size())); P32(s, uint32_t(dictionary.size()));
   for (const auto& value : dictionary) PutBlob(s, value);
   PutBlob(s, presence); PutBlob(s, operations); PutBlob(s, ie); PutBlob(s, it); PutBlob(s, ito); PutBlob(s, EncodeRle(ii)); PutBlob(s, be); PutBlob(s, bt); PutBlob(s, EncodeRle(bi));
 }
-Status DecodePayload(const std::string& s, size_t row_limit, ProjectionChain* c) {
+Status DecodePayload(const std::string& s, size_t row_limit, size_t* allocation_used,
+                     ProjectionChain* c) {
   size_t p = 0; uint32_t magic = 0, ni = 0, nb = 0, nd = 0;
   if (row_limit < sizeof(ProjectionInterval) || row_limit < sizeof(ProjectionBoundary))
     return Status::ResourceExhausted("projection", "row output budget exhausted");
@@ -98,8 +99,9 @@ Status DecodePayload(const std::string& s, size_t row_limit, ProjectionChain* c)
   std::vector<Value> dictionary; dictionary.reserve(nd);
   for (uint32_t n = 0; n < nd; ++n) {
     std::string encoded; if (!GetBlob(s, &p, &encoded)) return Status::Corruption("projection", "invalid value dictionary");
-    if (encoded.size() > row_limit) return Status::ResourceExhausted("projection", "dictionary exceeds budget");
-    auto value = Value::Decode(encoded); if (!value) return Status::Corruption("projection", "invalid dictionary value"); dictionary.push_back(*value);
+    size_t value_cost = sizeof(Value) + encoded.size();
+    if (value_cost > row_limit - std::min(row_limit, *allocation_used)) return Status::ResourceExhausted("projection", "dictionary exceeds budget");
+    auto value = Value::Decode(encoded); if (!value) return Status::Corruption("projection", "invalid dictionary value"); dictionary.push_back(*value); *allocation_used += value_cost;
   }
   std::string presence, operations, ie, it, ito, irle, be, bt, brle;
   if (!GetBlob(s, &p, &presence) || !GetBlob(s, &p, &operations) || !GetBlob(s, &p, &ie) || !GetBlob(s, &p, &it) || !GetBlob(s, &p, &ito) || !GetBlob(s, &p, &irle) || !GetBlob(s, &p, &be) || !GetBlob(s, &p, &bt) || !GetBlob(s, &p, &brle) || presence.size() != (ni + 7) / 8 || operations.size() != (nb + 7) / 8) return Status::Corruption("projection", "invalid column stream");
@@ -110,11 +112,11 @@ Status DecodePayload(const std::string& s, size_t row_limit, ProjectionChain* c)
   if (ie.size() != ni * 8 || it.size() != ni * 8 || ito.size() != ni * 8 || be.size() != nb * 8 || bt.size() != nb * 8) return Status::Corruption("projection", "invalid delta column");
   size_t ie_at = 0, it_at = 0, ito_at = 0, be_at = 0, bt_at = 0; uint64_t prev = 0, prev_entity = 0;
   for (uint32_t n = 0; n < ni; ++n) {
-    uint64_t entity_delta = 0, time_delta = 0, to = 0, entity = 0; if (!G64(ie, &ie_at, &entity_delta) || !G64(it, &it_at, &time_delta) || !G64(ito, &ito_at, &to) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid interval delta"); prev_entity = entity; prev += time_delta; bool has = (uint8_t(presence[n / 8]) & (1u << (n % 8))) != 0; if (has && to < prev || ii[n] >= dictionary.size()) return Status::Corruption("projection", "invalid interval range"); c->intervals.push_back({{ValidTime{prev}, has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt}, dictionary[ii[n]], prev_entity});
+    uint64_t entity_delta = 0, time_delta = 0, to = 0, entity = 0; if (!G64(ie, &ie_at, &entity_delta) || !G64(it, &it_at, &time_delta) || !G64(ito, &ito_at, &to) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || ii[n] >= dictionary.size()) return Status::Corruption("projection", "invalid interval delta"); if (entity != prev_entity) prev = 0; if (time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid interval time delta"); if (sizeof(ProjectionInterval) > row_limit - std::min(row_limit, *allocation_used)) return Status::ResourceExhausted("projection", "interval rows exceed budget"); *allocation_used += sizeof(ProjectionInterval) + dictionary[ii[n]].Encode().size(); prev_entity = entity; prev += time_delta; bool has = (uint8_t(presence[n / 8]) & (1u << (n % 8))) != 0; if (has && to < prev || ii[n] >= dictionary.size()) return Status::Corruption("projection", "invalid interval range"); c->intervals.push_back({{ValidTime{prev}, has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt}, dictionary[ii[n]], prev_entity});
   }
   prev = prev_entity = 0;
   for (uint32_t n = 0; n < nb; ++n) {
-    uint64_t entity_delta = 0, time_delta = 0, entity = 0; if (!G64(be, &be_at, &entity_delta) || !G64(bt, &bt_at, &time_delta) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || time_delta > UINT64_MAX - prev || bi[n] >= dictionary.size()) return Status::Corruption("projection", "invalid boundary delta"); prev_entity = entity; prev += time_delta; auto op = (uint8_t(operations[n / 8]) & (1u << (n % 8))) ? FactOperation::kPut : FactOperation::kDelete; c->boundaries.push_back({ValidTime{prev}, op, dictionary[bi[n]], prev_entity});
+    uint64_t entity_delta = 0, time_delta = 0, entity = 0; if (!G64(be, &be_at, &entity_delta) || !G64(bt, &bt_at, &time_delta) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || bi[n] >= dictionary.size()) return Status::Corruption("projection", "invalid boundary delta"); if (entity != prev_entity) prev = 0; if (time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid boundary time delta"); if (sizeof(ProjectionBoundary) > row_limit - std::min(row_limit, *allocation_used)) return Status::ResourceExhausted("projection", "boundary rows exceed budget"); *allocation_used += sizeof(ProjectionBoundary) + dictionary[bi[n]].Encode().size(); prev_entity = entity; prev += time_delta; auto op = (uint8_t(operations[n / 8]) & (1u << (n % 8))) ? FactOperation::kPut : FactOperation::kDelete; c->boundaries.push_back({ValidTime{prev}, op, dictionary[bi[n]], prev_entity});
   }
   return p == s.size() ? Status::OK() : Status::Corruption("projection", "trailing payload");
 }
@@ -142,17 +144,17 @@ StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, Compression
   auto hr = ValidRange(c.header.entity_min, c.header.entity_max_exclusive, c.header.valid_from_min.value, c.header.valid_to_max); if (!hr.ok()) return hr;
   uint64_t previous_time = 0, previous_entity = 0;
   for (const auto& interval : c.intervals) {
-    if (interval.effective.from.value < previous_time || interval.entity_id < previous_entity)
+    if (interval.entity_id < previous_entity || (interval.entity_id == previous_entity && interval.effective.from.value < previous_time))
       return Status::InvalidArgument("projection", "non-monotonic interval columns");
-    previous_time = interval.effective.from.value; previous_entity = interval.entity_id;
+    previous_time = interval.entity_id == previous_entity ? interval.effective.from.value : 0; previous_entity = interval.entity_id;
   }
   previous_time = previous_entity = 0;
   for (const auto& boundary : c.boundaries) {
-    if (boundary.time.value < previous_time || boundary.entity_id < previous_entity)
+    if (boundary.entity_id < previous_entity || (boundary.entity_id == previous_entity && boundary.time.value < previous_time))
       return Status::InvalidArgument("projection", "non-monotonic boundary columns");
     if (boundary.operation != FactOperation::kPut && boundary.operation != FactOperation::kDelete)
       return Status::InvalidArgument("projection", "unknown fact operation");
-    previous_time = boundary.time.value; previous_entity = boundary.entity_id;
+    previous_time = boundary.entity_id == previous_entity ? boundary.time.value : 0; previous_entity = boundary.entity_id;
   }
   for (const auto& interval : c.intervals)
     if (interval.value.Encode().size() > UINT32_MAX)
@@ -176,6 +178,13 @@ StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, Compression
       d.valid_from_min = c.header.valid_from_min;
       d.valid_to_max = c.header.valid_to_max;
     }
+    if (c.header.kind == ProjectionKind::kAdjacency) {
+      d.bloom_bits = 64;
+      d.bloom_hashes = 1;
+      d.bloom_mask = 0;
+      for (const auto& row : pages[i].intervals) d.bloom_mask |= 1ULL << (row.entity_id % 64);
+      for (const auto& row : pages[i].boundaries) d.bloom_mask |= 1ULL << (row.entity_id % 64);
+    }
     auto vd = ValidPage(d); if (!vd.ok()) return vd; d.offset = offset; d.compressed_bytes = uint32_t(cp.ValueOrDie().size()); d.uncompressed_bytes = uint32_t(raw.size()); d.row_count = uint32_t(pages[i].intervals.size() + pages[i].boundaries.size()); d.payload_crc32c = crc32c::Value(cp.ValueOrDie().data(), cp.ValueOrDie().size()); dirs.push_back(d); offset += cp.ValueOrDie().size(); payloads.push_back(cp.ConsumeValueOrDie()); }
   for (const auto& d : dirs) { P64(&out, d.offset); P32(&out, d.compressed_bytes); P32(&out, d.uncompressed_bytes); P32(&out, d.row_count); P64(&out, d.entity_min); P64(&out, d.entity_max_exclusive); P64(&out, d.valid_from_min.value); out.push_back(char(d.valid_to_max ? 1 : 0)); P64(&out, d.valid_to_max ? d.valid_to_max->value : 0); out.push_back(char(d.edge_type_min ? 1 : 0)); P64(&out, d.edge_type_min.value_or(0)); P64(&out, d.edge_type_max.value_or(0)); P32(&out, d.payload_crc32c); P64(&out, d.bloom_bits); out.push_back(char(d.bloom_hashes)); P64(&out, d.bloom_mask); }
   for (const auto& p : payloads) out.append(p); P32(&out, crc32c::Value(out.data(), out.size())); return out;
@@ -193,7 +202,7 @@ StatusOr<ProjectionChain> DecodeProjectionPageImpl(const std::string& b, size_t 
   c.header.generation_id = gen; c.header.base_seq = {base}; c.header.part_id = {part}; c.header.property_id = {prop}; c.header.schema_epoch = schema; c.header.entity_min = emin; c.header.entity_max_exclusive = emax; c.header.valid_from_min = {from}; c.header.valid_to_max = has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt; c.page_directory.reserve(count);
   for (uint32_t i = 0; i < count; ++i) { ProjectionPageDirectoryEntry d; uint8_t hp = 0, he = 0; uint64_t vf = 0, vt = 0, mn = 0, mx = 0; if (!G64(b, &p, &d.offset) || !G32(b, &p, &d.compressed_bytes) || !G32(b, &p, &d.uncompressed_bytes) || !G32(b, &p, &d.row_count) || !G64(b, &p, &d.entity_min) || !G64(b, &p, &d.entity_max_exclusive) || !G64(b, &p, &vf) || p >= b.size()) return Status::Corruption("projection", "truncated directory"); d.valid_from_min = {vf}; hp = uint8_t(b[p++]); if (hp > 1 || !G64(b, &p, &vt) || p >= b.size()) return Status::Corruption("projection", "invalid page flag"); he = uint8_t(b[p++]); if (he > 1 || !G64(b, &p, &mn) || !G64(b, &p, &mx) || !G32(b, &p, &d.payload_crc32c) || !G64(b, &p, &d.bloom_bits) || p >= b.size()) return Status::Corruption("projection", "truncated page metadata"); d.bloom_hashes = uint8_t(b[p++]); if (!G64(b, &p, &d.bloom_mask)) return Status::Corruption("projection", "truncated bloom metadata"); d.valid_to_max = hp ? std::optional<ValidTime>(ValidTime{vt}) : std::nullopt; if (he) { d.edge_type_min = mn; d.edge_type_max = mx; } auto vd = ValidPage(d); if (!vd.ok()) return vd; c.page_directory.push_back(d); }
   size_t start = kHeaderBytes + size_t(count) * kDirectoryBytes; auto valid = ValidDirectory(c.page_directory, start, b.size()); if (!valid.ok()) return valid; size_t fc_at = b.size() - 4; uint32_t fc = 0; if (!G32(b, &fc_at, &fc) || fc != crc32c::Value(b.data(), b.size() - 4)) return Status::Corruption("projection", "file CRC32C mismatch");
-  size_t used_bytes = 0, rows = 0; for (size_t page_index = 0; page_index < c.page_directory.size(); ++page_index) { if (only_page && page_index != *only_page) continue; const auto& d = c.page_directory[page_index]; size_t offset = size_t(d.offset); if (d.payload_crc32c != crc32c::Value(b.data() + offset, d.compressed_bytes)) return Status::Corruption("projection", "page payload CRC32C mismatch"); if (d.uncompressed_bytes > limit - std::min(limit, used_bytes)) return Status::ResourceExhausted("projection", "decoded bytes exceed remaining budget"); size_t remaining = limit - used_bytes; if (d.compressed_bytes > remaining) return Status::ResourceExhausted("projection", "compressed payload exceeds remaining budget"); auto raw = DecompressProjectionPayload(codec, b.substr(offset, d.compressed_bytes), std::min<size_t>(d.uncompressed_bytes, remaining)); if (!raw.ok()) return raw.status(); if (raw.ValueOrDie().size() != d.uncompressed_bytes) return Status::Corruption("projection", "decoded length mismatch"); size_t before = rows; auto ds = DecodePayload(raw.ValueOrDie(), limit - std::min(limit, rows), &c); if (!ds.ok()) return ds; rows = c.intervals.size() + c.boundaries.size(); if (rows - before != d.row_count) return Status::Corruption("projection", "directory row count mismatch"); used_bytes += d.uncompressed_bytes; }
+  size_t used_bytes = 0, allocation_used = 0, rows = 0; for (size_t page_index = 0; page_index < c.page_directory.size(); ++page_index) { if (only_page && page_index != *only_page) continue; const auto& d = c.page_directory[page_index]; size_t offset = size_t(d.offset); if (d.payload_crc32c != crc32c::Value(b.data() + offset, d.compressed_bytes)) return Status::Corruption("projection", "page payload CRC32C mismatch"); if (d.uncompressed_bytes > limit - std::min(limit, used_bytes) || d.compressed_bytes > limit - std::min(limit, used_bytes)) return Status::ResourceExhausted("projection", "payload exceeds remaining budget"); size_t remaining = limit - used_bytes; auto raw = DecompressProjectionPayload(codec, b.substr(offset, d.compressed_bytes), std::min<size_t>(d.uncompressed_bytes, remaining)); if (!raw.ok()) return raw.status(); if (raw.ValueOrDie().size() != d.uncompressed_bytes) return Status::Corruption("projection", "decoded length mismatch"); size_t before = rows; auto ds = DecodePayload(raw.ValueOrDie(), limit - std::min(limit, rows), &allocation_used, &c); if (!ds.ok()) return ds; rows = c.intervals.size() + c.boundaries.size(); if (rows - before != d.row_count) return Status::Corruption("projection", "directory row count mismatch"); used_bytes += d.uncompressed_bytes; }
   return c;
 }
 

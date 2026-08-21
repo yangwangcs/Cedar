@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "cedar/core/crc32c.h"
 #include "query/projection/projection_format.h"
 
 namespace cedar::internal {
@@ -21,8 +22,35 @@ ProjectionChain Fixture() {
   chain.intervals = {{{ValidTime{0}, ValidTime{30}}, Value::Int64(7)}};
   chain.boundaries = {{ValidTime{0}, FactOperation::kPut, Value::Int64(7)},
                       {ValidTime{10}, FactOperation::kPut, Value::Int64(7)}};
-  chain.page_directory = {{0, 0, 0, 1, 4, 9, ValidTime{0}, ValidTime{30}, 0}};
+  ProjectionPageDirectoryEntry page;
+  page.entity_min = 40;
+  page.entity_max_exclusive = 48;
+  page.valid_from_min = ValidTime{3};
+  page.valid_to_max = ValidTime{27};
+  page.edge_type_min = 100;
+  page.edge_type_max = 200;
+  chain.page_directory = {page};
   return chain;
+}
+
+void Put32At(std::string* bytes, size_t offset, uint32_t value) {
+  for (unsigned i = 0; i < 4; ++i) (*bytes)[offset + i] = static_cast<char>(value >> (8 * i));
+}
+
+void RefreshFileCrc(std::string* bytes) {
+  Put32At(bytes, bytes->size() - 4,
+          crc32c::Value(bytes->data(), bytes->size() - 4));
+}
+
+void RefreshHeaderCrc(std::string* bytes) {
+  Put32At(bytes, 77, crc32c::Value(bytes->data(), 77));
+  RefreshFileCrc(bytes);
+}
+
+std::string Bytes(std::initializer_list<unsigned char> values) {
+  std::string out;
+  for (unsigned char value : values) out.push_back(static_cast<char>(value));
+  return out;
 }
 
 TEST(ProjectionFormatTest, RoundTripsIntervalsAndLatentBoundaries) {
@@ -37,6 +65,12 @@ TEST(ProjectionFormatTest, RoundTripsIntervalsAndLatentBoundaries) {
   ASSERT_EQ(decoded.ValueOrDie().page_directory.size(), 1U);
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().row_count, 3U);
   EXPECT_GT(decoded.ValueOrDie().page_directory.front().compressed_bytes, 0U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().entity_min, 40U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().entity_max_exclusive, 48U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().valid_from_min.value, 3U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().valid_to_max->value, 27U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().edge_type_min, 100U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().edge_type_max, 200U);
 }
 
 TEST(ProjectionFormatTest, RejectsBitFlippedPayload) {
@@ -55,6 +89,77 @@ TEST(ProjectionFormatTest, RefusesToAllocatePastCallerBudget) {
   auto decoded = DecodeProjectionPage(encoded.ValueOrDie(), 1);
   ASSERT_FALSE(decoded.ok());
   EXPECT_TRUE(decoded.status().IsResourceExhausted());
+}
+
+TEST(ProjectionFormatTest, UncompressedBytesPastRemainingBudgetIsResourceExhausted) {
+  auto encoded = EncodeProjectionPage(Fixture(), CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  auto decoded = DecodeProjectionPage(encoded.ValueOrDie(), 10);
+  ASSERT_FALSE(decoded.ok());
+  EXPECT_TRUE(decoded.status().IsResourceExhausted()) << decoded.status().ToString();
+}
+
+TEST(ProjectionFormatTest, RejectsDirectoryRowCountMismatch) {
+  auto encoded = EncodeProjectionPage(Fixture(), CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok());
+  std::string bytes = encoded.ValueOrDie();
+  Put32At(&bytes, 81 + 16, 99);
+  RefreshFileCrc(&bytes);
+  auto decoded = DecodeProjectionPage(bytes);
+  ASSERT_FALSE(decoded.ok());
+  EXPECT_TRUE(decoded.status().IsCorruption()) << decoded.status().ToString();
+}
+
+TEST(ProjectionFormatTest, RejectsNonBooleanFlagsAndReversedRanges) {
+  auto encoded = EncodeProjectionPage(Fixture(), CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok());
+  std::string bad_header_flag = encoded.ValueOrDie();
+  bad_header_flag[64] = 2;
+  RefreshHeaderCrc(&bad_header_flag);
+  auto header_result = DecodeProjectionPage(bad_header_flag);
+  ASSERT_FALSE(header_result.ok());
+  EXPECT_TRUE(header_result.status().IsCorruption());
+
+  std::string bad_page_range = encoded.ValueOrDie();
+  // First directory entry: valid_to flag at 81 + 44, value starts at +45.
+  Put32At(&bad_page_range, 81 + 45, 1);
+  bad_page_range[81 + 44] = 1;
+  RefreshFileCrc(&bad_page_range);
+  auto page_result = DecodeProjectionPage(bad_page_range);
+  ASSERT_FALSE(page_result.ok());
+  EXPECT_TRUE(page_result.status().IsCorruption());
+}
+
+TEST(ProjectionFormatTest, CodecVectorsAndMalformedInputs) {
+  const std::string input("\0\x01\xff", 3);
+  auto delta = CompressProjectionPayload(CompressionCodec::kDelta, input);
+  ASSERT_TRUE(delta.ok());
+  EXPECT_EQ(delta.ValueOrDie(), std::string("\x03\0\x01\xfe", 4));
+  EXPECT_EQ(DecompressProjectionPayload(CompressionCodec::kDelta,
+                                        delta.ValueOrDie(), 3).ValueOrDie(), input);
+
+  auto packed = CompressProjectionPayload(CompressionCodec::kBitPacked,
+                                           std::string("\0\x01\x02\x03", 4));
+  ASSERT_TRUE(packed.ok());
+  EXPECT_EQ(packed.ValueOrDie(), std::string("\x04\x02\xe4", 3));
+  EXPECT_EQ(DecompressProjectionPayload(CompressionCodec::kBitPacked,
+                                        packed.ValueOrDie(), 4).ValueOrDie(),
+            std::string("\0\x01\x02\x03", 4));
+
+  auto rle = CompressProjectionPayload(CompressionCodec::kRle, "aaabb");
+  ASSERT_TRUE(rle.ok());
+  EXPECT_EQ(rle.ValueOrDie(), Bytes({5, 'a', 3, 'b', 2}));
+  auto dict = CompressProjectionPayload(CompressionCodec::kDictionary, "abca");
+  ASSERT_TRUE(dict.ok());
+  EXPECT_EQ(dict.ValueOrDie(), Bytes({4, 3, 'a', 'b', 'c', 0, 1, 2, 0}));
+
+  EXPECT_TRUE(DecompressProjectionPayload(CompressionCodec::kDelta, "\x80", 64)
+                  .status().IsCorruption());
+  EXPECT_TRUE(DecompressProjectionPayload(CompressionCodec::kRle, "\x01a\0", 64)
+                  .status().IsCorruption());
+  EXPECT_TRUE(DecompressProjectionPayload(CompressionCodec::kDictionary,
+                                           "\x01\x01a\x01", 64)
+                  .status().IsCorruption());
 }
 
 TEST(ProjectionFormatTest, RejectsUnknownFormatVersion) {

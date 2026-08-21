@@ -19,7 +19,8 @@ void PutVarint(std::string* out, uint64_t value) {
 }
 bool GetVarint(const std::string& in, size_t* at, uint64_t* value) {
   uint64_t result = 0;
-  for (unsigned shift = 0; shift < 64 && *at < in.size(); shift += 7) {
+  for (unsigned shift = 0; shift < 64; shift += 7) {
+    if (*at >= in.size()) return false;
     const uint8_t byte = static_cast<uint8_t>(in[(*at)++]);
     if (shift == 63 && byte > 1) return false;
     result |= uint64_t(byte & 0x7f) << shift;
@@ -100,7 +101,9 @@ StatusOr<std::string> TransformDecode(CompressionCodec codec,
                                        const std::string& input, size_t limit) {
   size_t at = 0;
   uint64_t count = 0;
-  if (!GetVarint(input, &at, &count) || count > limit)
+  if (!GetVarint(input, &at, &count))
+    return Status::Corruption("projection", "invalid length varint");
+  if (count > limit)
     return Status::ResourceExhausted("projection", "decoded bytes exceed budget");
   std::string out;
   out.reserve(static_cast<size_t>(count));
@@ -119,7 +122,7 @@ StatusOr<std::string> TransformDecode(CompressionCodec codec,
       if (at >= input.size()) return Status::Corruption("projection", "RLE payload truncated");
       const char byte = input[at++];
       uint64_t run = 0;
-      if (!GetVarint(input, &at, &run) || run > count - out.size())
+      if (!GetVarint(input, &at, &run) || run == 0 || run > count - out.size())
         return Status::Corruption("projection", "invalid RLE run");
       out.append(static_cast<size_t>(run), byte);
     }
@@ -130,12 +133,16 @@ StatusOr<std::string> TransformDecode(CompressionCodec codec,
     if (at >= input.size()) return Status::Corruption("projection", "bit-packed payload truncated");
     const uint8_t width = static_cast<uint8_t>(input[at++]);
     if (width > 8) return Status::Corruption("projection", "invalid bit width");
+    if (width != 0 && count > (std::numeric_limits<size_t>::max() - 7) / width)
+      return Status::ResourceExhausted("projection", "bit-packed size overflow");
     const size_t bytes = (static_cast<size_t>(count) * width + 7) / 8;
     if (bytes != input.size() - at) return Status::Corruption("projection", "bit-packed length mismatch");
     uint32_t bits = 0;
     unsigned used = 0;
     for (size_t i = 0; i < count; ++i) {
       while (used < width) {
+        if (at >= input.size())
+          return Status::Corruption("projection", "bit-packed payload truncated");
         bits |= uint32_t(static_cast<uint8_t>(input[at++])) << used;
         used += 8;
       }
@@ -193,6 +200,10 @@ StatusOr<std::string> DecompressProjectionPayload(CompressionCodec codec,
   if (limit > static_cast<size_t>(std::numeric_limits<int>::max())) {
     return Status::InvalidArgument("projection",
                                    "decode budget exceeds LZ4 limit");
+  }
+  if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return Status::ResourceExhausted("projection",
+                                     "compressed payload exceeds LZ4 limit");
   }
   std::string output(limit, '\0');
   const int decoded = LZ4_decompress_safe(input.data(), output.data(),

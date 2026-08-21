@@ -39,17 +39,21 @@ struct ProjectionPageDirectoryEntry {
   std::optional<uint64_t> edge_type_min;
   std::optional<uint64_t> edge_type_max;
   uint32_t payload_crc32c = 0;
+  uint64_t bloom_bits = 0;
+  uint8_t bloom_hashes = 0;
   bool operator==(const ProjectionPageDirectoryEntry&) const = default;
 };
 struct ProjectionInterval {
   ValidTimeInterval effective;
   Value value;
+  uint64_t entity_id = 0;
   bool operator==(const ProjectionInterval&) const = default;
 };
 struct ProjectionBoundary {
   ValidTime time;
   FactOperation operation;
   Value value;
+  uint64_t entity_id = 0;
   bool operator==(const ProjectionBoundary&) const = default;
 };
 struct ProjectionChain {
@@ -63,6 +67,9 @@ StatusOr<std::string> EncodeProjectionPage(const ProjectionChain&,
                                            CompressionCodec);
 StatusOr<ProjectionChain> DecodeProjectionPage(const std::string&,
                                                size_t allocation_limit =
-                                                   64ULL * 1024ULL * 1024ULL);
+                                               64ULL * 1024ULL * 1024ULL);
+StatusOr<ProjectionChain> ReadProjectionPage(const std::string&, size_t page_index,
+                                              size_t allocation_limit =
+                                                  64ULL * 1024ULL * 1024ULL);
 }  // namespace cedar::internal
 #endif

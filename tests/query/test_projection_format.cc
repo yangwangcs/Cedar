@@ -29,7 +29,12 @@ ProjectionChain Fixture() {
   page.valid_to_max = ValidTime{27};
   page.edge_type_min = 100;
   page.edge_type_max = 200;
+  page.bloom_bits = 64;
+  page.bloom_hashes = 2;
   chain.page_directory = {page};
+  chain.intervals[0].entity_id = 42;
+  chain.boundaries[0].entity_id = 42;
+  chain.boundaries[1].entity_id = 43;
   return chain;
 }
 
@@ -71,6 +76,10 @@ TEST(ProjectionFormatTest, RoundTripsIntervalsAndLatentBoundaries) {
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().valid_to_max->value, 27U);
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().edge_type_min, 100U);
   EXPECT_EQ(decoded.ValueOrDie().page_directory.front().edge_type_max, 200U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().bloom_bits, 64U);
+  EXPECT_EQ(decoded.ValueOrDie().page_directory.front().bloom_hashes, 2U);
+  EXPECT_EQ(decoded.ValueOrDie().intervals.front().entity_id, 42U);
+  EXPECT_EQ(decoded.ValueOrDie().boundaries.back().entity_id, 43U);
 }
 
 TEST(ProjectionFormatTest, RejectsBitFlippedPayload) {
@@ -194,12 +203,7 @@ TEST(ProjectionFormatTest, EncodesFixedWidthIntegersLittleEndian) {
 }
 
 TEST(ProjectionFormatTest, RoundTripsAllBoundedPageCodecs) {
-  for (CompressionCodec codec : {CompressionCodec::kNone,
-                                 CompressionCodec::kLz4,
-                                 CompressionCodec::kDelta,
-                                 CompressionCodec::kBitPacked,
-                                 CompressionCodec::kDictionary,
-                                 CompressionCodec::kRle}) {
+  for (CompressionCodec codec : {CompressionCodec::kNone, CompressionCodec::kLz4}) {
     auto encoded = EncodeProjectionPage(Fixture(), codec);
     ASSERT_TRUE(encoded.ok()) << static_cast<int>(codec) << ": "
                               << encoded.status().ToString();
@@ -209,6 +213,27 @@ TEST(ProjectionFormatTest, RoundTripsAllBoundedPageCodecs) {
     EXPECT_EQ(decoded.ValueOrDie().intervals, Fixture().intervals);
     EXPECT_EQ(decoded.ValueOrDie().boundaries, Fixture().boundaries);
   }
+}
+
+TEST(ProjectionFormatTest, FileCodecRejectsColumnTransforms) {
+  for (CompressionCodec codec : {CompressionCodec::kDelta, CompressionCodec::kBitPacked,
+                                 CompressionCodec::kDictionary, CompressionCodec::kRle}) {
+    auto encoded = EncodeProjectionPage(Fixture(), codec);
+    ASSERT_FALSE(encoded.ok());
+    EXPECT_TRUE(encoded.status().IsNotSupportedError());
+  }
+}
+
+TEST(ProjectionFormatTest, ReadsOnePageWithoutDecodingOtherPages) {
+  ProjectionChain chain = Fixture();
+  chain.page_directory.resize(2);
+  chain.intervals.push_back({{ValidTime{30}, ValidTime{40}}, Value::Int64(8), 99});
+  auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok());
+  auto page = ReadProjectionPage(encoded.ValueOrDie(), 0);
+  ASSERT_TRUE(page.ok()) << page.status().ToString();
+  ASSERT_EQ(page.ValueOrDie().intervals.size(), 2U);
+  EXPECT_EQ(page.ValueOrDie().intervals.front().entity_id, 42U);
 }
 
 TEST(ProjectionFormatTest, EncodesMultiplePagesAndRejectsTruncatedDirectory) {

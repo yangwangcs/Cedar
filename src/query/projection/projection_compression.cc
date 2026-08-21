@@ -179,6 +179,8 @@ StatusOr<std::string> CompressProjectionPayload(CompressionCodec codec,
     return Status::ResourceExhausted("projection", "payload exceeds LZ4 limit");
   }
   const int bound = LZ4_compressBound(static_cast<int>(input.size()));
+  if (bound <= 0)
+    return Status::ResourceExhausted("projection", "LZ4 compression bound overflow");
   std::string output(static_cast<size_t>(bound), '\0');
   const int encoded = LZ4_compress_default(
       input.data(), output.data(), static_cast<int>(input.size()), bound);

@@ -299,6 +299,23 @@ TEST(ProjectionFormatTest, RejectsNonZeroColumnPaddingBits) {
   EXPECT_TRUE(decoded.status().IsCorruption());
 }
 
+TEST(ProjectionFormatTest, AdjacencyBuildsAndUsesBloomMask) {
+  ProjectionChain chain = Fixture();
+  chain.header.kind = ProjectionKind::kAdjacency;
+  chain.page_directory.front().bloom_bits = 0;
+  chain.page_directory.front().bloom_hashes = 0;
+  chain.page_directory.front().bloom_mask = 0;
+  auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  auto decoded = DecodeProjectionPage(encoded.ValueOrDie());
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  const auto& page = decoded.ValueOrDie().page_directory.front();
+  EXPECT_EQ(page.bloom_bits, 64U);
+  EXPECT_EQ(page.bloom_hashes, 1U);
+  EXPECT_TRUE(PageMayContainEntity(page, 42));
+  EXPECT_FALSE(PageMayContainEntity(page, 7));
+}
+
 TEST(ProjectionFormatTest, EncodesMultiplePagesAndRejectsTruncatedDirectory) {
   ProjectionChain chain = Fixture();
   chain.page_directory.resize(2);

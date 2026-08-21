@@ -196,4 +196,64 @@ TEST(TemporalExpandTest, AdjacencyIndexBoundsSelectedPostingAndPreservesIdentity
   EXPECT_NE(both.ValueOrDie()[0].edge_ref(), both.ValueOrDie()[1].edge_ref());
 }
 
+TEST(TemporalExpandTest, KHopBothUsesFrontierEndpointAndDeduplicatesDiamond) {
+  char pattern[] = "/tmp/cedar_temporal_khop_both_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok());
+  const VertexRef one{PartId{0}, VertexId{1}};
+  const VertexRef two{PartId{0}, VertexId{2}};
+  const VertexRef three{PartId{0}, VertexId{3}};
+  const VertexRef four{PartId{0}, VertexId{4}};
+  const std::vector<VertexRef> vertices{one, two, three, four};
+  const EdgeIdentity e12{EdgeRef{PartId{0}, EdgeId{12}}, one, two, 1};
+  const EdgeIdentity e13{EdgeRef{PartId{0}, EdgeId{13}}, one, three, 1};
+  const EdgeIdentity e24{EdgeRef{PartId{0}, EdgeId{24}}, two, four, 1};
+  const EdgeIdentity e34{EdgeRef{PartId{0}, EdgeId{34}}, three, four, 1};
+  auto txn = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(txn.ok());
+  for (const auto& vertex : vertices)
+    ASSERT_TRUE(txn.ValueOrDie()->Assert(EntityFact::Vertex(vertex), ValidTime{0}).ok());
+  for (const auto& edge : {e12, e13, e24, e34})
+    ASSERT_TRUE(txn.ValueOrDie()->Assert(edge, ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Commit().ok());
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  const QueryDeltaView delta{CommitSeq{0}, snapshot.ValueOrDie().commit_seq(),
+                             {}, {e12, e13, e24, e34}, {}, CommitSeq{}};
+  GraphFrontierOptions options{nullptr, &delta, 1};
+  options.adjacency_seek = [&delta](const std::vector<VertexRef>&,
+                                    ExpandDirection,
+                                    std::optional<uint64_t>) {
+    return StatusOr<std::vector<EdgeIdentity>>(delta.edge_identities);
+  };
+  GraphExpansionRequest incoming{{two}, ValidTimeInterval{ValidTime{0}, ValidTime{10}},
+                                 ExpandDirection::kBoth, std::nullopt};
+  auto result = KHopExpand(snapshot.ValueOrDie(), incoming, options);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().labels.size(), 2U);
+  EXPECT_EQ(result.ValueOrDie().labels[0].vertex, one);
+  EXPECT_EQ(result.ValueOrDie().labels[0].predecessor, two);
+  EXPECT_EQ(result.ValueOrDie().labels[1].vertex, four);
+  EXPECT_EQ(result.ValueOrDie().labels[1].predecessor, two);
+
+  options.max_hops = 2;
+  GraphExpansionRequest diamond{{one}, ValidTimeInterval{ValidTime{0}, ValidTime{10}},
+                                ExpandDirection::kOut, std::nullopt};
+  result = KHopExpand(snapshot.ValueOrDie(), diamond, options);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result.ValueOrDie().labels.size(), 3U);
+  size_t four_count = 0;
+  for (const auto& label : result.ValueOrDie().labels) {
+    if (label.vertex == four) {
+      ++four_count;
+      EXPECT_EQ(label.depth, 2U);
+    }
+  }
+  EXPECT_EQ(four_count, 1U);
+  database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
 }  // namespace cedar::internal

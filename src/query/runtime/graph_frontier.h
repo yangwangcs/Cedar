@@ -59,7 +59,8 @@ class AdjacencyIndex {
       const std::vector<VertexRef>& frontier, ExpandDirection direction,
       std::optional<uint64_t> edge_type, CommitSeq snapshot_seq,
       std::optional<uint64_t> generation = std::nullopt,
-      const QueryDeltaView* delta = nullptr) const;
+      const QueryDeltaView* delta = nullptr,
+      const std::function<Status()>& check_abort = {}) const;
   bool covers(CommitSeq snapshot_seq) const { return built_through_.value >= snapshot_seq.value; }
   CommitSeq built_through() const { return built_through_; }
 
@@ -87,6 +88,8 @@ struct GraphFrontierOptions {
       const std::vector<VertexRef>&, ExpandDirection,
       std::optional<uint64_t>)> adjacency_seek;
   std::shared_ptr<const AdjacencyIndex> adjacency_index;
+  std::optional<uint64_t> projection_generation;
+  std::function<Status()> check_abort;
   // Zero means no fallback bound. A non-zero value makes a cache miss fail
   // explicitly once the authoritative fallback would exceed this count.
   uint64_t fallback_candidate_limit = 0;

@@ -5,6 +5,7 @@
 #define CEDAR_QUERY_QUERY_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,7 @@ struct ExpandSpec {
   Slot<EdgeRef> edge;
   Slot<VertexRef> destination;
   ExpandDirection direction = ExpandDirection::kOut;
+  std::optional<uint64_t> edge_type;
 };
 
 class Query {

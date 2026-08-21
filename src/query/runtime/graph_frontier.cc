@@ -55,7 +55,8 @@ std::optional<ValidTimeInterval> RequestInterval(const ValidTimeInterval& value)
 
 StatusOr<std::vector<FactEvent>> ReadEvents(Snapshot& snapshot,
                                              const FactRef& ref,
-                                             const QueryDeltaView* delta) {
+                                             const QueryDeltaView* delta,
+                                             const std::function<Status()>& check_abort = {}) {
   std::vector<FactEvent> events;
   FactScanSpec spec;
   spec.part_id = ref.part_id();
@@ -63,21 +64,28 @@ StatusOr<std::vector<FactEvent>> ReadEvents(Snapshot& snapshot,
   spec.property_id = ref.property_id();
   spec.entity_id_min = ref.entity_id();
   spec.entity_id_max = ref.entity_id();
-  Status status = snapshot.EventScan(spec, [&events](const FactEventBatch& batch) {
+  Status status = snapshot.EventScan(spec, [&events, &check_abort](const FactEventBatch& batch) {
+    if (check_abort) {
+      if (Status status = check_abort(); !status.ok()) return status;
+    }
     events.insert(events.end(), batch.events.begin(), batch.events.end());
     return Status::OK();
   });
   if (!status.ok()) return status;
   if (delta != nullptr) {
     auto tail = delta->EventsFor(ref);
+    if (check_abort) {
+      if (Status status = check_abort(); !status.ok()) return status;
+    }
     events.insert(events.end(), tail.begin(), tail.end());
   }
   return events;
 }
 
 StatusOr<std::vector<StateInterval>> VisibleIntervals(
-    Snapshot& snapshot, const FactRef& ref, const QueryDeltaView* delta) {
-  auto events = ReadEvents(snapshot, ref, delta);
+    Snapshot& snapshot, const FactRef& ref, const QueryDeltaView* delta,
+    const std::function<Status()>& check_abort = {}) {
+  auto events = ReadEvents(snapshot, ref, delta, check_abort);
   if (!events.ok()) return events.status();
   if (events.ValueOrDie().empty()) return std::vector<StateInterval>{};
   auto corrected = ResolveCorrectedBoundaries(events.ValueOrDie(),
@@ -88,10 +96,14 @@ StatusOr<std::vector<StateInterval>> VisibleIntervals(
 
 StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
                                                 const QueryDeltaView* delta,
-                                                uint64_t max_candidates = 0) {
+                                                uint64_t max_candidates = 0,
+                                                const std::function<Status()>& check_abort = {}) {
   std::map<IdentityKey, EdgeIdentity> unique;
   Status status = snapshot.ScanFamily(FactFamily::kEdgeIdentity,
-                                      [&unique, max_candidates](const FactEvent& event) {
+                                      [&unique, max_candidates, &check_abort](const FactEvent& event) {
+    if (check_abort) {
+      if (Status status = check_abort(); !status.ok()) return status;
+    }
     if (!event.edge_identity.has_value()) return Status::OK();
     const EdgeIdentity& identity = *event.edge_identity;
     const EdgeIdentity copy = identity;
@@ -106,6 +118,9 @@ StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
   if (delta != nullptr) {
     for (const EdgeIdentity& identity : delta->EdgeIdentitiesThrough(
              snapshot.commit_seq())) {
+      if (check_abort) {
+        if (Status status = check_abort(); !status.ok()) return status;
+      }
       unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
                                  identity.target_ref(), identity.edge_type},
                      identity);
@@ -122,6 +137,9 @@ bool Contains(const VertexRef& ref, const std::vector<VertexRef>& frontier) {
 }
 
 Status ChargeTraversal(const GraphFrontierOptions& options) {
+  if (options.check_abort) {
+    if (Status status = options.check_abort(); !status.ok()) return status;
+  }
   if (options.reservation == nullptr) return Status::OK();
   if (Status status = options.reservation->ReserveGraphLabels(1); !status.ok())
     return status;
@@ -204,7 +222,8 @@ Status AdjacencyIndex::ApplyDelta(const QueryDeltaView& delta,
 StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
     const std::vector<VertexRef>& frontier, ExpandDirection direction,
     std::optional<uint64_t> edge_type, CommitSeq snapshot_seq,
-    std::optional<uint64_t> generation, const QueryDeltaView* delta) const {
+    std::optional<uint64_t> generation, const QueryDeltaView* delta,
+    const std::function<Status()>& check_abort) const {
   const bool delta_has_identity =
       delta != nullptr && (!delta->edge_identities.empty() ||
                            !delta->edge_identity_records.empty());
@@ -214,11 +233,14 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
     return Status::NotFound("adjacency index", "posting coverage is missing");
   }
   std::map<IdentityKey, EdgeIdentity> unique;
-  auto collect = [&](const VertexRef& vertex, ExpandDirection posting_direction) {
+  auto collect = [&](const VertexRef& vertex, ExpandDirection posting_direction) -> Status {
     const Key key{vertex, posting_direction, edge_type};
     const auto found = postings_.find(key);
-    if (found == postings_.end()) return;
+    if (found == postings_.end()) return Status::OK();
     for (const Entry& entry : found->second) {
+      if (check_abort) {
+        if (Status status = check_abort(); !status.ok()) return status;
+      }
       if (entry.commit_seq.value > snapshot_seq.value) continue;
       if (generation.has_value() && entry.generation != *generation) continue;
       const EdgeIdentity& identity = entry.identity;
@@ -226,12 +248,18 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
                                  identity.target_ref(), identity.edge_type},
                      identity);
     }
+    return Status::OK();
   };
   for (const VertexRef& vertex : frontier) {
-    if (direction == ExpandDirection::kIn || direction == ExpandDirection::kBoth)
-      collect(vertex, ExpandDirection::kIn);
-    if (direction == ExpandDirection::kOut || direction == ExpandDirection::kBoth)
-      collect(vertex, ExpandDirection::kOut);
+    if (check_abort) {
+      if (Status status = check_abort(); !status.ok()) return status;
+    }
+    if (direction == ExpandDirection::kIn || direction == ExpandDirection::kBoth) {
+      if (Status status = collect(vertex, ExpandDirection::kIn); !status.ok()) return status;
+    }
+    if (direction == ExpandDirection::kOut || direction == ExpandDirection::kBoth) {
+      if (Status status = collect(vertex, ExpandDirection::kOut); !status.ok()) return status;
+    }
   }
   if (delta != nullptr) {
     auto add_delta = [&](CommitSeq seq, const EdgeIdentity& identity) {
@@ -247,11 +275,19 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
                      identity);
     };
     if (delta->edge_identity_records.empty()) {
-      for (const EdgeIdentity& identity : delta->edge_identities)
+      for (const EdgeIdentity& identity : delta->edge_identities) {
+        if (check_abort) {
+          if (Status status = check_abort(); !status.ok()) return status;
+        }
         add_delta(delta->through, identity);
+      }
     } else {
-      for (const auto& record : delta->edge_identity_records)
+      for (const auto& record : delta->edge_identity_records) {
+        if (check_abort) {
+          if (Status status = check_abort(); !status.ok()) return status;
+        }
         add_delta(record.first, record.second);
+      }
     }
   }
   std::vector<EdgeIdentity> result;
@@ -271,22 +307,21 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
       options.adjacency_index
           ? options.adjacency_index->Seek(request.frontier, request.direction,
                                          request.edge_type, snapshot.commit_seq(),
-                                         std::nullopt, options.delta)
+                                         options.projection_generation,
+                                         options.delta,
+                                         options.check_abort)
           : options.adjacency_seek
           ? options.adjacency_seek(request.frontier, request.direction,
                                    request.edge_type)
-      : Identities(snapshot, options.delta, options.fallback_candidate_limit);
-  if (!identities.ok() && identities.status().IsNotFound() &&
-      options.adjacency_seek) {
-    identities = options.adjacency_seek(request.frontier, request.direction,
-                                        request.edge_type);
-  } else if (!identities.ok() && identities.status().IsNotFound() &&
-             options.adjacency_index) {
+      : Identities(snapshot, options.delta, options.fallback_candidate_limit,
+                   options.check_abort);
+  if (!identities.ok() && identities.status().IsNotFound()) {
     // Cache misses are explicit: the canonical lane is only used when the
     // caller supplied a finite fallback bound (or left it unlimited for an
     // analytical query).
     identities = Identities(snapshot, options.delta,
-                            options.fallback_candidate_limit);
+                            options.fallback_candidate_limit,
+                            options.check_abort);
   }
   if (!identities.ok()) return identities.status();
   if (options.fallback_candidate_limit != 0 &&
@@ -298,6 +333,9 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
   }
   std::vector<TemporalTraversal> output;
   for (const EdgeIdentity& identity : identities.ValueOrDie()) {
+    if (options.check_abort) {
+      if (Status status = options.check_abort(); !status.ok()) return status;
+    }
     if (request.edge_type.has_value() &&
         identity.edge_type != *request.edge_type) continue;
     const bool out = Contains(identity.source_ref(), request.frontier);
@@ -308,13 +346,16 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
       continue;
     }
     auto edge_intervals = VisibleIntervals(
-        snapshot, EntityFact::Edge(identity.edge_ref()).ref(), options.delta);
+        snapshot, EntityFact::Edge(identity.edge_ref()).ref(), options.delta,
+        options.check_abort);
     if (!edge_intervals.ok()) return edge_intervals.status();
     auto source_intervals = VisibleIntervals(
-        snapshot, EntityFact::Vertex(identity.source_ref()).ref(), options.delta);
+        snapshot, EntityFact::Vertex(identity.source_ref()).ref(), options.delta,
+        options.check_abort);
     if (!source_intervals.ok()) return source_intervals.status();
     auto target_intervals = VisibleIntervals(
-        snapshot, EntityFact::Vertex(identity.target_ref()).ref(), options.delta);
+        snapshot, EntityFact::Vertex(identity.target_ref()).ref(), options.delta,
+        options.check_abort);
     if (!target_intervals.ok()) return target_intervals.status();
     for (const StateInterval& edge : edge_intervals.ValueOrDie()) {
       for (const StateInterval& source : source_intervals.ValueOrDie()) {
@@ -360,44 +401,96 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
     auto expanded = ExpandTemporal(snapshot, layer, options);
     if (!expanded.ok()) return expanded.status();
     std::vector<VertexRef> next;
-    for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
-      result.traversals.push_back(traversal);
-      const VertexRef destination =
-          request.direction == ExpandDirection::kIn ? traversal.source
-                                                     : traversal.target;
-      auto found = visited.find(VertexKey{destination});
-      if (found != visited.end()) {
-        if (found->second.first < depth) continue;
-        bool covered = false;
-        for (const auto& prior : found->second.second) {
-          const uint64_t prior_to = prior.to.value_or(
-              ValidTime{std::numeric_limits<uint64_t>::max()}).value;
-          const uint64_t current_to = traversal.effective.to.value_or(
-              ValidTime{std::numeric_limits<uint64_t>::max()}).value;
-          if (prior.from.value <= traversal.effective.from.value &&
-              current_to <= prior_to) {
-            covered = true;
-            break;
+    std::set<VertexKey> next_seen;
+    auto interval_end = [](const ValidTimeInterval& interval) {
+      return interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}).value;
+    };
+    auto subtract_covered = [&](const ValidTimeInterval& current,
+                                const std::vector<ValidTimeInterval>& prior) {
+      std::vector<ValidTimeInterval> pieces{current};
+      for (const auto& cover : prior) {
+        std::vector<ValidTimeInterval> remaining;
+        for (const auto& piece : pieces) {
+          const auto overlap = Intersect(piece, cover);
+          if (!overlap) {
+            remaining.push_back(piece);
+            continue;
+          }
+          if (piece.from.value < overlap->from.value)
+            remaining.push_back({piece.from, overlap->from});
+          const auto overlap_to = interval_end(*overlap);
+          const auto piece_to = interval_end(piece);
+          if (overlap_to < piece_to) {
+            remaining.push_back({ValidTime{overlap_to}, piece.to});
           }
         }
-        if (covered) continue;
-        found->second.second.push_back(traversal.effective);
+        pieces = std::move(remaining);
+        if (pieces.empty()) break;
       }
-      if (options.reservation != nullptr) {
-        if (found == visited.end()) {
-          if (Status status = options.reservation->ReserveVisitedVertices(1);
-              !status.ok()) return status;
+      return pieces;
+    };
+    auto merge_interval = [&](std::vector<ValidTimeInterval>* intervals,
+                              const ValidTimeInterval& added) {
+      intervals->push_back(added);
+      std::sort(intervals->begin(), intervals->end(),
+                [](const auto& a, const auto& b) { return a.from.value < b.from.value; });
+      std::vector<ValidTimeInterval> merged;
+      for (const auto& interval : *intervals) {
+        if (merged.empty() || interval.from.value > interval_end(merged.back())) {
+          merged.push_back(interval);
+          continue;
+        }
+        auto& last = merged.back();
+        if (!last.to.has_value() || !interval.to.has_value() ||
+            interval_end(interval) > interval_end(last)) {
+          last.to = interval.to;
         }
       }
-      if (found == visited.end()) {
-        visited.emplace(VertexKey{destination},
-                        std::make_pair(depth,
-                                       std::vector<ValidTimeInterval>{traversal.effective}));
+      *intervals = std::move(merged);
+    };
+    for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
+      if (options.check_abort) {
+        if (Status status = options.check_abort(); !status.ok()) return status;
       }
-      next.push_back(destination);
-      result.labels.push_back(GraphLabel{destination, depth,
-                                         std::optional<VertexRef>{traversal.source},
-                                         traversal.effective});
+      std::vector<std::pair<VertexRef, VertexRef>> moves;
+      const bool out = Contains(traversal.source, layer.frontier);
+      const bool in = Contains(traversal.target, layer.frontier);
+      if ((request.direction == ExpandDirection::kOut && out) ||
+          (request.direction == ExpandDirection::kBoth && out))
+        moves.emplace_back(traversal.target, traversal.source);
+      if ((request.direction == ExpandDirection::kIn && in) ||
+          (request.direction == ExpandDirection::kBoth && in)) {
+        if (moves.empty() || moves.front().first != traversal.source)
+          moves.emplace_back(traversal.source, traversal.target);
+      }
+      for (const auto& move : moves) {
+        const VertexRef destination = move.first;
+        const VertexRef predecessor = move.second;
+        auto found = visited.find(VertexKey{destination});
+        if (found != visited.end() && found->second.first < depth) continue;
+        std::vector<ValidTimeInterval> pieces;
+        if (found == visited.end()) {
+          found = visited.emplace(VertexKey{destination},
+                                  std::make_pair(depth, std::vector<ValidTimeInterval>{})).first;
+          if (options.reservation != nullptr) {
+            if (Status status = options.reservation->ReserveVisitedVertices(1); !status.ok())
+              return status;
+          }
+          pieces.push_back(traversal.effective);
+        } else if (found->second.first == depth) {
+          pieces = subtract_covered(traversal.effective, found->second.second);
+        }
+        if (pieces.empty()) continue;
+        merge_interval(&found->second.second, traversal.effective);
+        if (next_seen.insert(VertexKey{destination}).second) next.push_back(destination);
+        for (const auto& piece : pieces) {
+          TemporalTraversal emitted = traversal;
+          emitted.effective = piece;
+          result.traversals.push_back(emitted);
+          result.labels.push_back(GraphLabel{destination, depth,
+                                             std::optional<VertexRef>{predecessor}, piece});
+        }
+      }
     }
     frontier = std::move(next);
   }

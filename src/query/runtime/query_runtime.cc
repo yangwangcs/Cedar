@@ -493,7 +493,8 @@ StatusOr<ValidTimeInterval> ScopeAsInterval(const TemporalScope& scope) {
 
 StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
-    internal::QueryReservation* reservation) {
+    internal::QueryReservation* reservation,
+    const std::function<Status()>& check_abort = {}) {
   if (!plan.graph_expand) {
     return Status::InvalidArgument("graph expansion", "missing graph specification");
   }
@@ -503,7 +504,11 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   if (!seeds.ok()) return seeds.status();
   const internal::QueryDeltaView* delta = plan.bound_delta_view ? plan.bound_delta_view.get() : nullptr;
   internal::GraphFrontierOptions options{reservation, delta, plan.graph_k_hops};
+  options.check_abort = check_abort;
   options.adjacency_index = snapshot.adjacency_index();
+  if (plan.projection_generation.has_value()) {
+    options.projection_generation = plan.projection_generation->generation_id();
+  }
   // A missing/lagging cache must never silently turn an interactive expansion
   // into an unbounded family scan. The canonical path remains available for
   // plans that do not provide a budget (for example analytical callers).
@@ -512,8 +517,9 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   std::vector<RuntimeRow> result;
   for (const RuntimeRow& seed : seeds.ValueOrDie()) {
     VertexRef vertex{seed.ref.part_id(), VertexId{seed.ref.entity_id()}};
-    internal::GraphExpansionRequest request{{vertex}, interval.ValueOrDie(), plan.graph_expand->direction,
-                                  std::nullopt};
+    internal::GraphExpansionRequest request{{vertex}, interval.ValueOrDie(),
+                                            plan.graph_expand->direction,
+                                            plan.graph_expand->edge_type};
     if (plan.graph_k_hops > 1) {
       auto hops = KHopExpand(snapshot, request, options);
       if (!hops.ok()) return hops.status();
@@ -535,6 +541,12 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
                           traversal.edge_type});
       }
     }
+  }
+  if (!plan.property_bindings.empty()) {
+    auto bound = BindPropertyRows(snapshot, std::move(result),
+                                  plan.property_bindings.front());
+    if (!bound.ok()) return bound.status();
+    return std::move(bound).ConsumeValueOrDie();
   }
   return result;
 }
@@ -1072,7 +1084,17 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     }
     auto rows = state_->plan.graph_expand.has_value()
                     ? MaterializeGraphRows(*state_->snapshot, state_->plan,
-                                           &state_->reservation)
+                                           &state_->reservation,
+                                           [state = state_.get()]() -> Status {
+                                             if (state->cancelled.load(std::memory_order_acquire))
+                                               return Status::QueryCancelled("query", "query cancelled");
+                                             if (state->options.budget.deadline_us != 0 &&
+                                                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                     std::chrono::steady_clock::now() - state->started_at).count()) >=
+                                                     state->options.budget.deadline_us)
+                                               return Status::DeadlineExceeded("query", "deadline_us budget exhausted");
+                                             return Status::OK();
+                                           })
                     : MaterializeRows(*state_->snapshot, state_->plan,
                                       &state_->reservation);
     // The lease owns the pre-materialization reservation. Reset it now that

@@ -11,7 +11,10 @@
 #include "cedar/query/expression.h"
 
 namespace cedar {
-namespace internal { class LogicalPlanNode; }
+namespace internal {
+class LogicalPlanInspector;
+class LogicalPlanNode;
+}
 struct RowColumn { SlotId slot; QueryType type; bool optional = false; bool operator==(const RowColumn&) const = default; };
 class RowSchema {
  public:
@@ -44,6 +47,7 @@ class Query {
   explicit Query(std::shared_ptr<const internal::LogicalPlanNode> root) : root_(std::move(root)) {}
   StatusOr<Query> BindVertexPropertyImpl(SlotId vertex, PropertyId property, RowColumn output) const;
   std::shared_ptr<const internal::LogicalPlanNode> root_;
+  friend class internal::LogicalPlanInspector;
 };
 }  // namespace cedar
 

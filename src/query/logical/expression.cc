@@ -4,77 +4,80 @@
 #include "query/logical/expression.h"
 
 namespace cedar {
-namespace internal {
-
-class ExpressionFactory {
- public:
-  template <typename T>
-  static Expr<T> Make(ExpressionKind kind,
-                      std::vector<std::shared_ptr<const ExpressionNode>> children = {}) {
-    return Expr<T>(std::make_shared<const ExpressionNode>(
-        kind, QueryTypeOf<T>(), std::move(children)));
-  }
-};
-
-}  // namespace internal
+namespace detail {
 namespace {
 
-template <typename T>
-std::vector<std::shared_ptr<const internal::ExpressionNode>> Children(Expr<T> left, Expr<T> right) {
-  return {internal::ExpressionInspector::Share(left),
-          internal::ExpressionInspector::Share(right)};
+std::shared_ptr<const internal::ExpressionNode> MakeBinary(
+    internal::ExpressionKind kind,
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return std::make_shared<const internal::ExpressionNode>(
+      kind, QueryType::kBool,
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{
+          std::move(left), std::move(right)});
 }
 
 }  // namespace
 
-template <typename T, bool Optional>
-Expr<T> ValueOf(const Slot<T, Optional>& slot) {
-  return internal::ExpressionFactory::Make<T>(internal::ExpressionKind::kSlot);
+std::shared_ptr<const internal::ExpressionNode> MakeSlotExpression(
+    QueryType type, SlotId slot) {
+  return std::make_shared<const internal::ExpressionNode>(
+      internal::ExpressionKind::kSlot, type,
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{}, slot);
 }
 
-template <typename T>
-Expr<bool> IsPresent(const OptionalSlot<T>& slot) {
-  return internal::ExpressionFactory::Make<bool>(internal::ExpressionKind::kIsPresent);
+std::shared_ptr<const internal::ExpressionNode> MakeLiteralExpression(
+    QueryType type, ExpressionLiteral literal) {
+  return std::make_shared<const internal::ExpressionNode>(
+      internal::ExpressionKind::kLiteral, type,
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{}, SlotId{},
+      std::move(literal));
 }
 
-template <typename T>
-Expr<T> Literal(T value) {
-  return internal::ExpressionFactory::Make<T>(internal::ExpressionKind::kLiteral);
+std::shared_ptr<const internal::ExpressionNode> MakeIsPresentExpression(
+    std::shared_ptr<const internal::ExpressionNode> expression) {
+  return std::make_shared<const internal::ExpressionNode>(
+      internal::ExpressionKind::kIsPresent, QueryType::kBool,
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{
+          std::move(expression)});
 }
 
-template <typename T>
-Expr<bool> Equal(Expr<T> left, Expr<T> right) {
-  return internal::ExpressionFactory::Make<bool>(internal::ExpressionKind::kEqual,
-                                                  Children(left, right));
+std::shared_ptr<const internal::ExpressionNode> MakeEqualExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kEqual, std::move(left),
+                    std::move(right));
 }
 
-template <typename T>
-Expr<bool> NotEqual(Expr<T> left, Expr<T> right) {
-  return internal::ExpressionFactory::Make<bool>(internal::ExpressionKind::kNotEqual,
-                                                  Children(left, right));
+std::shared_ptr<const internal::ExpressionNode> MakeNotEqualExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kNotEqual, std::move(left),
+                    std::move(right));
 }
 
-template <typename T>
-  requires std::is_arithmetic_v<T>
-Expr<bool> GreaterThan(Expr<T> left, Expr<T> right) {
-  return internal::ExpressionFactory::Make<bool>(internal::ExpressionKind::kGreaterThan,
-                                                  Children(left, right));
+std::shared_ptr<const internal::ExpressionNode> MakeGreaterThanExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kGreaterThan, std::move(left),
+                    std::move(right));
 }
 
-Expr<bool> operator&&(Expr<bool> left, Expr<bool> right) {
-  return internal::ExpressionFactory::Make<bool>(internal::ExpressionKind::kAnd,
-                                                  Children(left, right));
+std::shared_ptr<const internal::ExpressionNode> MakeAndExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kAnd, std::move(left),
+                    std::move(right));
 }
 
-Expr<bool> Not(Expr<bool> expression) {
-  return internal::ExpressionFactory::Make<bool>(internal::ExpressionKind::kNot,
-      {internal::ExpressionInspector::Share(expression)});
+std::shared_ptr<const internal::ExpressionNode> MakeNotExpression(
+    std::shared_ptr<const internal::ExpressionNode> expression) {
+  return std::make_shared<const internal::ExpressionNode>(
+      internal::ExpressionKind::kNot, QueryType::kBool,
+      std::vector<std::shared_ptr<const internal::ExpressionNode>>{
+          std::move(expression)});
 }
 
-template Expr<int64_t> ValueOf(const OptionalSlot<int64_t>&);
-template Expr<bool> IsPresent(const OptionalSlot<int64_t>&);
-template Expr<int64_t> Literal(int64_t);
-template Expr<bool> Equal(Expr<int64_t>, Expr<int64_t>);
-template Expr<bool> GreaterThan(Expr<int64_t>, Expr<int64_t>);
+}  // namespace detail
 
 }  // namespace cedar

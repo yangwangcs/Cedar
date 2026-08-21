@@ -5,6 +5,7 @@
 #define CEDAR_QUERY_LOGICAL_EXPRESSION_H_
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -26,27 +27,24 @@ enum class ExpressionKind : uint8_t {
 class ExpressionNode {
  public:
   ExpressionNode(ExpressionKind kind, QueryType type,
-                 std::vector<std::shared_ptr<const ExpressionNode>> children)
-      : kind_(kind), type_(type), children_(std::move(children)) {}
+                 std::vector<std::shared_ptr<const ExpressionNode>> children,
+                 SlotId slot = {},
+                 std::optional<detail::ExpressionLiteral> literal = std::nullopt)
+      : kind_(kind), type_(type), children_(std::move(children)), slot_(slot),
+        literal_(std::move(literal)) {}
   ExpressionKind kind() const { return kind_; }
   QueryType type() const { return type_; }
   const std::vector<std::shared_ptr<const ExpressionNode>>& children() const { return children_; }
+  SlotId slot() const { return slot_; }
+  const std::optional<detail::ExpressionLiteral>& literal() const {
+    return literal_;
+  }
  private:
   const ExpressionKind kind_;
   const QueryType type_;
   const std::vector<std::shared_ptr<const ExpressionNode>> children_;
-};
-
-class ExpressionInspector {
- public:
-  template <typename T>
-  static const ExpressionNode* Inspect(const Expr<T>& expression) {
-    return expression.node_.get();
-  }
-  template <typename T>
-  static std::shared_ptr<const ExpressionNode> Share(const Expr<T>& expression) {
-    return expression.node_;
-  }
+  const SlotId slot_;
+  const std::optional<detail::ExpressionLiteral> literal_;
 };
 
 }  // namespace cedar::internal

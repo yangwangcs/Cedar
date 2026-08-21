@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "cedar/query/query.h"
+#include "query/logical/expression.h"
 
 namespace cedar::internal {
 
@@ -24,21 +25,51 @@ enum class LogicalOpKind : uint8_t {
   kEarliestArrival, kLatestDeparture, kFastestDuration,
 };
 
+struct PropertyBinding {
+  SlotId source;
+  PropertyId property;
+  RowColumn output;
+};
+
+struct LogicalPlanPayload {
+  std::optional<TemporalScope> scope;
+  std::optional<ExpandSpec> expand_spec;
+  std::optional<PropertyBinding> property_binding;
+  std::shared_ptr<const ExpressionNode> predicate;
+};
+
 class LogicalPlanNode {
  public:
   LogicalPlanNode(LogicalOpKind kind, RowSchema schema,
                   std::vector<std::shared_ptr<const LogicalPlanNode>> inputs = {},
-                  std::optional<TemporalScope> scope = std::nullopt)
+                  LogicalPlanPayload payload = {})
       : kind_(kind), schema_(std::move(schema)), inputs_(std::move(inputs)),
-        scope_(std::move(scope)) {}
+        payload_(std::move(payload)) {}
   LogicalOpKind kind() const { return kind_; }
   const RowSchema& schema() const { return schema_; }
   const std::vector<std::shared_ptr<const LogicalPlanNode>>& inputs() const { return inputs_; }
+  const std::optional<TemporalScope>& scope() const { return payload_.scope; }
+  const std::optional<ExpandSpec>& expand_spec() const {
+    return payload_.expand_spec;
+  }
+  const std::optional<PropertyBinding>& property_binding() const {
+    return payload_.property_binding;
+  }
+  const std::shared_ptr<const ExpressionNode>& predicate() const {
+    return payload_.predicate;
+  }
  private:
   const LogicalOpKind kind_;
   const RowSchema schema_;
   const std::vector<std::shared_ptr<const LogicalPlanNode>> inputs_;
-  const std::optional<TemporalScope> scope_;
+  const LogicalPlanPayload payload_;
+};
+
+class LogicalPlanInspector {
+ public:
+  static const LogicalPlanNode* Inspect(const Query& query) {
+    return query.root_.get();
+  }
 };
 
 }  // namespace cedar::internal

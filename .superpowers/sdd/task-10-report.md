@@ -90,3 +90,20 @@ Runtime follow-up after review:
   10, and 15 and asserts values `1, 3, 2, 4` with no duplicate rows.
 - Plan copy-assignment now preserves both the bound delta view and delta reader,
   so execution cannot silently reacquire a moving maintenance view.
+
+Final review follow-up:
+
+- Planner detects any overlapping valid-time regions with different
+  `(kind, part, property, schema)` keys and emits one canonical fallback; the
+  one-dimensional `CoverageSlice` cannot represent those parallel key domains.
+  Empty manifest regions likewise fall back to canonical access.
+- Physical execution clips every canonical and derived row to each half-open
+  coverage slice before concatenation. This prevents a full canonical interval
+  from being duplicated across projection gaps, including when the projection
+  reader is unavailable and canonical fallback is selected.
+- Physical explain now reports pushdowns, per-slice generation/base metadata,
+  fallback sources, and confidence (`known` versus `conservative`), with root
+  projection metadata and logical child descriptions populated.
+- Projection readers retain generation/base checks and return `Conflict` if a
+  rollover changes the requested generation; no silent generation switch is
+  permitted. This is conflict-safe validation, not a claimed pinned handle.

@@ -967,6 +967,31 @@ TEST(QueryRuntimeRelationalTest,
     EXPECT_EQ(run_at(expected.first, true), expected.second);
     EXPECT_EQ(run_at(expected.first, false), expected.second);
   }
+
+  PreparedQueryPlan gap_plan = canonical_plan;
+  gap_plan.scope = History{ValidTimeInterval{ValidTime{0}, ValidTime{30}}};
+  PhysicalPlan gap_physical;
+  gap_physical.coverage_slices = {
+      CoverageSlice{CoverageSource::kCanonical,
+                    ValidTimeInterval{ValidTime{0}, ValidTime{10}}},
+      CoverageSlice{CoverageSource::kCanonical,
+                    ValidTimeInterval{ValidTime{20}, ValidTime{30}}}};
+  gap_plan.physical_plan =
+      std::make_shared<const PhysicalPlan>(std::move(gap_physical));
+  gap_plan.projection_reader = [](const CoverageSlice&) {
+    return StatusOr<std::vector<ProjectionChain>>(
+        Status::NotFound("query test", "canonical-only slice"));
+  };
+  auto gap_cursor = run(std::move(gap_plan));
+  ASSERT_TRUE(gap_cursor.ok()) << gap_cursor.status().ToString();
+  auto gap_batch = gap_cursor.ValueOrDie().Next();
+  ASSERT_TRUE(gap_batch.ok()) << gap_batch.status().ToString();
+  ASSERT_TRUE(gap_batch.ValueOrDie().has_value());
+  ASSERT_EQ(gap_batch.ValueOrDie()->row_count(), 3U);
+  EXPECT_EQ(gap_batch.ValueOrDie()->Get<int64_t>(score_slot, 0), 1);
+  EXPECT_EQ(gap_batch.ValueOrDie()->Get<int64_t>(score_slot, 1), 3);
+  EXPECT_EQ(gap_batch.ValueOrDie()->Get<int64_t>(score_slot, 2), 4);
+  EXPECT_FALSE(gap_cursor.ValueOrDie().Next().ValueOrDie().has_value());
   EXPECT_FALSE(canonical_cursor.ValueOrDie().Next().ValueOrDie().has_value());
   EXPECT_FALSE(delta_cursor.ValueOrDie().Next().ValueOrDie().has_value());
   EXPECT_TRUE(database.ValueOrDie()->Close().ok());

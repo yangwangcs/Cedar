@@ -334,6 +334,30 @@ bool RowInInterval(const RuntimeRow& row, const ValidTimeInterval& interval) {
   return from < end && interval.from.value < to;
 }
 
+std::optional<RuntimeRow> ClipRowToInterval(
+    const RuntimeRow& row, const ValidTimeInterval& interval) {
+  if (row.point.has_value()) {
+    return RowInInterval(row, interval) ? std::optional<RuntimeRow>(row)
+                                        : std::nullopt;
+  }
+  if (!row.effective.has_value()) return std::nullopt;
+  const uint64_t from = std::max(row.effective->from.value,
+                                 interval.from.value);
+  const std::optional<uint64_t> row_to =
+      row.effective->to ? std::optional<uint64_t>(row.effective->to->value)
+                        : std::nullopt;
+  std::optional<uint64_t> to = interval.to
+                                   ? std::optional<uint64_t>(interval.to->value)
+                                   : row_to;
+  if (row_to && (!to || *row_to < *to)) to = row_to;
+  if (to && from >= *to) return std::nullopt;
+  RuntimeRow clipped = row;
+  clipped.effective = ValidTimeInterval{
+      ValidTime{from}, to ? std::optional<ValidTime>(ValidTime{*to})
+                          : std::nullopt};
+  return clipped;
+}
+
 StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
     Snapshot& snapshot, std::vector<RuntimeRow> rows,
     const internal::PreparedPropertyBinding& binding) {
@@ -367,22 +391,24 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan) {
   StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan);
   if (!rows.ok()) return rows.status();
-  if (plan.physical_plan && plan.projection_reader) {
-    auto derived = ReadProjectionRows(plan);
+  if (plan.physical_plan) {
+    StatusOr<std::vector<RuntimeRow>> derived =
+        Status::NotFound("query runtime", "projection reader is unavailable");
+    if (plan.projection_reader) derived = ReadProjectionRows(plan);
     if (!derived.ok() && !derived.status().IsNotFound()) return derived.status();
-    if (derived.ok()) {
-      std::vector<RuntimeRow> combined;
-      for (const auto& slice : plan.physical_plan->coverage_slices) {
-        const auto& source = slice.source;
-        const auto& input = source != internal::CoverageSource::kCanonical
-                                ? derived.ValueOrDie()
-                                : rows.ValueOrDie();
-        for (const auto& row : input) {
-          if (RowInInterval(row, slice.interval)) combined.push_back(row);
-        }
+    const bool have_derived = derived.ok();
+    std::vector<RuntimeRow> combined;
+    for (const auto& slice : plan.physical_plan->coverage_slices) {
+      const auto& input = slice.source != internal::CoverageSource::kCanonical &&
+                                  have_derived
+                              ? derived.ValueOrDie()
+                              : rows.ValueOrDie();
+      for (const auto& row : input) {
+        auto clipped = ClipRowToInterval(row, slice.interval);
+        if (clipped) combined.push_back(std::move(*clipped));
       }
-      rows = std::move(combined);
     }
+    rows = std::move(combined);
   }
   if (!rows.ok()) return rows.status();
   if (!plan.property_bindings.empty()) {

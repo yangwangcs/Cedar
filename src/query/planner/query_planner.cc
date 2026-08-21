@@ -131,6 +131,10 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
       context.projections.database_identity != context.database_identity) {
     return Status::IdentityConflict("query planner", "projection database identity differs");
   }
+  if (context.projections.base_seq.value > context.snapshot_seq.value) {
+    return Status::Corruption("query planner",
+                              "projection base is newer than snapshot");
+  }
 
   std::vector<CoverageRegion> regions;
   for (const auto& region : context.projections.regions) {
@@ -141,25 +145,33 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   });
   bool entity_partition = false;
   bool partial_entity_coverage = false;
+  bool key_overlap_fallback = false;
   for (const auto& region : regions) {
     if (region.entity_min != 0 || region.entity_max_exclusive != UINT64_MAX) {
       partial_entity_coverage = true;
       break;
     }
   }
-  for (size_t i = 1; i < regions.size(); ++i) {
-    const auto& left = regions[i - 1];
-    const auto& right = regions[i];
-    const bool same_key = left.kind == right.kind && left.part_id == right.part_id &&
-                          left.property_id == right.property_id &&
-                          left.schema_epoch == right.schema_epoch;
-    if (same_key && EntityOverlap(left, right) &&
-        Overlap(left.valid_time, right.valid_time)) {
-      return Status::Corruption("query planner", "overlapping projection coverage");
-    }
-    if (same_key && !EntityOverlap(left, right) &&
-        Overlap(left.valid_time, right.valid_time)) {
-      entity_partition = true;
+  for (size_t i = 0; i < regions.size(); ++i) {
+    for (size_t j = i + 1; j < regions.size(); ++j) {
+      const auto& left = regions[i];
+      const auto& right = regions[j];
+      if (!Overlap(left.valid_time, right.valid_time)) continue;
+      const bool same_key =
+          left.kind == right.kind && left.part_id == right.part_id &&
+          left.property_id == right.property_id &&
+          left.schema_epoch == right.schema_epoch;
+      if (!same_key) {
+        // CoverageSlice is one-dimensional in valid time and has no key
+        // domain. Parallel regions for different parts/properties cannot be
+        // represented without dropping one of them, so use canonical truth.
+        key_overlap_fallback = true;
+      } else if (EntityOverlap(left, right)) {
+        return Status::Corruption("query planner",
+                                  "overlapping projection coverage");
+      } else {
+        entity_partition = true;
+      }
     }
   }
 
@@ -188,15 +200,16 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   uint64_t cursor = requested->from.value;
   const uint64_t requested_to = requested->to ? requested->to->value
                                              : std::numeric_limits<uint64_t>::max();
-  if (entity_partition || partial_entity_coverage) {
+  if (key_overlap_fallback || entity_partition || partial_entity_coverage) {
     // CoverageSlice is intentionally one-dimensional in valid time. When
     // regions partition the entity key space, claiming a complete temporal
     // slice would omit entities; retain canonical correctness until an
     // executor with multidimensional slices is available.
     plan.coverage_slices.push_back(Canonical(*requested));
+    plan.pushdowns.push_back("canonical-fallback");
   }
   for (const auto& region : regions) {
-    if (entity_partition || partial_entity_coverage) break;
+    if (key_overlap_fallback || entity_partition || partial_entity_coverage) break;
     const uint64_t region_from = std::max(cursor, region.valid_time.from.value);
     const uint64_t region_end = region.valid_time.to
                                     ? region.valid_time.to->value
@@ -220,19 +233,24 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     slice.entity_min = region.entity_min;
     slice.entity_max_exclusive = region.entity_max_exclusive;
     slice.database_identity = context.projections.database_identity;
-    if (context.projections.base_seq.value > context.snapshot_seq.value) {
-      return Status::Corruption("query planner", "projection base is newer than snapshot");
+    if (region.segments.empty()) {
+      slice.source = CoverageSource::kCanonical;
+      slice.projection_generation.reset();
+      slice.projection_base.reset();
+      plan.pushdowns.push_back("canonical-fallback");
     }
     const bool delta_complete =
         context.projections.base_seq.value <= context.snapshot_seq.value &&
         context.delta.base_seq == context.projections.base_seq &&
         context.delta.through.value >= context.snapshot_seq.value &&
         context.delta.first_missing.value == 0;
-    if (context.projections.base_seq.value < context.snapshot_seq.value &&
+    if (slice.source != CoverageSource::kCanonical &&
+        context.projections.base_seq.value < context.snapshot_seq.value &&
         delta_complete && context.allow_delta_merge) {
       slice.source = CoverageSource::kDeltaMerge;
       plan.operations.push_back(PhysicalOpKind::kDeltaMerge);
-    } else if (context.projections.base_seq.value < context.snapshot_seq.value) {
+    } else if (slice.source != CoverageSource::kCanonical &&
+               context.projections.base_seq.value < context.snapshot_seq.value) {
       // A projection without a contiguous (base,S] tail is not complete.
       // Keep the slice canonical rather than claiming a partial merge.
       slice.source = CoverageSource::kCanonical;
@@ -244,11 +262,15 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     cursor = region_to;
     if (cursor >= requested_to) break;
   }
-  if (!entity_partition && !partial_entity_coverage && cursor < requested_to) {
+  if (!key_overlap_fallback && !entity_partition && !partial_entity_coverage &&
+      cursor < requested_to) {
     plan.coverage_slices.push_back(Canonical(ValidTimeInterval{
         ValidTime{cursor}, requested->to}));
   }
-  if (plan.coverage_slices.empty()) plan.coverage_slices.push_back(Canonical(*requested));
+  if (plan.coverage_slices.empty()) {
+    plan.coverage_slices.push_back(Canonical(*requested));
+    plan.pushdowns.push_back("canonical-fallback");
+  }
   for (const auto& slice : plan.coverage_slices) {
     plan.operations.push_back(slice.source == CoverageSource::kProjection
                                   ? PhysicalOpKind::kProjectionScan
@@ -266,9 +288,24 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   plan.explain.lane = plan.lane;
   plan.explain.estimate = plan.estimate;
   for (const auto& slice : plan.coverage_slices) {
+    if (slice.projection_generation) {
+      plan.explain.projection_generation = slice.projection_generation;
+      plan.explain.projection_base = slice.projection_base;
+      break;
+    }
+  }
+  for (const auto& slice : plan.coverage_slices) {
     plan.explain.coverage.push_back({slice.source, slice.interval.from.value,
                                     slice.interval.to ? std::optional<uint64_t>(slice.interval.to->value) : std::nullopt,
                                     slice.projection_generation, slice.projection_base});
+  }
+  for (const auto& child : logical.inputs()) {
+    QueryPlanNodeDescription child_description;
+    child_description.logical = child->kind();
+    child_description.physical = PhysicalOpKind::kCanonicalScan;
+    child_description.lane = plan.lane;
+    child_description.estimate = plan.estimate;
+    plan.explain.children.push_back(std::move(child_description));
   }
   return plan;
 }
@@ -286,7 +323,20 @@ std::string QueryPlanner::ExplainPhysical(const PhysicalPlan& plan) {
   std::ostringstream out;
   out << "lane=" << (plan.lane == QueryExecutionMode::kAnalytical ? "analytical" : "interactive")
       << " rows=" << plan.estimate.rows << " uncertain=" << (plan.estimate.uncertain ? "true" : "false")
-      << " spill=" << (plan.spill_allowed ? "true" : "false") << " ops=";
+      << " spill=" << (plan.spill_allowed ? "true" : "false")
+      << " confidence=" << (plan.conservative ? "conservative" : "known")
+      << " generation=";
+  if (plan.explain.projection_generation) out << *plan.explain.projection_generation;
+  else out << "none";
+  out << " base=";
+  if (plan.explain.projection_base) out << plan.explain.projection_base->value;
+  else out << "none";
+  out << " pushdowns=";
+  for (size_t i = 0; i < plan.pushdowns.size(); ++i) {
+    if (i) out << ',';
+    out << plan.pushdowns[i];
+  }
+  out << " ops=";
   for (size_t i = 0; i < plan.operations.size(); ++i) {
     if (i) out << ',';
     out << PhysicalName(plan.operations[i]);
@@ -299,6 +349,8 @@ std::string QueryPlanner::ExplainPhysical(const PhysicalPlan& plan) {
     if (slice.interval.to) out << slice.interval.to->value;
     else out << "inf";
     out << ')';
+    if (slice.projection_generation) out << "@generation=" << *slice.projection_generation;
+    if (slice.projection_base) out << "@base=" << slice.projection_base->value;
   }
   return out.str();
 }

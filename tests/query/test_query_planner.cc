@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "cedar/query/query.h"
 #include "query/logical/logical_plan.h"
 #include "query/planner/query_planner.h"
@@ -64,6 +66,73 @@ TEST(QueryPlannerTest, RejectsOverlappingManifestRegions) {
   auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{130}}});
   ASSERT_TRUE(query.ok()) << query.status().ToString();
   auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()), Context(catalog, stats));
+  EXPECT_TRUE(plan.status().IsCorruption());
+}
+
+TEST(QueryPlannerTest, DifferentPartOverlapFallsBackWithoutDroppingCoverage) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 4;
+  catalog.base_seq = CommitSeq{10};
+  auto part_zero = Region(0, 100);
+  auto part_one = Region(0, 100);
+  part_one.part_id = PartId{1};
+  catalog.regions = {part_zero, part_one};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{100}}});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 Context(catalog, stats));
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan.ValueOrDie().slices().size(), 1U);
+  EXPECT_EQ(plan.ValueOrDie().slices().front().source,
+            CoverageSource::kCanonical);
+  EXPECT_NE(std::find(plan.ValueOrDie().pushdowns.begin(),
+                      plan.ValueOrDie().pushdowns.end(),
+                      "canonical-fallback"),
+            plan.ValueOrDie().pushdowns.end());
+  const std::string explain =
+      QueryPlanner::ExplainPhysical(plan.ValueOrDie());
+  EXPECT_NE(explain.find("canonical-fallback"), std::string::npos);
+  EXPECT_NE(explain.find("generation=none"), std::string::npos);
+  EXPECT_NE(explain.find("base=none"), std::string::npos);
+  EXPECT_NE(explain.find("confidence=conservative"), std::string::npos);
+}
+
+TEST(QueryPlannerTest, EmptyProjectionRegionFallsBackAndExplainsIt) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 8;
+  catalog.base_seq = CommitSeq{10};
+  catalog.regions.push_back(Region(0, 100));
+  catalog.regions.front().segments.clear();
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{100}}});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 Context(catalog, stats));
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan.ValueOrDie().slices().size(), 1U);
+  EXPECT_EQ(plan.ValueOrDie().slices().front().source,
+            CoverageSource::kCanonical);
+  const std::string explain =
+      QueryPlanner::ExplainPhysical(plan.ValueOrDie());
+  EXPECT_NE(explain.find("canonical-fallback"), std::string::npos);
+  EXPECT_NE(explain.find("generation=none"), std::string::npos);
+  EXPECT_NE(explain.find("base=none"), std::string::npos);
+}
+
+TEST(QueryPlannerTest, RejectsNewerBaseBeforeKeyOverlapFallback) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 9;
+  catalog.base_seq = CommitSeq{26};
+  auto part_zero = Region(0, 100);
+  auto part_one = Region(0, 100);
+  part_one.part_id = PartId{1};
+  catalog.regions = {part_zero, part_one};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{100}}});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 Context(catalog, stats, CommitSeq{25}));
   EXPECT_TRUE(plan.status().IsCorruption());
 }
 

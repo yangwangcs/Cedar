@@ -1515,6 +1515,33 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
                                  ? 0
                                  : AvailableBytes(*reservation));
     }
+    // The fallback materializes normalized coverage rows only after this
+    // guard. Account for the worst-case per-left overlap vector and candidate
+    // row copies before allowing that path to allocate.
+    for (const RelationalRow& left : input.left.rows) {
+      if (input.right.rows.size() >
+          (std::numeric_limits<size_t>::max() - 1) /
+              sizeof(ValidTimeInterval)) {
+        return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                               reservation == nullptr
+                                   ? 0
+                                   : AvailableBytes(*reservation));
+      }
+      const size_t overlap_bytes =
+          (input.right.rows.size() + 1) * sizeof(ValidTimeInterval);
+      if (!AddBytes(overlap_bytes, &scratch_bytes) ||
+          input.right.rows.size() + 1 >
+              std::numeric_limits<size_t>::max() /
+                  std::max<size_t>(EstimateRowBytes(left), 1) ||
+          !AddBytes((input.right.rows.size() + 1) *
+                        std::max<size_t>(EstimateRowBytes(left), 1),
+                    &scratch_bytes)) {
+        return MemoryExhausted(std::numeric_limits<size_t>::max(),
+                               reservation == nullptr
+                                   ? 0
+                                   : AvailableBytes(*reservation));
+      }
+    }
     if (reservation == nullptr) {
       return TemporalBudgetExhausted(scratch_bytes, output_rows, output_bytes,
                                      budget->limit_fragments(),

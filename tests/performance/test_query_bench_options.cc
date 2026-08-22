@@ -7,7 +7,8 @@ TEST(QueryBenchOptions, ParsesWriteSweepControls){auto p=ParseQueryBenchmarkOpti
 TEST(QueryBenchOptions, ReportsUnsupportedOperationsExplicitly){
   EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kStateAt));
   EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kEvents));
-  EXPECT_FALSE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kExpandOut));
-  EXPECT_FALSE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kEarliestArrival));
+  EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kExpandOut));
+  EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kEarliestArrival));
+  EXPECT_FALSE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kPropertyFilter));
 }
 }

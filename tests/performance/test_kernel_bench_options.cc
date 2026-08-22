@@ -59,7 +59,7 @@ TEST(KernelBenchmarkOptionsTest, RequiresAbsolutePath) {
 
 TEST(KernelBenchmarkOptionsTest, RejectsRemovedExecutionProfileOption) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
-                   {"--path", "/tmp/cedar", "--profile", "lean"})
+                   {"--path", "/tmp/cedar", "--profile", "experimental"})
                    .ok());
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
                    {"--path", "/tmp/cedar", "--profile", "kernel"})

@@ -131,7 +131,8 @@ add_library(cedar_query_bench_options STATIC benchmarks/cedar_query_bench_option
 target_include_directories(cedar_query_bench_options PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(cedar_query_bench_options PUBLIC cedar_core)
 add_library(cedar_query_bench_workload STATIC benchmarks/cedar_query_bench_workload.cc)
-target_include_directories(cedar_query_bench_workload PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(cedar_query_bench_workload PUBLIC ${CMAKE_SOURCE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(cedar_query_bench_workload PUBLIC cedar_core)
 
 option(BUILD_BENCHMARKS "Build Cedar kernel benchmarks" OFF)

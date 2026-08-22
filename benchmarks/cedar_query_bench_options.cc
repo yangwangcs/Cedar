@@ -38,6 +38,14 @@ bool QueryBenchmarkOperationSupported(QueryBenchmarkOperation operation) {
     case QueryBenchmarkOperation::kHistory:
     case QueryBenchmarkOperation::kEvents:
     case QueryBenchmarkOperation::kChanges:
+    case QueryBenchmarkOperation::kExpandOut:
+    case QueryBenchmarkOperation::kExpandIn:
+    case QueryBenchmarkOperation::kExpandBoth:
+    case QueryBenchmarkOperation::kKHop:
+    case QueryBenchmarkOperation::kCoexistingShortestPath:
+    case QueryBenchmarkOperation::kEarliestArrival:
+    case QueryBenchmarkOperation::kLatestDeparture:
+    case QueryBenchmarkOperation::kFastestDuration:
       return true;
     default:
       return false;

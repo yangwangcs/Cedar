@@ -290,10 +290,26 @@ Status QueryProjectionStore::LoadCurrent() {
 
 Status QueryProjectionStore::PublishCurrent(uint64_t generation) {
   const fs::path temp = fs::path(projections_path_) / "PROJECTION-CURRENT.tmp";
+  if (options_.crash_fault_injector) {
+    auto injected = options_.crash_fault_injector("current_write_before");
+    if (!injected.ok()) return injected;
+  }
   const Status written = WriteFile(temp, CurrentBytes(generation)); if (!written.ok()) return written;
+  if (options_.crash_fault_injector) {
+    auto injected = options_.crash_fault_injector("current_write_after");
+    if (!injected.ok()) return injected;
+  }
   if (options_.fault_injector) { auto s=options_.fault_injector(ProjectionStoreFaultPoint::kCurrentTemporaryWrite); if (!s.ok()) return s; }
   auto sync = SyncFile(temp); if (!sync.ok()) return sync;
+  if (options_.crash_fault_injector) {
+    auto injected = options_.crash_fault_injector("current_rename_before");
+    if (!injected.ok()) return injected;
+  }
   if (::rename(temp.c_str(), (fs::path(projections_path_) / "PROJECTION-CURRENT").c_str()) != 0) return Status::IOError("projection store", "CURRENT rename failed");
+  if (options_.crash_fault_injector) {
+    auto injected = options_.crash_fault_injector("current_rename_after");
+    if (!injected.ok()) return injected;
+  }
   if (options_.fault_injector) { auto s=options_.fault_injector(ProjectionStoreFaultPoint::kCurrentRename); if (!s.ok()) return s; }
   if (options_.crash_fault_injector) { auto s=options_.crash_fault_injector("current_replace"); if (!s.ok()) return s; }
   return SyncDirectory(projections_path_);
@@ -350,10 +366,18 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
     if (fs::exists(destination, exists_error) || exists_error || fs::is_symlink(destination, exists_error) || (fs::exists(destination, exists_error) && !fs::is_regular_file(destination, exists_error))) return Status::Conflict("projection store", "segment filename already exists or is not regular");
     const fs::path temp = fs::path(projections_path_) / (input.descriptor.filename + ".tmp");
     if (fs::exists(temp, exists_error) || exists_error || fs::is_symlink(temp, exists_error)) return Status::Conflict("projection store", "segment temporary filename already exists");
-    auto s=WriteFile(temp,input.bytes); if (!s.ok()) return s; s=SyncFile(temp); if (!s.ok()) return s;
+    Status s;
+    if (options_.crash_fault_injector) { s = options_.crash_fault_injector("segment_write_before"); if (!s.ok()) return s; }
+    s=WriteFile(temp,input.bytes); if (!s.ok()) return s;
+    if (options_.crash_fault_injector) { s = options_.crash_fault_injector("segment_write_after"); if (!s.ok()) return s; }
+    if (options_.crash_fault_injector) { s = options_.crash_fault_injector("segment_sync_before"); if (!s.ok()) return s; }
+    s=SyncFile(temp); if (!s.ok()) return s;
+    if (options_.crash_fault_injector) { s = options_.crash_fault_injector("segment_sync_after"); if (!s.ok()) return s; }
     if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kAfterSegmentSync); if (!s.ok()) return s; }
     if (options_.crash_fault_injector) { s=options_.crash_fault_injector("segment_sync"); if (!s.ok()) return s; }
+    if (options_.crash_fault_injector) { s = options_.crash_fault_injector("segment_rename_before"); if (!s.ok()) return s; }
     if (::rename(temp.c_str(), (fs::path(projections_path_) / input.descriptor.filename).c_str()) != 0) return Status::IOError("projection store", "segment rename failed");
+    if (options_.crash_fault_injector) { s = options_.crash_fault_injector("segment_rename_after"); if (!s.ok()) return s; }
   }
   auto encoded = EncodeProjectionManifest(build.manifest); if (!encoded.ok()) return encoded.status();
   const fs::path manifest = fs::path(manifests_path_) / (std::to_string(build.manifest.generation_id) + ".cmanifest");
@@ -361,10 +385,18 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   if (fs::exists(manifest, manifest_error) || manifest_error || fs::is_symlink(manifest, manifest_error)) return Status::Conflict("projection store", "manifest generation already exists");
   const fs::path temp_manifest = manifest.string() + ".tmp";
   if (fs::exists(temp_manifest, manifest_error) || manifest_error || fs::is_symlink(temp_manifest, manifest_error)) return Status::Conflict("projection store", "manifest temporary filename already exists");
-  auto s=WriteFile(temp_manifest, encoded.ValueOrDie()); if (!s.ok()) return s; s=SyncFile(temp_manifest); if (!s.ok()) return s;
+  Status s;
+  if (options_.crash_fault_injector) { s = options_.crash_fault_injector("manifest_write_before"); if (!s.ok()) return s; }
+  s=WriteFile(temp_manifest, encoded.ValueOrDie()); if (!s.ok()) return s;
+  if (options_.crash_fault_injector) { s = options_.crash_fault_injector("manifest_write_after"); if (!s.ok()) return s; }
+  if (options_.crash_fault_injector) { s = options_.crash_fault_injector("manifest_sync_before"); if (!s.ok()) return s; }
+  s=SyncFile(temp_manifest); if (!s.ok()) return s;
+  if (options_.crash_fault_injector) { s = options_.crash_fault_injector("manifest_sync_after"); if (!s.ok()) return s; }
   if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kAfterManifestSync); if (!s.ok()) return s; }
   if (options_.crash_fault_injector) { s=options_.crash_fault_injector("manifest_sync"); if (!s.ok()) return s; }
+  if (options_.crash_fault_injector) { s = options_.crash_fault_injector("manifest_rename_before"); if (!s.ok()) return s; }
   if (::rename(temp_manifest.c_str(), manifest.c_str()) != 0) return Status::IOError("projection store", "manifest rename failed");
+  if (options_.crash_fault_injector) { s = options_.crash_fault_injector("manifest_rename_after"); if (!s.ok()) return s; }
   s=SyncDirectory(manifests_path_); if (!s.ok()) return s;
   if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kDirectorySync); if (!s.ok()) return s; }
   s=PublishCurrent(build.manifest.generation_id); if (!s.ok()) return s;

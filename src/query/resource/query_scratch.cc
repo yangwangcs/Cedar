@@ -234,10 +234,23 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
     rollback();
     return status;
   }
+  if (crash_fault_injector_) {
+    const Status injected = crash_fault_injector_("scratch_write_before");
+    if (!injected.ok()) { rollback(); return injected; }
+  }
   std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     rollback();
     return Status::IOError("query scratch", "cannot create scratch block");
+  }
+  if (crash_fault_injector_) {
+    const Status injected = crash_fault_injector_("scratch_write_after");
+    if (!injected.ok()) {
+      std::error_code remove_ec;
+      std::filesystem::remove(temp_path, remove_ec);
+      rollback();
+      return injected;
+    }
   }
   out.write(kMagic.data(), kMagic.size());
   Write<uint32_t>(out, static_cast<uint32_t>(query_id_.size()));
@@ -259,11 +272,19 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
       return injected;
     }
   }
+  if (crash_fault_injector_) {
+    const Status injected = crash_fault_injector_("scratch_rename_before");
+    if (!injected.ok()) { rollback(); return injected; }
+  }
   std::error_code rename_ec;
   std::filesystem::rename(temp_path, path, rename_ec);
   if (rename_ec) {
     rollback();
     return Status::IOError("query scratch", rename_ec.message());
+  }
+  if (crash_fault_injector_) {
+    const Status injected = crash_fault_injector_("scratch_rename_after");
+    if (!injected.ok()) return injected;
   }
   written_bytes_ += bytes;
   return path;

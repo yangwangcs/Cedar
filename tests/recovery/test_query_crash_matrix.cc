@@ -214,5 +214,34 @@ TEST_F(QueryCrashMatrixTest, UnpublishedTemporaryFilesAreIgnoredOnOpen) {
   EXPECT_FALSE(opened.ValueOrDie()->projections_enabled());
 }
 
+TEST_F(QueryCrashMatrixTest, ProjectionBitFlipDeletionAndTruncationFailClosed) {
+  ProjectionChain chain;
+  chain.header.kind = ProjectionKind::kState;
+  chain.header.generation_id = 1;
+  chain.header.base_seq = CommitSeq{1};
+  chain.header.part_id = PartId{0};
+  chain.header.entity_min = 1;
+  chain.header.entity_max_exclusive = 2;
+  chain.header.valid_from_min = ValidTime{0};
+  chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, std::nullopt},
+                             Value::Int64(7), 1});
+  auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  const std::string good = encoded.ValueOrDie();
+  std::string flipped = good;
+  ASSERT_GT(flipped.size(), 16U);
+  flipped[16] ^= 0x01;
+  EXPECT_TRUE(DecodeProjectionPage(flipped).status().IsCorruption());
+  EXPECT_TRUE(DecodeProjectionPage(good.substr(0, good.size() - 1))
+                  .status()
+                  .IsCorruption());
+  EXPECT_TRUE(DecodeProjectionPage(std::string{}).status().IsCorruption());
+  std::ofstream(path_ + "/segment.csegment", std::ios::binary)
+      .write(flipped.data(), static_cast<std::streamsize>(flipped.size()));
+  auto opened = QueryProjectionStore::Open({path_, "query-db", {}});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  EXPECT_FALSE(opened.ValueOrDie()->projections_enabled());
+}
+
 }  // namespace
 }  // namespace cedar::internal

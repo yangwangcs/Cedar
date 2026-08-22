@@ -1605,9 +1605,7 @@ Status Database::Close() {
   if (had_active_queries) {
     impl_->CancelActiveQueries();
     impl_->ObserveShutdownStage("query_cancel_requested");
-    // Query cancellation is atomic and does not wait for a user callback.
-    // The callback releases query-owned derived resources before the store
-    // close below; no query task is allowed to publish after this point.
+    impl_->WaitForActiveQueries();
     impl_->ObserveShutdownStage("query_tasks_joined");
   }
   lock.lock();
@@ -1765,9 +1763,24 @@ void Database::Impl::CancelActiveQueries() {
   {
     std::lock_guard<std::mutex> lock(mutex);
     states = active_query_states;
+  }
+  for (const auto& state : states) if (state) state->RequestCancel();
+}
+
+void Database::Impl::WaitForActiveQueries() {
+  std::vector<std::shared_ptr<QueryExecutionState>> states;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    states = active_query_states;
+  }
+  // RequestCancel is deliberately non-blocking. Close supplies the ordered
+  // acknowledgement barrier: it waits for every in-flight Next operation,
+  // then releases the query Snapshot and scratch before RocksDB shutdown.
+  for (const auto& state : states) if (state) state->Close();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
     active_query_states.clear();
   }
-  for (const auto& state : states) state->RequestCancel();
 }
 
 Status Database::Vacuum(CommitSeq oldest_readable) {

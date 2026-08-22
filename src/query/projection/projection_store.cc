@@ -67,6 +67,7 @@ struct ProjectionGeneration::State {
   std::atomic<uint64_t> pins{0};
   std::atomic<bool> present{true};
   std::atomic<bool> retired{false};
+  mutable std::set<std::string> unavailable_segments;
 };
 
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGeneration(
@@ -99,11 +100,20 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
       continue;
     }
     for (const auto& segment : region.segments) {
+      if (state->unavailable_segments.count(segment.filename) != 0) {
+        continue;
+      }
       std::ifstream in(fs::path(state->directory) / segment.filename, std::ios::binary);
-      if (!in) return Status::IOError("projection store", "segment read failed");
+      if (!in) {
+        state->unavailable_segments.insert(segment.filename);
+        continue;
+      }
       std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
       auto decoded = DecodeProjectionPage(bytes);
-      if (!decoded.ok()) return decoded.status();
+      if (!decoded.ok()) {
+        state->unavailable_segments.insert(segment.filename);
+        continue;
+      }
       result.push_back(std::move(decoded).ConsumeValueOrDie());
     }
   }
@@ -139,6 +149,18 @@ StatusOr<std::unique_ptr<QueryProjectionStore>> QueryProjectionStore::Open(Proje
   if (options.path.empty() || options.database_identity.empty()) return Status::InvalidArgument("projection store", "path and database identity are required");
   auto store = std::unique_ptr<QueryProjectionStore>(new QueryProjectionStore(std::move(options)));
   std::error_code ec; fs::create_directories(store->manifests_path_, ec); if (ec) return Status::IOError("projection store", ec.message());
+  // Crash recovery leaves only unpublished temporary artifacts. They are
+  // never authoritative; remove them before loading CURRENT so a killed
+  // writer cannot accumulate stale segments across reopen cycles.
+  for (const fs::path& root : {fs::path(store->projections_path_),
+                               fs::path(store->manifests_path_)}) {
+    for (fs::directory_iterator it(root, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+      if (it->is_regular_file(ec) && it->path().extension() == ".tmp") {
+        fs::remove(it->path(), ec);
+      }
+    }
+    ec.clear();
+  }
   const Status loaded = store->LoadCurrent();
   if (!loaded.ok() && !loaded.IsNotFound()) { store->enabled_ = false; }
   return store;
@@ -153,6 +175,14 @@ Status QueryProjectionStore::LoadCurrent() {
   auto bytes = ReadFile(manifest_path); if (!bytes.ok()) return bytes.status();
   auto manifest = DecodeProjectionManifest(bytes.ValueOrDie(), options_.database_identity); if (!manifest.ok()) return manifest.status();
   if (manifest.ValueOrDie().generation_id != generation) return Status::Corruption("projection store", "manifest generation mismatch");
+  if (options_.visible_seq && manifest.ValueOrDie().base_seq.value > options_.visible_seq->value) {
+    enabled_ = false;
+    return Status::NotFound("projection store", "projection base is ahead of authoritative visible watermark");
+  }
+  if (options_.oldest_readable_seq && manifest.ValueOrDie().base_seq.value < options_.oldest_readable_seq->value) {
+    enabled_ = false;
+    return Status::NotFound("projection store", "projection base is below authoritative retention watermark");
+  }
   for (const auto& r : manifest.ValueOrDie().regions) for (const auto& seg : r.segments) {
     const fs::path segment_path = fs::path(projections_path_) / seg.filename;
     std::error_code ec; if (!fs::exists(segment_path, ec) || ec || fs::file_size(segment_path, ec) != seg.file_bytes || ec) return Status::Corruption("projection store", "referenced segment is missing or sized differently");

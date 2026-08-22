@@ -279,6 +279,9 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
           database->query_resource_pool.get(),
           [database](const std::shared_ptr<QueryExecutionState>& state) {
             database->RegisterQueryState(state);
+          },
+          [database](const std::shared_ptr<QueryExecutionState>& state) {
+            database->UnregisterQueryState(state);
           });
     }
   }
@@ -291,6 +294,9 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       database->query_resource_pool.get(),
       [database](const std::shared_ptr<QueryExecutionState>& state) {
         database->RegisterQueryState(state);
+      },
+      [database](const std::shared_ptr<QueryExecutionState>& state) {
+        database->UnregisterQueryState(state);
       });
 }
 

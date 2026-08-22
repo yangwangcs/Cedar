@@ -293,6 +293,7 @@ class Database::Impl {
   void UnregisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
   bool HasActiveQueries() const;
   void CancelActiveQueries();
+  void WaitForActiveQueries();
 
   mutable std::mutex mutex;
   std::condition_variable commits_drained;

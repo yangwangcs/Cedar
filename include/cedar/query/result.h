@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -200,17 +201,28 @@ class QueryExecutionState {
   Status FinishFailed(Status status);
   QueryTerminalInfo terminal_info() const;
   Status Close();
+  // QueryRuntime brackets every potentially blocking Next call with these
+  // methods. Close waits for the last operation before releasing snapshots.
+  void BeginOperation();
+  void EndOperation();
+  void WaitForOperations();
   void SetCancelCallback(std::function<void()> callback);
+  void SetCloseCallback(std::function<void()> callback);
   void ClearCancelCallback();
   void SetSnapshotSeq(CommitSeq seq);
   std::optional<CommitSeq> snapshot_seq() const;
 
  private:
   mutable std::mutex mutex_;
+  std::condition_variable operations_cv_;
+  uint32_t active_operations_ = 0;
+  bool close_started_ = false;
+  bool close_callback_called_ = false;
   std::atomic<bool> cancelled_{false};
   QueryTerminalInfo terminal_;
   std::optional<CommitSeq> snapshot_seq_;
   std::function<void()> cancel_callback_;
+  std::function<void()> close_callback_;
 };
 
 class QueryBatch {

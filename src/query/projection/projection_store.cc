@@ -303,6 +303,21 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   std::lock_guard<std::mutex> build_lock(mutex_);
   auto publication_lock = AcquirePublicationFileLock(projections_path_);
   if (!publication_lock.ok()) return publication_lock.status();
+  // Each process has its own in-memory CURRENT.  Re-read the durable pointer
+  // while holding the shared publication lock so two processes cannot publish
+  // the same (or an older) generation based on stale local state.
+  auto on_disk_current = ReadFile(fs::path(projections_path_) / "PROJECTION-CURRENT");
+  if (on_disk_current.ok()) {
+    uint64_t on_disk_generation = 0;
+    if (!ParseCurrent(on_disk_current.ValueOrDie(), &on_disk_generation)) {
+      return Status::Corruption("projection store", "bad PROJECTION-CURRENT");
+    }
+    if (on_disk_generation != 0 && build.manifest.generation_id <= on_disk_generation) {
+      return Status::Conflict("projection store", "generation is not newer than published CURRENT");
+    }
+  } else if (!on_disk_current.status().IsNotFound()) {
+    return on_disk_current.status();
+  }
   const Status manifest_status = ValidateProjectionManifest(build.manifest, options_.database_identity);
   if (!manifest_status.ok()) return manifest_status;
   if (build.manifest.generation_id == 0 || (current_ && build.manifest.generation_id <= current_->manifest.generation_id)) return Status::Conflict("projection store", "generation is not strictly newer");
@@ -371,7 +386,51 @@ std::optional<ProjectionGeneration> QueryProjectionStore::Acquire(const Coverage
   }
   return std::nullopt;
 }
-Status QueryProjectionStore::RetireBefore(CommitSeq seq) { std::lock_guard<std::mutex> lock(mutex_); if (current_ && current_->manifest.base_seq.value < seq.value) { auto published = PublishCurrent(0); if (!published.ok()) return published; current_->retired=true; retired_.push_back(current_); current_.reset(); enabled_=false; } for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; fs::remove(fs::path((*it)->directory) / file, ec); } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } return Status::OK(); }
+Status QueryProjectionStore::RetireBefore(CommitSeq seq) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (current_ && current_->manifest.base_seq.value < seq.value) {
+    // Retiring publishes generation zero through the same inter-process lock
+    // used by Build and statistics refresh.
+    auto publication_lock = AcquirePublicationFileLock(projections_path_);
+    if (!publication_lock.ok()) return publication_lock.status();
+    auto on_disk_current = ReadFile(fs::path(projections_path_) / "PROJECTION-CURRENT");
+    if (!on_disk_current.ok()) {
+      return on_disk_current.status().IsNotFound()
+                 ? Status::Conflict("projection store", "durable CURRENT disappeared")
+                 : on_disk_current.status();
+    }
+    uint64_t on_disk_generation = 0;
+    if (!ParseCurrent(on_disk_current.ValueOrDie(), &on_disk_generation)) {
+      return Status::Corruption("projection store", "bad PROJECTION-CURRENT");
+    }
+    if (on_disk_generation != current_->manifest.generation_id) {
+      return Status::Conflict("projection store", "durable CURRENT changed before retirement");
+    }
+    auto published = PublishCurrent(0);
+    if (!published.ok()) return published;
+    current_->retired = true;
+    retired_.push_back(current_);
+    current_.reset();
+    enabled_ = false;
+  }
+  for (auto it = retired_.begin(); it != retired_.end();) {
+    if ((*it)->pins.load() == 0) {
+      for (const auto& file : (*it)->segment_files) {
+        std::error_code ec;
+        fs::remove(fs::path((*it)->directory) / file, ec);
+      }
+      if (!(*it)->manifest_file.empty()) {
+        std::error_code ec;
+        fs::remove((*it)->manifest_file, ec);
+      }
+      (*it)->present = false;
+      it = retired_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return Status::OK();
+}
 void QueryProjectionStore::CollectRetired() { std::lock_guard<std::mutex> lock(mutex_); for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; const fs::path source = fs::path((*it)->directory) / file; if ((*it)->corrupt_segments.count(file) != 0 && fs::exists(source)) { fs::create_directories(fs::path((*it)->directory) / "quarantine", ec); if (!ec) { fs::rename(source, fs::path((*it)->directory) / "quarantine" / file, ec); } } else { fs::remove(source, ec); } } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } }
 size_t QueryProjectionStore::pending_rebuild_requests() const { std::lock_guard<std::mutex> lock(mutex_); return rebuild_requests_.size(); }
 Status QueryProjectionStore::Quarantine(const std::string& filename) { std::lock_guard<std::mutex> lock(mutex_); if (!SafeName(filename) || filename == "PROJECTION-CURRENT") return Status::InvalidArgument("projection store", "invalid quarantine filename"); auto referenced = [&](const std::shared_ptr<ProjectionGeneration::State>& generation) { if (!generation) return false; for (const auto& file : generation->segment_files) if (file == filename) return true; return generation->manifest_file == (fs::path(projections_path_) / filename).string(); }; if (referenced(current_)) return Status::Conflict("projection store", "cannot quarantine referenced current file"); for (const auto& generation : retired_) if (referenced(generation) && generation->pins.load() != 0) return Status::Conflict("projection store", "cannot quarantine pinned file"); std::error_code ec; fs::create_directories(fs::path(projections_path_) / "quarantine", ec); if (ec) return Status::IOError("projection store", ec.message()); fs::rename(fs::path(projections_path_) / filename, fs::path(projections_path_) / "quarantine" / filename, ec); if (ec) return Status::IOError("projection store", ec.message()); return SyncDirectory(fs::path(projections_path_) / "quarantine"); }

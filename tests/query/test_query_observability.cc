@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "cedar/core/crc32c.h"
+#include "cedar/database.h"
 #include "query/observability/query_metrics.h"
 #include "query/projection/projection_manifest.h"
 
@@ -319,3 +320,41 @@ TEST(QueryObservabilityTest, RefreshIsSerializedAndRepeatable) {
 
 }  // namespace
 }  // namespace cedar::internal
+
+namespace cedar {
+namespace {
+
+TEST(PublicQueryObservabilityTest, SnapshotExposesAllBoundedDimensions) {
+  QueryMetricsSnapshot snapshot;
+  snapshot.admission[static_cast<size_t>(QueryMetricAdmission::kQueued)] = 1;
+  snapshot.projection[static_cast<size_t>(QueryMetricProjection::kFallback)] = 2;
+  snapshot.projection_health[
+      static_cast<size_t>(QueryMetricProjectionHealth::kHole)] = 3;
+  snapshot.adjacency_pruning[
+      static_cast<size_t>(QueryMetricAdjacencyPruning::kPruned)] = 4;
+  snapshot.label_dominance[
+      static_cast<size_t>(QueryMetricLabelDominance::kDominant)] = 5;
+  snapshot.latency_us[0] = 6;
+  snapshot.admission_wait_us[1] = 7;
+  snapshot.worker_wait_us[2] = 8;
+  snapshot.io_wait_us[3] = 9;
+  snapshot.delta_lag[4] = 10;
+  snapshot.memory_bytes = 11;
+  snapshot.scratch_bytes = 12;
+
+  EXPECT_EQ(snapshot.admission[1], 1U);
+  EXPECT_EQ(snapshot.projection[1], 2U);
+  EXPECT_EQ(snapshot.projection_health[1], 3U);
+  EXPECT_EQ(snapshot.adjacency_pruning[0], 4U);
+  EXPECT_EQ(snapshot.label_dominance[1], 5U);
+  EXPECT_EQ(snapshot.latency_us[0], 6U);
+  EXPECT_EQ(snapshot.admission_wait_us[1], 7U);
+  EXPECT_EQ(snapshot.worker_wait_us[2], 8U);
+  EXPECT_EQ(snapshot.io_wait_us[3], 9U);
+  EXPECT_EQ(snapshot.delta_lag[4], 10U);
+  EXPECT_EQ(snapshot.memory_bytes, 11U);
+  EXPECT_EQ(snapshot.scratch_bytes, 12U);
+}
+
+}  // namespace
+}  // namespace cedar

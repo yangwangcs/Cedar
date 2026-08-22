@@ -1776,11 +1776,23 @@ QueryMetricsSnapshot Database::SampleQueryMetrics() const {
   result.operator_rows = snapshot.operator_rows;
   result.terminal = snapshot.terminal;
   result.fallback = snapshot.fallback;
+  result.admission = snapshot.admission;
+  result.projection = snapshot.projection;
+  result.projection_health = snapshot.projection_health;
+  result.adjacency_pruning = snapshot.adjacency_pruning;
+  result.label_dominance = snapshot.label_dominance;
+  result.latency_us = snapshot.latency_us;
+  result.admission_wait_us = snapshot.admission_wait_us;
+  result.worker_wait_us = snapshot.worker_wait_us;
+  result.io_wait_us = snapshot.io_wait_us;
+  result.delta_lag = snapshot.delta_lag;
   result.batches = snapshot.batches;
   result.physical_bytes = snapshot.physical_bytes;
   result.decoded_bytes = snapshot.decoded_bytes;
   result.interval_fragments = snapshot.interval_fragments;
   result.spill_bytes = snapshot.spill_bytes;
+  result.memory_bytes = snapshot.memory_bytes;
+  result.scratch_bytes = snapshot.scratch_bytes;
   return result;
 }
 

@@ -194,6 +194,26 @@ TEST_F(ProjectionStoreTest, RetirePersistsDisabledStateAcrossReopen) {
   EXPECT_FALSE(reopened.ValueOrDie()->current_generation_id().has_value());
 }
 
+TEST_F(ProjectionStoreTest, RetireRejectsStaleDurableCurrent) {
+  auto first = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(first.ok());
+  ASSERT_TRUE(first.ValueOrDie()->Build(Build(10)).ok());
+
+  // Simulate a second process that opened before the first process advanced
+  // the durable pointer to generation 20.
+  auto stale = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(stale.ok());
+  ASSERT_EQ(stale.ValueOrDie()->current_generation_id(),
+            std::optional<uint64_t>(10));
+  ASSERT_TRUE(first.ValueOrDie()->Build(Build(20, "seg-b")).ok());
+
+  EXPECT_TRUE(stale.ValueOrDie()->RetireBefore(CommitSeq{20}).IsConflict());
+  auto reopened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(reopened.ok());
+  EXPECT_EQ(reopened.ValueOrDie()->current_generation_id(),
+            std::optional<uint64_t>(20));
+}
+
 TEST_F(ProjectionStoreTest, RejectsGenerationFilenameCollisionAndPinnedQuarantine) {
   auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
   ASSERT_TRUE(opened.ok());

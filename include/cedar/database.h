@@ -26,15 +26,56 @@ namespace cedar {
 
 class Query;
 
+// Query metrics use fixed Cedar-owned dimensions so snapshots remain bounded
+// and cannot accidentally acquire query-, property-, or value-level labels.
+enum class QueryMetricOperator : uint8_t {
+  kScan = 0, kExpand, kJoin, kFilter, kProject, kAggregate, kSort, kCount,
+};
+enum class QueryMetricTerminal : uint8_t {
+  kComplete = 0, kCancelled, kFailed, kCount,
+};
+enum class QueryMetricFallback : uint8_t {
+  kNone = 0, kCanonical, kDelta, kUntrustedStatistics, kCount,
+};
+enum class QueryMetricAdmission : uint8_t {
+  kAdmitted = 0, kQueued, kRejected, kCount,
+};
+enum class QueryMetricProjection : uint8_t {
+  kHit = 0, kFallback, kCount,
+};
+enum class QueryMetricProjectionHealth : uint8_t {
+  kHealthy = 0, kHole, kCorrupt, kStale, kCount,
+};
+enum class QueryMetricAdjacencyPruning : uint8_t {
+  kPruned = 0, kExpanded, kCount,
+};
+enum class QueryMetricLabelDominance : uint8_t {
+  kBalanced = 0, kDominant, kCount,
+};
+
+constexpr size_t kQueryMetricHistogramBuckets = 16;
+
 struct QueryMetricsSnapshot {
-  std::array<uint64_t, 7> operator_rows{};
-  std::array<uint64_t, 3> terminal{};
-  std::array<uint64_t, 4> fallback{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricOperator::kCount)> operator_rows{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricTerminal::kCount)> terminal{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricFallback::kCount)> fallback{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricAdmission::kCount)> admission{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricProjection::kCount)> projection{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricProjectionHealth::kCount)> projection_health{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricAdjacencyPruning::kCount)> adjacency_pruning{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricLabelDominance::kCount)> label_dominance{};
+  std::array<uint64_t, kQueryMetricHistogramBuckets> latency_us{};
+  std::array<uint64_t, kQueryMetricHistogramBuckets> admission_wait_us{};
+  std::array<uint64_t, kQueryMetricHistogramBuckets> worker_wait_us{};
+  std::array<uint64_t, kQueryMetricHistogramBuckets> io_wait_us{};
+  std::array<uint64_t, kQueryMetricHistogramBuckets> delta_lag{};
   uint64_t batches = 0;
   uint64_t physical_bytes = 0;
   uint64_t decoded_bytes = 0;
   uint64_t interval_fragments = 0;
   uint64_t spill_bytes = 0;
+  uint64_t memory_bytes = 0;
+  uint64_t scratch_bytes = 0;
 };
 
 class QueryMaintenanceHandle {

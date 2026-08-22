@@ -37,6 +37,10 @@ statistics publication.
   when profile capture is disabled, and `Database::SampleQueryMetrics()` exposes
   only fixed-size bounded arrays. CLI JSON/text inspection now includes Cedar
   authority and all query-file metadata.
+- Refresh now emits bounded approximate histograms, top values, quantiles,
+  interval/edge counts and HLL registers and marks the snapshot complete only
+  when a real schema identity is present. A completed snapshot with an empty
+  schema identity is rejected at load time.
 
 ## Verification
 

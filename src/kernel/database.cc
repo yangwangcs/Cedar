@@ -1470,6 +1470,7 @@ QueryMaintenanceHandle::~QueryMaintenanceHandle() = default;
 void QueryMaintenanceHandle::Cancel() {
   if (!state_) return;
   std::lock_guard<std::mutex> lock(state_->shared->mutex);
+  if (state_->shared->done) return;
   state_->shared->cancelled = true;
   state_->shared->cv.notify_all();
 }
@@ -1477,7 +1478,7 @@ Status QueryMaintenanceHandle::Await() {
   if (!state_) return Status::InvalidArgument("query maintenance", "moved-from handle");
   std::unique_lock<std::mutex> lock(state_->shared->mutex);
   state_->shared->cv.wait(lock, [this] { return state_->shared->done; });
-  if (state_->shared->cancelled) return Status::QueryCancelled("query maintenance", "refresh cancelled");
+  if (state_->shared->cancelled && !state_->shared->done) return Status::QueryCancelled("query maintenance", "refresh cancelled");
   return state_->shared->status;
 }
 

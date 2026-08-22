@@ -177,8 +177,19 @@ resolve_turning_point() {
 
 write_turning_point_artifact() {
   local source="$output/summary.csv" run_csv="$output/release-calibration"
-  local value
-  value=$(find "$run_csv" -type f -name run.csv -print0 | xargs -0 -r awk -F, 'FNR==1 {for(i=1;i<=NF;i++) {if($i=="facts_per_txn") f=i; if($i=="facts_per_second") r=i; if($i=="hard_gate_pass") g=i}} FNR==2 && $g=="true" && $r+0>max {max=$r; value=$f} END {if(value!="") print value}' | sort -nr | sed -n '1p')
+  local value="" candidate rate best_rate=0 run_file
+  while IFS= read -r run_file; do
+    candidate=$(awk -F, 'FNR==1 {for(i=1;i<=NF;i++) {if($i=="facts_per_txn") f=i; if($i=="facts_per_second") r=i; if($i=="hard_gate_pass") g=i}} FNR==2 && $g=="true" {print $f ";" $r; exit}' "$run_file")
+    if [[ "$candidate" == *\;* ]]; then
+      value=${candidate%%;*}
+      rate=${candidate#*;}
+      if awk -v rate="$rate" -v best="$best_rate" 'BEGIN {exit !(rate+0 > best+0)}'; then
+        best_rate="$rate"
+        turning_value="$value"
+      fi
+    fi
+  done < <(find "$run_csv" -type f -name run.csv -print)
+  value="${turning_value:-}"
   [[ "$value" =~ ^[0-9]+$ ]] || return 1
   printf '{"facts_per_txn":%s,"source_summary":"%s"}\n' "$value" "$source" > "$turning_point_artifact"
 }

@@ -141,6 +141,15 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.hard_gate_pass = false;
     return result;
   }
+  if (options.projection != ProjectionState::kCanonicalOnly ||
+      options.projection_work == ProjectionWork::kActive) {
+    result.projection_state_supported = false;
+    result.terminal_status =
+        "projection benchmark setup unavailable: canonical-only paused is the only measured state";
+    result.gate_classification = "unsupported";
+    result.hard_gate_pass = false;
+    return result;
+  }
   const auto run_start = Clock::now();
   result.projection_active = options.projection_work == ProjectionWork::kActive;
   std::optional<QueryMaintenanceHandle> maintenance;
@@ -310,6 +319,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                                          result.authoritative_bytes;
   result.hard_gate_pass = result.metrics_complete &&
                           result.operation_supported &&
+                          result.projection_state_supported &&
                           result.terminal_status == "OK" &&
                           (!options.verify_reopen || result.reopen_verified) &&
                           (result.authoritative_bytes == 0 ||
@@ -319,7 +329,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,rows,elapsed_seconds,transactions_per_second,facts_per_second,mib_per_second,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,derived_bytes,scratch_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,cache_conditioned,operation_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,rows,elapsed_seconds,transactions_per_second,facts_per_second,mib_per_second,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,derived_bytes,scratch_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -342,6 +352,7 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.projection_lag << ',' << (r.projection_active ? "active" : "paused") << ','
     << (r.cache_conditioned ? "true" : "false") << ','
     << (r.operation_supported ? "true" : "false") << ','
+    << (r.projection_state_supported ? "true" : "false") << ','
     << (r.metrics_complete ? "true" : "false") << ','
     << r.build_type << ',' << r.sanitizer << ',' << r.host << ','
     << r.plan_fingerprint << ',' << r.raw_sample_path << ','
@@ -372,10 +383,12 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << "\",\"host\":\"" << r.host
     << "\",\"plan_fingerprint\":\"" << r.plan_fingerprint
     << "\",\"raw_sample_path\":\"" << r.raw_sample_path
-    << ",\"seed\":" << o.seed << ",\"dataset_checksum\":"
+    << "\",\"seed\":" << o.seed << ",\"dataset_checksum\":"
     << r.dataset_checksum << ",\"cache_conditioned\":"
     << (r.cache_conditioned ? "true" : "false")
     << ",\"operation_supported\":" << (r.operation_supported ? "true" : "false")
+    << ",\"projection_state_supported\":"
+    << (r.projection_state_supported ? "true" : "false")
     << ",\"metrics_complete\":" << (r.metrics_complete ? "true" : "false")
     << ",\"terminal_status\":\"" << r.terminal_status
     << "\",\"reopen_verified\":" << (r.reopen_verified ? "true" : "false")

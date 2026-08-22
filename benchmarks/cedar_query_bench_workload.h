@@ -35,6 +35,7 @@ struct QueryBenchmarkResult {
   bool metrics_complete = false;
   bool cache_conditioned = false;
   bool operation_supported = true;
+  bool projection_state_supported = true;
   std::string gate_classification = "incomplete";
   std::string terminal_status = "OK";
   std::string build_type = "unknown";

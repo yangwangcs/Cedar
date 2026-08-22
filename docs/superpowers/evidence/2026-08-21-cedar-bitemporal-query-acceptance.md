@@ -11,7 +11,7 @@ a sustained-capability claim because the complete Release matrices and the
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `0d4dd7d` (`codex/cedar-bitemporal-query-execution`)
+- Source snapshot: `bb9d87e` (`codex/cedar-bitemporal-query-execution`)
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
 - Build: `build/query-debug`, C++20, Debug
 - Install prefix: `build-install-consumer-prefix`
@@ -123,6 +123,11 @@ verification explicitly because `cedar_query_bench` has no interface to reopen
 and checksum databases from a prior campaign input. Those phases return a
 nonzero status and write `unsupported` to their summary; they must not be
 treated as passed evidence.
+
+The current runner summary schema reports facts/s and end-to-end p99 for these
+campaign cases. It does not yet enforce the complete WAL-sync p99 and
+idle-overhead gates required by the full Release acceptance plan; those remain
+open implementation and evidence work.
 
 ## Gates not completed in this evidence point
 

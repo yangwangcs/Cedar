@@ -109,6 +109,7 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
       if (decoded.ok()) {
         metadata.generation_id = decoded.ValueOrDie().generation_id;
         metadata.base_seq = decoded.ValueOrDie().base_seq.value;
+        metadata.coverage = decoded.ValueOrDie().coverage;
         for (size_t i = 0; i < decoded.ValueOrDie().columns.size(); ++i) {
           const auto& column = decoded.ValueOrDie().columns[i];
           if (!column.entity_range) continue;

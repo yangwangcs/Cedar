@@ -337,6 +337,17 @@ target_link_libraries(test_kernel_bench_options
     PRIVATE cedar_kernel_bench_options ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bench_options)
 
+add_executable(test_query_bench_options performance/test_query_bench_options.cc)
+target_include_directories(test_query_bench_options PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_query_bench_options PRIVATE cedar_query_bench_options ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_bench_options TEST_PREFIX "QueryBench.")
+
+if(TARGET cedar_query_bench)
+  add_test(NAME QueryBenchmarkCsvContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_benchmark_csv.cmake)
+endif()
+
 add_executable(test_kernel_bounded_benchmark performance/test_kernel_bounded_benchmark.cc)
 target_include_directories(test_kernel_bounded_benchmark PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_kernel_bounded_benchmark

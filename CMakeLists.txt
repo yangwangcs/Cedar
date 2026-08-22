@@ -127,6 +127,13 @@ add_library(cedar_kernel_bench_workload STATIC
 target_include_directories(cedar_kernel_bench_workload PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(cedar_kernel_bench_workload PUBLIC cedar_core)
 
+add_library(cedar_query_bench_options STATIC benchmarks/cedar_query_bench_options.cc)
+target_include_directories(cedar_query_bench_options PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(cedar_query_bench_options PUBLIC cedar_core)
+add_library(cedar_query_bench_workload STATIC benchmarks/cedar_query_bench_workload.cc)
+target_include_directories(cedar_query_bench_workload PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(cedar_query_bench_workload PUBLIC cedar_core)
+
 option(BUILD_BENCHMARKS "Build Cedar kernel benchmarks" OFF)
 if(BUILD_BENCHMARKS)
     add_executable(cedar_kernel_bench benchmarks/cedar_kernel_bench.cc)
@@ -137,6 +144,8 @@ if(BUILD_BENCHMARKS)
     target_include_directories(cedar_kernel_columnar_bench PRIVATE
         ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
     target_link_libraries(cedar_kernel_columnar_bench PRIVATE cedar_core)
+    add_executable(cedar_query_bench benchmarks/cedar_query_bench.cc)
+    target_link_libraries(cedar_query_bench PRIVATE cedar_query_bench_options cedar_query_bench_workload)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets

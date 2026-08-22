@@ -13,6 +13,7 @@
 
 #include "cedar/database.h"
 #include "cedar/core/crc32c.h"
+#include "cedar/storage_files.h"
 #include "cedar/query/query.h"
 #include "query/projection/projection_store.h"
 #include "query/projection/projection_format.h"
@@ -209,6 +210,7 @@ TEST_F(QueryCrashMatrixTest, CrashPhaseArgumentsSurviveSigkillAndReopen) {
     auto snapshot = database->BeginSnapshot();
     ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
     EXPECT_GE(snapshot.ValueOrDie().commit_seq().value, 1U);
+    const CommitSeq reopened_cut = snapshot.ValueOrDie().commit_seq();
     auto vertex = cedar::Slot<cedar::VertexRef>::Named("v");
     auto scan = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{1}});
     ASSERT_TRUE(scan.ok()) << scan.status().ToString();
@@ -224,9 +226,33 @@ TEST_F(QueryCrashMatrixTest, CrashPhaseArgumentsSurviveSigkillAndReopen) {
     ASSERT_TRUE(batch.ok()) << batch.status().ToString();
     ASSERT_TRUE(batch.ValueOrDie().has_value());
     EXPECT_GE(batch.ValueOrDie()->row_count(), 1U);
+    auto cursor_again = prepared.ValueOrDie().Execute(
+        [&]() {
+          auto next_snapshot = database->BeginSnapshot();
+          EXPECT_TRUE(next_snapshot.ok()) << next_snapshot.status().ToString();
+          return std::move(next_snapshot).ConsumeValueOrDie();
+        }(),
+        cedar::Bindings{}, cedar::QueryOptions{});
+    ASSERT_TRUE(cursor_again.ok()) << cursor_again.status().ToString();
+    for (;;) {
+      auto next = cursor_again.ValueOrDie().Next();
+      ASSERT_TRUE(next.ok()) << next.status().ToString();
+      if (!next.ValueOrDie().has_value()) break;
+    }
+    EXPECT_TRUE(cursor_again.ValueOrDie().terminal_info().complete);
+    auto projection_store = QueryProjectionStore::Open(
+        ProjectionStoreOptions{child_db + "/projections", child_db, {}});
+    ASSERT_TRUE(projection_store.ok()) << projection_store.status().ToString();
+    if (projection_store.ValueOrDie()->projections_enabled()) {
+      const auto current_base = projection_store.ValueOrDie()->current_base_seq();
+      ASSERT_TRUE(current_base.has_value());
+      EXPECT_LE(current_base->value, reopened_cut.value);
+    }
     ASSERT_TRUE(database->Close().ok());
     for (const auto& entry : std::filesystem::recursive_directory_iterator(child_db)) {
       EXPECT_NE(entry.path().extension(), ".tmp");
+      EXPECT_NE(entry.path().extension(), ".cscratch");
+      EXPECT_EQ(entry.path().string().find("/query/scratch/"), std::string::npos);
     }
   }
 }
@@ -304,6 +330,155 @@ TEST_F(QueryCrashMatrixTest, ProjectionBitFlipDeletionAndTruncationFailClosed) {
   auto opened = QueryProjectionStore::Open({path_, "query-db", {}});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   EXPECT_FALSE(opened.ValueOrDie()->projections_enabled());
+}
+
+TEST_F(QueryCrashMatrixTest,
+       AuthoritativeFactsCorruptionRequiresRecoveryWhileProjectionFailsClosed) {
+  const std::vector<std::string> mutations = {"bitflip", "truncate", "delete"};
+  for (const std::string& mutation : mutations) {
+    const std::string database_path = path_ + "/facts-" + mutation;
+    DatabaseOptions options;
+    options.path = database_path;
+    options.storage_profile = StorageProfile::kDebugSmallThresholds;
+    auto opened = Database::Open(std::move(options));
+    ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+    auto database = std::move(opened).ConsumeValueOrDie();
+    for (uint64_t first_vertex = 1; first_vertex <= 4096; first_vertex += 128) {
+      auto transaction = database->BeginTransaction();
+      ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+      for (uint64_t vertex = first_vertex; vertex < first_vertex + 128; ++vertex) {
+        ASSERT_TRUE(transaction.ValueOrDie()
+                        ->Assert(EntityFact::Vertex(
+                                     VertexRef{PartId{0}, VertexId{vertex}}),
+                                 ValidTime{1})
+                        .ok());
+      }
+      ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+    }
+    ASSERT_TRUE(database->Close().ok());
+
+    auto inspected = InspectStorageFiles({.path = database_path,
+                                          .storage_profile =
+                                              StorageProfile::kDebugSmallThresholds});
+    ASSERT_TRUE(inspected.ok()) << inspected.status().ToString();
+    std::filesystem::path facts_sst;
+    for (const StorageFileInfo& file : inspected.ValueOrDie()) {
+      if (file.role == StorageFileRole::kAuthoritativeFacts &&
+          file.table_format == StorageTableFormat::kCedarParquet) {
+        facts_sst = std::filesystem::path(database_path) / file.relative_filename;
+        break;
+      }
+    }
+    ASSERT_FALSE(facts_sst.empty()) << "no authoritative facts SST for " << mutation
+                                    << " files=" << inspected.ValueOrDie().size();
+    ASSERT_TRUE(std::filesystem::exists(facts_sst));
+    if (mutation == "bitflip") {
+      std::fstream file(facts_sst, std::ios::in | std::ios::out | std::ios::binary);
+      ASSERT_TRUE(file.good());
+      file.seekg(0, std::ios::end);
+      const auto size = file.tellg();
+      ASSERT_GT(size, 32);
+      // Corrupt the table header so the first canonical scan must observe it.
+      file.seekg(0);
+      char byte = 0;
+      file.read(&byte, 1);
+      byte ^= static_cast<char>(0x01);
+      file.seekp(0);
+      file.write(&byte, 1);
+      file.flush();
+    } else if (mutation == "truncate") {
+      const uintmax_t size = std::filesystem::file_size(facts_sst);
+      ASSERT_GT(size, 32U);
+      std::filesystem::resize_file(facts_sst, size / 2);
+    } else {
+      ASSERT_TRUE(std::filesystem::remove(facts_sst));
+    }
+
+    auto reopened = Database::Open(DatabaseOptions{.path = database_path});
+    Status canonical_status = reopened.ok() ? Status::OK() : reopened.status();
+    if (reopened.ok()) {
+      auto database = std::move(reopened).ConsumeValueOrDie();
+      auto snapshot = database->BeginSnapshot();
+      if (!snapshot.ok()) {
+        canonical_status = snapshot.status();
+      } else {
+        auto vertex = Slot<VertexRef>::Named("canonical_corrupt_vertex");
+        auto scan = Query::Vertices(vertex, At{ValidTime{1}});
+        auto selected = scan.ok() ? scan.ValueOrDie().Select({Project(vertex)})
+                                  : StatusOr<Query>{scan.status()};
+        auto prepared = selected.ok() ? database->PrepareQuery(selected.ValueOrDie())
+                                      : StatusOr<PreparedQuery>{selected.status()};
+        auto cursor = prepared.ok()
+                          ? prepared.ValueOrDie().Execute(
+                                std::move(snapshot).ConsumeValueOrDie(), Bindings{},
+                                QueryOptions{})
+                          : StatusOr<QueryCursor>{prepared.status()};
+        if (!cursor.ok()) {
+          canonical_status = cursor.status();
+        } else {
+          for (;;) {
+            auto batch = cursor.ValueOrDie().Next();
+            if (!batch.ok()) {
+              canonical_status = batch.status();
+              break;
+            }
+            if (!batch.ValueOrDie().has_value()) break;
+          }
+        }
+      }
+      database->Close().IgnoreError();
+    }
+    EXPECT_TRUE(canonical_status.IsRecoveryRequired() ||
+                canonical_status.IsCorruption() || canonical_status.IsIOError())
+        << mutation << ": canonical corruption was not surfaced: "
+        << canonical_status.ToString();
+
+    const std::string projection_path = path_ + "/projection-" + mutation;
+    auto projection = QueryProjectionStore::Open(
+        ProjectionStoreOptions{projection_path, "query-db", {}});
+    ASSERT_TRUE(projection.ok()) << projection.status().ToString();
+    ProjectionBuild build;
+    build.manifest.database_identity = "query-db";
+    build.manifest.generation_id = 1;
+    build.manifest.base_seq = CommitSeq{1};
+    CoverageRegion region;
+    region.kind = ProjectionKind::kState;
+    region.part_id = PartId{0};
+    region.entity_max_exclusive = 2;
+    region.valid_time = {ValidTime{0}, std::nullopt};
+    SegmentDescriptor descriptor;
+    descriptor.segment_id = "derived-corrupt";
+    descriptor.filename = "derived-corrupt.csegment";
+    descriptor.header.kind = ProjectionKind::kState;
+    descriptor.header.generation_id = 1;
+    descriptor.header.base_seq = CommitSeq{1};
+    descriptor.header.part_id = PartId{0};
+    descriptor.header.entity_max_exclusive = 2;
+    descriptor.header.valid_from_min = ValidTime{0};
+    ProjectionChain chain;
+    chain.header = descriptor.header;
+    chain.intervals.push_back({{ValidTime{0}, std::nullopt}, Value::Int64(1), 1});
+    auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    descriptor.file_bytes = encoded.ValueOrDie().size();
+    descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(),
+                                        encoded.ValueOrDie().size());
+    region.segments.push_back(descriptor);
+    build.manifest.regions.push_back(region);
+    build.segments.push_back({descriptor, encoded.ValueOrDie()});
+    ASSERT_TRUE(projection.ValueOrDie()->Build(build).ok());
+    ASSERT_TRUE(std::filesystem::remove(projection_path + "/" + descriptor.filename));
+    CoverageRequest request;
+    request.kind = ProjectionKind::kState;
+    request.part_id = PartId{0};
+    request.entity_min = 0;
+    request.entity_max_exclusive = 2;
+    request.valid_time = {ValidTime{0}, std::nullopt};
+    request.snapshot_seq = CommitSeq{1};
+    EXPECT_TRUE(projection.ValueOrDie()->ReadChains(request).status().IsNotFound());
+    EXPECT_FALSE(projection.ValueOrDie()->projections_enabled());
+    EXPECT_EQ(projection.ValueOrDie()->pending_rebuild_requests(), 1U);
+  }
 }
 
 }  // namespace

@@ -139,6 +139,35 @@ TEST(TemporalJourneyTest, LatestDepartureReconstructsMultiHopOrder) {
   EXPECT_EQ(journey.ValueOrDie().edges[1].edge_id.value, 33U);
 }
 
+TEST(TemporalJourneyTest, LatestDepartureRejectsWaitingAcrossTargetGap) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a, 0, 100);
+  graph.Vertex(graph.d, 0, 100);
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{0});
+    if (!status.ok()) return status;
+    status = txn.Retract(EntityFact::Vertex(graph.b), ValidTime{3});
+    if (!status.ok()) return status;
+    status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{16});
+    if (!status.ok()) return status;
+    return txn.Retract(EntityFact::Vertex(graph.b), ValidTime{20});
+  });
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{34}}, graph.a, graph.b, 0, 20);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{35}}, graph.b, graph.d, 10, 15);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{20}},
+                         JourneyObjective::kLatestDeparture};
+  request.arrival_deadline = ValidTime{20};
+  request.duration_at = [](EdgeRef, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{1}};
+  };
+  auto journey = LatestDeparture(snapshot.ValueOrDie(), request);
+  ASSERT_FALSE(journey.ok());
+  EXPECT_TRUE(journey.status().IsNotFound()) << journey.status().ToString();
+}
+
 TEST(TemporalJourneyTest, FastestDurationRetainsDepartureArrivalParetoLabels) {
   JourneyFixture graph;
   graph.Vertex(graph.a, 0, 1'000'000);

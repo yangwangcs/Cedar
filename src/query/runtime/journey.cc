@@ -257,7 +257,11 @@ Status CheckFragmentBudget(const JourneyOptions& options, uint64_t count) {
 StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
     Snapshot& snapshot, const JourneyRequest& request,
     const JourneyOptions& options, VertexRef target, ValidTime deadline) {
-  GraphExpansionRequest graph{{target}, request.interval, ExpandDirection::kIn,
+  const ExpandDirection reverse_direction =
+      request.direction == ExpandDirection::kOut ? ExpandDirection::kIn
+      : request.direction == ExpandDirection::kIn ? ExpandDirection::kOut
+                                                  : ExpandDirection::kBoth;
+  GraphExpansionRequest graph{{target}, request.interval, reverse_direction,
                               request.edge_type};
   GraphFrontierOptions graph_options;
   graph_options.reservation = nullptr;
@@ -276,10 +280,21 @@ StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
   std::optional<JourneyTraversal> best;
   for (const TemporalTraversal& raw : expanded.ValueOrDie()) {
     if (Status status = Check(options); !status.ok()) return status;
-    if (raw.target != target) continue;
-    if (Status fifo = ValidateCallbackFifo(request, raw); !fifo.ok())
-      return fifo;
     TemporalTraversal oriented = raw;
+    if (request.direction == ExpandDirection::kOut) {
+      if (raw.target != target) continue;
+    } else if (request.direction == ExpandDirection::kIn) {
+      if (raw.source != target) continue;
+      std::swap(oriented.source, oriented.target);
+    } else if (raw.target == target) {
+      // Already oriented from predecessor into current target.
+    } else if (raw.source == target) {
+      std::swap(oriented.source, oriented.target);
+    } else {
+      continue;
+    }
+    if (Status fifo = ValidateCallbackFifo(request, oriented); !fifo.ok())
+      return fifo;
     const uint64_t lower = oriented.effective.from.value;
     if (deadline.value < lower) continue;
     uint64_t upper = deadline.value;
@@ -324,6 +339,12 @@ StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
     if (!duration.ValueOrDie()) continue;
     auto arrival = AddDuration(ValidTime{lo}, *duration.ValueOrDie());
     if (!arrival.ok()) return arrival.status();
+    auto target_intervals = VertexIntervals(snapshot, target, options.delta);
+    if (!target_intervals.ok()) return target_intervals.status();
+    if (!CoversWaitingInterval(target_intervals.ValueOrDie(),
+                               arrival.ValueOrDie(), deadline)) {
+      continue;
+    }
     JourneyTraversal candidate{oriented, ValidTime{lo}, arrival.ValueOrDie(),
                                *duration.ValueOrDie()};
     if (!best || candidate.departure.value > best->departure.value ||

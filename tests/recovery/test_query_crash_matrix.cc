@@ -64,6 +64,47 @@ void RunCrashChildIfRequested() {
   // selected fault boundary. This keeps the crash matrix meaningful when a
   // hook is reached after ordinary commit/query activity.
   std::atomic<bool> workload_done{false};
+  // Start derived publication before the commit/query workers so the crash
+  // matrix exercises all three Cedar-owned lanes concurrently.
+  std::thread projection_thread([&] {
+    ProjectionStoreOptions projection_options;
+    projection_options.path = *db + "/projections";
+    projection_options.database_identity = *db;
+    projection_options.crash_fault_injector = crash_injector;
+    auto store = QueryProjectionStore::Open(std::move(projection_options));
+    if (!store.ok()) _exit(122);
+    ProjectionBuild build;
+    build.manifest.database_identity = *db;
+    build.manifest.generation_id = 1;
+    build.manifest.base_seq = CommitSeq{1};
+    CoverageRegion region;
+    region.kind = ProjectionKind::kState;
+    region.part_id = PartId{0};
+    region.entity_min = 0;
+    region.entity_max_exclusive = 100;
+    region.valid_time = ValidTimeInterval{ValidTime{0}, std::nullopt};
+    SegmentDescriptor descriptor;
+    descriptor.segment_id = "crash-segment";
+    descriptor.filename = "crash-segment.csegment";
+    descriptor.header.kind = ProjectionKind::kState;
+    descriptor.header.generation_id = 1;
+    descriptor.header.base_seq = CommitSeq{1};
+    descriptor.header.part_id = PartId{0};
+    descriptor.header.entity_max_exclusive = 100;
+    descriptor.header.valid_from_min = ValidTime{0};
+    ProjectionChain chain;
+    chain.header = descriptor.header;
+    chain.intervals.push_back(ProjectionInterval{
+        ValidTimeInterval{ValidTime{0}, std::nullopt}, Value::Int64(1), 42});
+    auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+    if (!encoded.ok()) _exit(123);
+    descriptor.file_bytes = encoded.ValueOrDie().size();
+    descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
+    region.segments.push_back(descriptor);
+    build.manifest.regions.push_back(region);
+    build.segments.push_back(ProjectionSegmentInput{descriptor, encoded.ValueOrDie()});
+    (void)store.ValueOrDie()->Build(build);
+  });
   std::thread commit_thread([&] {
     for (uint64_t id = 100; id < 108; ++id) {
       auto tx = database->BeginTransaction();
@@ -131,48 +172,8 @@ void RunCrashChildIfRequested() {
                                        crash_injector});
     QueryDeltaCommit descriptor(CommitSeq{1});
     (void)delta.EnqueuePublished(descriptor);
-  } else {
-    ProjectionStoreOptions projection_options;
-    projection_options.path = *db + "/projections";
-    projection_options.database_identity = *db;
-    projection_options.crash_fault_injector = crash_injector;
-    auto store = QueryProjectionStore::Open(std::move(projection_options));
-    if (!store.ok()) _exit(122);
-    ProjectionBuild build;
-    build.manifest.database_identity = *db;
-    build.manifest.generation_id = 1;
-    build.manifest.base_seq = CommitSeq{1};
-    CoverageRegion region;
-    region.kind = ProjectionKind::kState;
-    region.part_id = PartId{0};
-    region.schema_epoch = 0;
-    region.entity_min = 0;
-    region.entity_max_exclusive = 100;
-    region.valid_time = ValidTimeInterval{ValidTime{0}, std::nullopt};
-    SegmentDescriptor descriptor;
-    descriptor.segment_id = "crash-segment";
-    descriptor.filename = "crash-segment.csegment";
-    descriptor.header.kind = ProjectionKind::kState;
-    descriptor.header.generation_id = 1;
-    descriptor.header.base_seq = CommitSeq{1};
-    descriptor.header.part_id = PartId{0};
-    descriptor.header.schema_epoch = 0;
-    descriptor.header.entity_min = 0;
-    descriptor.header.entity_max_exclusive = 100;
-    descriptor.header.valid_from_min = ValidTime{0};
-    ProjectionChain chain;
-    chain.header = descriptor.header;
-    chain.intervals.push_back(ProjectionInterval{
-        ValidTimeInterval{ValidTime{0}, std::nullopt}, Value::Int64(1), 42});
-    auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
-    if (!encoded.ok()) _exit(123);
-    descriptor.file_bytes = encoded.ValueOrDie().size();
-    descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
-    region.segments.push_back(descriptor);
-    build.manifest.regions.push_back(region);
-    build.segments.push_back(ProjectionSegmentInput{descriptor, encoded.ValueOrDie()});
-    (void)store.ValueOrDie()->Build(build);
   }
+  projection_thread.join();
   _exit(124);  // The selected hook must have paused before reaching here.
 }
 

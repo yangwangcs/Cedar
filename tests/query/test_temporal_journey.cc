@@ -234,6 +234,44 @@ TEST(TemporalJourneyTest, EarliestArrivalRetainsLabelsAtDifferentHopDepths) {
   EXPECT_EQ(journey.ValueOrDie().final_arrival, (ValidTime{6}));
 }
 
+TEST(TemporalJourneyTest, EarliestArrivalRetainsIntermediateVisibilityGapLabel) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.d);
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{0});
+    if (!status.ok()) return status;
+    status = txn.Retract(EntityFact::Vertex(graph.b), ValidTime{5});
+    if (!status.ok()) return status;
+    status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{10});
+    if (!status.ok()) return status;
+    return txn.Retract(EntityFact::Vertex(graph.b), ValidTime{100});
+  });
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{81}}, graph.a, graph.b, 0, 5);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{82}}, graph.a, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{83}}, graph.b, graph.d, 10, 100);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kEarliestArrival};
+  request.max_hops = 2;
+  request.duration_at = [](EdgeRef edge, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    const uint64_t duration = edge.edge_id.value == 81 ? 1 :
+                              (edge.edge_id.value == 82 ? 10 : 1);
+    return std::optional<ValidDuration>{ValidDuration{duration}};
+  };
+  auto journey = EarliestArrival(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  ASSERT_EQ(journey.ValueOrDie().edges.size(), 2U);
+  EXPECT_EQ(journey.ValueOrDie().edges[0].edge_id.value, 82U);
+  EXPECT_EQ(journey.ValueOrDie().edges[1].edge_id.value, 83U);
+  ASSERT_EQ(journey.ValueOrDie().departures.size(), 2U);
+  EXPECT_EQ(journey.ValueOrDie().departures[0].value, 10U);
+  EXPECT_EQ(journey.ValueOrDie().departures[1].value, 20U);
+  EXPECT_EQ(journey.ValueOrDie().arrivals[0].value, 20U);
+  EXPECT_EQ(journey.ValueOrDie().final_arrival.value, 21U);
+}
+
 TEST(TemporalJourneyTest, LatestDepartureUsesReverseSearch) {
   JourneyFixture graph;
   graph.Vertex(graph.a, 0, 1'000'000);
@@ -426,6 +464,40 @@ TEST(TemporalJourneyTest, FastestDurationRetainsLabelsAtDifferentHopDepths) {
   EXPECT_EQ(journey.ValueOrDie().vertices,
             (std::vector<VertexRef>{graph.a, graph.b, graph.d}));
   EXPECT_EQ(journey.ValueOrDie().duration, (ValidDuration{6}));
+}
+
+TEST(TemporalJourneyTest, FastestDurationRetainsIntermediateVisibilityGapLabel) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.d);
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{0});
+    if (!status.ok()) return status;
+    status = txn.Retract(EntityFact::Vertex(graph.b), ValidTime{5});
+    if (!status.ok()) return status;
+    status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{10});
+    if (!status.ok()) return status;
+    return txn.Retract(EntityFact::Vertex(graph.b), ValidTime{100});
+  });
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{91}}, graph.a, graph.b, 0, 5);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{92}}, graph.a, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{93}}, graph.b, graph.d, 10, 100);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kFastestDuration};
+  request.max_hops = 2;
+  request.duration_at = [](EdgeRef edge, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    const uint64_t duration = edge.edge_id.value == 91 ? 1 :
+                              (edge.edge_id.value == 92 ? 10 : 1);
+    return std::optional<ValidDuration>{ValidDuration{duration}};
+  };
+  auto journey = FastestDuration(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  ASSERT_EQ(journey.ValueOrDie().edges.size(), 2U);
+  EXPECT_EQ(journey.ValueOrDie().edges[0].edge_id.value, 92U);
+  EXPECT_EQ(journey.ValueOrDie().edges[1].edge_id.value, 93U);
+  EXPECT_EQ(journey.ValueOrDie().duration, (ValidDuration{11}));
 }
 
 TEST(TemporalJourneyTest, IntervalFragmentBudgetAccumulatesAcrossExpansions) {

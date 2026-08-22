@@ -16,11 +16,13 @@ class ProjectionStoreTest : public ::testing::Test {
     ASSERT_TRUE(std::filesystem::create_directories(path_));
   }
   void TearDown() override { std::filesystem::remove_all(path_); }
-  ProjectionBuild Build(uint64_t generation, const std::string& id = "seg-a") {
+  ProjectionBuild Build(uint64_t generation, const std::string& id = "seg-a",
+                        uint64_t base_seq = 0) {
+    if (base_seq == 0) base_seq = generation;
     ProjectionBuild b;
     b.manifest.database_identity = "test-db";
     b.manifest.generation_id = generation;
-    b.manifest.base_seq = CommitSeq{generation};
+    b.manifest.base_seq = CommitSeq{base_seq};
     CoverageRegion r;
     r.kind = ProjectionKind::kState;
     r.part_id = PartId{1};
@@ -33,7 +35,7 @@ class ProjectionStoreTest : public ::testing::Test {
     d.filename = id + ".csegment";
     d.header.kind = ProjectionKind::kState;
     d.header.generation_id = generation;
-    d.header.base_seq = CommitSeq{generation};
+    d.header.base_seq = CommitSeq{base_seq};
     d.header.part_id = PartId{1};
     d.header.schema_epoch = 1;
     d.header.entity_min = 1;
@@ -124,6 +126,8 @@ TEST_F(ProjectionStoreTest, DebugBoundsPreserveRolloverCoverageAndCleanup) {
   ASSERT_TRUE(opened.ok());
   auto& store = *opened.ValueOrDie();
   ASSERT_TRUE(store.Build(Build(10)).ok());
+  EXPECT_TRUE(store.Build(Build(30, "seg-limit", /*base_seq=*/4))
+                  .IsResourceExhausted());
   CoverageRequest request;
   request.part_id = PartId{1};
   request.schema_epoch = 1;

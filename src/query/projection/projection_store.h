@@ -54,6 +54,7 @@ struct ProjectionStoreOptions {
   // outside this range is derived-only stale state and must be disabled.
   std::optional<CommitSeq> visible_seq;
   std::optional<CommitSeq> oldest_readable_seq;
+  bool defer_derived_load = false;
 };
 
 class ProjectionGeneration {
@@ -80,12 +81,19 @@ class QueryProjectionStore {
  public:
   static StatusOr<std::unique_ptr<QueryProjectionStore>> Open(
       ProjectionStoreOptions options);
+  // Creates the catalog directory but does not select/enable a generation.
+  // Database recovery uses this phase to read only the derived base watermark
+  // before repairing QueryDelta from authoritative facts.
+  static StatusOr<std::unique_ptr<QueryProjectionStore>> OpenDeferred(
+      ProjectionStoreOptions options);
   ~QueryProjectionStore();
 
   QueryProjectionStore(const QueryProjectionStore&) = delete;
   QueryProjectionStore& operator=(const QueryProjectionStore&) = delete;
 
   Status Build(const ProjectionBuild& build);
+  Status LoadDerived();
+  StatusOr<CommitSeq> ReadCurrentBaseMetadata() const;
   std::optional<ProjectionGeneration> Acquire(const CoverageRequest&) const;
   Status RetireBefore(CommitSeq seq);
   Status Quarantine(const std::string& filename);

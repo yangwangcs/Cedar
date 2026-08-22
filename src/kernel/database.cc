@@ -1550,25 +1550,32 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (impl->query_open_stage_observer_for_testing) {
     impl->query_open_stage_observer_for_testing("authoritative_recovery");
   }
-  auto projections = internal::QueryProjectionStore::Open(
-      internal::ProjectionStoreOptions{database_path + "/projections", database_path, {}});
+  const CommitSeq recovered_visible = impl->store.visible_seq();
+  CommitSeq recovered_oldest{0};
+  if (auto recovery_snapshot = impl->store.BeginSnapshot(); recovery_snapshot.ok()) {
+    recovered_oldest = recovery_snapshot.ValueOrDie().oldest_readable_seq();
+  }
+  internal::ProjectionStoreOptions projection_options;
+  projection_options.path = database_path + "/projections";
+  projection_options.database_identity = database_path;
+  projection_options.visible_seq = recovered_visible;
+  projection_options.oldest_readable_seq = recovered_oldest;
+  auto projections = internal::QueryProjectionStore::OpenDeferred(
+      std::move(projection_options));
   if (!projections.ok()) {
     impl->store.Close().IgnoreError();
     return projections.status();
   }
   impl->projection_store = projections.ConsumeValueOrDie();
-  if (impl->query_open_stage_observer_for_testing) {
-    impl->query_open_stage_observer_for_testing("derived_loaded");
-  }
-  const CommitSeq projection_base =
-      impl->projection_store->current_base_seq().value_or(CommitSeq{0});
+  const auto metadata_base = impl->projection_store->ReadCurrentBaseMetadata();
+  const CommitSeq projection_base = metadata_base.ok()
+      ? metadata_base.ValueOrDie() : CommitSeq{0};
   impl->query_delta = std::make_unique<internal::QueryDelta>(
       internal::QueryDeltaOptions{projection_base});
   // Reconstruct the derived tail from durable sequence metadata before any
   // new publication can be observed.  A derived rebuild failure must not make
   // authoritative Open fail; in that case start a fresh tail at the current
   // durable watermark and let canonical reads serve the older range.
-  const CommitSeq recovered_visible = impl->store.visible_seq();
   if (recovered_visible.value > projection_base.value) {
     auto recovery_snapshot = impl->store.BeginSnapshot();
     if (recovery_snapshot.ok()) {
@@ -1586,6 +1593,15 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   }
   if (impl->query_open_stage_observer_for_testing) {
     impl->query_open_stage_observer_for_testing("query_delta_repaired");
+  }
+  const Status derived_loaded = impl->projection_store->LoadDerived();
+  if (!derived_loaded.ok() && !derived_loaded.IsNotFound() &&
+      !derived_loaded.IsCorruption() && !derived_loaded.IsIOError()) {
+    impl->store.Close().IgnoreError();
+    return derived_loaded;
+  }
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("derived_loaded");
   }
   const Status pipeline_started = impl->StartAppendCommitPipeline();
   if (!pipeline_started.ok()) {

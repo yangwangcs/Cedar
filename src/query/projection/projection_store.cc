@@ -146,6 +146,17 @@ QueryProjectionStore::~QueryProjectionStore() {
 }
 
 StatusOr<std::unique_ptr<QueryProjectionStore>> QueryProjectionStore::Open(ProjectionStoreOptions options) {
+  auto store = QueryProjectionStore::OpenDeferred(options);
+  if (!store.ok()) return store;
+  const Status loaded = store.ValueOrDie()->LoadDerived();
+  if (!loaded.ok() && !loaded.IsNotFound()) {
+    store.ValueOrDie()->enabled_ = false;
+  }
+  return store;
+}
+
+StatusOr<std::unique_ptr<QueryProjectionStore>> QueryProjectionStore::OpenDeferred(
+    ProjectionStoreOptions options) {
   if (options.path.empty() || options.database_identity.empty()) return Status::InvalidArgument("projection store", "path and database identity are required");
   auto store = std::unique_ptr<QueryProjectionStore>(new QueryProjectionStore(std::move(options)));
   std::error_code ec; fs::create_directories(store->manifests_path_, ec); if (ec) return Status::IOError("projection store", ec.message());
@@ -161,9 +172,31 @@ StatusOr<std::unique_ptr<QueryProjectionStore>> QueryProjectionStore::Open(Proje
     }
     ec.clear();
   }
-  const Status loaded = store->LoadCurrent();
-  if (!loaded.ok() && !loaded.IsNotFound()) { store->enabled_ = false; }
   return store;
+}
+
+Status QueryProjectionStore::LoadDerived() {
+  const Status loaded = LoadCurrent();
+  if (!loaded.ok() && !loaded.IsNotFound()) enabled_ = false;
+  return loaded;
+}
+
+StatusOr<CommitSeq> QueryProjectionStore::ReadCurrentBaseMetadata() const {
+  auto current = ReadFile(fs::path(projections_path_) / "PROJECTION-CURRENT");
+  if (!current.ok()) return CommitSeq{0};
+  uint64_t generation = 0;
+  if (!ParseCurrent(current.ValueOrDie(), &generation) || generation == 0) {
+    return CommitSeq{0};
+  }
+  const fs::path manifest_path = fs::path(manifests_path_) /
+      (std::to_string(generation) + ".cmanifest");
+  auto bytes = ReadFile(manifest_path);
+  if (!bytes.ok()) return CommitSeq{0};
+  auto manifest = DecodeProjectionManifest(bytes.ValueOrDie(), options_.database_identity);
+  if (!manifest.ok() || manifest.ValueOrDie().generation_id != generation) {
+    return CommitSeq{0};
+  }
+  return manifest.ValueOrDie().base_seq;
 }
 
 Status QueryProjectionStore::LoadCurrent() {

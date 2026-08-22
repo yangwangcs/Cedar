@@ -3,13 +3,15 @@
 Date: 2026-08-22 (Asia/Shanghai)
 
 This document records only commands actually run in this worktree. It is an
-installation and focused Debug gate record, not a sustained-capability claim.
+installation, Debug/sanitizer, and campaign-contract record. It does not make
+a sustained-capability claim because the complete Release matrices and the
+1,800-second mixed campaign did not pass all gates.
 
 ## Build identity
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot before the acceptance commit: `b4f04d5403ec62bbd05bf74328f0cbbd75f8fcba`
+- Source snapshot: `0d4dd7d` (`codex/cedar-bitemporal-query-execution`)
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
 - Build: `build/query-debug`, C++20, Debug
 - Install prefix: `build-install-consumer-prefix`
@@ -64,23 +66,70 @@ typed StateAt/property reads, query lifecycle and cancellation, projection
 publication/reopen/pinning, delta repair, temporal expansion, paths, journeys,
 and the public installation checks.
 
-## Gates not run in this evidence point
+## Fresh Debug and sanitizer gates
 
-- The full clean Debug suite was not rerun after the installation-only edits;
-  the focused 128-test set above is the executed Debug evidence.
-- ASAN, UBSAN, and TSAN commands were not rerun after these source changes.
-  Existing sanitizer directories are therefore stale and are **blocked**, not
-  evidence for this commit.
-- No `build/query-release` was available in this worktree. The write
-  turning-point matrix, cold/warm read matrices, reopen/space audit, and the
-  1,800-second mixed campaign were not run. Their status is
-  **calibration-only/blocked**.
+These results were run after the Task 19 installation and campaign changes:
 
-Consequently this document does not claim Release throughput, physical-read
-byte capability, or a 30-minute sustained Cedar capability. Task 18's physical
-read accounting review is approved at the source snapshot, but the Release
-throughput and sustained capability claims still require fresh Release and
-sanitizer builds plus all preceding gates.
+```text
+ctest --test-dir build/query-debug --output-on-failure
+684/684 passed, exit 0, 210.30 seconds
+
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 ctest --test-dir build/query-asan \
+  --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
+254/254 passed, exit 0
+
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --test-dir build/query-ubsan \
+  --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
+255/255 passed, exit 0
+
+TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ctest --test-dir build/query-tsan \
+  --output-on-failure -R 'QueryLifecycle|QueryDelta|ProjectionStore|QueryCrashMatrix|Vacuum'
+51/51 passed, exit 0, 44.60 seconds
+```
+
+macOS does not support the requested ASAN leak detector in this environment;
+the ASAN run therefore used `detect_leaks=0`. No leak capability is claimed.
+
+The campaign option contract was then run against the Release benchmark after
+the runner fixes:
+
+```text
+ctest --test-dir build/query-debug --output-on-failure \
+  -R QueryCampaignOptionsContract
+1/1 passed, exit 0, 160.02 seconds
+```
+
+This contract covers strict matrix parsing, property-filter result status,
+turning-point artifact use, missing-input failures, and active-projection
+baseline failures.
+
+## Release artifacts and limits
+
+Release calibration output is at
+`build/query-release/evidence/release-calibration/` and recorded one successful
+calibration row: `17,660 facts/s`, hard gate true, 5,000 microsecond end-to-end
+p99. This is calibration-only and is not a Cedar capability claim.
+
+The attempted short write sweep is at
+`build/query-release/evidence/write-idle-short/`. It was intentionally stopped
+after 53 data rows while covering the 1/4/8/16/32/64/128/256/512/1024/2048
+facts-per-transaction values and writers 1/8; it is incomplete and cannot
+identify a production turning point. No cold/warm read matrix, active
+projection matrix, 1,800-second mixed campaign, reopen verification, or space
+audit passed in this evidence point.
+
+The campaign runner now rejects unsupported cross-artifact reopen/space
+verification explicitly because `cedar_query_bench` has no interface to reopen
+and checksum databases from a prior campaign input. Those phases return a
+nonzero status and write `unsupported` to their summary; they must not be
+treated as passed evidence.
+
+## Gates not completed in this evidence point
+
+The complete Release write/read/space and 1,800-second mixed gates remain
+**blocked/incomplete**. Consequently this document does not claim Release
+throughput, physical-read capability, turning-point capability, or sustained
+Cedar capability.
 
 ## Obsolete benchmark cleanup
 

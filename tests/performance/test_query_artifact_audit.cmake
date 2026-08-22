@@ -51,13 +51,29 @@ endif()
 
 file(MAKE_DIRECTORY "${OUTPUT}/duplicate-header")
 set(DUPLICATE_HEADER "exit_code,dataset_checksum,dataset_checksum,authoritative_bytes,derived_bytes,statistics_bytes,scratch_bytes,space_amplification,reopen_verified,hard_gate_pass,terminal_status${LF}")
-file(WRITE "${OUTPUT}/duplicate-header/run.csv" "${DUPLICATE_HEADER}${PASS_ROW}")
+set(DUPLICATE_ROW "0,123,123,100,100,1,0,1.0,true,true,OK${LF}")
+file(WRITE "${OUTPUT}/duplicate-header/run.csv" "${DUPLICATE_HEADER}${DUPLICATE_ROW}")
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
     --phase reopen-verification --input "${OUTPUT}/duplicate-header" --output "${OUTPUT}/duplicate-header-out"
-  RESULT_VARIABLE DUPLICATE_HEADER_RC)
+  RESULT_VARIABLE DUPLICATE_HEADER_RC OUTPUT_VARIABLE DUPLICATE_HEADER_OUT ERROR_VARIABLE DUPLICATE_HEADER_ERR)
 if(DUPLICATE_HEADER_RC EQUAL 0)
-  message(FATAL_ERROR "duplicate header was accepted")
+  message(FATAL_ERROR "duplicate header was accepted\n${DUPLICATE_HEADER_ERR}\n${DUPLICATE_HEADER_OUT}")
+endif()
+if(NOT EXISTS "${OUTPUT}/duplicate-header-out/audit-summary.csv" OR
+   NOT EXISTS "${OUTPUT}/duplicate-header-out/audit-summary.json")
+  message(FATAL_ERROR "duplicate-header audit output missing")
+endif()
+file(READ "${OUTPUT}/duplicate-header-out/audit-summary.csv" DUPLICATE_HEADER_CSV)
+string(FIND "${DUPLICATE_HEADER_CSV}" "FAIL,duplicate header field: dataset_checksum" DUPLICATE_HEADER_REASON_POS)
+if(DUPLICATE_HEADER_REASON_POS LESS 0)
+  message(FATAL_ERROR "duplicate-header CSV missing FAIL reason: ${DUPLICATE_HEADER_CSV}")
+endif()
+file(READ "${OUTPUT}/duplicate-header-out/audit-summary.json" DUPLICATE_HEADER_JSON)
+string(FIND "${DUPLICATE_HEADER_JSON}" "\"pass\":false" DUPLICATE_HEADER_PASS_POS)
+string(FIND "${DUPLICATE_HEADER_JSON}" "\"failed_rows\":1" DUPLICATE_HEADER_FAILED_ROWS_POS)
+if(DUPLICATE_HEADER_PASS_POS LESS 0 OR DUPLICATE_HEADER_FAILED_ROWS_POS LESS 0)
+  message(FATAL_ERROR "duplicate-header JSON missing failure status: ${DUPLICATE_HEADER_JSON}")
 endif()
 
 foreach(OUTPUT_ROOT IN ITEMS "${OUTPUT}/pass-out" "${OUTPUT}/pass-space-out")

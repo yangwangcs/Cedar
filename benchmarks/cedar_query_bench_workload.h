@@ -36,6 +36,7 @@ struct QueryBenchmarkResult {
   double write_mib_per_second = 0;
   double query_mib_per_second = 0;
   bool query_bytes_complete = false;
+  uint64_t query_physical_bytes = 0;
   double write_amplification = 0;
   double space_amplification = 0;
   uint64_t group_fill_p50 = 0;

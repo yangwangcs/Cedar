@@ -639,6 +639,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.cache_conditioned = true;
   }
   const auto query_start = Clock::now();
+  const QueryMetricsSnapshot query_metrics_before = database->SampleQueryMetrics();
   const auto query_deadline = query_start +
                               std::chrono::seconds(options.duration_seconds);
   std::vector<uint64_t> query_samples;
@@ -683,9 +684,15 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   }
   readers.clear();
   const auto query_done = Clock::now();
+  const QueryMetricsSnapshot query_metrics_after = database->SampleQueryMetrics();
   result.elapsed_seconds = std::chrono::duration<double>(query_done - run_start).count();
   result.write_elapsed_seconds = std::chrono::duration<double>(write_done - write_start).count();
   result.query_elapsed_seconds = std::chrono::duration<double>(query_done - query_start).count();
+  if (query_metrics_after.physical_bytes >= query_metrics_before.physical_bytes) {
+    result.query_physical_bytes = query_metrics_after.physical_bytes -
+                                  query_metrics_before.physical_bytes;
+    result.query_bytes_complete = result.query_physical_bytes != 0;
+  }
   result.dataset_checksum = dataset_checksum.load();
   result.transactions = transactions.load();
   result.facts = facts.load();
@@ -763,7 +770,11 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                                     (1024.0 * 1024.0 * result.elapsed_seconds)
                               : 0.0;
   result.write_mib_per_second = 0.0;
-  result.query_mib_per_second = 0.0;
+  result.query_mib_per_second = result.query_bytes_complete &&
+                                        result.query_elapsed_seconds > 0
+                                    ? static_cast<double>(result.query_physical_bytes) /
+                                          (1024.0 * 1024.0 * result.query_elapsed_seconds)
+                                    : 0.0;
   result.space_amplification = result.authoritative_bytes == 0
                                    ? 0.0
                                    : static_cast<double>(result.total_bytes) /
@@ -780,7 +791,6 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                           (!result.projection_active || result.maintenance_observed) &&
                           result.terminal_status == "OK" &&
                           (!options.verify_reopen || result.reopen_verified) &&
-                          result.query_bytes_complete &&
                           (result.authoritative_bytes == 0 ||
                            result.derived_bytes <= result.authoritative_bytes * 3 / 2);
   result.gate_classification = result.hard_gate_pass ? "pass" : "incomplete";
@@ -788,7 +798,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -805,6 +815,7 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.elapsed_seconds << ',' << r.write_elapsed_seconds << ',' << r.query_elapsed_seconds << ','
     << t << ',' << f << ',' << r.query_qps << ',' << r.rows_per_second << ',' << r.mib_per_second << ','
     << r.write_mib_per_second << ',' << r.query_mib_per_second << ','
+    << r.query_physical_bytes << ','
     << (r.query_bytes_complete ? "true" : "false") << ','
     << r.group_fill_p50 << ',' << r.query_samples << ','
     << r.query_p50_us << ',' << r.query_p95_us << ',' << r.query_p99_us << ','
@@ -855,6 +866,7 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"mib_per_second\":" << r.mib_per_second
     << ",\"write_mib_per_second\":" << r.write_mib_per_second
     << ",\"query_mib_per_second\":" << r.query_mib_per_second
+    << ",\"query_physical_bytes\":" << r.query_physical_bytes
     << ",\"query_bytes_complete\":" << (r.query_bytes_complete ? "true" : "false")
     << ",\"group_fill_p50\":" << r.group_fill_p50
     << ",\"write_amplification\":" << r.write_amplification

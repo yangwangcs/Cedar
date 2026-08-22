@@ -165,8 +165,8 @@ foreach(UNSUPPORTED_PHASE IN ITEMS reopen-verification space-audit)
       --duration-seconds 1 --input "${OUTPUT}/input" --output "${OUTPUT}/${UNSUPPORTED_PHASE}"
     RESULT_VARIABLE UNSUPPORTED_RC OUTPUT_VARIABLE UNSUPPORTED_OUT ERROR_VARIABLE UNSUPPORTED_ERR)
   file(READ "${OUTPUT}/${UNSUPPORTED_PHASE}/summary.csv" UNSUPPORTED_SUMMARY)
-  if(UNSUPPORTED_RC EQUAL 0 OR NOT UNSUPPORTED_SUMMARY MATCHES "${UNSUPPORTED_PHASE},input-artifacts,1,false,unsupported,")
-    message(FATAL_ERROR "${UNSUPPORTED_PHASE} did not fail explicitly for unsupported cross-artifact verification: ${UNSUPPORTED_RC} ${UNSUPPORTED_ERR}\n${UNSUPPORTED_OUT}\n${UNSUPPORTED_SUMMARY}")
+  if(UNSUPPORTED_RC EQUAL 0 OR NOT UNSUPPORTED_SUMMARY MATCHES "${UNSUPPORTED_PHASE},input-artifacts,1,false,artifact audit failed,")
+    message(FATAL_ERROR "${UNSUPPORTED_PHASE} did not fail explicitly for invalid artifact input: ${UNSUPPORTED_RC} ${UNSUPPORTED_ERR}\n${UNSUPPORTED_OUT}\n${UNSUPPORTED_SUMMARY}")
   endif()
 endforeach()
 

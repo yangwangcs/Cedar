@@ -291,6 +291,154 @@ compare_active_overhead() {
   return 1
 }
 
+audit_run_csv() {
+  local phase="$1" file="$2" records="$3"
+  awk -F, -v mode="$phase" '
+    function fail(message) {
+      if (reason == "") reason = message
+      invalid = 1
+    }
+    function number(value) {
+      return value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ &&
+             value + 0 >= 0 && value + 0 < 1e308
+    }
+    function integer(value) {
+      return value ~ /^[0-9]+$/
+    }
+    function emit(status, message, exit_value, gate_value, terminal_value,
+                  reopen_value, auth_value, derived_value, stats_value,
+                  scratch_value, amplification_value) {
+      if (message == "") message = "-"
+      if (exit_value == "") exit_value = "-"
+      if (gate_value == "") gate_value = "-"
+      if (terminal_value == "") terminal_value = "-"
+      if (reopen_value == "") reopen_value = "-"
+      if (auth_value == "") auth_value = "-"
+      if (derived_value == "") derived_value = "-"
+      if (stats_value == "") stats_value = "-"
+      if (scratch_value == "") scratch_value = "-"
+      if (amplification_value == "") amplification_value = "-"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        status, message, exit_value, gate_value, terminal_value, reopen_value,
+        auth_value, derived_value, stats_value, scratch_value, amplification_value
+    }
+    NR == 1 {
+      header_fields = NF
+      for (i = 1; i <= NF; i++) {
+        if ($i in column) fail("duplicate header field: " $i)
+        column[$i] = i
+      }
+      required[1] = "dataset_checksum"
+      required[2] = "authoritative_bytes"
+      required[3] = "derived_bytes"
+      required[4] = "statistics_bytes"
+      required[5] = "scratch_bytes"
+      required[6] = "space_amplification"
+      required[7] = "reopen_verified"
+      required[8] = "hard_gate_pass"
+      required[9] = "terminal_status"
+      for (i = 1; i <= 9; i++) {
+        if (!(required[i] in column)) fail("missing header field: " required[i])
+      }
+      next
+    }
+    {
+      rows++
+      invalid = 0
+      reason = ""
+      if (NF != header_fields) fail("row field count does not match header")
+      dataset = $(column["dataset_checksum"])
+      auth = $(column["authoritative_bytes"])
+      derived = $(column["derived_bytes"])
+      stats = $(column["statistics_bytes"])
+      scratch = $(column["scratch_bytes"])
+      amplification = $(column["space_amplification"])
+      reopen = $(column["reopen_verified"])
+      gate = $(column["hard_gate_pass"])
+      terminal = $(column["terminal_status"])
+      exit_value = "0"
+      if ("exit_code" in column) exit_value = $(column["exit_code"])
+      if ("exit_code" in column && exit_value != "0") fail("exit_code is not zero")
+      if (!integer(dataset)) fail("dataset_checksum is not an unsigned integer")
+      if (!integer(auth) || !integer(derived) || !integer(stats) || !integer(scratch)) {
+        fail("byte accounting field is not an unsigned integer")
+      }
+      if (!number(amplification)) fail("space_amplification is not finite")
+      if (reopen != "true") fail("reopen_verified is not true")
+      if (gate != "true") fail("hard_gate_pass is not true")
+      if (terminal != "OK") fail("terminal_status is not OK")
+      if (mode == "space-audit") {
+        if (scratch != "0") fail("scratch_bytes is nonzero")
+        if ((amplification + 0) > 1.5) fail("space_amplification exceeds 1.5")
+        if ((derived + 0) == 0) {
+          if ((stats + 0) != 0) fail("statistics_bytes exceeds 2% of derived bytes")
+        } else if ((stats + 0) > (derived + 0) * 0.02) {
+          fail("statistics_bytes exceeds 2% of derived bytes")
+        }
+      }
+      emit(invalid ? "FAIL" : "PASS", reason, exit_value, gate, terminal,
+           reopen, auth, derived, stats, scratch, amplification)
+    }
+    END {
+      if (NR == 0 || rows == 0) {
+        emit("FAIL", "missing data row", "", "", "", "", "", "", "", "", "")
+      } else if (header_fields == 0) {
+        emit("FAIL", "missing header", "", "", "", "", "", "", "", "")
+      }
+    }
+  ' "$file" >> "$records"
+}
+
+run_artifact_audit() {
+  local phase="$1"
+  [[ -n "$input" && -d "$input" ]] || {
+    echo "--input directory is required for $phase" >&2
+    exit 2
+  }
+  local records="$output/.${phase}-audit-records"
+  local audit_csv="$output/audit-summary.csv"
+  local audit_json="$output/audit-summary.json"
+  : > "$records"
+  local input_run_count=0 run_file
+  while IFS= read -r run_file; do
+    input_run_count=$((input_run_count + 1))
+    audit_run_csv "$phase" "$run_file" "$records"
+  done < <(find "$input" -type f -name run.csv -print)
+  if ((input_run_count == 0)); then
+    echo "$phase input contains no run.csv artifacts" >&2
+    rm -f "$records"
+    exit 2
+  fi
+
+  printf 'phase,file,status,reason,exit_code,hard_gate_pass,terminal_status,reopen_verified,authoritative_bytes,derived_bytes,statistics_bytes,scratch_bytes,space_amplification\n' > "$audit_csv"
+  local total_rows=0 failed_rows=0 status reason exit_value gate terminal reopen auth derived stats scratch amplification
+  while IFS=$'\t' read -r status reason exit_value gate terminal reopen auth derived stats scratch amplification; do
+    [[ -n "$status" ]] || continue
+    total_rows=$((total_rows + 1))
+    [[ "$status" == PASS ]] || failed_rows=$((failed_rows + 1))
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$phase" "input-artifacts" "$status" "$reason" "$exit_value" "$gate" \
+      "$terminal" "$reopen" "$auth" "$derived" "$stats" "$scratch" "$amplification" >> "$audit_csv"
+  done < "$records"
+  rm -f "$records"
+
+  local audit_pass=true audit_exit=0 audit_gate=true audit_terminal=OK audit_reopen=true
+  if ((failed_rows != 0)); then
+    audit_pass=false
+    audit_exit=1
+    audit_gate=false
+    audit_terminal="artifact audit failed"
+    audit_reopen=false
+    overall=1
+  fi
+  printf '{"phase":"%s","input":"%s","run_files":%d,"rows":%d,"pass":%s,"failed_rows":%d}\n' \
+    "$phase" "$input" "$input_run_count" "$total_rows" "$audit_pass" "$failed_rows" > "$audit_json"
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$phase" "input-artifacts" "$audit_exit" \
+    "$audit_gate" "$audit_terminal" 0 0 >> "$summary"
+  printf '{"phase":"%s","input":"%s","status":"%s","run_files":%d,"rows":%d,"failed_rows":%d}\n' \
+    "$phase" "$input" "$audit_pass" "$input_run_count" "$total_rows" "$failed_rows" >> "$summary_json"
+}
+
 for phase in "${phases[@]}"; do
   case "$phase" in
     release-calibration) [[ "$facts_auto" == false ]] || { echo "release-calibration cannot consume auto-turning-point without a prior artifact" >&2; exit 2; }; while IFS= read -r facts; do run_case "$phase" "calibration-f${facts}" cold paused state-at "$facts" 1 8 10 1 canonical-only; done < <(csv_values "$facts_values" facts-per-txn); write_turning_point_artifact || { echo "release calibration produced no valid turning-point artifact" >&2; overall=1; } ;;
@@ -299,7 +447,7 @@ for phase in "${phases[@]}"; do
     read-cold) for operation in state-at history events changes expand-out expand-in expand-both property-filter temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration; do while IFS= read -r readers; do while IFS= read -r degree; do while IFS= read -r selectivity; do while IFS= read -r projection; do run_case "$phase" "cold-${operation}-r${readers}-d${degree}-s${selectivity}-p${projection}" cold paused "$operation" 16 1 "$readers" "$degree" "$selectivity" "$(projection_value "$projection")"; done < <(csv_values "$projection_states" projection-states); done < <(csv_values "$selectivities_values" selectivities); done < <(csv_values "$degrees_values" degrees); done < <(csv_values "$readers_values" readers); done ;;
     read-warm) for operation in state-at history events changes expand-out expand-in expand-both property-filter temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration; do while IFS= read -r readers; do while IFS= read -r degree; do while IFS= read -r selectivity; do while IFS= read -r projection; do run_case "$phase" "warm-${operation}-r${readers}-d${degree}-s${selectivity}-p${projection}" warm paused "$operation" 16 1 "$readers" "$degree" "$selectivity" "$(projection_value "$projection")"; done < <(csv_values "$projection_states" projection-states); done < <(csv_values "$selectivities_values" selectivities); done < <(csv_values "$degrees_values" degrees); done < <(csv_values "$readers_values" readers); done ;;
     mixed-30-minute) [[ "$facts_auto" == false ]] || facts_values="$(resolve_turning_point)"; mixed_ops=(state-at events expand-out temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration); mixed_case_duration=$(( (duration + ${#mixed_ops[@]} - 1) / ${#mixed_ops[@]} )); for operation in "${mixed_ops[@]}"; do run_case "$phase" "mixed-${operation}" cold active "$operation" "$(first_csv_value "$facts_values" facts-per-txn)" "$(first_csv_value "$writers_values" writers)" "$(first_csv_value "$readers_values" readers)" "$(first_csv_value "$degrees_values" degrees)" "$(first_csv_value "$selectivities_values" selectivities)" canonical-only "$mixed_case_duration"; done ;;
-    reopen-verification|space-audit) [[ -n "$input" && -d "$input" ]] || { echo "--input directory is required for $phase" >&2; exit 2; }; input_run_count=0; while IFS= read -r _input_run; do input_run_count=$((input_run_count + 1)); done < <(find "$input" -type f -name run.csv -print); ((input_run_count > 0)) || { echo "$phase input contains no run.csv artifacts" >&2; exit 2; }; overall=1; printf '%s,%s,1,false,unsupported,0,0\n' "$phase" "input-artifacts" >> "$summary"; printf '{"phase":"%s","input":"%s","status":"unsupported","reason":"cross-artifact verification is not supported by cedar_query_bench"}\n' "$phase" "$input" >> "$summary_json" ;;
+    reopen-verification|space-audit) run_artifact_audit "$phase" ;;
   esac
 done
 

@@ -350,6 +350,10 @@ if(TARGET cedar_query_bench)
       -DCEDAR_CAMPAIGN=${CMAKE_SOURCE_DIR}/benchmarks/run_cedar_query_campaign.sh
       -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_campaign_options.cmake)
+  add_test(NAME QueryArtifactAuditContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_CAMPAIGN=${CMAKE_SOURCE_DIR}/benchmarks/run_cedar_query_campaign.sh
+      -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_artifact_audit.cmake)
 endif()
 
 add_executable(test_kernel_bounded_benchmark performance/test_kernel_bounded_benchmark.cc)

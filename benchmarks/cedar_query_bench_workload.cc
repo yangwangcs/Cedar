@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "cedar/database.h"
+#include "cedar/core/crc32c.h"
 #include "cedar/query/query.h"
 #include "cedar/query/result.h"
 #include "cedar/storage_files.h"
@@ -22,6 +23,8 @@
 #include "query/runtime/property_binding.h"
 #include "query/runtime/relational.h"
 #include "query/runtime/temporal_source.h"
+#include "query/projection/projection_format.h"
+#include "query/projection/projection_store.h"
 
 namespace cedar::benchmark {
 namespace {
@@ -165,6 +168,57 @@ Status SeedBenchmarkScore(Database* db, const BenchmarkGraph& graph) {
   return committed.ValueOrDie().outcome == CommitOutcome::kCommitted
              ? Status::OK()
              : committed.ValueOrDie().status;
+}
+
+Status BuildBenchmarkProjection(const std::string& database_path,
+                                const BenchmarkGraph& graph,
+                                CommitSeq base_seq) {
+  internal::ProjectionStoreOptions options;
+  options.path = database_path + "/projections";
+  options.database_identity = database_path;
+  options.visible_seq = base_seq;
+  options.oldest_readable_seq = CommitSeq{1};
+  auto opened = internal::QueryProjectionStore::Open(std::move(options));
+  if (!opened.ok()) return opened.status();
+
+  constexpr uint64_t kGeneration = 1;
+  internal::ProjectionChain chain;
+  chain.header.kind = internal::ProjectionKind::kState;
+  chain.header.generation_id = kGeneration;
+  chain.header.base_seq = base_seq;
+  chain.header.part_id = graph.source.part_id;
+  chain.header.entity_min = graph.source.vertex_id.value;
+  chain.header.entity_max_exclusive = graph.source.vertex_id.value + 1;
+  chain.header.valid_from_min = ValidTime{0};
+  chain.header.valid_to_max = ValidTime{100};
+  chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, ValidTime{100}},
+                             Value::Int64(1), graph.source.vertex_id.value});
+  auto encoded = internal::EncodeProjectionPage(chain,
+                                                 internal::CompressionCodec::kNone);
+  if (!encoded.ok()) return encoded.status();
+
+  internal::SegmentDescriptor descriptor;
+  descriptor.segment_id = "cedar-benchmark-state";
+  descriptor.filename = "cedar-benchmark-state.csegment";
+  descriptor.header = chain.header;
+  descriptor.file_bytes = encoded.ValueOrDie().size();
+  descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(),
+                                      encoded.ValueOrDie().size());
+  internal::CoverageRegion region;
+  region.kind = internal::ProjectionKind::kState;
+  region.part_id = chain.header.part_id;
+  region.schema_epoch = chain.header.schema_epoch;
+  region.entity_min = chain.header.entity_min;
+  region.entity_max_exclusive = chain.header.entity_max_exclusive;
+  region.valid_time = ValidTimeInterval{ValidTime{0}, ValidTime{100}};
+  region.segments.push_back(descriptor);
+  internal::ProjectionBuild build;
+  build.manifest.database_identity = database_path;
+  build.manifest.generation_id = kGeneration;
+  build.manifest.base_seq = base_seq;
+  build.manifest.regions.push_back(std::move(region));
+  build.segments.push_back({descriptor, encoded.ConsumeValueOrDie()});
+  return opened.ValueOrDie()->Build(build);
 }
 
 Status ExecuteOperation(Database* database, Snapshot& snapshot,
@@ -459,25 +513,6 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   transactions.store(1);
   facts.store(seeded_checksum.ValueOrDie().first);
   dataset_checksum.store(seeded_checksum.ValueOrDie().second);
-  if (result.projection_active) {
-    auto refreshed = database->RefreshQueryStatistics();
-    if (!refreshed.ok()) {
-      if (!refreshed.status().IsNotFound()) {
-        result.terminal_status = refreshed.status().ToString();
-        result.gate_classification = "incomplete";
-        return result;
-      }
-      result.projection_state_supported = false;
-      result.terminal_status = "active maintenance unavailable: no projection generation";
-      result.maintenance_status = "no-generation";
-      result.gate_classification = "unsupported";
-      return result;
-    } else {
-      maintenance = std::move(refreshed).ConsumeValueOrDie();
-      result.maintenance_status = "refresh-submitted";
-      result.maintenance_observed = true;
-    }
-  }
   const auto seed_done = Clock::now();
   const uint64_t seed_facts = std::max<uint64_t>(options.degree * 4,
                                                   options.facts_per_txn);
@@ -494,6 +529,34 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       dataset_checksum.fetch_xor(id * kChecksumSalt);
   }
   seed_transaction_count = transactions.load();
+  if (result.projection_active) {
+    CommitSeq base_seq;
+    {
+      auto seeded_snapshot = database->BeginSnapshot();
+      if (!seeded_snapshot.ok()) return seeded_snapshot.status();
+      base_seq = seeded_snapshot.ValueOrDie().commit_seq();
+    }
+    if (Status closed = database->Close(); !closed.ok()) return closed;
+    database.reset();
+    if (Status built = BuildBenchmarkProjection(options.path, graph, base_seq);
+        !built.ok()) {
+      result.terminal_status = built.ToString();
+      result.gate_classification = "incomplete";
+      return result;
+    }
+    auto reopened = Database::Open(db_options);
+    if (!reopened.ok()) return reopened.status();
+    database = std::move(reopened).ConsumeValueOrDie();
+    auto refreshed = database->RefreshQueryStatistics();
+    if (!refreshed.ok()) {
+      result.terminal_status = refreshed.status().ToString();
+      result.gate_classification = "incomplete";
+      return result;
+    }
+    maintenance = std::move(refreshed).ConsumeValueOrDie();
+    result.maintenance_status = "refresh-submitted";
+    result.maintenance_observed = true;
+  }
   const auto write_start = Clock::now();
   const auto deadline = write_start +
                         std::chrono::seconds(options.duration_seconds);

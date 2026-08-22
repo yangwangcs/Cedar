@@ -41,6 +41,22 @@ namespace internal {
 class AdjacencyIndex;
 }
 
+inline QueryRuntimeOptions ResolveQueryRuntimeOptions(const DatabaseOptions& options) {
+  QueryRuntimeOptions resolved = options.query_runtime;
+  if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    const auto& t = kQueryDebugThresholds;
+    resolved.query_workers = 1;
+    resolved.reserved_interactive_workers = 1;
+    resolved.query_memory_bytes = t.query_memory_bytes;
+    resolved.projection_cache_bytes = t.projection_segment_bytes;
+    resolved.query_delta_bytes = t.query_delta_hard_bytes;
+    resolved.scratch_disk_bytes = t.scratch_run_bytes;
+    resolved.scratch_free_space_reserve_bytes = 0;
+    resolved.max_prefetch_bytes = std::min<uint64_t>(resolved.max_prefetch_bytes, 4ULL << 10);
+  }
+  return resolved;
+}
+
 inline AsyncSubmissionExecutor::Options ResolveAsyncExecutorOptions(
     const DatabaseOptions& options) {
   AsyncSubmissionExecutor::Options resolved{
@@ -208,7 +224,7 @@ class Database::Impl {
                                std::move(options.snapshot_open_observer_for_testing),
                                std::move(options.kernel_write_observer_for_testing)}),
         async_executor(ResolveAsyncExecutorOptions(options)),
-        query_runtime_options(options.query_runtime),
+        query_runtime_options(ResolveQueryRuntimeOptions(options)),
         query_database_path(options.path) {
     internal::QueryResourcePoolOptions pool_options;
     pool_options.memory_bytes = query_runtime_options.query_memory_bytes;

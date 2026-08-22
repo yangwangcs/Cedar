@@ -1509,8 +1509,12 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       options.query_runtime.max_prefetch_bytes == 0) {
     return Status::InvalidArgument("database", "query runtime bounds are invalid");
   }
+  if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    options.query_runtime = ResolveQueryRuntimeOptions(options);
+  }
   if (options.storage_profile == StorageProfile::kProductionAppend ||
-      options.storage_profile == StorageProfile::kKernelTest) {
+      options.storage_profile == StorageProfile::kKernelTest ||
+      options.storage_profile == StorageProfile::kDebugSmallThresholds) {
     FactStoreOptions storage_options;
     storage_options.path = options.path;
     storage_options.write_buffer_bytes = options.write_buffer_bytes;
@@ -1607,8 +1611,21 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   const CommitSeq projection_base = metadata_base.ok()
       ? metadata_base.ValueOrDie() : CommitSeq{0};
   impl->query_delta = std::make_unique<internal::QueryDelta>(
-      internal::QueryDeltaOptions{projection_base, 262144, 256ULL << 20,
-                                  512ULL << 20, 262144, 30,
+      internal::QueryDeltaOptions{
+          projection_base,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? kQueryDebugThresholds.delta_lag_hard_commits * 2
+              : 262144,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? kQueryDebugThresholds.query_delta_soft_bytes
+              : 256ULL << 20,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? kQueryDebugThresholds.query_delta_hard_bytes
+              : 512ULL << 20,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? kQueryDebugThresholds.delta_lag_hard_commits
+              : 262144,
+          30,
                                   impl->query_crash_fault_injector_for_testing});
   // Reconstruct the derived tail from durable sequence metadata before any
   // new publication can be observed.  A derived rebuild failure must not make

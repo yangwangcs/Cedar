@@ -40,6 +40,7 @@ constexpr uint64_t kKernelTestDefaultWriteBufferBytes = 8ULL * 1024ULL;
 constexpr uint64_t kKernelTestBlockCacheBytes = 256ULL * 1024ULL;
 constexpr uint64_t kKernelTestMemoryBudgetBytes = 1ULL * kMiB;
 constexpr uint64_t kKernelTestWriteBufferManagerBytes = 1ULL * kMiB;
+constexpr uint64_t kDebugWriteBufferManagerBytes = 256ULL * 1024ULL;
 constexpr int kCedarFlushWorkerCapacity = 2;
 constexpr int kCedarCompactionWorkerCapacity = 2;
 
@@ -128,12 +129,17 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
         "production storage profile",
         "WAL recycling must be disabled or use two through four files");
   }
-  if (options.storage_profile == StorageProfile::kKernelTest) {
+  if (options.storage_profile == StorageProfile::kKernelTest ||
+      options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    const bool debug = options.storage_profile == StorageProfile::kDebugSmallThresholds;
     result.memory_budget_bytes = kKernelTestMemoryBudgetBytes;
     result.block_cache_bytes = kKernelTestBlockCacheBytes;
-    result.facts_write_buffer_bytes = kKernelTestFactsWriteBufferBytes;
-    result.meta_write_buffer_bytes = kKernelTestMetaWriteBufferBytes;
-    result.default_write_buffer_bytes = kKernelTestDefaultWriteBufferBytes;
+    result.facts_write_buffer_bytes = debug ? 64ULL * 1024ULL
+                                            : kKernelTestFactsWriteBufferBytes;
+    result.meta_write_buffer_bytes = debug ? 16ULL * 1024ULL
+                                           : kKernelTestMetaWriteBufferBytes;
+    result.default_write_buffer_bytes = debug ? 16ULL * 1024ULL
+                                              : kKernelTestDefaultWriteBufferBytes;
     result.max_background_jobs = 2;
     result.max_subcompactions = 1;
     result.max_total_wal_size = 256ULL * 1024ULL;
@@ -241,6 +247,8 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
   const uint64_t write_buffer_manager_bytes =
       options.storage_profile == StorageProfile::kKernelTest
           ? kKernelTestWriteBufferManagerBytes
+          : options.storage_profile == StorageProfile::kDebugSmallThresholds
+                ? kDebugWriteBufferManagerBytes
           : resolved->facts_write_buffer_bytes + resolved->meta_write_buffer_bytes;
   result.write_buffer_manager = std::make_shared<rocksdb::WriteBufferManager>(
       static_cast<size_t>(write_buffer_manager_bytes),
@@ -270,6 +278,7 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
   result.recycle_log_file_num = options.production.recycle_log_file_num;
   result.cedar_kernel_mode =
       options.storage_profile == StorageProfile::kKernelTest ||
+      options.storage_profile == StorageProfile::kDebugSmallThresholds ||
       options.production.kernel_mode;
   result.cedar_disable_periodic_tasks =
       !options.production.diagnostic_periodic_tasks;
@@ -314,9 +323,12 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
     default_options.enable_blob_files = false;
 
     const bool kernel_test =
-        store_options.storage_profile == StorageProfile::kKernelTest;
+        store_options.storage_profile == StorageProfile::kKernelTest ||
+        store_options.storage_profile == StorageProfile::kDebugSmallThresholds;
     facts_options.write_buffer_size = kernel_test
-                                         ? kKernelTestFactsWriteBufferBytes
+                                         ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
+                                                ? 64ULL * 1024ULL
+                                                : kKernelTestFactsWriteBufferBytes)
                                          : 128 * kMiB;
     // Two buffers can be draining under Cedar flush credits, while bounded
     // queued debt and one active buffer remain available for foreground work.
@@ -332,7 +344,9 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
     facts_options.hard_pending_compaction_bytes_limit =
         kernel_test ? 2ULL * kMiB : 32 * kGiB;
     meta_options.write_buffer_size = kernel_test
-                                        ? kKernelTestMetaWriteBufferBytes
+                                        ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
+                                                ? 16ULL * 1024ULL
+                                                : kKernelTestMetaWriteBufferBytes)
                                         : 32 * kMiB;
     meta_options.max_write_buffer_number = kernel_test ? 6 : 3;
     meta_options.min_write_buffer_number_to_merge = 1;

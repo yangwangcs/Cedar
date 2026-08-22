@@ -22,6 +22,12 @@ add_executable(test_query_types query/test_query_types.cc)
 target_link_libraries(test_query_types PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_types)
 
+add_executable(test_query_differential query/test_query_differential.cc)
+target_include_directories(test_query_differential PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_differential PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_differential TEST_PREFIX "QueryDifferential.")
+
 add_executable(test_logical_plan query/test_logical_plan.cc)
 target_include_directories(test_logical_plan PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_logical_plan PRIVATE cedar_core ${GTEST_MAIN_TARGET})

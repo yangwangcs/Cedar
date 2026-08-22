@@ -343,10 +343,12 @@ target_link_libraries(test_kernel_bounded_benchmark
     PRIVATE cedar_kernel_bench_workload ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bounded_benchmark)
 
-add_test(NAME KernelBenchmarkCsvContract
-    COMMAND ${CMAKE_COMMAND}
-        -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
+if(TARGET cedar_kernel_bench)
+    add_test(NAME KernelBenchmarkCsvContract
+        COMMAND ${CMAKE_COMMAND}
+            -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
+endif()
 
 if(TARGET cedar_kernel_columnar_bench)
     add_test(NAME KernelColumnarBenchmarkSmoke

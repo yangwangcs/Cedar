@@ -48,7 +48,10 @@ the owning task.
 - The projection repair queue/quarantine worker is not yet wired to a Cedar
   maintenance queue; damaged derived regions are isolated and canonical
   fallback is safe, but rebuild scheduling remains follow-up work.
-- Database Open still constructs the projection catalog before QueryDelta
-  repair in the existing startup path; watermark validation prevents stale
-  generations from being enabled, but the observer-backed ordering contract
-  needs a subsequent integration change.
+- Database Open now exposes `query_open_stage_observer_for_testing` so the
+  current authoritative-recovery, derived-catalog-load, and QueryDelta-repair
+  sequence is observable. The existing implementation still loads the
+  projection catalog before repairing QueryDelta; watermark validation
+  prevents stale generations from being enabled, but changing that startup
+  order without rebuilding the full delta tail is a follow-up integration
+  task.

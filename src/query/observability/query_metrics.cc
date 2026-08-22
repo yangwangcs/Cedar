@@ -165,11 +165,10 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
     if (!current.ok()) return current.status();
     if (!current.ValueOrDie()) return Status::OK();
     const auto& current_manifest = *current.ValueOrDie();
-    if (current_manifest.generation_id > manifest.generation_id) {
-      return Status::Conflict("query statistics", "statistics refresh generation is stale");
+    if (current_manifest.generation_id != manifest.generation_id) {
+      return Status::Conflict("query statistics", "statistics refresh generation is not current");
     }
-    if (current_manifest.generation_id == manifest.generation_id &&
-        current_manifest.base_seq != manifest.base_seq) {
+    if (current_manifest.base_seq != manifest.base_seq) {
       return Status::Conflict("query statistics", "statistics refresh base is stale");
     }
     return Status::OK();

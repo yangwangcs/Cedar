@@ -57,13 +57,18 @@ TEST(QueryObservabilityTest, StatisticsStorePublishesCstats) {
   auto store = QueryStatisticsStore(root.string(), root.string());
   ASSERT_TRUE(store.Refresh(manifest).ok());
   EXPECT_TRUE(std::filesystem::exists(root / "generation-3.cstats"));
-  auto encoded_manifest = EncodeProjectionManifest(manifest);
-  ASSERT_TRUE(encoded_manifest.ok()) << encoded_manifest.status().ToString();
-  std::filesystem::create_directories(root / "manifests");
+  // Refresh publishes the generation manifest and its linked statistics
+  // reference before replacing CSTATS-CURRENT.
+  ASSERT_TRUE(std::filesystem::exists(root / "manifests" / "3.cmanifest"));
   {
-    std::ofstream out(root / "manifests" / "3.cmanifest", std::ios::binary);
-    ASSERT_TRUE(out);
-    out.write(encoded_manifest.ValueOrDie().data(), encoded_manifest.ValueOrDie().size());
+    std::ifstream in(root / "manifests" / "3.cmanifest", std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    auto linked_manifest = DecodeProjectionManifest(bytes, root.string());
+    ASSERT_TRUE(linked_manifest.ok()) << linked_manifest.status().ToString();
+    ASSERT_TRUE(linked_manifest.ValueOrDie().statistics.has_value());
+    EXPECT_EQ(linked_manifest.ValueOrDie().statistics->filename,
+              "generation-3.cstats");
   }
   auto loaded = store.Load(3, CommitSeq{9});
   ASSERT_TRUE(loaded.ok()) << loaded.status().ToString();

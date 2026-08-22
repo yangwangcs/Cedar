@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -217,6 +218,7 @@ struct QueryProfile {
 // holding a query/runtime mutex or waiting for a blocked read callback.
 class QueryExecutionState {
  public:
+  QueryExecutionState();
   void RequestCancel();
   bool cancelled() const;
   Status FinishClean();
@@ -254,6 +256,11 @@ class QueryExecutionState {
   std::function<void()> cancel_callback_;
   std::function<void()> close_callback_;
   internal::QueryMetrics* metrics_ = nullptr;
+  std::chrono::steady_clock::time_point profile_started_at_;
+  std::chrono::steady_clock::time_point profile_last_at_;
+  uint64_t profile_cpu_started_us_ = 0;
+  uint64_t profile_cpu_last_us_ = 0;
+  bool profile_first_result_recorded_ = false;
 };
 
 class QueryBatch {

@@ -33,12 +33,22 @@ struct CoverageRegion {
   bool operator==(const CoverageRegion&) const = default;
 };
 
+struct StatisticsReference {
+  std::string filename;
+  uint64_t generation_id = 0;
+  CommitSeq base_seq;
+  uint32_t checksum = 0;
+  bool complete = false;
+  bool operator==(const StatisticsReference&) const = default;
+};
+
 struct ProjectionManifest {
   std::string database_identity;
   uint64_t generation_id = 0;
   CommitSeq base_seq;
   std::vector<std::string> schema_fingerprints;
   std::vector<CoverageRegion> regions;
+  std::optional<StatisticsReference> statistics;
   bool operator==(const ProjectionManifest&) const = default;
 };
 

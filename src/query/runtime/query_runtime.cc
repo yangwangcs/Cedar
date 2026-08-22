@@ -13,6 +13,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <time.h>
 
 #include "query/logical/logical_plan.h"
 #include "query/runtime/property_binding.h"
@@ -25,6 +26,13 @@ namespace cedar {
 namespace {
 
 std::atomic<uint64_t> g_next_query_id{1};
+
+uint64_t ThreadCpuMicros() {
+  struct timespec ts;
+  if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
+         static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+}
 
 std::pair<uint32_t, internal::QueryMetricOperator> ProfileOperatorFor(
     const internal::PreparedQueryPlan& plan) {
@@ -1236,13 +1244,18 @@ QueryProfile QueryExecutionState::profile() const {
   return copy;
 }
 
+QueryExecutionState::QueryExecutionState()
+    : profile_started_at_(std::chrono::steady_clock::now()),
+      profile_last_at_(profile_started_at_),
+      profile_cpu_started_us_(ThreadCpuMicros()),
+      profile_cpu_last_us_(profile_cpu_started_us_) {}
+
 void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes,
                                       bool capture_profile, uint64_t physical_bytes,
                                       uint64_t pages, uint64_t interval_fragments,
                                       uint32_t operator_id, uint8_t metric_operator) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (capture_profile) {
-    if (profile_.operators.empty()) profile_.operators.push_back(QueryOperatorProfile{});
     auto it = std::find_if(profile_.operators.begin(), profile_.operators.end(),
                            [operator_id](const QueryOperatorProfile& value) {
                              return value.operator_id == operator_id;
@@ -1252,6 +1265,11 @@ void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes,
       it = std::prev(profile_.operators.end());
       it->operator_id = operator_id;
     }
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t cpu = ThreadCpuMicros();
+    const uint64_t wall_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(now - profile_last_at_).count());
+    const uint64_t cpu_us = cpu >= profile_cpu_last_us_ ? cpu - profile_cpu_last_us_ : 0;
     auto& op = *it;
     op.rows += rows;
     op.batches += 1;
@@ -1259,6 +1277,15 @@ void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes,
     op.decoded_bytes += decoded_bytes;
     op.pages += pages;
     op.interval_fragments += interval_fragments;
+    op.wall_us += wall_us;
+    op.cpu_us += cpu_us;
+    if (!profile_first_result_recorded_) {
+      op.first_result_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(now - profile_started_at_).count());
+      profile_first_result_recorded_ = true;
+    }
+    profile_last_at_ = now;
+    profile_cpu_last_us_ = cpu;
   }
   if (metrics_) {
     const auto bounded = static_cast<internal::QueryMetricOperator>(metric_operator);
@@ -1687,19 +1714,26 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     lease->backing = std::make_shared<QueryBatch>(std::move(stored));
     lease->retained = state_->retained_batches;
     uint64_t decoded_bytes = 0;
-    if (state_->options.capture_profile) {
-      for (const auto& column : lease->backing->columns()) {
-        decoded_bytes += std::visit(
-            [](const auto& values) -> uint64_t {
-              using T = typename std::decay_t<decltype(values)>::value_type;
-              if constexpr (std::is_same_v<T, std::string>) {
-                uint64_t bytes = 0;
-                for (const auto& value : values) bytes += value.size();
-                return bytes;
-              } else {
-                return static_cast<uint64_t>(values.size()) * sizeof(T);
+    for (const auto& column : lease->backing->columns()) {
+      const uint64_t column_bytes = std::visit(
+          [](const auto& values) -> uint64_t {
+            using T = typename std::decay_t<decltype(values)>::value_type;
+            if constexpr (std::is_same_v<T, std::string>) {
+              uint64_t bytes = 0;
+              for (const auto& value : values) {
+                if (value.size() > UINT64_MAX - bytes) return UINT64_MAX;
+                bytes += value.size();
               }
-            }, column.values);
+              return bytes;
+            } else {
+              if (values.size() > UINT64_MAX / sizeof(T)) return UINT64_MAX;
+              return static_cast<uint64_t>(values.size()) * sizeof(T);
+            }
+          }, column.values);
+      if (column_bytes > UINT64_MAX - decoded_bytes) {
+        decoded_bytes = UINT64_MAX;
+      } else {
+        decoded_bytes += column_bytes;
       }
     }
     // Global metrics are always batch-level and do not require profile clocks
@@ -1714,11 +1748,18 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       fragments = estimate.interval_fragments == 0 ? 0 : std::max<uint64_t>(1, estimate.interval_fragments * lease->backing->row_count() /
           std::max<uint64_t>(1, estimate.rows));
     }
-    // A vector batch is the physical accounting boundary.  Decoded bytes are
-    // a lower bound for bytes consumed by Cedar's column decoder; projection
-    // estimates are used only to apportion pages/fragments across batches.
+    uint64_t physical_bytes = decoded_bytes;
+    if (state_->plan.physical_plan) {
+      const auto& estimate = state_->plan.physical_plan->estimate;
+      if (estimate.physical_bytes != 0 && estimate.rows != 0) {
+        physical_bytes = std::max<uint64_t>(1, estimate.physical_bytes *
+            lease->backing->row_count() / estimate.rows);
+      }
+    }
+    // A vector batch is the physical accounting boundary.  The byte estimate
+    // is computed for every query; profile capture only adds clocks.
     state_->execution->RecordBatch(lease->backing->row_count(), decoded_bytes,
-                                   state_->options.capture_profile, decoded_bytes,
+                                   state_->options.capture_profile, physical_bytes,
                                    pages, fragments, profile_operator.first,
                                    static_cast<uint8_t>(profile_operator.second));
     return std::optional<QueryBatch>{

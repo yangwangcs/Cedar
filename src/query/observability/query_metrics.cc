@@ -114,15 +114,44 @@ QueryStatisticsStore::QueryStatisticsStore(std::string directory, std::string da
 Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const std::string& schema_fingerprint) {
   QueryStatisticsSnapshot snapshot; snapshot.database_identity=database_identity_; snapshot.schema_fingerprint=schema_fingerprint; snapshot.generation_id=manifest.generation_id; snapshot.base_seq=manifest.base_seq; for(const auto& region:manifest.regions){if(!snapshot.coverage.empty())snapshot.coverage.push_back('|');snapshot.coverage += "part="+std::to_string(region.part_id.value)+",entity=["+std::to_string(region.entity_min)+","+std::to_string(region.entity_max_exclusive)+"),valid=["+std::to_string(region.valid_time.from.value)+","+(region.valid_time.to?std::to_string(region.valid_time.to->value):"inf")+")";}
   snapshot.columns.reserve(manifest.regions.size()); for(const auto& region:manifest.regions){QueryColumnStatistics c;c.distinct.registers.assign(size_t{1} << c.distinct.precision, 0);for(const auto& segment:region.segments){c.pages++;c.bytes+=segment.file_bytes;c.rows+=segment.header.entity_max_exclusive-segment.header.entity_min;}c.interval_count=c.rows;c.edge_count=(region.kind==ProjectionKind::kAdjacency?c.rows:0);c.entity_range=EntityRange{region.entity_min,region.entity_max_exclusive};c.valid_time_range=region.valid_time;if(c.rows!=0){c.histogram.push_back({Value::Int64(static_cast<int64_t>(c.rows)),c.rows});c.fanout.push_back({0.5,c.edge_count});c.interval_length.push_back({0.5,region.valid_time.to?region.valid_time.to->value-region.valid_time.from.value:0});c.top_values.push_back({Value::Int64(static_cast<int64_t>(region.entity_min)),c.rows});}snapshot.columns.push_back(std::move(c));} snapshot.complete=false;
-  auto encoded=EncodeQueryStatistics(snapshot);if(!encoded.ok())return encoded.status();std::error_code ec;std::filesystem::create_directories(directory_,ec);if(ec)return Status::IOError("query statistics",ec.message());const auto path=std::filesystem::path(directory_)/FileName(manifest.generation_id);const auto temp=path.string()+".tmp";{std::ofstream out(temp,std::ios::binary|std::ios::trunc);if(!out)return Status::IOError("query statistics","cannot create file");out.write(encoded.ValueOrDie().data(),encoded.ValueOrDie().size());out.flush();if(!out)return Status::IOError("query statistics","write failed");}auto synced=SyncPath(temp,false);if(!synced.ok()){std::filesystem::remove(temp);return synced;}std::filesystem::rename(temp,path,ec);if(ec){std::filesystem::remove(temp);return Status::IOError("query statistics",ec.message());}if(!SyncPath(directory_,true).ok())return Status::IOError("query statistics","statistics directory sync failed");
-  // CSTATS-CURRENT is a second, generation/base/checksum-validated pointer.
-  // It is replaced only after the immutable payload has been synced, so a
-  // crash can expose either the old complete pointer or no statistics.
+  auto encoded=EncodeQueryStatistics(snapshot);if(!encoded.ok())return encoded.status();
+  std::error_code ec;
+  std::filesystem::create_directories(std::filesystem::path(directory_) / "manifests", ec);
+  if(ec)return Status::IOError("query statistics",ec.message());
+  const auto path=std::filesystem::path(directory_)/FileName(manifest.generation_id);
+  const auto temp=path.string()+".tmp";
+  {std::ofstream out(temp,std::ios::binary|std::ios::trunc);if(!out)return Status::IOError("query statistics","cannot create file");out.write(encoded.ValueOrDie().data(),encoded.ValueOrDie().size());out.flush();if(!out)return Status::IOError("query statistics","write failed");}
+  auto synced=SyncPath(temp,false);if(!synced.ok()){std::filesystem::remove(temp);return synced;}
+  std::filesystem::rename(temp,path,ec);if(ec){std::filesystem::remove(temp);return Status::IOError("query statistics",ec.message());}
+  if(!SyncPath(directory_,true).ok())return Status::IOError("query statistics","statistics directory sync failed");
+
+  // Publish the immutable generation manifest's statistics reference before
+  // publishing CSTATS-CURRENT.  A crash before the final pointer replacement
+  // therefore leaves either an old pointer or no loadable statistics; a
+  // pointer can never name a manifest that lacks the matching reference.
+  ProjectionManifest linked_manifest = manifest;
+  StatisticsReference reference;
+  reference.filename = FileName(manifest.generation_id);
+  reference.generation_id = manifest.generation_id;
+  reference.base_seq = manifest.base_seq;
+  reference.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
+  reference.complete = snapshot.complete;
+  linked_manifest.statistics = reference;
+  auto manifest_bytes = EncodeProjectionManifest(linked_manifest);
+  if (!manifest_bytes.ok()) return manifest_bytes.status();
+  const auto manifest_path = std::filesystem::path(directory_) / "manifests" /
+      (std::to_string(manifest.generation_id) + ".cmanifest");
+  const auto manifest_tmp = manifest_path.string() + ".tmp";
+  { std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc); if (!out) return Status::IOError("query statistics", "cannot create generation manifest"); out.write(manifest_bytes.ValueOrDie().data(), manifest_bytes.ValueOrDie().size()); out.flush(); if (!out) return Status::IOError("query statistics", "generation manifest write failed"); }
+  if (!(SyncPath(manifest_tmp, false).ok())) return Status::IOError("query statistics", "generation manifest sync failed");
+  if (std::filesystem::rename(manifest_tmp, manifest_path, ec), ec) return Status::IOError("query statistics", ec.message());
+  if (!SyncPath(std::filesystem::path(directory_) / "manifests", true).ok()) return Status::IOError("query statistics", "manifest directory sync failed");
+
+  // CSTATS-CURRENT is a generation/base/checksum-validated pointer.  The
+  // manifest CRC binds this pointer to the just-published reference.
   std::string current("CSC2", 4); Put64(&current, manifest.generation_id);
   Put64(&current, manifest.base_seq.value);
-  Put32(&current, crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size()));
-  auto manifest_bytes = EncodeProjectionManifest(manifest);
-  if (!manifest_bytes.ok()) return manifest_bytes.status();
+  Put32(&current, reference.checksum);
   Put32(&current, crc32c::Value(manifest_bytes.ValueOrDie().data(), manifest_bytes.ValueOrDie().size()));
   Put32(&current, crc32c::Value(current.data(), current.size()));
   const auto current_path = std::filesystem::path(directory_) / "CSTATS-CURRENT";
@@ -150,10 +179,12 @@ StatusOr<QueryStatisticsSnapshot> QueryStatisticsStore::Load(uint64_t generation
   std::string manifest_bytes((std::istreambuf_iterator<char>(manifest_in)), std::istreambuf_iterator<char>());
   if (crc32c::Value(manifest_bytes.data(), manifest_bytes.size()) != manifest_crc) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
   auto decoded_manifest = DecodeProjectionManifest(manifest_bytes, database_identity_);
-  if (!decoded_manifest.ok() || decoded_manifest.ValueOrDie().generation_id != generation_id || decoded_manifest.ValueOrDie().base_seq != base_seq) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
-  const auto path=std::filesystem::path(directory_)/FileName(generation_id);std::ifstream in(path,std::ios::binary);if(!in)return Status::NotFound("query statistics","statistics unavailable");std::string bytes((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+  if (!decoded_manifest.ok() || decoded_manifest.ValueOrDie().generation_id != generation_id || decoded_manifest.ValueOrDie().base_seq != base_seq || !decoded_manifest.ValueOrDie().statistics) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
+  const auto& reference = *decoded_manifest.ValueOrDie().statistics;
+  if (reference.generation_id != linked || reference.base_seq.value != linked_base || reference.checksum != payload_crc || reference.complete != decoded_manifest.ValueOrDie().statistics->complete) return Status::NotFound("query statistics", "statistics reference is stale");
+  const auto path=std::filesystem::path(directory_)/reference.filename;std::ifstream in(path,std::ios::binary);if(!in)return Status::NotFound("query statistics","statistics unavailable");std::string bytes((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
   if(crc32c::Value(bytes.data(),bytes.size())!=payload_crc)return Status::Corruption("query statistics","statistics payload checksum mismatch");
-  auto decoded=DecodeQueryStatistics(bytes);if(!decoded.ok())return decoded.status();const auto& s=decoded.ValueOrDie();if(s.database_identity!=database_identity_||s.generation_id!=generation_id||s.base_seq!=base_seq||(s.complete&&s.schema_fingerprint.empty())||(!schema_fingerprint.empty()&&s.schema_fingerprint!=schema_fingerprint))return Status::Conflict("query statistics","statistics identity is stale");return decoded;
+  auto decoded=DecodeQueryStatistics(bytes);if(!decoded.ok())return decoded.status();const auto& s=decoded.ValueOrDie();if(s.database_identity!=database_identity_||s.generation_id!=generation_id||s.base_seq!=base_seq||s.complete!=reference.complete||(s.complete&&s.schema_fingerprint.empty())||(!schema_fingerprint.empty()&&s.schema_fingerprint!=schema_fingerprint))return Status::Conflict("query statistics","statistics identity is stale");return decoded;
 }
 
 void QueryMetrics::AddBatch(QueryMetricOperator op,uint64_t rows,uint64_t physical_bytes,uint64_t decoded_bytes,uint64_t interval_fragments){const auto i=static_cast<size_t>(op);if(i>=operator_rows_.size())return;operator_rows_[i].fetch_add(rows);batches_.fetch_add(1);physical_bytes_.fetch_add(physical_bytes);decoded_bytes_.fetch_add(decoded_bytes);interval_fragments_.fetch_add(interval_fragments);}

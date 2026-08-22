@@ -28,6 +28,15 @@ statistics publication.
   renames it, and fsyncs the containing directory. A missing publication is
   therefore safely treated as unavailable by planner binding.
 - Statistics decode validates the HLL precision/register cardinality.
+- Metadata-only refresh files carry `complete=false` and can never become
+  planner statistics; the generation linkage (`CSTATS-CURRENT`) is itself
+  checksummed and published with temp+fsync+rename+directory-fsync.
+- Quantile summaries reject non-finite, out-of-range, or descending quantiles.
+- One-shot refresh tickets release their bounded executor reservation exactly
+  once after handoff. Global metrics are recorded for every output batch even
+  when profile capture is disabled, and `Database::SampleQueryMetrics()` exposes
+  only fixed-size bounded arrays. CLI JSON/text inspection now includes Cedar
+  authority and all query-file metadata.
 
 ## Verification
 

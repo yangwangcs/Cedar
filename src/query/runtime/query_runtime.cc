@@ -1219,13 +1219,16 @@ QueryProfile QueryExecutionState::profile() const {
   return copy;
 }
 
-void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes) {
+void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes,
+                                      bool capture_profile) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (profile_.operators.empty()) profile_.operators.push_back(QueryOperatorProfile{});
-  auto& op = profile_.operators.front();
-  op.rows += rows;
-  op.batches += 1;
-  op.decoded_bytes += decoded_bytes;
+  if (capture_profile) {
+    if (profile_.operators.empty()) profile_.operators.push_back(QueryOperatorProfile{});
+    auto& op = profile_.operators.front();
+    op.rows += rows;
+    op.batches += 1;
+    op.decoded_bytes += decoded_bytes;
+  }
   if (metrics_) metrics_->AddBatch(internal::QueryMetricOperator::kScan, rows, 0, decoded_bytes);
 }
 
@@ -1649,8 +1652,8 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     auto lease = std::make_shared<BatchLease>();
     lease->backing = std::make_shared<QueryBatch>(std::move(stored));
     lease->retained = state_->retained_batches;
+    uint64_t decoded_bytes = 0;
     if (state_->options.capture_profile) {
-      uint64_t decoded_bytes = 0;
       for (const auto& column : lease->backing->columns()) {
         decoded_bytes += std::visit(
             [](const auto& values) -> uint64_t {
@@ -1664,8 +1667,11 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
               }
             }, column.values);
       }
-      state_->execution->RecordBatch(lease->backing->row_count(), decoded_bytes);
     }
+    // Global metrics are always batch-level and do not require profile clocks
+    // or per-row instrumentation when capture_profile is disabled.
+    state_->execution->RecordBatch(lease->backing->row_count(), decoded_bytes,
+                                   state_->options.capture_profile);
     return std::optional<QueryBatch>{
         QueryBatch(lease->backing->row_count(), lease->backing->columns(), lease)};
   }

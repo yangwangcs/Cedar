@@ -53,7 +53,8 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
         ? database->query_statistics->Load(catalog.generation_id, catalog.base_seq,
                                            schema.ValueOrDie())
         : StatusOr<internal::QueryStatisticsSnapshot>(schema.status());
-    if (loaded.ok() && !loaded.ValueOrDie().schema_fingerprint.empty()) {
+    if (loaded.ok() && loaded.ValueOrDie().complete &&
+        !loaded.ValueOrDie().schema_fingerprint.empty()) {
       statistics.known = true;
       for (const auto& column : loaded.ValueOrDie().columns) {
         statistics.candidate_rows += column.rows;

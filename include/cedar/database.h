@@ -26,6 +26,17 @@ namespace cedar {
 
 class Query;
 
+struct QueryMetricsSnapshot {
+  std::array<uint64_t, 7> operator_rows{};
+  std::array<uint64_t, 3> terminal{};
+  std::array<uint64_t, 4> fallback{};
+  uint64_t batches = 0;
+  uint64_t physical_bytes = 0;
+  uint64_t decoded_bytes = 0;
+  uint64_t interval_fragments = 0;
+  uint64_t spill_bytes = 0;
+};
+
 class QueryMaintenanceHandle {
  public:
   QueryMaintenanceHandle() = default;
@@ -257,6 +268,7 @@ class Database {
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
   CommitPipelineMetrics GetCommitPipelineMetrics() const;
   StatusOr<RuntimeMetrics> SampleRuntimeMetrics() const;
+  QueryMetricsSnapshot SampleQueryMetrics() const;
   Status Vacuum(CommitSeq oldest_readable);
 
  private:

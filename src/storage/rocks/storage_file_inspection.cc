@@ -109,6 +109,13 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
       if (decoded.ok()) {
         metadata.generation_id = decoded.ValueOrDie().generation_id;
         metadata.base_seq = decoded.ValueOrDie().base_seq.value;
+        for (size_t i = 0; i < decoded.ValueOrDie().columns.size(); ++i) {
+          const auto& column = decoded.ValueOrDie().columns[i];
+          if (!column.entity_range) continue;
+          if (!metadata.coverage.empty()) metadata.coverage.push_back('|');
+          metadata.coverage += "entity=[" + std::to_string(column.entity_range->min) + "," +
+              std::to_string(column.entity_range->max_exclusive) + ")";
+        }
       }
     } else if (format == StorageTableFormat::kCedarManifest) {
       const auto decoded = internal::DecodeProjectionManifest(bytes, root);

@@ -52,6 +52,16 @@ const char* TableFormatName(cedar::StorageTableFormat format) {
   return "unknown";
 }
 
+const char* AuthorityName(cedar::StorageFileAuthority authority) {
+  switch (authority) {
+    case cedar::StorageFileAuthority::kAuthoritative: return "authoritative";
+    case cedar::StorageFileAuthority::kDerived: return "derived";
+    case cedar::StorageFileAuthority::kTemporary: return "temporary";
+    case cedar::StorageFileAuthority::kEngineInternal: return "engine-internal";
+  }
+  return "unknown";
+}
+
 std::string FormatBytes(uint64_t bytes) {
   constexpr uint64_t kKiB = 1024;
   constexpr uint64_t kMiB = 1024 * kKiB;
@@ -122,6 +132,7 @@ void PrintJson(const std::vector<cedar::StorageFileInfo>& files) {
     WriteJsonString(file.largest_key_hex);
     if (file.query_file) {
       std::cout << ",\"query_file\":{";
+      std::cout << "\"authority\":"; WriteJsonString(AuthorityName(file.query_file->authority));
       std::cout << "\"checksum_valid\":" << (file.query_file->checksum_valid ? "true" : "false");
       if (file.query_file->generation_id) std::cout << ",\"generation_id\":" << *file.query_file->generation_id;
       if (file.query_file->base_seq) std::cout << ",\"base_seq\":" << *file.query_file->base_seq;
@@ -143,7 +154,15 @@ void PrintText(const std::vector<cedar::StorageFileInfo>& files) {
               << RoleName(file.role) << std::setw(16)
               << TableFormatName(file.table_format) << std::setw(8)
               << ("L" + std::to_string(file.level)) << std::setw(12)
-              << FormatBytes(file.size_bytes) << SequenceRange(file) << '\n';
+              << FormatBytes(file.size_bytes) << SequenceRange(file);
+    if (file.query_file) {
+      std::cout << " authority=" << AuthorityName(file.query_file->authority)
+                << " generation=" << (file.query_file->generation_id ? std::to_string(*file.query_file->generation_id) : "-")
+                << " base=" << (file.query_file->base_seq ? std::to_string(*file.query_file->base_seq) : "-")
+                << " checksum=" << (file.query_file->checksum_valid ? "valid" : "invalid/unavailable")
+                << " coverage=" << (file.query_file->coverage.empty() ? "-" : file.query_file->coverage);
+    }
+    std::cout << '\n';
   }
 }
 

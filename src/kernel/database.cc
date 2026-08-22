@@ -1675,6 +1675,7 @@ StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
   auto state = std::make_shared<QueryMaintenanceHandle::State::Shared>();
   auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
   ticket->estimated_bytes = 1;
+  ticket->release_after_handoff = true;
   ticket->handoff = [state, statistics, manifest, schema = schema.ValueOrDie()] {
     Status result;
     {
@@ -1765,6 +1766,21 @@ Status Database::Close() {
   impl_->closed = true;
   impl_->closing = false;
   return Status::OK();
+}
+
+QueryMetricsSnapshot Database::SampleQueryMetrics() const {
+  QueryMetricsSnapshot result;
+  if (!impl_) return result;
+  const auto snapshot = impl_->query_metrics.Snapshot();
+  result.operator_rows = snapshot.operator_rows;
+  result.terminal = snapshot.terminal;
+  result.fallback = snapshot.fallback;
+  result.batches = snapshot.batches;
+  result.physical_bytes = snapshot.physical_bytes;
+  result.decoded_bytes = snapshot.decoded_bytes;
+  result.interval_fragments = snapshot.interval_fragments;
+  result.spill_bytes = snapshot.spill_bytes;
+  return result;
 }
 
 Status Database::CreateCheckpoint(const std::string& checkpoint_path) const {

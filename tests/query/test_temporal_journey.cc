@@ -98,6 +98,43 @@ TEST(TemporalJourneyTest, EarliestArrivalMaterializesOrderedJourney) {
   EXPECT_EQ(journey.ValueOrDie().final_arrival, (ValidTime{12}));
 }
 
+TEST(TemporalJourneyTest, LatestDepartureUsesReverseSearch) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a, 0, 1'000'000);
+  graph.Vertex(graph.b, 0, 1'000'000);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{31}}, graph.a, graph.b, 0, 1'000'000);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.b, {ValidTime{0}, ValidTime{1'000'000}},
+                         JourneyObjective::kLatestDeparture};
+  request.arrival_deadline = ValidTime{500'000};
+  request.duration_at = [](EdgeRef, ValidTime) -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{5}};
+  };
+  auto journey = LatestDeparture(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{499'995}));
+}
+
+TEST(TemporalJourneyTest, FastestDurationRetainsDepartureArrivalParetoLabels) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a, 0, 1'000'000);
+  graph.Vertex(graph.b, 0, 1'000'000);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{41}}, graph.a, graph.b, 0, 1'000'000);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{42}}, graph.a, graph.b, 500'000, 1'000'000);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.b, {ValidTime{0}, ValidTime{1'000'000}},
+                         JourneyObjective::kFastestDuration};
+  request.duration_at = [](EdgeRef edge, ValidTime) -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{static_cast<uint64_t>(edge.edge_id.value == 41 ? 100 : 1)}};
+  };
+  auto journey = FastestDuration(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{500'000}));
+  EXPECT_EQ(journey.ValueOrDie().duration, (ValidDuration{1}));
+}
+
 TEST(TemporalJourneyTest, PrepareRejectsUnprovenRegisteredDurationFifo) {
   JourneyFixture graph;
   ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{

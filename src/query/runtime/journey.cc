@@ -217,6 +217,122 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
   return result;
 }
 
+bool TraversalLess(const JourneyTraversal& a, const JourneyTraversal& b) {
+  return std::tie(a.traversal.source.part_id.value,
+                  a.traversal.source.vertex_id.value,
+                  a.traversal.target.part_id.value,
+                  a.traversal.target.vertex_id.value,
+                  a.traversal.edge.home_part_id.value,
+                  a.traversal.edge.edge_id.value,
+                  a.departure.value,
+                  a.arrival.value) <
+         std::tie(b.traversal.source.part_id.value,
+                  b.traversal.source.vertex_id.value,
+                  b.traversal.target.part_id.value,
+                  b.traversal.target.vertex_id.value,
+                  b.traversal.edge.home_part_id.value,
+                  b.traversal.edge.edge_id.value,
+                  b.departure.value,
+                  b.arrival.value);
+}
+
+bool PathLess(const std::vector<JourneyTraversal>& a,
+              const std::vector<JourneyTraversal>& b) {
+  const size_t common = std::min(a.size(), b.size());
+  for (size_t i = 0; i < common; ++i) {
+    if (TraversalLess(a[i], b[i])) return true;
+    if (TraversalLess(b[i], a[i])) return false;
+  }
+  return a.size() < b.size();
+}
+
+Status CheckFragmentBudget(const JourneyOptions& options, uint64_t count) {
+  if (options.max_interval_fragments != 0 &&
+      count > options.max_interval_fragments) {
+    return Status::ResourceExhausted("journey", "interval fragment budget exceeded");
+  }
+  return Status::OK();
+}
+
+StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
+    Snapshot& snapshot, const JourneyRequest& request,
+    const JourneyOptions& options, VertexRef target, ValidTime deadline) {
+  GraphExpansionRequest graph{{target}, request.interval, ExpandDirection::kIn,
+                              request.edge_type};
+  GraphFrontierOptions graph_options;
+  graph_options.reservation = nullptr;
+  graph_options.delta = options.delta;
+  graph_options.adjacency_index = options.adjacency_index
+                                      ? options.adjacency_index
+                                      : snapshot.adjacency_index();
+  graph_options.projection_generation = options.projection_generation;
+  graph_options.check_abort = options.check_abort;
+  auto expanded = ExpandTemporal(snapshot, graph, graph_options);
+  if (!expanded.ok()) return expanded.status();
+  if (Status budget = CheckFragmentBudget(options, expanded.ValueOrDie().size());
+      !budget.ok())
+    return budget;
+
+  std::optional<JourneyTraversal> best;
+  for (const TemporalTraversal& raw : expanded.ValueOrDie()) {
+    if (Status status = Check(options); !status.ok()) return status;
+    if (raw.target != target) continue;
+    if (Status fifo = ValidateCallbackFifo(request, raw); !fifo.ok())
+      return fifo;
+    TemporalTraversal oriented = raw;
+    const uint64_t lower = oriented.effective.from.value;
+    if (deadline.value < lower) continue;
+    uint64_t upper = deadline.value;
+    if (oriented.effective.to) {
+      if (*oriented.effective.to == ValidTime{0}) continue;
+      upper = std::min(upper, oriented.effective.to->value - 1);
+    }
+    if (request.interval.to) {
+      if (*request.interval.to == ValidTime{0}) continue;
+      upper = std::min(upper, request.interval.to->value - 1);
+    }
+    if (upper < lower) continue;
+    auto feasible = [&](uint64_t point) -> StatusOr<bool> {
+      auto duration = PropertyDuration(snapshot, oriented.edge, ValidTime{point},
+                                       request, options.delta);
+      if (!duration.ok()) return duration.status();
+      if (!duration.ValueOrDie()) return false;
+      auto arrival = AddDuration(ValidTime{point}, *duration.ValueOrDie());
+      if (!arrival.ok()) return arrival.status();
+      if (arrival.ValueOrDie().value > deadline.value) return false;
+      if (request.interval.to &&
+          arrival.ValueOrDie().value >= request.interval.to->value)
+        return false;
+      return TraversalFits(oriented.effective, ValidTime{point},
+                           *duration.ValueOrDie());
+    };
+    auto at_lower = feasible(lower);
+    if (!at_lower.ok()) return at_lower.status();
+    if (!at_lower.ValueOrDie()) continue;
+    uint64_t lo = lower;
+    uint64_t hi = upper;
+    while (lo < hi) {
+      const uint64_t mid = lo + (hi - lo + 1) / 2;
+      auto ok = feasible(mid);
+      if (!ok.ok()) return ok.status();
+      if (ok.ValueOrDie()) lo = mid;
+      else hi = mid - 1;
+    }
+    auto duration = PropertyDuration(snapshot, oriented.edge, ValidTime{lo},
+                                     request, options.delta);
+    if (!duration.ok()) return duration.status();
+    if (!duration.ValueOrDie()) continue;
+    auto arrival = AddDuration(ValidTime{lo}, *duration.ValueOrDie());
+    if (!arrival.ok()) return arrival.status();
+    JourneyTraversal candidate{oriented, ValidTime{lo}, arrival.ValueOrDie(),
+                               *duration.ValueOrDie()};
+    if (!best || candidate.departure.value > best->departure.value ||
+        (candidate.departure == best->departure && TraversalLess(candidate, *best)))
+      best = candidate;
+  }
+  return best;
+}
+
 JourneyValue BuildJourney(const std::vector<JourneyTraversal>& edges,
                           ValidTime initial) {
   JourneyValue result;
@@ -299,32 +415,68 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
                                         const JourneyOptions& options) {
   if (!request.interval.to && !request.arrival_deadline)
     return Status::NotSupported("journey", "latest departure requires a finite time bound");
-  JourneyRequest copy = request;
-  copy.objective = JourneyObjective::kEarliestArrival;
   const ValidTime deadline = request.arrival_deadline.value_or(
       request.interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}));
   if (deadline.value <= request.interval.from.value)
     return Status::NotFound("journey", "target is unreachable");
-  if (deadline.value - request.interval.from.value > 1'000'000)
-    return Status::ResourceExhausted("journey", "latest departure candidate range is too wide");
-  // Reverse feasibility is equivalent to enumerating candidate departure
-  // boundaries and selecting the latest one; the edge searches remain
-  // authoritative and preserve the same half-open checks.
-  std::optional<JourneyValue> best;
-  for (uint64_t t = request.interval.from.value;
-       t < deadline.value && t != std::numeric_limits<uint64_t>::max(); ++t) {
-    copy.interval.from = ValidTime{t};
-    auto candidate = EarliestArrival(snapshot, copy, options);
-    if (!candidate.ok()) {
-      if (candidate.status().IsNotFound()) continue;
-      return candidate.status();
+  struct Label {
+    VertexRef vertex;
+    ValidTime time;
+    uint32_t depth;
+    uint64_t successor;
+    JourneyTraversal edge;
+  };
+  std::vector<Label> labels;
+  std::map<VertexRef, uint64_t, VertexLess> best;
+  using HeapEntry = std::pair<uint64_t, uint64_t>;
+  std::priority_queue<HeapEntry> heap;
+  labels.push_back({request.target, deadline, 0,
+                    std::numeric_limits<uint64_t>::max(), {}});
+  best[request.target] = 0;
+  heap.push({deadline.value, 0});
+  while (!heap.empty()) {
+    if (Status status = Check(options); !status.ok()) return status;
+    const auto [time, id] = heap.top();
+    heap.pop();
+    const Label current = labels[id];
+    auto found = best.find(current.vertex);
+    if (found == best.end() || found->second != id || current.time.value != time)
+      continue;
+    if (current.vertex == request.source) {
+      std::vector<JourneyTraversal> path;
+      uint64_t cursor = id;
+      while (labels[cursor].successor != std::numeric_limits<uint64_t>::max()) {
+        path.push_back(labels[cursor].edge);
+        cursor = labels[cursor].successor;
+      }
+      std::reverse(path.begin(), path.end());
+      return BuildJourney(path, current.time);
     }
-    if (candidate.ValueOrDie().final_arrival.value <= deadline.value &&
-        (!best || candidate.ValueOrDie().initial_departure.value > best->initial_departure.value))
-      best = candidate.ValueOrDie();
+    if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
+    auto edge = LatestIncoming(snapshot, request, options, current.vertex,
+                               current.time);
+    if (!edge.ok()) return edge.status();
+    if (!edge.ValueOrDie()) continue;
+    const JourneyTraversal candidate = *edge.ValueOrDie();
+    const VertexRef predecessor = candidate.traversal.source;
+    auto existing = best.find(predecessor);
+    if (existing != best.end()) {
+      const Label& prior = labels[existing->second];
+      if (prior.time.value > candidate.departure.value ||
+          (prior.time == candidate.departure &&
+           !TraversalLess(candidate, prior.edge)))
+        continue;
+    }
+    if (options.max_labels && labels.size() >= options.max_labels)
+      return Status::ResourceExhausted("journey", "label budget exceeded");
+    if (Status status = Charge(options); !status.ok()) return status;
+    const uint64_t next = labels.size();
+    labels.push_back({predecessor, candidate.departure, current.depth + 1,
+                      id, candidate});
+    best[predecessor] = next;
+    heap.push({candidate.departure.value, next});
   }
-  if (!best) return Status::NotFound("journey", "target is unreachable");
-  return *best;
+  return Status::NotFound("journey", "target is unreachable");
 }
 
 StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
@@ -334,30 +486,94 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
     return Status::NotSupported("journey", "fastest duration requires a finite time bound");
   if (request.interval.to->value <= request.interval.from.value)
     return Status::NotFound("journey", "target is unreachable");
-  if (request.interval.to->value - request.interval.from.value > 1'000'000)
-    return Status::ResourceExhausted("journey", "fastest duration candidate range is too wide");
-  // Keep non-dominated departure/arrival labels per vertex.  This bounded
-  // search intentionally shares traversal feasibility with earliest arrival.
-  std::vector<JourneyValue> candidates;
-  for (uint64_t t = request.interval.from.value;
-       (!request.interval.to || t < request.interval.to->value) &&
-       t != std::numeric_limits<uint64_t>::max(); ++t) {
-    JourneyRequest point = request;
-    point.interval.from = ValidTime{t};
-    auto result = EarliestArrival(snapshot, point, options);
-    if (!result.ok()) {
-      if (result.status().IsNotFound()) continue;
-      return result.status();
+  struct Label {
+    VertexRef vertex;
+    ValidTime departure;
+    ValidTime arrival;
+    uint32_t depth;
+    uint64_t predecessor;
+    JourneyTraversal edge;
+  };
+  std::vector<Label> labels;
+  std::map<VertexRef, std::vector<uint64_t>, VertexLess> frontier;
+  auto dominates = [](const Label& a, const Label& b) {
+    return a.departure.value >= b.departure.value &&
+           a.arrival.value <= b.arrival.value &&
+           (a.departure.value > b.departure.value ||
+            a.arrival.value < b.arrival.value);
+  };
+  auto path_for = [&](uint64_t id) {
+    std::vector<JourneyTraversal> path;
+    for (uint64_t cursor = id;
+         cursor != std::numeric_limits<uint64_t>::max() && labels[cursor].predecessor != std::numeric_limits<uint64_t>::max();
+         cursor = labels[cursor].predecessor)
+      path.push_back(labels[cursor].edge);
+    std::reverse(path.begin(), path.end());
+    return path;
+  };
+  labels.push_back({request.source, request.interval.from, request.interval.from,
+                    0, std::numeric_limits<uint64_t>::max(), {}});
+  frontier[request.source].push_back(0);
+  std::queue<uint64_t> pending;
+  pending.push(0);
+  std::optional<uint64_t> answer;
+  while (!pending.empty()) {
+    if (Status status = Check(options); !status.ok()) return status;
+    const uint64_t id = pending.front();
+    pending.pop();
+    const Label current = labels[id];
+    if (current.vertex == request.target && current.depth != 0) {
+      const uint64_t duration = current.arrival.value - current.departure.value;
+      bool better = !answer;
+      if (answer) {
+        const Label& prior = labels[*answer];
+        const uint64_t prior_duration = prior.arrival.value - prior.departure.value;
+        better = duration < prior_duration ||
+                 (duration == prior_duration &&
+                  (current.departure.value < prior.departure.value ||
+                   (current.departure == prior.departure &&
+                    PathLess(path_for(id), path_for(*answer)))));
+      }
+      if (better)
+        answer = id;
     }
-    candidates.push_back(std::move(result).ConsumeValueOrDie());
-    if (options.max_labels && candidates.size() > options.max_labels)
-      return Status::ResourceExhausted("journey", "Pareto label budget exceeded");
+    if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
+    auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, options);
+    if (!next.ok()) return next.status();
+    std::sort(next.ValueOrDie().begin(), next.ValueOrDie().end(), TraversalLess);
+    if (Status budget = CheckFragmentBudget(options, next.ValueOrDie().size());
+        !budget.ok())
+      return budget;
+    for (const JourneyTraversal& edge : next.ValueOrDie()) {
+      Label candidate{edge.traversal.target,
+                      current.depth == 0 ? edge.departure : current.departure,
+                      edge.arrival, current.depth + 1, id, edge};
+      auto& labels_at_vertex = frontier[candidate.vertex];
+      bool rejected = false;
+      for (uint64_t prior_id : labels_at_vertex) {
+        if (dominates(labels[prior_id], candidate) ||
+            (labels[prior_id].departure == candidate.departure &&
+             labels[prior_id].arrival == candidate.arrival)) {
+          rejected = true;
+          break;
+        }
+      }
+      if (rejected) continue;
+      labels_at_vertex.erase(
+          std::remove_if(labels_at_vertex.begin(), labels_at_vertex.end(),
+                         [&](uint64_t prior_id) { return dominates(candidate, labels[prior_id]); }),
+          labels_at_vertex.end());
+      if (options.max_labels && labels.size() >= options.max_labels)
+        return Status::ResourceExhausted("journey", "Pareto label budget exceeded");
+      if (Status status = Charge(options); !status.ok()) return status;
+      const uint64_t next_id = labels.size();
+      labels.push_back(std::move(candidate));
+      labels_at_vertex.push_back(next_id);
+      pending.push(next_id);
+    }
   }
-  if (candidates.empty()) return Status::NotFound("journey", "target is unreachable");
-  return *std::min_element(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-    if (a.duration.value != b.duration.value) return a.duration.value < b.duration.value;
-    return a.initial_departure.value < b.initial_departure.value;
-  });
+  if (!answer) return Status::NotFound("journey", "target is unreachable");
+  return BuildJourney(path_for(*answer), labels[*answer].departure);
 }
 
 StatusOr<JourneyValue> FindJourney(Snapshot& snapshot,

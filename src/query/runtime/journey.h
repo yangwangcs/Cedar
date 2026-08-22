@@ -38,6 +38,7 @@ struct JourneyOptions {
   std::optional<uint64_t> projection_generation;
   std::function<Status()> check_abort;
   uint64_t max_labels = 0;
+  uint64_t max_interval_fragments = 0;
 };
 
 struct JourneyTraversal {

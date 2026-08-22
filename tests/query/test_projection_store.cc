@@ -227,6 +227,30 @@ TEST_F(ProjectionStoreTest, PartialCorruptionFallsBackAndQueuesRebuild) {
   EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
 }
 
+TEST_F(ProjectionStoreTest, PinnedCorruptionRetiresAndQuarantinesGeneration) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  auto& store = *opened.ValueOrDie();
+  ASSERT_TRUE(store.Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  auto pin = store.Acquire(request);
+  ASSERT_TRUE(pin.has_value());
+  std::ofstream(path_ + "/seg-a.csegment", std::ios::binary | std::ios::trunc)
+      << "corrupt";
+  EXPECT_TRUE(store.ReadChains(request, *pin).status().IsNotFound());
+  EXPECT_FALSE(store.projections_enabled());
+  EXPECT_EQ(store.pending_rebuild_requests(), 1U);
+  pin.reset();
+  store.CollectRetired();
+  EXPECT_TRUE(std::filesystem::exists(path_ + "/quarantine/seg-a.csegment"));
+}
+
 TEST_F(ProjectionStoreTest, FaultAfterSegmentSyncLeavesCurrentUnchanged) {
   bool fail = true;
   auto opened = QueryProjectionStore::Open({path_, "test-db", [&](ProjectionStoreFaultPoint point) {

@@ -120,6 +120,10 @@ struct DatabaseOptions {
   std::function<void(bool sync)> commit_write_options_observer_for_testing;
   std::function<void()> commit_transaction_lookup_observer_for_testing;
   std::function<Status(VacuumFaultPoint)> vacuum_fault_injector_for_testing;
+  // Deterministic Cedar-owned publication fault hook. The phase names are
+  // segment_sync, manifest_sync, current_replace, delta_enqueue, and
+  // scratch_write. Production callers leave this unset.
+  std::function<Status(const char*)> query_crash_fault_injector_for_testing;
   uint64_t group_commit_max_batch_bytes = 2ULL * 1024ULL * 1024ULL;
   uint32_t group_commit_max_queue_requests = 1024;
   uint64_t group_commit_max_queue_bytes = 16ULL * 1024ULL * 1024ULL;

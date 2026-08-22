@@ -253,6 +253,7 @@ Status QueryProjectionStore::PublishCurrent(uint64_t generation) {
   auto sync = SyncFile(temp); if (!sync.ok()) return sync;
   if (::rename(temp.c_str(), (fs::path(projections_path_) / "PROJECTION-CURRENT").c_str()) != 0) return Status::IOError("projection store", "CURRENT rename failed");
   if (options_.fault_injector) { auto s=options_.fault_injector(ProjectionStoreFaultPoint::kCurrentRename); if (!s.ok()) return s; }
+  if (options_.crash_fault_injector) { auto s=options_.crash_fault_injector("current_replace"); if (!s.ok()) return s; }
   return SyncDirectory(projections_path_);
 }
 
@@ -292,6 +293,7 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
     if (fs::exists(temp, exists_error) || exists_error || fs::is_symlink(temp, exists_error)) return Status::Conflict("projection store", "segment temporary filename already exists");
     auto s=WriteFile(temp,input.bytes); if (!s.ok()) return s; s=SyncFile(temp); if (!s.ok()) return s;
     if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kAfterSegmentSync); if (!s.ok()) return s; }
+    if (options_.crash_fault_injector) { s=options_.crash_fault_injector("segment_sync"); if (!s.ok()) return s; }
     if (::rename(temp.c_str(), (fs::path(projections_path_) / input.descriptor.filename).c_str()) != 0) return Status::IOError("projection store", "segment rename failed");
   }
   auto encoded = EncodeProjectionManifest(build.manifest); if (!encoded.ok()) return encoded.status();
@@ -302,6 +304,7 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   if (fs::exists(temp_manifest, manifest_error) || manifest_error || fs::is_symlink(temp_manifest, manifest_error)) return Status::Conflict("projection store", "manifest temporary filename already exists");
   auto s=WriteFile(temp_manifest, encoded.ValueOrDie()); if (!s.ok()) return s; s=SyncFile(temp_manifest); if (!s.ok()) return s;
   if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kAfterManifestSync); if (!s.ok()) return s; }
+  if (options_.crash_fault_injector) { s=options_.crash_fault_injector("manifest_sync"); if (!s.ok()) return s; }
   if (::rename(temp_manifest.c_str(), manifest.c_str()) != 0) return Status::IOError("projection store", "manifest rename failed");
   s=SyncDirectory(manifests_path_); if (!s.ok()) return s;
   if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kDirectorySync); if (!s.ok()) return s; }
@@ -354,14 +357,15 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
       request.database_identity != current_->manifest.database_identity) {
     return Status::IdentityConflict("projection store", "projection identity changed");
   }
-  auto chains = ReadChainsForGeneration(current_, request);
-  if (current_->coverage_hole) {
-    if (!current_->rebuild_enqueued) {
-      current_->rebuild_enqueued = true;
-      rebuild_requests_.push_back("generation=" + std::to_string(current_->manifest.generation_id));
+  const auto generation = current_;
+  auto chains = ReadChainsForGeneration(generation, request);
+  if (generation->coverage_hole) {
+    if (!generation->rebuild_enqueued) {
+      generation->rebuild_enqueued = true;
+      rebuild_requests_.push_back("generation=" + std::to_string(generation->manifest.generation_id));
     }
-    current_->retired = true;
-    retired_.push_back(current_);
+    generation->retired = true;
+    retired_.push_back(generation);
     current_.reset();
     enabled_ = false;
   }
@@ -369,8 +373,8 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     // A derived page is never authoritative. Disable the affected generation
     // immediately so subsequent readers fall back to CedarParquet facts; the
     // generation remains pinned until existing leases release it.
-    current_->retired = true;
-    retired_.push_back(current_);
+    generation->retired = true;
+    retired_.push_back(generation);
     current_.reset();
     enabled_ = false;
   }
@@ -384,6 +388,14 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     return Status::NotFound("projection store", "projection generation is no longer available");
   }
   auto chains = ReadChainsForGeneration(generation.state_, request);
+  if (generation.state_->coverage_hole && current_ == generation.state_) {
+    // Existing leases keep this immutable generation alive, but it must no
+    // longer be eligible for new readers after a hole is detected.
+    generation.state_->retired = true;
+    retired_.push_back(generation.state_);
+    current_.reset();
+    enabled_ = false;
+  }
   if (generation.state_->coverage_hole && !generation.state_->rebuild_enqueued) {
     generation.state_->rebuild_enqueued = true;
     rebuild_requests_.push_back("generation=" + std::to_string(generation.state_->manifest.generation_id));

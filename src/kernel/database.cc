@@ -1560,6 +1560,8 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   projection_options.database_identity = database_path;
   projection_options.visible_seq = recovered_visible;
   projection_options.oldest_readable_seq = recovered_oldest;
+  projection_options.crash_fault_injector =
+      impl->query_crash_fault_injector_for_testing;
   auto projections = internal::QueryProjectionStore::OpenDeferred(
       std::move(projection_options));
   if (!projections.ok()) {
@@ -1571,7 +1573,9 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   const CommitSeq projection_base = metadata_base.ok()
       ? metadata_base.ValueOrDie() : CommitSeq{0};
   impl->query_delta = std::make_unique<internal::QueryDelta>(
-      internal::QueryDeltaOptions{projection_base});
+      internal::QueryDeltaOptions{projection_base, 262144, 256ULL << 20,
+                                  512ULL << 20, 262144, 30,
+                                  impl->query_crash_fault_injector_for_testing});
   // Reconstruct the derived tail from durable sequence metadata before any
   // new publication can be observed.  A derived rebuild failure must not make
   // authoritative Open fail; in that case start a fresh tail at the current
@@ -1583,12 +1587,13 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
           impl->store, recovery_snapshot.ValueOrDie(), recovered_visible,
           internal::QueryDeltaRepairLimits{262144, 512ULL << 20});
       if (!repaired.ok()) {
-        impl->query_delta = std::make_unique<internal::QueryDelta>(
-            internal::QueryDeltaOptions{recovered_visible});
+        // Never advance the derived base past a failed repair. Keep the
+        // observed base and force canonical fallback until Cedar maintenance
+        // can retry the exact missing range.
+        impl->query_delta->ResetBase(projection_base).IgnoreError();
       }
     } else {
-      impl->query_delta = std::make_unique<internal::QueryDelta>(
-          internal::QueryDeltaOptions{recovered_visible});
+      impl->query_delta->ResetBase(projection_base).IgnoreError();
     }
   }
   if (impl->query_open_stage_observer_for_testing) {

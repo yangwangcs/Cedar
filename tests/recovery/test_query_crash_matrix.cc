@@ -12,8 +12,12 @@
 #include <vector>
 
 #include "cedar/database.h"
+#include "cedar/core/crc32c.h"
 #include "cedar/query/query.h"
 #include "query/projection/projection_store.h"
+#include "query/projection/projection_format.h"
+#include "query/projection/query_delta.h"
+#include "query/resource/query_scratch.h"
 
 namespace cedar::internal {
 namespace {
@@ -32,6 +36,14 @@ void RunCrashChildIfRequested() {
   if (!phase || !db || !ready) return;
   cedar::DatabaseOptions options;
   options.path = *db;
+  const int fd = std::stoi(*ready);
+  auto crash_injector = [phase = *phase, fd](const char* point) {
+    if (phase != point) return cedar::Status::OK();
+    const char byte = 'R';
+    (void)::write(fd, &byte, 1);
+    for (;;) ::pause();
+  };
+  options.query_crash_fault_injector_for_testing = crash_injector;
   auto opened = cedar::Database::Open(std::move(options));
   if (!opened.ok()) _exit(120);
   auto database = std::move(opened).ConsumeValueOrDie();
@@ -45,24 +57,61 @@ void RunCrashChildIfRequested() {
       !transaction.ValueOrDie()->Commit().ok()) {
     _exit(121);
   }
-  // The canonical commit above is real Cedar state. The phase marker models
-  // the derived publication edge that may be interrupted by SIGKILL; it is
-  // deliberately placed under the database's projection/scratch roots so
-  // Database::Open recovery, not a standalone projection reader, owns the
-  // subsequent cleanup.
-  std::filesystem::create_directories(*db + "/projections/manifests");
+  // Exercise the actual Cedar publication owners. The callback pauses only
+  // after the requested durable boundary has been reached.
   if (*phase == "scratch_write") {
-    std::ofstream(*db + "/query-scratch.active.tmp") << "unpublished";
+    QueryScratch scratch(*db, "active", "crash", 1 << 20);
+    scratch.SetCrashFaultInjector(crash_injector);
+    (void)scratch.WriteRun("run-0", "payload");
   } else if (*phase == "delta_enqueue") {
-    std::ofstream(*db + "/query-delta.enqueue.tmp") << "unpublished";
+    QueryDelta delta(QueryDeltaOptions{CommitSeq{0}, 16, 256ULL << 20,
+                                       512ULL << 20, 262144, 30,
+                                       crash_injector});
+    QueryDeltaCommit descriptor(CommitSeq{1});
+    (void)delta.EnqueuePublished(descriptor);
   } else {
-    std::ofstream(*db + "/projections/" + *phase + ".csegment.tmp")
-        << "unpublished";
+    ProjectionStoreOptions projection_options;
+    projection_options.path = *db + "/projections";
+    projection_options.database_identity = *db;
+    projection_options.crash_fault_injector = crash_injector;
+    auto store = QueryProjectionStore::Open(std::move(projection_options));
+    if (!store.ok()) _exit(122);
+    ProjectionBuild build;
+    build.manifest.database_identity = *db;
+    build.manifest.generation_id = 1;
+    build.manifest.base_seq = CommitSeq{1};
+    CoverageRegion region;
+    region.kind = ProjectionKind::kState;
+    region.part_id = PartId{0};
+    region.schema_epoch = 0;
+    region.entity_min = 0;
+    region.entity_max_exclusive = 100;
+    region.valid_time = ValidTimeInterval{ValidTime{0}, std::nullopt};
+    SegmentDescriptor descriptor;
+    descriptor.segment_id = "crash-segment";
+    descriptor.filename = "crash-segment.csegment";
+    descriptor.header.kind = ProjectionKind::kState;
+    descriptor.header.generation_id = 1;
+    descriptor.header.base_seq = CommitSeq{1};
+    descriptor.header.part_id = PartId{0};
+    descriptor.header.schema_epoch = 0;
+    descriptor.header.entity_min = 0;
+    descriptor.header.entity_max_exclusive = 100;
+    descriptor.header.valid_from_min = ValidTime{0};
+    ProjectionChain chain;
+    chain.header = descriptor.header;
+    chain.intervals.push_back(ProjectionInterval{
+        ValidTimeInterval{ValidTime{0}, std::nullopt}, Value::Int64(1), 42});
+    auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
+    if (!encoded.ok()) _exit(123);
+    descriptor.file_bytes = encoded.ValueOrDie().size();
+    descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
+    region.segments.push_back(descriptor);
+    build.manifest.regions.push_back(region);
+    build.segments.push_back(ProjectionSegmentInput{descriptor, encoded.ValueOrDie()});
+    (void)store.ValueOrDie()->Build(build);
   }
-  const int fd = std::stoi(*ready);
-  const char byte = 'R';
-  (void)::write(fd, &byte, 1);
-  for (;;) ::pause();
+  _exit(124);  // The selected hook must have paused before reaching here.
 }
 
 class QueryCrashMatrixTest : public ::testing::Test {
@@ -150,16 +199,6 @@ TEST_F(QueryCrashMatrixTest, CrashPhaseArgumentsSurviveSigkillAndReopen) {
     ASSERT_TRUE(batch.ValueOrDie().has_value());
     EXPECT_GE(batch.ValueOrDie()->row_count(), 1U);
     ASSERT_TRUE(database->Close().ok());
-    // These phase markers model unpublished derived artifacts. The
-    // authoritative reopen above deliberately ignores them; remove them as
-    // the Cedar maintenance cleanup would before asserting the directory is
-    // clean, while retaining the canonical recovery assertion as the oracle.
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(child_db)) {
-      if (entry.path().extension() == ".tmp") {
-        std::error_code ec;
-        std::filesystem::remove(entry.path(), ec);
-      }
-    }
     for (const auto& entry : std::filesystem::recursive_directory_iterator(child_db)) {
       EXPECT_NE(entry.path().extension(), ".tmp");
     }

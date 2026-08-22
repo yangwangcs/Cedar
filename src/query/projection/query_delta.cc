@@ -221,6 +221,10 @@ Status QueryDelta::EnqueuePublished(const QueryDeltaCommit& commit) {
     if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;
     return Status::ResourceExhausted("query delta", "descriptor queue is full");
   }
+  if (options_.crash_fault_injector) {
+    const Status injected = options_.crash_fault_injector("delta_enqueue");
+    if (!injected.ok()) return injected;
+  }
   published_queue_.push_back(commit);
   enqueued_through_ = commit.commit_seq;
   if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;

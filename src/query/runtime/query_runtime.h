@@ -162,7 +162,9 @@ class QueryRuntime {
                                        std::function<Status(const std::shared_ptr<QueryExecutionState>&)>
                                            register_query_state = {},
                                        std::function<void(const std::shared_ptr<QueryExecutionState>&)>
-                                           unregister_query_state = {});
+                                           unregister_query_state = {},
+                                       std::function<Status(const char*)>
+                                           crash_fault_injector = {});
 };
 
 }  // namespace cedar::internal

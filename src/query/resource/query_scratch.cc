@@ -133,8 +133,12 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
   }
   if (Status status = ValidateChild(name); !status.ok()) return status;
   const auto path = query_dir_ / name;
+  const auto temp_path = query_dir_ / (name + ".tmp");
   if (std::filesystem::exists(path)) {
     return Status::InvalidArgument("query scratch", "scratch child already exists");
+  }
+  if (std::filesystem::exists(temp_path)) {
+    return Status::InvalidArgument("query scratch", "scratch temporary child already exists");
   }
   if (payload.size() > std::numeric_limits<uint64_t>::max() - 64) {
     return Status::ResourceExhausted("query scratch", "scratch_bytes overflow");
@@ -207,7 +211,7 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
     rollback();
     return status;
   }
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     rollback();
     return Status::IOError("query scratch", "cannot create scratch block");
@@ -222,6 +226,21 @@ StatusOr<std::filesystem::path> QueryScratch::WriteRun(const std::string& name,
   if (!out) {
     rollback();
     return Status::IOError("query scratch", "cannot finalize scratch block");
+  }
+  if (crash_fault_injector_) {
+    const Status injected = crash_fault_injector_("scratch_write");
+    if (!injected.ok()) {
+      std::error_code remove_ec;
+      std::filesystem::remove(temp_path, remove_ec);
+      rollback();
+      return injected;
+    }
+  }
+  std::error_code rename_ec;
+  std::filesystem::rename(temp_path, path, rename_ec);
+  if (rename_ec) {
+    rollback();
+    return Status::IOError("query scratch", rename_ec.message());
   }
   written_bytes_ += bytes;
   return path;
@@ -347,10 +366,11 @@ Status QueryScratch::CleanupOldInstances(
   }
   for (const auto& child : std::filesystem::directory_iterator(scratch_root, ec)) {
     if (ec) return Status::IOError("query scratch", ec.message());
-    if (child.path().filename() == active_instance) continue;
     if (!SafeName(child.path().filename().string()) || child.is_symlink()) {
       return Status::InvalidArgument("query scratch", "invalid scratch instance");
     }
+    // A process killed during a query leaves an active-instance directory;
+    // on the next authoritative Open every scratch instance is stale.
     std::filesystem::remove_all(child.path(), ec);
     if (ec) return Status::IOError("query scratch", ec.message());
   }

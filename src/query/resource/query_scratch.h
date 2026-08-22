@@ -40,6 +40,9 @@ class QueryScratch {
   void SetIoAdmission(
       std::function<StatusOr<std::shared_ptr<IoPermit>>(uint64_t)> acquire);
   void SetAbortCheck(std::function<Status()> check);
+  void SetCrashFaultInjector(std::function<Status(const char*)> injector) {
+    crash_fault_injector_ = std::move(injector);
+  }
   static Status CleanupOldInstances(const std::filesystem::path& database_root,
                                     const std::string& active_instance);
   const std::filesystem::path& query_directory() const { return query_dir_; }
@@ -64,6 +67,7 @@ class QueryScratch {
   mutable uint64_t rate_scratch_bytes_ = 0;
   std::function<StatusOr<std::shared_ptr<IoPermit>>(uint64_t)> io_admission_;
   std::function<Status()> abort_check_;
+  std::function<Status(const char*)> crash_fault_injector_;
   mutable bool created_ = false;
   bool free_space_admitted_ = false;
 };

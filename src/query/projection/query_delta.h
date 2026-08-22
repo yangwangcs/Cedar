@@ -54,6 +54,7 @@ struct QueryDeltaOptions {
   uint64_t hard_memory_bytes = 512ULL << 20;
   uint64_t max_lag_commits = 262144;
   uint64_t target_lag_seconds = 30;
+  std::function<Status(const char*)> crash_fault_injector;
 };
 
 struct QueryDeltaRepairLimits {

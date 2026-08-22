@@ -1915,7 +1915,9 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             std::function<Status(const std::shared_ptr<QueryExecutionState>&)>
                                                 register_query_state,
                                             std::function<void(const std::shared_ptr<QueryExecutionState>&)>
-                                                unregister_query_state) {
+                                                unregister_query_state,
+                                            std::function<Status(const char*)>
+                                                crash_fault_injector) {
   QueryOptions resolved_options = options;
   if (resolved_options.mode == QueryExecutionMode::kAuto &&
       plan.physical_plan != nullptr) {
@@ -1953,6 +1955,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                       ? 0
                                       : resource_pool->options().scratch_bytes_per_second;
     scratch->SetRateLimits(read_rate, scratch_rate);
+    scratch->SetCrashFaultInjector(std::move(crash_fault_injector));
     if (resource_pool != nullptr) {
       scratch->SetIoAdmission([resource_pool](uint64_t bytes)
                                   -> StatusOr<std::shared_ptr<IoPermit>> {

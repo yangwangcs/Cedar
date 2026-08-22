@@ -50,6 +50,7 @@ struct ProjectionStoreOptions {
   std::string path;
   std::string database_identity;
   std::function<Status(ProjectionStoreFaultPoint)> fault_injector;
+  std::function<Status(const char*)> crash_fault_injector;
   // Authoritative Cedar watermarks supplied by Database::Open. A generation
   // outside this range is derived-only stale state and must be disabled.
   std::optional<CommitSeq> visible_seq;

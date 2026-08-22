@@ -282,7 +282,8 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
           },
           [database](const std::shared_ptr<QueryExecutionState>& state) {
             database->UnregisterQueryState(state);
-          });
+          },
+          database->query_crash_fault_injector_for_testing);
     }
   }
   if (!state_->plan.canonical_temporal) {
@@ -297,7 +298,8 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       },
       [database](const std::shared_ptr<QueryExecutionState>& state) {
         database->UnregisterQueryState(state);
-      });
+      },
+      database->query_crash_fault_injector_for_testing);
 }
 
 StatusOr<std::string> PreparedQuery::ExplainLogical() const {

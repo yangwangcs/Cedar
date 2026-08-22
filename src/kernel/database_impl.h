@@ -168,6 +168,8 @@ class Database::Impl {
             std::move(options.shutdown_stage_observer_for_testing)),
         query_open_stage_observer_for_testing(
             std::move(options.query_open_stage_observer_for_testing)),
+        query_crash_fault_injector_for_testing(
+            std::move(options.query_crash_fault_injector_for_testing)),
         stop_pipeline_before_drain_for_testing(
             options.stop_pipeline_before_drain_for_testing),
         foreground_admission_concurrency(
@@ -336,6 +338,7 @@ class Database::Impl {
   std::function<void(PressureSample*)> runtime_pressure_override_for_testing;
   std::function<void(const char*)> shutdown_stage_observer_for_testing;
   std::function<void(const char*)> query_open_stage_observer_for_testing;
+  std::function<Status(const char*)> query_crash_fault_injector_for_testing;
   bool stop_pipeline_before_drain_for_testing = false;
   bool enforce_disk_pressure = false;
   std::mutex append_commit_mutex;

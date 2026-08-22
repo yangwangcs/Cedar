@@ -44,6 +44,7 @@ StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(
     const std::vector<std::string>& arguments);
 const char* QueryBenchmarkOperationName(QueryBenchmarkOperation operation);
 const char* ProjectionStateName(ProjectionState state);
+bool QueryBenchmarkOperationSupported(QueryBenchmarkOperation operation);
 
 }  // namespace cedar::benchmark
 

@@ -21,11 +21,16 @@ struct QueryBenchmarkResult {
   uint64_t derived_bytes = 0;
   uint64_t scratch_bytes = 0;
   uint64_t total_bytes = 0;
+  uint64_t dataset_checksum = 0;
+  uint64_t seed = 0;
   double elapsed_seconds = 0;
   double projection_lag = 0;
   bool projection_active = false;
   bool reopen_verified = false;
   bool hard_gate_pass = false;
+  bool metrics_complete = false;
+  bool cache_conditioned = false;
+  bool operation_supported = true;
   std::string gate_classification = "incomplete";
   std::string terminal_status = "OK";
 };

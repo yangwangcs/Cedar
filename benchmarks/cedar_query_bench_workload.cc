@@ -43,6 +43,10 @@ Status CommitFacts(Database* db, uint64_t first, uint64_t count,
 
 Status ExecuteOperation(const Snapshot& snapshot, QueryBenchmarkOperation op,
                         uint64_t limit, uint64_t* rows) {
+  if (!QueryBenchmarkOperationSupported(op)) {
+    return Status::NotSupported("query benchmark",
+                                QueryBenchmarkOperationName(op));
+  }
   FactScanSpec spec{PartId{1}, FactFamily::kVertexState, PropertyId{},
                     ValidTime{1}, 256};
   uint64_t seen = 0;
@@ -102,15 +106,32 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   if (!opened.ok()) return opened.status();
   auto database = std::move(opened).ConsumeValueOrDie();
   QueryBenchmarkResult result;
+  result.seed = options.seed;
+  result.dataset_checksum = options.seed;
+  if (!QueryBenchmarkOperationSupported(options.operation)) {
+    result.operation_supported = false;
+    result.terminal_status = std::string("unsupported operation: ") +
+                             QueryBenchmarkOperationName(options.operation);
+    result.gate_classification = "unsupported";
+    result.hard_gate_pass = false;
+    return result;
+  }
   const auto run_start = Clock::now();
   result.projection_active = options.projection_work == ProjectionWork::kActive;
   std::optional<QueryMaintenanceHandle> maintenance;
   if (result.projection_active) {
     auto refreshed = database->RefreshQueryStatistics();
-    if (refreshed.ok()) maintenance = std::move(refreshed).ConsumeValueOrDie();
+    if (!refreshed.ok()) {
+      result.terminal_status = refreshed.status().ToString();
+      result.gate_classification = "incomplete";
+      result.hard_gate_pass = false;
+      return result;
+    }
+    maintenance = std::move(refreshed).ConsumeValueOrDie();
   }
 
   std::atomic<uint64_t> next_id{1}, transactions{0}, facts{0};
+  std::atomic<uint64_t> dataset_checksum{options.seed};
   std::atomic<bool> failed{false};
   std::mutex failure_mutex, sample_mutex;
   std::string failure;
@@ -125,6 +146,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     if (!s.ok()) return s;
     transactions.fetch_add(1);
     facts.fetch_add(committed);
+    dataset_checksum.fetch_xor(first + committed * 0x9e3779b97f4a7c15ULL);
   }
   const auto deadline = Clock::now() +
                         std::chrono::seconds(options.duration_seconds);
@@ -143,6 +165,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       }
       transactions.fetch_add(1);
       facts.fetch_add(committed);
+      dataset_checksum.fetch_xor(first + committed * 0x9e3779b97f4a7c15ULL);
       const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
           Clock::now() - start).count();
       std::lock_guard<std::mutex> lock(sample_mutex);
@@ -155,26 +178,52 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   writers.clear();
   if (failed.load()) result.terminal_status = failure;
 
-  std::vector<uint64_t> query_samples;
-  uint64_t rows = 0;
-  for (uint32_t i = 0; i < options.readers; ++i) {
-    auto snapshot = database->BeginSnapshot();
-    if (!snapshot.ok()) return snapshot.status();
-    const auto start = Clock::now();
-    const Status s = ExecuteOperation(snapshot.ValueOrDie(), options.operation,
-                                      options.result_limit, &rows);
-    if (!s.ok()) {
-      result.terminal_status = s.ToString();
-      break;
-    }
-    query_samples.push_back(static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start)
-            .count()));
+  if (options.cache == QueryCacheState::kWarm) {
+    auto warm_snapshot = database->BeginSnapshot();
+    if (!warm_snapshot.ok()) return warm_snapshot.status();
+    uint64_t warm_rows = 0;
+    const Status warm_status = ExecuteOperation(
+        warm_snapshot.ValueOrDie(), options.operation, options.result_limit,
+        &warm_rows);
+    if (!warm_status.ok()) return warm_status;
+    result.cache_conditioned = true;
   }
+  std::vector<uint64_t> query_samples;
+  std::mutex query_mutex;
+  std::atomic<uint64_t> rows{0};
+  std::vector<std::jthread> readers;
+  readers.reserve(options.readers);
+  for (uint32_t i = 0; i < options.readers; ++i) {
+    readers.emplace_back([&] {
+    auto snapshot = database->BeginSnapshot();
+    if (!snapshot.ok()) {
+      std::lock_guard<std::mutex> lock(query_mutex);
+      result.terminal_status = snapshot.status().ToString();
+      return;
+    }
+    const auto start = Clock::now();
+    uint64_t local_rows = 0;
+    const Status s = ExecuteOperation(snapshot.ValueOrDie(), options.operation,
+                                      options.result_limit, &local_rows);
+    if (!s.ok()) {
+      std::lock_guard<std::mutex> lock(query_mutex);
+      result.terminal_status = s.ToString();
+      return;
+    }
+    rows.fetch_add(local_rows);
+    const uint64_t elapsed = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start)
+            .count());
+    std::lock_guard<std::mutex> lock(query_mutex);
+    query_samples.push_back(elapsed);
+  });
+  }
+  readers.clear();
   result.elapsed_seconds = std::chrono::duration<double>(Clock::now() - run_start).count();
+  result.dataset_checksum = dataset_checksum.load();
   result.transactions = transactions.load();
   result.facts = facts.load();
-  result.rows = rows;
+  result.rows = rows.load();
   result.query_samples = query_samples.size();
   result.query_p50_us = Percentile(query_samples, 50);
   result.query_p95_us = Percentile(query_samples, 95);
@@ -182,8 +231,14 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   result.write_p50_us = Percentile(write_samples, 50);
   result.write_p95_us = Percentile(write_samples, 95);
   result.write_p99_us = Percentile(write_samples, 99);
-  result.wal_sync_p99_us = result.write_p99_us;
-  result.end_to_end_p99_us = result.write_p99_us;
+  const CommitPipelineMetrics pipeline = database->GetCommitPipelineMetrics();
+  result.wal_sync_p99_us =
+      pipeline.latency.wal_sync.ApproximatePercentile(99);
+  result.end_to_end_p99_us =
+      pipeline.latency.end_to_end.ApproximatePercentile(99);
+  result.metrics_complete = pipeline.latency.wal_sync.count > 0 &&
+                            pipeline.latency.end_to_end.count > 0 &&
+                            !query_samples.empty();
 
   if (options.verify_reopen && result.terminal_status == "OK") {
     const Status closed = database->Close();
@@ -209,16 +264,18 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   auto files = InspectStorageFiles({options.path, StorageProfile::kProductionAppend,
                                     db_options.production});
   if (files.ok()) AddFileBytes(files.ValueOrDie(), &result);
-  result.hard_gate_pass = result.terminal_status == "OK" &&
+  result.hard_gate_pass = result.metrics_complete &&
+                          result.operation_supported &&
+                          result.terminal_status == "OK" &&
                           (!options.verify_reopen || result.reopen_verified) &&
                           (result.authoritative_bytes == 0 ||
                            result.derived_bytes <= result.authoritative_bytes * 3 / 2);
-  result.gate_classification = result.hard_gate_pass ? "pass" : "fail";
+  result.gate_classification = result.hard_gate_pass ? "pass" : "incomplete";
   return result;
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,transactions,facts,rows,elapsed_seconds,transactions_per_second,facts_per_second,query_samples,query_p50_us,query_p95_us,query_p99_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,derived_bytes,scratch_bytes,total_bytes,projection_lag,projection_work,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,rows,elapsed_seconds,transactions_per_second,facts_per_second,query_samples,query_p50_us,query_p95_us,query_p99_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,derived_bytes,scratch_bytes,total_bytes,projection_lag,projection_work,cache_conditioned,operation_supported,metrics_complete,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -229,13 +286,17 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
   x << QueryBenchmarkOperationName(o.operation) << ',' << ProjectionStateName(o.projection)
     << ',' << o.degree << ',' << o.selectivity_percent << ',' << o.readers << ','
     << (o.cache == QueryCacheState::kCold ? "cold" : "warm") << ',' << o.writers << ','
-    << o.facts_per_txn << ',' << r.transactions << ',' << r.facts << ',' << r.rows << ','
+    << o.facts_per_txn << ',' << o.seed << ',' << r.dataset_checksum << ','
+    << r.transactions << ',' << r.facts << ',' << r.rows << ','
     << r.elapsed_seconds << ',' << t << ',' << f << ',' << r.query_samples << ','
     << r.query_p50_us << ',' << r.query_p95_us << ',' << r.query_p99_us << ','
     << r.write_p50_us << ',' << r.write_p95_us << ',' << r.write_p99_us << ','
     << r.wal_sync_p99_us << ',' << r.end_to_end_p99_us << ',' << r.authoritative_bytes << ','
     << r.derived_bytes << ',' << r.scratch_bytes << ',' << r.total_bytes << ','
     << r.projection_lag << ',' << (r.projection_active ? "active" : "paused") << ','
+    << (r.cache_conditioned ? "true" : "false") << ','
+    << (r.operation_supported ? "true" : "false") << ','
+    << (r.metrics_complete ? "true" : "false") << ','
     << r.terminal_status << ',' << (r.reopen_verified ? "true" : "false") << ','
     << r.gate_classification << ',' << (r.hard_gate_pass ? "true" : "false");
   return x.str();
@@ -254,6 +315,11 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"authoritative_bytes\":" << r.authoritative_bytes
     << ",\"derived_bytes\":" << r.derived_bytes
     << ",\"scratch_bytes\":" << r.scratch_bytes
+    << ",\"seed\":" << o.seed << ",\"dataset_checksum\":"
+    << r.dataset_checksum << ",\"cache_conditioned\":"
+    << (r.cache_conditioned ? "true" : "false")
+    << ",\"operation_supported\":" << (r.operation_supported ? "true" : "false")
+    << ",\"metrics_complete\":" << (r.metrics_complete ? "true" : "false")
     << ",\"terminal_status\":\"" << r.terminal_status
     << "\",\"reopen_verified\":" << (r.reopen_verified ? "true" : "false")
     << ",\"gate_classification\":\"" << r.gate_classification

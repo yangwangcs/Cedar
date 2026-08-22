@@ -32,6 +32,18 @@ const char* ProjectionStateName(ProjectionState state) {
   return names[static_cast<size_t>(state)];
 }
 
+bool QueryBenchmarkOperationSupported(QueryBenchmarkOperation operation) {
+  switch (operation) {
+    case QueryBenchmarkOperation::kStateAt:
+    case QueryBenchmarkOperation::kHistory:
+    case QueryBenchmarkOperation::kEvents:
+    case QueryBenchmarkOperation::kChanges:
+      return true;
+    default:
+      return false;
+  }
+}
+
 StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(
     const std::vector<std::string>& args) {
   QueryBenchmarkOptions options;

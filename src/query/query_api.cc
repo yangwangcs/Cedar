@@ -48,9 +48,12 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
   }
   internal::QueryStatisticsView statistics;
   if (database->query_statistics && catalog.generation_id != 0) {
-    const auto loaded = database->query_statistics->Load(
-        catalog.generation_id, catalog.base_seq);
-    if (loaded.ok()) {
+    const auto schema = database->store.SchemaFingerprint();
+    const auto loaded = schema.ok()
+        ? database->query_statistics->Load(catalog.generation_id, catalog.base_seq,
+                                           schema.ValueOrDie())
+        : StatusOr<internal::QueryStatisticsSnapshot>(schema.status());
+    if (loaded.ok() && !loaded.ValueOrDie().schema_fingerprint.empty()) {
       statistics.known = true;
       for (const auto& column : loaded.ValueOrDie().columns) {
         statistics.candidate_rows += column.rows;
@@ -297,7 +300,8 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
           [database](const std::shared_ptr<QueryExecutionState>& state) {
             database->UnregisterQueryState(state);
           },
-          database->query_crash_fault_injector_for_testing);
+          database->query_crash_fault_injector_for_testing,
+          &database->query_metrics);
     }
   }
   if (!state_->plan.canonical_temporal) {
@@ -313,7 +317,8 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       [database](const std::shared_ptr<QueryExecutionState>& state) {
         database->UnregisterQueryState(state);
       },
-      database->query_crash_fault_injector_for_testing);
+      database->query_crash_fault_injector_for_testing,
+      &database->query_metrics);
 }
 
 StatusOr<std::string> PreparedQuery::ExplainLogical() const {

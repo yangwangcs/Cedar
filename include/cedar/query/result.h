@@ -22,6 +22,7 @@
 #include "cedar/query/types.h"
 
 namespace cedar {
+namespace internal { class QueryMetrics; }
 
 class Database;
 class Snapshot;
@@ -235,6 +236,7 @@ class QueryExecutionState {
   void SetSnapshotSeq(CommitSeq seq);
   std::optional<CommitSeq> snapshot_seq() const;
   void RecordBatch(uint64_t rows, uint64_t decoded_bytes);
+  void SetMetrics(internal::QueryMetrics* metrics) { metrics_ = metrics; }
 
  private:
   mutable std::mutex mutex_;
@@ -248,6 +250,7 @@ class QueryExecutionState {
   QueryProfile profile_;
   std::function<void()> cancel_callback_;
   std::function<void()> close_callback_;
+  internal::QueryMetrics* metrics_ = nullptr;
 };
 
 class QueryBatch {

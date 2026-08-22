@@ -1450,10 +1450,16 @@ Database::~Database() { Close().IgnoreError(); }
 
 class QueryMaintenanceHandle::State {
  public:
-  explicit State(Status status) : status(std::move(status)) {}
-  std::mutex mutex;
-  Status status;
-  bool cancelled = false;
+  struct Shared {
+    std::mutex mutex;
+    std::condition_variable cv;
+    Status status;
+    bool cancelled = false;
+    bool done = false;
+  };
+  State() : shared(std::make_shared<Shared>()) {}
+  explicit State(std::shared_ptr<Shared> value) : shared(std::move(value)) {}
+  std::shared_ptr<Shared> shared;
 };
 
 QueryMaintenanceHandle::QueryMaintenanceHandle(std::unique_ptr<State> state)
@@ -1463,14 +1469,16 @@ QueryMaintenanceHandle& QueryMaintenanceHandle::operator=(QueryMaintenanceHandle
 QueryMaintenanceHandle::~QueryMaintenanceHandle() = default;
 void QueryMaintenanceHandle::Cancel() {
   if (!state_) return;
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  state_->cancelled = true;
+  std::lock_guard<std::mutex> lock(state_->shared->mutex);
+  state_->shared->cancelled = true;
+  state_->shared->cv.notify_all();
 }
 Status QueryMaintenanceHandle::Await() {
   if (!state_) return Status::InvalidArgument("query maintenance", "moved-from handle");
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  if (state_->cancelled) return Status::QueryCancelled("query maintenance", "refresh cancelled");
-  return state_->status;
+  std::unique_lock<std::mutex> lock(state_->shared->mutex);
+  state_->shared->cv.wait(lock, [this] { return state_->shared->done; });
+  if (state_->shared->cancelled) return Status::QueryCancelled("query maintenance", "refresh cancelled");
+  return state_->shared->status;
 }
 
 StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
@@ -1645,17 +1653,58 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
 
 StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
-  if (impl_->closing) return Status::ShutdownInProgress("database", "database close is in progress");
-  if (!impl_->projection_store || !impl_->query_statistics) {
-    return Status::NotFound("query statistics", "projection catalog is unavailable");
+  std::shared_ptr<internal::QueryStatisticsStore> statistics;
+  std::shared_ptr<internal::ProjectionManifest> manifest;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+    if (impl_->closing) return Status::ShutdownInProgress("database", "database close is in progress");
+    if (!impl_->projection_store || !impl_->query_statistics) {
+      return Status::NotFound("query statistics", "projection catalog is unavailable");
+    }
+    const auto current = impl_->projection_store->current_manifest();
+    if (!current) return Status::NotFound("query statistics", "projection generation is unavailable");
+    manifest = std::make_shared<internal::ProjectionManifest>(*current);
+    // The store owns the object; keep a non-owning shared wrapper only for the
+    // worker lifetime. Database shutdown joins the executor before destruction.
+    statistics = std::shared_ptr<internal::QueryStatisticsStore>(
+        impl_, impl_->query_statistics.get());
   }
-  const auto manifest = impl_->projection_store->current_manifest();
-  if (!manifest) return Status::NotFound("query statistics", "projection generation is unavailable");
-  Status refreshed = impl_->query_statistics->Refresh(*manifest);
-  return QueryMaintenanceHandle(std::make_unique<QueryMaintenanceHandle::State>(
-      std::move(refreshed)));
+  const auto schema = impl_->store.SchemaFingerprint();
+  if (!schema.ok()) return schema.status();
+  auto state = std::make_shared<QueryMaintenanceHandle::State::Shared>();
+  auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
+  ticket->estimated_bytes = 1;
+  ticket->handoff = [state, statistics, manifest, schema = schema.ValueOrDie()] {
+    Status result;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->cancelled) {
+        state->status = Status::QueryCancelled("query maintenance", "refresh cancelled");
+        state->done = true;
+        state->cv.notify_all();
+        return state->status;
+      }
+    }
+    result = statistics->Refresh(*manifest, schema);
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->status = std::move(result);
+      state->done = true;
+    }
+    state->cv.notify_all();
+    return Status::OK();
+  };
+  ticket->fail = [state](const Status& status) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->status = status;
+    state->done = true;
+    state->cv.notify_all();
+  };
+  ticket->release = [] {};
+  const Status submitted = impl_->async_executor.TrySubmit(ticket);
+  if (!submitted.ok()) return submitted;
+  return QueryMaintenanceHandle(std::make_unique<QueryMaintenanceHandle::State>(std::move(state)));
 }
 
 Status Database::Close() {

@@ -4,9 +4,12 @@
 #include "query/observability/query_metrics.h"
 
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <cstring>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_manifest.h"
@@ -38,11 +41,20 @@ Status ValidateBounds(const QueryStatisticsSnapshot& snapshot) {
   if (snapshot.database_identity.size() > 4096 || snapshot.schema_fingerprint.size() > 4096 ||
       snapshot.columns.size() > 4096) return Status::ResourceExhausted("query statistics", "metadata exceeds bound");
   for (const auto& c : snapshot.columns) {
-    if (c.distinct.precision > 20 || c.distinct.registers.size() > (1u << 20) ||
+    if (c.distinct.precision > 20 || c.distinct.registers.size() != (size_t{1} << c.distinct.precision) ||
         c.histogram.size() > 128 || c.top_values.size() > 64 || c.fanout.size() > 128 ||
         c.interval_length.size() > 128) return Status::ResourceExhausted("query statistics", "sketch exceeds bound");
   }
   return Status::OK();
+}
+
+Status SyncPath(const std::filesystem::path& path, bool directory) {
+  const int flags = O_RDONLY | (directory ? O_DIRECTORY : 0);
+  const int fd = ::open(path.c_str(), flags);
+  if (fd < 0) return Status::IOError("query statistics", "open for sync failed");
+  const int result = ::fsync(fd);
+  ::close(fd);
+  return result == 0 ? Status::OK() : Status::IOError("query statistics", "sync failed");
 }
 }
 
@@ -85,8 +97,8 @@ std::string QueryStatisticsStore::FileName(uint64_t generation_id) { return "gen
 QueryStatisticsStore::QueryStatisticsStore(std::string directory, std::string database_identity):directory_(std::move(directory)),database_identity_(std::move(database_identity)){}
 Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const std::string& schema_fingerprint) {
   QueryStatisticsSnapshot snapshot; snapshot.database_identity=database_identity_; snapshot.schema_fingerprint=schema_fingerprint; snapshot.generation_id=manifest.generation_id; snapshot.base_seq=manifest.base_seq;
-  snapshot.columns.reserve(manifest.regions.size()); for(const auto& region:manifest.regions){QueryColumnStatistics c;for(const auto& segment:region.segments){c.pages++;c.bytes+=segment.file_bytes;c.rows+=segment.header.entity_max_exclusive-segment.header.entity_min;}c.entity_range=EntityRange{region.entity_min,region.entity_max_exclusive};c.valid_time_range=region.valid_time;snapshot.columns.push_back(std::move(c));}
-  auto encoded=EncodeQueryStatistics(snapshot);if(!encoded.ok())return encoded.status();std::error_code ec;std::filesystem::create_directories(directory_,ec);if(ec)return Status::IOError("query statistics",ec.message());const auto path=std::filesystem::path(directory_)/FileName(manifest.generation_id);const auto temp=path.string()+".tmp";{std::ofstream out(temp,std::ios::binary|std::ios::trunc);if(!out)return Status::IOError("query statistics","cannot create file");out.write(encoded.ValueOrDie().data(),encoded.ValueOrDie().size());if(!out)return Status::IOError("query statistics","write failed");}std::filesystem::rename(temp,path,ec);if(ec){std::filesystem::remove(temp);return Status::IOError("query statistics",ec.message());}return Status::OK();
+  snapshot.columns.reserve(manifest.regions.size()); for(const auto& region:manifest.regions){QueryColumnStatistics c;c.distinct.registers.assign(size_t{1} << c.distinct.precision, 0);for(const auto& segment:region.segments){c.pages++;c.bytes+=segment.file_bytes;c.rows+=segment.header.entity_max_exclusive-segment.header.entity_min;}c.entity_range=EntityRange{region.entity_min,region.entity_max_exclusive};c.valid_time_range=region.valid_time;snapshot.columns.push_back(std::move(c));}
+  auto encoded=EncodeQueryStatistics(snapshot);if(!encoded.ok())return encoded.status();std::error_code ec;std::filesystem::create_directories(directory_,ec);if(ec)return Status::IOError("query statistics",ec.message());const auto path=std::filesystem::path(directory_)/FileName(manifest.generation_id);const auto temp=path.string()+".tmp";{std::ofstream out(temp,std::ios::binary|std::ios::trunc);if(!out)return Status::IOError("query statistics","cannot create file");out.write(encoded.ValueOrDie().data(),encoded.ValueOrDie().size());out.flush();if(!out)return Status::IOError("query statistics","write failed");}auto synced=SyncPath(temp,false);if(!synced.ok()){std::filesystem::remove(temp);return synced;}std::filesystem::rename(temp,path,ec);if(ec){std::filesystem::remove(temp);return Status::IOError("query statistics",ec.message());}return SyncPath(directory_,true);
 }
 StatusOr<QueryStatisticsSnapshot> QueryStatisticsStore::Load(uint64_t generation_id, CommitSeq base_seq, const std::string& schema_fingerprint) const {const auto path=std::filesystem::path(directory_)/FileName(generation_id);std::ifstream in(path,std::ios::binary);if(!in)return Status::NotFound("query statistics","statistics unavailable");std::string bytes((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());auto decoded=DecodeQueryStatistics(bytes);if(!decoded.ok())return decoded.status();const auto& s=decoded.ValueOrDie();if(s.database_identity!=database_identity_||s.generation_id!=generation_id||s.base_seq!=base_seq||( !schema_fingerprint.empty()&&s.schema_fingerprint!=schema_fingerprint))return Status::Conflict("query statistics","statistics identity is stale");return decoded;}
 

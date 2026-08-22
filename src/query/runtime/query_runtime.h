@@ -21,6 +21,7 @@
 #include "query/projection/projection_format.h"
 #include "query/projection/projection_store.h"
 #include "query/resource/query_resource_pool.h"
+#include "query/observability/query_metrics.h"
 
 namespace cedar::internal {
 
@@ -164,7 +165,8 @@ class QueryRuntime {
                                        std::function<void(const std::shared_ptr<QueryExecutionState>&)>
                                            unregister_query_state = {},
                                        std::function<Status(const char*)>
-                                           crash_fault_injector = {});
+                                           crash_fault_injector = {},
+                                       QueryMetrics* metrics = nullptr);
 };
 
 }  // namespace cedar::internal

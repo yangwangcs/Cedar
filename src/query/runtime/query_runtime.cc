@@ -1106,6 +1106,7 @@ void QueryExecutionState::RequestCancel() {
       terminal_.state = QueryCursorState::kCancelled;
       terminal_.complete = false;
       terminal_.status = Status::QueryCancelled("query", "query cancelled");
+      if (metrics_) metrics_->AddTerminal(internal::QueryMetricTerminal::kCancelled);
     }
     callback = cancel_callback_;
   }
@@ -1122,6 +1123,7 @@ Status QueryExecutionState::FinishClean() {
   terminal_.state = QueryCursorState::kCleanEnd;
   terminal_.complete = true;
   terminal_.status = Status::OK();
+  if (metrics_) metrics_->AddTerminal(internal::QueryMetricTerminal::kComplete);
   return Status::OK();
 }
 
@@ -1136,6 +1138,7 @@ Status QueryExecutionState::FinishFailed(Status status) {
   terminal_.state = QueryCursorState::kFailed;
   terminal_.complete = false;
   terminal_.status = std::move(status);
+  if (metrics_) metrics_->AddTerminal(internal::QueryMetricTerminal::kFailed);
   return terminal_.status;
 }
 
@@ -1223,6 +1226,7 @@ void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes) {
   op.rows += rows;
   op.batches += 1;
   op.decoded_bytes += decoded_bytes;
+  if (metrics_) metrics_->AddBatch(internal::QueryMetricOperator::kScan, rows, 0, decoded_bytes);
 }
 
 class QueryCursor::State {
@@ -1646,7 +1650,21 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     lease->backing = std::make_shared<QueryBatch>(std::move(stored));
     lease->retained = state_->retained_batches;
     if (state_->options.capture_profile) {
-      state_->execution->RecordBatch(lease->backing->row_count(), 0);
+      uint64_t decoded_bytes = 0;
+      for (const auto& column : lease->backing->columns()) {
+        decoded_bytes += std::visit(
+            [](const auto& values) -> uint64_t {
+              using T = typename std::decay_t<decltype(values)>::value_type;
+              if constexpr (std::is_same_v<T, std::string>) {
+                uint64_t bytes = 0;
+                for (const auto& value : values) bytes += value.size();
+                return bytes;
+              } else {
+                return static_cast<uint64_t>(values.size()) * sizeof(T);
+              }
+            }, column.values);
+      }
+      state_->execution->RecordBatch(lease->backing->row_count(), decoded_bytes);
     }
     return std::optional<QueryBatch>{
         QueryBatch(lease->backing->row_count(), lease->backing->columns(), lease)};
@@ -1947,7 +1965,8 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             std::function<void(const std::shared_ptr<QueryExecutionState>&)>
                                                 unregister_query_state,
                                             std::function<Status(const char*)>
-                                                crash_fault_injector) {
+                                                crash_fault_injector,
+                                            QueryMetrics* metrics) {
   QueryOptions resolved_options = options;
   if (resolved_options.mode == QueryExecutionMode::kAuto &&
       plan.physical_plan != nullptr) {
@@ -1998,6 +2017,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
   auto state = std::make_unique<QueryCursor::State>(
       plan, std::move(snapshot), std::move(resolved_options),
       std::move(admitted).ConsumeValueOrDie(), std::move(scratch));
+  state->execution->SetMetrics(metrics);
   // Every cursor owns an engine Snapshot and therefore participates in the
   // ordered shutdown/pin registry. The mode only changes budgeting, never
   // snapshot lifetime.

@@ -306,6 +306,7 @@ class Database::Impl {
   FactStore store;
   std::unique_ptr<internal::QueryProjectionStore> projection_store;
   std::unique_ptr<internal::QueryStatisticsStore> query_statistics;
+  internal::QueryMetrics query_metrics;
   // Derived, rebuildable commit tail.  It is deliberately independent from
   // the durable commit path; queue overflow records a gap but never rejects a
   // commit that RocksDB has already published.

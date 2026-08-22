@@ -19,6 +19,8 @@
 #include "storage/facts/fact_store.h"
 #include "storage/rocks/rocksdb_config.h"
 #include "query/observability/query_metrics.h"
+#include "query/projection/projection_format.h"
+#include "query/projection/projection_manifest.h"
 
 namespace cedar {
 namespace {
@@ -107,6 +109,36 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
       if (decoded.ok()) {
         metadata.generation_id = decoded.ValueOrDie().generation_id;
         metadata.base_seq = decoded.ValueOrDie().base_seq.value;
+      }
+    } else if (format == StorageTableFormat::kCedarManifest) {
+      const auto decoded = internal::DecodeProjectionManifest(bytes, root);
+      metadata.checksum_valid = decoded.ok();
+      if (decoded.ok()) {
+        const auto& manifest = decoded.ValueOrDie();
+        metadata.generation_id = manifest.generation_id;
+        metadata.base_seq = manifest.base_seq.value;
+        for (size_t i = 0; i < manifest.regions.size(); ++i) {
+          if (i != 0) metadata.coverage.push_back('|');
+          const auto& region = manifest.regions[i];
+          metadata.coverage += "part=" + std::to_string(region.part_id.value) +
+              ",entity=[" + std::to_string(region.entity_min) + "," +
+              std::to_string(region.entity_max_exclusive) + "),valid=[" +
+              std::to_string(region.valid_time.from.value) + "," +
+              (region.valid_time.to ? std::to_string(region.valid_time.to->value) : "inf") + ")";
+        }
+      }
+    } else {
+      const auto decoded = internal::DecodeProjectionPage(bytes);
+      metadata.checksum_valid = decoded.ok();
+      if (decoded.ok()) {
+        const auto& header = decoded.ValueOrDie().header;
+        metadata.generation_id = header.generation_id;
+        metadata.base_seq = header.base_seq.value;
+        metadata.coverage = "part=" + std::to_string(header.part_id.value) +
+            ",entity=[" + std::to_string(header.entity_min) + "," +
+            std::to_string(header.entity_max_exclusive) + "),valid=[" +
+            std::to_string(header.valid_from_min.value) + "," +
+            (header.valid_to_max ? std::to_string(header.valid_to_max->value) : "inf") + ")";
       }
     }
     info.query_file = std::move(metadata);

@@ -4,6 +4,7 @@
 #include "storage/rocks/rocks_adapter.h"
 
 #include <algorithm>
+#include <sstream>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -32,6 +33,7 @@
 #include <rocksdb/write_batch.h>
 
 #include "db/cedar_columnar_scan.h"
+#include "cedar/core/crc32c.h"
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
 #include "cedar/format.h"
@@ -3178,6 +3180,30 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
   const auto schemas = std::atomic_load(&store->property_schemas);
   return LookupPropertyInSchemas(*schemas, property_id,
                                  schema_epoch);
+}
+
+StatusOr<std::string> FactStore::SchemaFingerprint() const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("property definition", "store is not open");
+  }
+  const auto schemas = std::atomic_load(&store->property_schemas);
+  std::ostringstream canonical;
+  for (const auto& [property_id, epochs] : *schemas) {
+    if (epochs.empty()) continue;
+    const auto& definition = epochs.back();
+    canonical << property_id << ':' << definition.schema_epoch << ':'
+              << static_cast<unsigned>(definition.entity_kind) << ':'
+              << static_cast<unsigned>(definition.physical_type) << ':'
+              << definition.blob_threshold_bytes << ':' << definition.name << ';';
+  }
+  const std::string bytes = canonical.str();
+  const uint32_t digest = crc32c::Value(bytes.data(), bytes.size());
+  std::ostringstream fingerprint;
+  fingerprint << std::hex << digest << ':' << bytes.size();
+  return fingerprint.str();
 }
 
 StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(

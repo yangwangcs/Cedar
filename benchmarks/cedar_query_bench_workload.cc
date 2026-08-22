@@ -425,6 +425,30 @@ void AddFileBytes(const std::vector<StorageFileInfo>& files,
     }
   }
 }
+
+void AddWalManifestBytes(const std::string& root,
+                         const std::vector<StorageFileInfo>& inspected,
+                         QueryBenchmarkResult* result) {
+  std::unordered_set<std::string> known;
+  for (const auto& file : inspected) known.insert(file.relative_filename);
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it(root, ec), end;
+       it != end && !ec; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    const auto name = it->path().filename().string();
+    const bool wal = name == "CURRENT" || name == "LOG" ||
+                     name.rfind("MANIFEST-", 0) == 0 ||
+                     it->path().extension() == ".log";
+    if (!wal) continue;
+    const auto relative = std::filesystem::relative(it->path(), root, ec).string();
+    if (ec || known.count(relative) != 0) continue;
+    const uint64_t bytes = it->file_size(ec);
+    if (ec) continue;
+    result->total_bytes += bytes;
+    result->engine_internal_bytes += bytes;
+    result->wal_manifest_bytes += bytes;
+  }
+}
 }  // namespace
 
 StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
@@ -719,11 +743,20 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.terminal_status = result.storage_inspection_status;
   } else {
     AddFileBytes(files.ValueOrDie(), &result);
+    AddWalManifestBytes(options.path, files.ValueOrDie(), &result);
   }
   result.mib_per_second = result.elapsed_seconds > 0
                               ? static_cast<double>(result.total_bytes) /
                                     (1024.0 * 1024.0 * result.elapsed_seconds)
                               : 0.0;
+  result.write_mib_per_second = result.write_elapsed_seconds > 0
+                                    ? static_cast<double>(result.authoritative_bytes) /
+                                          (1024.0 * 1024.0 * result.write_elapsed_seconds)
+                                    : 0.0;
+  result.query_mib_per_second = result.query_elapsed_seconds > 0
+                                    ? static_cast<double>(result.total_bytes) /
+                                          (1024.0 * 1024.0 * result.query_elapsed_seconds)
+                                    : 0.0;
   result.group_fill_p50 = Percentile(group_fill_samples, 50);
   result.space_amplification = result.authoritative_bytes == 0
                                    ? 0.0
@@ -748,7 +781,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,mib_per_second,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,mib_per_second,write_mib_per_second,query_mib_per_second,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -764,6 +797,7 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.measured_facts << ',' << r.rows << ','
     << r.elapsed_seconds << ',' << r.write_elapsed_seconds << ',' << r.query_elapsed_seconds << ','
     << t << ',' << f << ',' << r.query_qps << ',' << r.mib_per_second << ','
+    << r.write_mib_per_second << ',' << r.query_mib_per_second << ','
     << r.group_fill_p50 << ',' << r.query_samples << ','
     << r.query_p50_us << ',' << r.query_p95_us << ',' << r.query_p99_us << ','
     << r.first_result_p50_us << ','
@@ -810,6 +844,8 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"engine_internal_bytes\":" << r.engine_internal_bytes
     << ",\"wal_manifest_bytes\":" << r.wal_manifest_bytes
     << ",\"mib_per_second\":" << r.mib_per_second
+    << ",\"write_mib_per_second\":" << r.write_mib_per_second
+    << ",\"query_mib_per_second\":" << r.query_mib_per_second
     << ",\"group_fill_p50\":" << r.group_fill_p50
     << ",\"write_amplification\":" << r.write_amplification
     << ",\"space_amplification\":" << r.space_amplification

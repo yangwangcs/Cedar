@@ -125,6 +125,12 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   if (!opened.ok()) return opened.status();
   auto database = std::move(opened).ConsumeValueOrDie();
   QueryBenchmarkResult result;
+  result.raw_sample_path = options.path;
+#ifdef NDEBUG
+  result.build_type = "release";
+#else
+  result.build_type = "debug";
+#endif
   result.seed = options.seed;
   result.dataset_checksum = 0;
   if (!QueryBenchmarkOperationSupported(options.operation)) {
@@ -286,6 +292,22 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   auto files = InspectStorageFiles({options.path, StorageProfile::kProductionAppend,
                                     db_options.production});
   if (files.ok()) AddFileBytes(files.ValueOrDie(), &result);
+  result.mib_per_second = result.elapsed_seconds > 0
+                              ? static_cast<double>(result.total_bytes) /
+                                    (1024.0 * 1024.0 * result.elapsed_seconds)
+                              : 0.0;
+  result.group_fill_p50 = result.transactions == 0
+                              ? 0
+                              : result.facts / result.transactions;
+  result.space_amplification = result.authoritative_bytes == 0
+                                   ? 0.0
+                                   : static_cast<double>(result.total_bytes) /
+                                         result.authoritative_bytes;
+  result.write_amplification = result.authoritative_bytes == 0
+                                   ? 0.0
+                                   : static_cast<double>(result.authoritative_bytes +
+                                                         result.derived_bytes) /
+                                         result.authoritative_bytes;
   result.hard_gate_pass = result.metrics_complete &&
                           result.operation_supported &&
                           result.terminal_status == "OK" &&
@@ -297,7 +319,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,rows,elapsed_seconds,transactions_per_second,facts_per_second,query_samples,query_p50_us,query_p95_us,query_p99_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,derived_bytes,scratch_bytes,total_bytes,projection_lag,projection_work,cache_conditioned,operation_supported,metrics_complete,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,rows,elapsed_seconds,transactions_per_second,facts_per_second,mib_per_second,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,derived_bytes,scratch_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,cache_conditioned,operation_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -310,15 +332,19 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << (o.cache == QueryCacheState::kCold ? "cold" : "warm") << ',' << o.writers << ','
     << o.facts_per_txn << ',' << o.seed << ',' << r.dataset_checksum << ','
     << r.transactions << ',' << r.facts << ',' << r.rows << ','
-    << r.elapsed_seconds << ',' << t << ',' << f << ',' << r.query_samples << ','
+    << r.elapsed_seconds << ',' << t << ',' << f << ',' << r.mib_per_second << ','
+    << r.group_fill_p50 << ',' << r.query_samples << ','
     << r.query_p50_us << ',' << r.query_p95_us << ',' << r.query_p99_us << ','
     << r.write_p50_us << ',' << r.write_p95_us << ',' << r.write_p99_us << ','
     << r.wal_sync_p99_us << ',' << r.end_to_end_p99_us << ',' << r.authoritative_bytes << ','
     << r.derived_bytes << ',' << r.scratch_bytes << ',' << r.total_bytes << ','
+    << r.write_amplification << ',' << r.space_amplification << ','
     << r.projection_lag << ',' << (r.projection_active ? "active" : "paused") << ','
     << (r.cache_conditioned ? "true" : "false") << ','
     << (r.operation_supported ? "true" : "false") << ','
     << (r.metrics_complete ? "true" : "false") << ','
+    << r.build_type << ',' << r.sanitizer << ',' << r.host << ','
+    << r.plan_fingerprint << ',' << r.raw_sample_path << ','
     << r.terminal_status << ',' << (r.reopen_verified ? "true" : "false") << ','
     << r.gate_classification << ',' << (r.hard_gate_pass ? "true" : "false");
   return x.str();
@@ -337,6 +363,15 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"authoritative_bytes\":" << r.authoritative_bytes
     << ",\"derived_bytes\":" << r.derived_bytes
     << ",\"scratch_bytes\":" << r.scratch_bytes
+    << ",\"mib_per_second\":" << r.mib_per_second
+    << ",\"group_fill_p50\":" << r.group_fill_p50
+    << ",\"write_amplification\":" << r.write_amplification
+    << ",\"space_amplification\":" << r.space_amplification
+    << ",\"build_type\":\"" << r.build_type
+    << "\",\"sanitizer\":\"" << r.sanitizer
+    << "\",\"host\":\"" << r.host
+    << "\",\"plan_fingerprint\":\"" << r.plan_fingerprint
+    << "\",\"raw_sample_path\":\"" << r.raw_sample_path
     << ",\"seed\":" << o.seed << ",\"dataset_checksum\":"
     << r.dataset_checksum << ",\"cache_conditioned\":"
     << (r.cache_conditioned ? "true" : "false")

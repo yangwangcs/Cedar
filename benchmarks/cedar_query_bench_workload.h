@@ -21,6 +21,10 @@ struct QueryBenchmarkResult {
   uint64_t derived_bytes = 0;
   uint64_t scratch_bytes = 0;
   uint64_t total_bytes = 0;
+  double mib_per_second = 0;
+  double write_amplification = 0;
+  double space_amplification = 0;
+  uint64_t group_fill_p50 = 0;
   uint64_t dataset_checksum = 0;
   uint64_t seed = 0;
   double elapsed_seconds = 0;
@@ -33,6 +37,11 @@ struct QueryBenchmarkResult {
   bool operation_supported = true;
   std::string gate_classification = "incomplete";
   std::string terminal_status = "OK";
+  std::string build_type = "unknown";
+  std::string sanitizer = "none";
+  std::string host = "unknown";
+  std::string plan_fingerprint = "cedar-canonical-scan-v1";
+  std::string raw_sample_path;
 };
 StatusOr<QueryBenchmarkResult> RunQueryBenchmark(const QueryBenchmarkOptions& options);
 std::string QueryBenchmarkCsvHeader();

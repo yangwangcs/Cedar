@@ -190,6 +190,28 @@ struct QueryTerminalInfo {
   Status status = Status::OK();
 };
 
+struct QueryOperatorProfile {
+  uint32_t operator_id = 0;
+  uint64_t rows = 0;
+  uint64_t batches = 0;
+  uint64_t cpu_us = 0;
+  uint64_t wall_us = 0;
+  uint64_t queue_us = 0;
+  uint64_t first_result_us = 0;
+  uint64_t physical_bytes = 0;
+  uint64_t decoded_bytes = 0;
+  uint64_t pages = 0;
+  uint64_t delta_repairs = 0;
+  uint64_t interval_fragments = 0;
+  uint64_t spill_bytes = 0;
+  uint64_t frontier_labels = 0;
+};
+
+struct QueryProfile {
+  std::vector<QueryOperatorProfile> operators;
+  QueryTerminalInfo terminal;
+};
+
 // Shared lifecycle state lets Database shutdown request cancellation without
 // holding a query/runtime mutex or waiting for a blocked read callback.
 class QueryExecutionState {
@@ -200,6 +222,7 @@ class QueryExecutionState {
   Status FinishCancelled();
   Status FinishFailed(Status status);
   QueryTerminalInfo terminal_info() const;
+  QueryProfile profile() const;
   Status Close();
   // QueryRuntime brackets every potentially blocking Next call with these
   // methods. Close waits for the last operation before releasing snapshots.
@@ -211,6 +234,7 @@ class QueryExecutionState {
   void ClearCancelCallback();
   void SetSnapshotSeq(CommitSeq seq);
   std::optional<CommitSeq> snapshot_seq() const;
+  void RecordBatch(uint64_t rows, uint64_t decoded_bytes);
 
  private:
   mutable std::mutex mutex_;
@@ -221,6 +245,7 @@ class QueryExecutionState {
   std::atomic<bool> cancelled_{false};
   QueryTerminalInfo terminal_;
   std::optional<CommitSeq> snapshot_seq_;
+  QueryProfile profile_;
   std::function<void()> cancel_callback_;
   std::function<void()> close_callback_;
 };
@@ -289,6 +314,7 @@ class QueryCursor {
   Status Cancel();
   Status Close();
   QueryTerminalInfo terminal_info() const;
+  QueryProfile profile() const;
 
  private:
   class State;

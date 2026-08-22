@@ -33,6 +33,7 @@
 #include "query/projection/projection_store.h"
 #include "query/projection/query_delta.h"
 #include "query/resource/query_resource_pool.h"
+#include "query/observability/query_metrics.h"
 
 namespace cedar {
 
@@ -304,6 +305,7 @@ class Database::Impl {
   std::string query_database_path;
   FactStore store;
   std::unique_ptr<internal::QueryProjectionStore> projection_store;
+  std::unique_ptr<internal::QueryStatisticsStore> query_statistics;
   // Derived, rebuildable commit tail.  It is deliberately independent from
   // the durable commit path; queue overflow records a gap but never rejects a
   // commit that RocksDB has already published.

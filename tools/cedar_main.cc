@@ -20,6 +20,12 @@ const char* RoleName(cedar::StorageFileRole role) {
       return "transaction-metadata";
     case cedar::StorageFileRole::kEngineInternal:
       return "engine-internal";
+    case cedar::StorageFileRole::kQueryProjection:
+      return "query-projection";
+    case cedar::StorageFileRole::kQueryStatistics:
+      return "query-statistics";
+    case cedar::StorageFileRole::kQueryScratch:
+      return "query-scratch";
   }
   return "unknown";
 }
@@ -30,6 +36,18 @@ const char* TableFormatName(cedar::StorageTableFormat format) {
       return "CedarParquet";
     case cedar::StorageTableFormat::kBlockBased:
       return "BlockBased";
+    case cedar::StorageTableFormat::kCedarManifest:
+      return "CedarManifest";
+    case cedar::StorageTableFormat::kCedarState:
+      return "CedarState";
+    case cedar::StorageTableFormat::kCedarAdjacency:
+      return "CedarAdjacency";
+    case cedar::StorageTableFormat::kCedarProperty:
+      return "CedarProperty";
+    case cedar::StorageTableFormat::kCedarStatistics:
+      return "CedarStatistics";
+    case cedar::StorageTableFormat::kCedarScratch:
+      return "CedarScratch";
   }
   return "unknown";
 }
@@ -102,6 +120,14 @@ void PrintJson(const std::vector<cedar::StorageFileInfo>& files) {
     WriteJsonString(file.smallest_key_hex);
     std::cout << ",\"largest_key_hex\":";
     WriteJsonString(file.largest_key_hex);
+    if (file.query_file) {
+      std::cout << ",\"query_file\":{";
+      std::cout << "\"checksum_valid\":" << (file.query_file->checksum_valid ? "true" : "false");
+      if (file.query_file->generation_id) std::cout << ",\"generation_id\":" << *file.query_file->generation_id;
+      if (file.query_file->base_seq) std::cout << ",\"base_seq\":" << *file.query_file->base_seq;
+      std::cout << ",\"coverage\":"; WriteJsonString(file.query_file->coverage);
+      std::cout << '}';
+    }
     std::cout << '}';
   }
   std::cout << "]}\n";

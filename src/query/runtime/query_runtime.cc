@@ -1209,6 +1209,22 @@ std::optional<CommitSeq> QueryExecutionState::snapshot_seq() const {
   return snapshot_seq_;
 }
 
+QueryProfile QueryExecutionState::profile() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  QueryProfile copy = profile_;
+  copy.terminal = terminal_;
+  return copy;
+}
+
+void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (profile_.operators.empty()) profile_.operators.push_back(QueryOperatorProfile{});
+  auto& op = profile_.operators.front();
+  op.rows += rows;
+  op.batches += 1;
+  op.decoded_bytes += decoded_bytes;
+}
+
 class QueryCursor::State {
  public:
   struct TerminalError {
@@ -1336,6 +1352,17 @@ QueryTerminalInfo QueryCursor::terminal_info() const {
                                                      "moved-from cursor")};
   }
   return state_->execution->terminal_info();
+}
+
+QueryProfile QueryCursor::profile() const {
+  if (!state_) {
+    QueryProfile profile;
+    profile.terminal = QueryTerminalInfo{QueryCursorState::kFailed, false,
+                                         Status::InvalidArgument("query cursor",
+                                                                 "moved-from cursor")};
+    return profile;
+  }
+  return state_->execution->profile();
 }
 
 StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
@@ -1618,6 +1645,9 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     auto lease = std::make_shared<BatchLease>();
     lease->backing = std::make_shared<QueryBatch>(std::move(stored));
     lease->retained = state_->retained_batches;
+    if (state_->options.capture_profile) {
+      state_->execution->RecordBatch(lease->backing->row_count(), 0);
+    }
     return std::optional<QueryBatch>{
         QueryBatch(lease->backing->row_count(), lease->backing->columns(), lease)};
   }

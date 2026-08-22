@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <optional>
 
 #include "cedar/core/status.h"
 #include "cedar/storage_options.h"
@@ -17,11 +18,35 @@ enum class StorageFileRole : uint8_t {
   kAuthoritativeFacts,
   kTransactionMetadata,
   kEngineInternal,
+  kQueryProjection,
+  kQueryStatistics,
+  kQueryScratch,
 };
 
 enum class StorageTableFormat : uint8_t {
   kCedarParquet,
   kBlockBased,
+  kCedarManifest,
+  kCedarState,
+  kCedarAdjacency,
+  kCedarProperty,
+  kCedarStatistics,
+  kCedarScratch,
+};
+
+enum class StorageFileAuthority : uint8_t {
+  kAuthoritative,
+  kDerived,
+  kTemporary,
+  kEngineInternal,
+};
+
+struct QueryFileMetadata {
+  StorageFileAuthority authority = StorageFileAuthority::kEngineInternal;
+  std::optional<uint64_t> generation_id;
+  std::optional<uint64_t> base_seq;
+  std::string coverage;
+  bool checksum_valid = false;
 };
 
 struct StorageFileInfo {
@@ -35,6 +60,7 @@ struct StorageFileInfo {
   uint64_t largest_seqno = 0;
   std::string smallest_key_hex;
   std::string largest_key_hex;
+  std::optional<QueryFileMetadata> query_file;
 };
 
 struct StorageFileInspectionOptions {

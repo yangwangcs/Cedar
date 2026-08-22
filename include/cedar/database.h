@@ -26,6 +26,24 @@ namespace cedar {
 
 class Query;
 
+class QueryMaintenanceHandle {
+ public:
+  QueryMaintenanceHandle() = default;
+  QueryMaintenanceHandle(QueryMaintenanceHandle&&) noexcept;
+  QueryMaintenanceHandle& operator=(QueryMaintenanceHandle&&) noexcept;
+  QueryMaintenanceHandle(const QueryMaintenanceHandle&) = delete;
+  QueryMaintenanceHandle& operator=(const QueryMaintenanceHandle&) = delete;
+  ~QueryMaintenanceHandle();
+  void Cancel();
+  Status Await();
+
+ private:
+  class State;
+  explicit QueryMaintenanceHandle(std::unique_ptr<State> state);
+  std::unique_ptr<State> state_;
+  friend class Database;
+};
+
 struct CommitLatencyHistogram {
   static constexpr size_t kBucketCount = 13;
   // Upper bounds in microseconds; the final bucket contains all larger values.
@@ -235,6 +253,7 @@ class Database {
       TransactionOptions options = {});
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
   StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;
+  StatusOr<QueryMaintenanceHandle> RefreshQueryStatistics();
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
   CommitPipelineMetrics GetCommitPipelineMetrics() const;
   StatusOr<RuntimeMetrics> SampleRuntimeMetrics() const;

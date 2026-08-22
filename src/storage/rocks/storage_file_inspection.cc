@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -17,6 +18,7 @@
 
 #include "storage/facts/fact_store.h"
 #include "storage/rocks/rocksdb_config.h"
+#include "query/observability/query_metrics.h"
 
 namespace cedar {
 namespace {
@@ -67,6 +69,49 @@ void CloseReadOnlyDatabase(std::unique_ptr<rocksdb::DB>* db,
   }
   handles->clear();
   db->reset();
+}
+
+std::optional<std::pair<StorageFileRole, StorageTableFormat>> ClassifyCedarPath(
+    const std::filesystem::path& path) {
+  const std::string ext = path.extension().string();
+  if (ext == ".cmanifest") return std::make_pair(StorageFileRole::kQueryProjection, StorageTableFormat::kCedarManifest);
+  if (ext == ".cstate" || ext == ".csegment") return std::make_pair(StorageFileRole::kQueryProjection, StorageTableFormat::kCedarState);
+  if (ext == ".cadj") return std::make_pair(StorageFileRole::kQueryProjection, StorageTableFormat::kCedarAdjacency);
+  if (ext == ".cprop") return std::make_pair(StorageFileRole::kQueryProjection, StorageTableFormat::kCedarProperty);
+  if (ext == ".cstats") return std::make_pair(StorageFileRole::kQueryStatistics, StorageTableFormat::kCedarStatistics);
+  if (ext == ".cscratch") return std::make_pair(StorageFileRole::kQueryScratch, StorageTableFormat::kCedarScratch);
+  return std::nullopt;
+}
+
+void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* files) {
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it(root, ec), end; it != end && !ec; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    const auto classified = ClassifyCedarPath(it->path());
+    if (!classified) continue;
+    const auto [role, format] = *classified;
+    StorageFileInfo info;
+    info.relative_filename = std::filesystem::relative(it->path(), root, ec).generic_string();
+    info.column_family_name = "cedar-query";
+    info.role = role;
+    info.table_format = format;
+    info.level = -1;
+    info.size_bytes = it->file_size(ec);
+    QueryFileMetadata metadata;
+    metadata.authority = role == StorageFileRole::kQueryScratch ? StorageFileAuthority::kTemporary : StorageFileAuthority::kDerived;
+    std::ifstream input(it->path(), std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (format == StorageTableFormat::kCedarStatistics) {
+      const auto decoded = internal::DecodeQueryStatistics(bytes);
+      metadata.checksum_valid = decoded.ok();
+      if (decoded.ok()) {
+        metadata.generation_id = decoded.ValueOrDie().generation_id;
+        metadata.base_seq = decoded.ValueOrDie().base_seq.value;
+      }
+    }
+    info.query_file = std::move(metadata);
+    files->push_back(std::move(info));
+  }
 }
 
 }  // namespace
@@ -151,6 +196,10 @@ StatusOr<std::vector<StorageFileInfo>> InspectStorageFiles(
                                     HexEncode(live_file.smallestkey),
                                     HexEncode(live_file.largestkey)});
   }
+  // Cedar query files are a separate namespace from RocksDB live-file
+  // metadata. In particular, an engine .sst is never classified as a Cedar
+  // projection merely because it lives below the database directory.
+  AppendCedarFiles(store_options.path, &files);
   CloseReadOnlyDatabase(&db, &handles);
   std::sort(files.begin(), files.end(), [](const StorageFileInfo& left,
                                            const StorageFileInfo& right) {

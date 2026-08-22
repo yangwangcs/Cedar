@@ -47,6 +47,20 @@ StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
     }
   }
   internal::QueryStatisticsView statistics;
+  if (database->query_statistics && catalog.generation_id != 0) {
+    const auto loaded = database->query_statistics->Load(
+        catalog.generation_id, catalog.base_seq);
+    if (loaded.ok()) {
+      statistics.known = true;
+      for (const auto& column : loaded.ValueOrDie().columns) {
+        statistics.candidate_rows += column.rows;
+        statistics.pages += column.pages;
+        statistics.physical_bytes += column.bytes;
+        statistics.interval_fragments += column.interval_count;
+        statistics.fanout += column.edge_count;
+      }
+    }
+  }
   internal::PlanningContext context{snapshot_seq, catalog, delta, statistics,
                                     options};
   context.database_identity = catalog.database_identity;

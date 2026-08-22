@@ -1448,6 +1448,31 @@ void Database::Impl::StopAppendCommitPipeline() {
 Database::Database(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Database::~Database() { Close().IgnoreError(); }
 
+class QueryMaintenanceHandle::State {
+ public:
+  explicit State(Status status) : status(std::move(status)) {}
+  std::mutex mutex;
+  Status status;
+  bool cancelled = false;
+};
+
+QueryMaintenanceHandle::QueryMaintenanceHandle(std::unique_ptr<State> state)
+    : state_(std::move(state)) {}
+QueryMaintenanceHandle::QueryMaintenanceHandle(QueryMaintenanceHandle&&) noexcept = default;
+QueryMaintenanceHandle& QueryMaintenanceHandle::operator=(QueryMaintenanceHandle&&) noexcept = default;
+QueryMaintenanceHandle::~QueryMaintenanceHandle() = default;
+void QueryMaintenanceHandle::Cancel() {
+  if (!state_) return;
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  state_->cancelled = true;
+}
+Status QueryMaintenanceHandle::Await() {
+  if (!state_) return Status::InvalidArgument("query maintenance", "moved-from handle");
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->cancelled) return Status::QueryCancelled("query maintenance", "refresh cancelled");
+  return state_->status;
+}
+
 StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (options.path.empty()) return Status::InvalidArgument("database", "missing path");
   if (options.group_commit_max_batch_size == 0 ||
@@ -1608,12 +1633,29 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (impl->query_open_stage_observer_for_testing) {
     impl->query_open_stage_observer_for_testing("derived_loaded");
   }
+  impl->query_statistics = std::make_unique<internal::QueryStatisticsStore>(
+      database_path + "/projections", database_path);
   const Status pipeline_started = impl->StartAppendCommitPipeline();
   if (!pipeline_started.ok()) {
     impl->store.Close().IgnoreError();
     return pipeline_started;
   }
   return std::unique_ptr<Database>(new Database(std::move(impl)));
+}
+
+StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  if (impl_->closing) return Status::ShutdownInProgress("database", "database close is in progress");
+  if (!impl_->projection_store || !impl_->query_statistics) {
+    return Status::NotFound("query statistics", "projection catalog is unavailable");
+  }
+  const auto manifest = impl_->projection_store->current_manifest();
+  if (!manifest) return Status::NotFound("query statistics", "projection generation is unavailable");
+  Status refreshed = impl_->query_statistics->Refresh(*manifest);
+  return QueryMaintenanceHandle(std::make_unique<QueryMaintenanceHandle::State>(
+      std::move(refreshed)));
 }
 
 Status Database::Close() {

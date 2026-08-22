@@ -37,7 +37,7 @@ manifest="$output/commands.manifest"
 summary="$output/summary.csv"
 summary_json="$output/summary.jsonl"
 printf 'phase,case,command\n' > "$manifest"
-printf 'phase,case,exit_code,hard_gate_pass,terminal_status\n' > "$summary"
+printf 'phase,case,exit_code,hard_gate_pass,terminal_status,facts_per_second,end_to_end_p99_us\n' > "$summary"
 : > "$summary_json"
 overall=0
 
@@ -54,13 +54,15 @@ run_case() {
   "${cmd[@]}" > "$csv" 2> "$json"
   local rc=$?
   set -e
-  local gate=unknown terminal=unknown
+  local gate=unknown terminal=unknown facts_rate=0 end_p99=0
   if [[ -s "$csv" ]]; then
     gate=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="hard_gate_pass") gate=i; next } NR==2 && gate { print $gate }' "$csv")
     terminal=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="terminal_status") status=i; next } NR==2 && status { print $status }' "$csv")
+    facts_rate=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="facts_per_second") rate=i; next } NR==2 && rate { print $rate }' "$csv")
+    end_p99=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="end_to_end_p99_us") p=i; next } NR==2 && p { print $p }' "$csv")
   fi
-  printf '%s,%s,%s,%s,%s\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" >> "$summary"
-  printf '{"phase":"%s","case":"%s","exit_code":%s,"hard_gate_pass":"%s","terminal_status":"%s"}\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" >> "$summary_json"
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" >> "$summary"
+  printf '{"phase":"%s","case":"%s","exit_code":%s,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":%s,"end_to_end_p99_us":%s}\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" >> "$summary_json"
   if [[ "$rc" -ne 0 || "$gate" != true ]]; then overall=1; fi
 }
 
@@ -76,6 +78,24 @@ for phase in "${phases[@]}"; do
     space-audit) for facts in 16 64 256; do run_case "$phase" "audit-f${facts}" cold paused state-at "$facts" 1; done ;;
   esac
 done
+
+# Compare active projection cases against the idle baseline when both phases
+# are present. The Cedar campaign gate allows at most 10% throughput loss and
+# 15% end-to-end p99 growth for active derived maintenance.
+if [[ "$requested_phase" == all ]]; then
+  idle_rate=$(awk -F, '$1=="write-idle-five-repeats" && $4=="true" {sum+=$6; n++} END {print n ? sum/n : 0}' "$summary")
+  active_rate=$(awk -F, '$1=="write-active-projection-five-repeats" && $4=="true" {sum+=$6; n++} END {print n ? sum/n : 0}' "$summary")
+  idle_p99=$(awk -F, '$1=="write-idle-five-repeats" && $4=="true" {sum+=$7; n++} END {print n ? sum/n : 0}' "$summary")
+  active_p99=$(awk -F, '$1=="write-active-projection-five-repeats" && $4=="true" {sum+=$7; n++} END {print n ? sum/n : 0}' "$summary")
+  if [[ "$idle_rate" != 0 && "$active_rate" != 0 ]] &&
+     awk -v i="$idle_rate" -v a="$active_rate" 'BEGIN {exit !(a >= i*0.90)}' &&
+     awk -v i="$idle_p99" -v a="$active_p99" 'BEGIN {exit !(i == 0 || a <= i*1.15)}'; then
+    :
+  else
+    overall=1
+    printf '{"gate":"active_projection_overhead","pass":false,"idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s}\n' "$idle_rate" "$active_rate" "$idle_p99" "$active_p99" >> "$summary_json"
+  fi
+fi
 
 cat "$summary"
 exit "$overall"

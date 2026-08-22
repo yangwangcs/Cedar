@@ -80,10 +80,19 @@ endif()
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase read-cold
     --duration-seconds 1 --readers 1 --degrees 1 --selectivities 1
-    --projection-states canonical --output "${OUTPUT}/property")
+    --projection-states canonical --output "${OUTPUT}/property"
+  RESULT_VARIABLE PROPERTY_RC OUTPUT_VARIABLE PROPERTY_OUT ERROR_VARIABLE PROPERTY_ERR)
+if(NOT PROPERTY_RC EQUAL 0)
+  message(FATAL_ERROR "property-filter campaign failed: ${PROPERTY_ERR}\n${PROPERTY_OUT}")
+endif()
 file(READ "${OUTPUT}/property/commands.manifest" PROPERTY_MANIFEST)
 if(NOT PROPERTY_MANIFEST MATCHES "--operation=property-filter")
   message(FATAL_ERROR "property-filter is missing from read matrix: ${PROPERTY_MANIFEST}")
+endif()
+file(READ "${OUTPUT}/property/summary.csv" PROPERTY_SUMMARY)
+string(REGEX MATCH "read-cold,cold-property-filter-[^,]*,0,true," PROPERTY_SUCCESS "${PROPERTY_SUMMARY}")
+if(NOT PROPERTY_SUCCESS)
+  message(FATAL_ERROR "property-filter did not produce a successful hard-gated result: ${PROPERTY_SUMMARY}")
 endif()
 
 execute_process(
@@ -93,6 +102,17 @@ execute_process(
 if(NOT EMPTY_RC EQUAL 2 OR NOT EMPTY_ERR MATCHES "empty")
   message(FATAL_ERROR "empty CSV component was accepted: ${EMPTY_RC} ${EMPTY_ERR}")
 endif()
+
+foreach(MALFORMED_CSV IN ITEMS "1," ",1" "1,,2")
+  string(RANDOM LENGTH 4 ALPHABET 0123456789 MALFORMED_TOKEN)
+  execute_process(
+    COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase write-idle-five-repeats
+      --duration-seconds 1 --facts-per-txn "${MALFORMED_CSV}" --output "${OUTPUT}/malformed-${MALFORMED_TOKEN}"
+    RESULT_VARIABLE MALFORMED_RC ERROR_VARIABLE MALFORMED_ERR)
+  if(NOT MALFORMED_RC EQUAL 2 OR NOT MALFORMED_ERR MATCHES "empty")
+    message(FATAL_ERROR "malformed CSV component was accepted (${MALFORMED_CSV}): ${MALFORMED_RC} ${MALFORMED_ERR}")
+  endif()
+endforeach()
 
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --output
@@ -106,9 +126,10 @@ file(WRITE "${OUTPUT}/input/run.csv" "header\nrow\n")
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase reopen-verification
     --duration-seconds 1 --input "${OUTPUT}/input" --output "${OUTPUT}/reopen"
-  RESULT_VARIABLE REOPEN_RC ERROR_VARIABLE REOPEN_ERR)
-if(REOPEN_RC EQUAL 0 OR NOT REOPEN_ERR MATCHES "not supported")
-  message(FATAL_ERROR "reopen phase did not fail explicitly for unsupported cross-artifact verification: ${REOPEN_RC} ${REOPEN_ERR}")
+  RESULT_VARIABLE REOPEN_RC OUTPUT_VARIABLE REOPEN_OUT ERROR_VARIABLE REOPEN_ERR)
+file(READ "${OUTPUT}/reopen/summary.csv" REOPEN_SUMMARY)
+if(REOPEN_RC EQUAL 0 OR NOT REOPEN_SUMMARY MATCHES "reopen-verification,input-artifacts,1,false,unsupported,")
+  message(FATAL_ERROR "reopen phase did not fail explicitly for unsupported cross-artifact verification: ${REOPEN_RC} ${REOPEN_ERR}\n${REOPEN_OUT}\n${REOPEN_SUMMARY}")
 endif()
 
 execute_process(

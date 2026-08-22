@@ -25,29 +25,40 @@ require_value() {
 
 csv_values() {
   local csv="$1" label="$2"
-  local -a values=()
-  IFS=',' read -r -a values <<< "$csv"
-  if ((${#values[@]} == 0)); then
-    echo "$label must not be empty" >&2
-    exit 2
-  fi
-  local value
-  for value in "${values[@]}"; do
+  local rest="$csv" value last=false
+  # Split explicitly so Bash does not discard a trailing empty field.
+  while :; do
+    if [[ "$rest" == *,* ]]; then
+      value="${rest%%,*}"
+      rest="${rest#*,}"
+    else
+      value="$rest"
+      last=true
+    fi
     [[ -n "$value" && "$value" != *[[:space:]]* ]] || {
       echo "$label contains an empty/whitespace component" >&2
       exit 2
     }
     printf '%s\n' "$value"
+    [[ "$last" == true ]] && break
   done
 }
 
 validate_values() {
   local csv="$1" label="$2" pattern="$3" value
-  local -a values=()
-  IFS=',' read -r -a values <<< "$csv"
-  for value in "${values[@]}"; do
+  local rest="$csv" last=false
+  # Keep leading, middle, and trailing empty components visible to validation.
+  while :; do
+    if [[ "$rest" == *,* ]]; then
+      value="${rest%%,*}"
+      rest="${rest#*,}"
+    else
+      value="$rest"
+      last=true
+    fi
     [[ -n "$value" && "$value" != *[[:space:]]* ]] || { echo "$label contains an empty/whitespace component" >&2; return 2; }
     [[ "$value" =~ $pattern ]] || { echo "unsupported $label value: $value" >&2; return 2; }
+    [[ "$last" == true ]] && break
   done
 }
 

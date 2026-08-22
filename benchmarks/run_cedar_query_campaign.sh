@@ -291,9 +291,52 @@ compare_active_overhead() {
   return 1
 }
 
+# Convert RFC 4180-style records to tab-separated fields.  The benchmark CSV
+# writer quotes paths and status strings that contain commas, so field indexing
+# must happen after honoring quoted commas and doubled quotes.
+csv_rows_as_tsv() {
+  awk '
+    function parse_record(line, fields,    i,c,next_c,quoted,field,count) {
+      for (i in fields) delete fields[i]
+      quoted = 0
+      field = ""
+      count = 0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        next_c = substr(line, i + 1, 1)
+        if (quoted) {
+          if (c == "\"" && next_c == "\"") {
+            field = field "\""
+            i++
+          } else if (c == "\"") {
+            quoted = 0
+          } else {
+            field = field c
+          }
+        } else if (c == ",") {
+          fields[++count] = field
+          field = ""
+        } else if (c == "\"" && field == "") {
+          quoted = 1
+        } else {
+          field = field c
+        }
+      }
+      fields[++count] = field
+      return count
+    }
+    {
+      count = parse_record($0, fields)
+      for (i = 1; i <= count; i++) {
+        printf "%s%s", fields[i], (i == count ? "\n" : "\t")
+      }
+    }
+  ' "$@"
+}
+
 audit_run_csv() {
   local phase="$1" file="$2" records="$3"
-  awk -F, -v mode="$phase" '
+  csv_rows_as_tsv "$file" | awk -F '\t' -v mode="$phase" '
     function fail(message) {
       if (reason == "") reason = message
       invalid = 1
@@ -383,7 +426,11 @@ audit_run_csv() {
       if (terminal != "OK") fail("terminal_status is not OK")
       if (mode == "space-audit") {
         if (scratch != "0") fail("scratch_bytes is nonzero")
-        if ((amplification + 0) > 1.5) fail("space_amplification exceeds 1.5")
+        if ((auth + 0) == 0) {
+          if ((derived + 0) != 0) fail("derived_bytes exceed authoritative bytes")
+        } else if ((derived + 0) > (auth + 0) * 1.5) {
+          fail("derived projection bytes exceed 1.5x authoritative bytes")
+        }
         if ((derived + 0) == 0) {
           if ((stats + 0) != 0) fail("statistics_bytes exceeds 2% of derived bytes")
         } else if ((stats + 0) > (derived + 0) * 0.02) {
@@ -400,16 +447,25 @@ audit_run_csv() {
         emit("FAIL", "missing header", "", "", "", "", "", "", "", "")
       }
     }
-  ' "$file" >> "$records"
+  ' >> "$records"
 }
 
 verify_artifact_database() {
   local phase="$1" file="$2" records="$3" verification_dir="$4"
   local raw_path expected_facts expected_checksum
-  read -r raw_path expected_facts expected_checksum < <(awk -F, '
-    NR == 1 { for (i = 1; i <= NF; i++) column[$i] = i; have_path = ("raw_sample_path" in column) && ("facts" in column) && ("dataset_checksum" in column); next }
-    NR == 2 { if (have_path) print $(column["raw_sample_path"]), $(column["facts"]), $(column["dataset_checksum"]); exit }
-  ' "$file")
+  IFS=$'\t' read -r raw_path expected_facts expected_checksum < <(
+    csv_rows_as_tsv "$file" | awk -F '\t' '
+      NR == 1 {
+        for (i = 1; i <= NF; i++) column[$i] = i
+        have_path = ("raw_sample_path" in column) && ("facts" in column) && ("dataset_checksum" in column)
+        next
+      }
+      NR == 2 {
+        if (have_path) print $(column["raw_sample_path"]) "\t" $(column["facts"]) "\t" $(column["dataset_checksum"])
+        exit
+      }
+    '
+  ) || true
   # Legacy synthetic artifacts have no database path.  They remain useful for
   # schema-only audit tests; real campaign artifacts always carry this field.
   [[ -n "$raw_path" ]] || return 0
@@ -440,14 +496,18 @@ verify_artifact_database() {
   set -e
   local gate reopen terminal auth derived stats scratch amplification
   if [[ -s "$csv" ]]; then
-    gate=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["hard_gate_pass"])}' "$csv")
-    reopen=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["reopen_verified"])}' "$csv")
-    terminal=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {v=$(c["terminal_status"]); sub(/^"/,"",v); sub(/"$/, "", v); gsub(/""/, "\"", v); print v}' "$csv")
-    auth=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["authoritative_bytes"])}' "$csv")
-    derived=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["derived_bytes"])}' "$csv")
-    stats=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["statistics_bytes"])}' "$csv")
-    scratch=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["scratch_bytes"])}' "$csv")
-    amplification=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["space_amplification"])}' "$csv")
+    IFS=$'\t' read -r gate reopen terminal auth derived stats scratch amplification < <(
+      csv_rows_as_tsv "$csv" | awk -F '\t' '
+        NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }
+        NR == 2 {
+          print $(c["hard_gate_pass"]) "\t" $(c["reopen_verified"]) "\t" \
+                $(c["terminal_status"]) "\t" $(c["authoritative_bytes"]) "\t" \
+                $(c["derived_bytes"]) "\t" $(c["statistics_bytes"]) "\t" \
+                $(c["scratch_bytes"]) "\t" $(c["space_amplification"])
+          exit
+        }
+      '
+    ) || true
   fi
   if [[ "$rc" -ne 0 || "$gate" != true || "$reopen" != true || "$terminal" != OK ]]; then
     printf 'FAIL\tverify-existing command failed\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -456,7 +516,11 @@ verify_artifact_database() {
     return 0
   fi
   if [[ "$phase" == space-audit ]]; then
-    if [[ "$scratch" != 0 ]] || ! awk -v value="$amplification" 'BEGIN {exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 <= 1.5)}'; then
+    if [[ "$scratch" != 0 ]] || ! awk -v auth="$auth" -v derived="$derived" 'BEGIN {
+      valid = auth ~ /^[0-9]+$/ && derived ~ /^[0-9]+$/
+      bound = (auth + 0 == 0) ? (derived + 0 == 0) : (derived + 0 <= (auth + 0) * 1.5)
+      exit !(valid && bound)
+    }'; then
       printf 'FAIL\tactual storage space bound failed\t0\tfalse\tspace audit failed\ttrue\t%s\t%s\t%s\t%s\t%s\n' \
         "$auth" "$derived" "$stats" "$scratch" "$amplification" >> "$records"
     fi

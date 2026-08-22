@@ -39,6 +39,7 @@ struct QueryBenchmarkResult {
   uint64_t query_physical_bytes = 0;
   double write_amplification = 0;
   double space_amplification = 0;
+  double total_space_amplification = 0;
   uint64_t group_fill_p50 = 0;
   uint64_t dataset_checksum = 0;
   uint64_t seed = 0;

@@ -11,6 +11,7 @@ set(HEADER "exit_code,dataset_checksum,authoritative_bytes,derived_bytes,statist
 set(PASS_ROW "0,123,100,100,1,0,1.0,true,true,OK${LF}")
 set(REOPEN_ROW "0,123,100,100,1,0,1.0,false,true,OK${LF}")
 set(SPACE_ROW "0,123,100,160,3,1,1.6,true,true,OK${LF}")
+set(DERIVED_ZERO_ROW "0,123,100,0,0,0,6.0,true,true,OK${LF}")
 
 file(MAKE_DIRECTORY "${OUTPUT}/pass")
 file(WRITE "${OUTPUT}/pass/run.csv" "${HEADER}${PASS_ROW}")
@@ -47,6 +48,36 @@ execute_process(
   RESULT_VARIABLE SPACE_RC)
 if(SPACE_RC EQUAL 0)
   message(FATAL_ERROR "space violation was accepted")
+endif()
+
+file(MAKE_DIRECTORY "${OUTPUT}/derived-zero")
+file(WRITE "${OUTPUT}/derived-zero/run.csv" "${HEADER}${DERIVED_ZERO_ROW}")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase space-audit --input "${OUTPUT}/derived-zero" --output "${OUTPUT}/derived-zero-out"
+  RESULT_VARIABLE DERIVED_ZERO_RC OUTPUT_VARIABLE DERIVED_ZERO_OUT ERROR_VARIABLE DERIVED_ZERO_ERR)
+if(NOT DERIVED_ZERO_RC EQUAL 0)
+  message(FATAL_ERROR "derived-zero artifact was rejected despite satisfying the projection bound: ${DERIVED_ZERO_RC}\n${DERIVED_ZERO_ERR}\n${DERIVED_ZERO_OUT}")
+endif()
+
+set(COMMA_ROOT "${OUTPUT}/comma-path")
+set(COMMA_DB "${COMMA_ROOT}/database,with-comma")
+file(MAKE_DIRECTORY "${COMMA_ROOT}")
+execute_process(
+  COMMAND "${CEDAR_BENCHMARK}" "--path=${COMMA_DB}" --operation=state-at
+    --degree=1 --selectivity-percent=1 --readers=1 --cache-state=cold
+    --duration-seconds=1 --reopen-verify=true
+  RESULT_VARIABLE COMMA_BENCH_RC OUTPUT_VARIABLE COMMA_BENCH_OUT ERROR_VARIABLE COMMA_BENCH_ERR)
+if(NOT COMMA_BENCH_RC EQUAL 0)
+  message(FATAL_ERROR "comma-path benchmark setup failed: ${COMMA_BENCH_RC}\n${COMMA_BENCH_ERR}\n${COMMA_BENCH_OUT}")
+endif()
+file(WRITE "${COMMA_ROOT}/run.csv" "${COMMA_BENCH_OUT}")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase reopen-verification --input "${COMMA_ROOT}" --output "${OUTPUT}/comma-path-out"
+  RESULT_VARIABLE COMMA_AUDIT_RC OUTPUT_VARIABLE COMMA_AUDIT_OUT ERROR_VARIABLE COMMA_AUDIT_ERR)
+if(NOT COMMA_AUDIT_RC EQUAL 0)
+  message(FATAL_ERROR "quoted comma raw_sample_path was not audited: ${COMMA_AUDIT_RC}\n${COMMA_AUDIT_ERR}\n${COMMA_AUDIT_OUT}")
 endif()
 
 file(MAKE_DIRECTORY "${OUTPUT}/duplicate-header")

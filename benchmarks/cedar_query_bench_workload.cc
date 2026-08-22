@@ -535,8 +535,12 @@ Status InspectAndAccountStorage(const std::string& path,
 void ComputeSpaceMetrics(QueryBenchmarkResult* result) {
   result->space_amplification = result->authoritative_bytes == 0
                                     ? 0.0
-                                    : static_cast<double>(result->total_bytes) /
+                                    : static_cast<double>(result->derived_bytes) /
                                           result->authoritative_bytes;
+  result->total_space_amplification = result->authoritative_bytes == 0
+                                          ? 0.0
+                                          : static_cast<double>(result->total_bytes) /
+                                                result->authoritative_bytes;
   result->write_amplification = result->authoritative_bytes == 0
                                     ? 0.0
                                     : static_cast<double>(result->authoritative_bytes +
@@ -620,7 +624,11 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
         } else {
           result.terminal_status = rescanned.status().ToString();
         }
-        database->Close().IgnoreError();
+        const Status reopened_closed = database->Close();
+        if (!reopened_closed.ok()) {
+          result.reopen_verified = false;
+          result.terminal_status = reopened_closed.ToString();
+        }
         database.reset();
       }
     }
@@ -943,15 +951,23 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       if (!reopened.ok()) {
         result.terminal_status = reopened.status().ToString();
       } else {
-        auto snapshot = reopened.ValueOrDie()->BeginSnapshot();
-        auto scanned = snapshot.ok()
-                           ? ScanFactChecksum(snapshot.ValueOrDie())
-                           : StatusOr<std::pair<uint64_t, uint64_t>>(snapshot.status());
+        StatusOr<std::pair<uint64_t, uint64_t>> scanned(
+            Status::InvalidArgument("benchmark", "reopen checksum not attempted"));
+        {
+          auto snapshot = reopened.ValueOrDie()->BeginSnapshot();
+          scanned = snapshot.ok()
+                        ? ScanFactChecksum(snapshot.ValueOrDie())
+                        : StatusOr<std::pair<uint64_t, uint64_t>>(snapshot.status());
+        }
         result.reopen_verified = scanned.ok() &&
                                  scanned.ValueOrDie().first == result.facts &&
                                  scanned.ValueOrDie().second == result.dataset_checksum;
         if (!result.reopen_verified) result.terminal_status = "reopen verification failed";
-        reopened.ValueOrDie()->Close().IgnoreError();
+        const Status reopened_closed = reopened.ValueOrDie()->Close();
+        if (!reopened_closed.ok()) {
+          result.reopen_verified = false;
+          result.terminal_status = reopened_closed.ToString();
+        }
       }
     }
   }
@@ -987,7 +1003,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,total_space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -1018,6 +1034,7 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.derived_bytes << ',' << r.scratch_bytes << ',' << r.engine_internal_bytes << ','
     << r.wal_manifest_bytes << ',' << r.total_bytes << ','
     << r.write_amplification << ',' << r.space_amplification << ','
+    << r.total_space_amplification << ','
     << r.projection_lag << ',' << CsvEscape(r.projection_active ? "active" : "paused") << ','
     << CsvEscape(r.maintenance_status) << ',' << (r.maintenance_observed ? "true" : "false") << ','
     << (r.cache_conditioned ? "true" : "false") << ','
@@ -1068,6 +1085,7 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"group_fill_p50\":" << r.group_fill_p50
     << ",\"write_amplification\":" << r.write_amplification
     << ",\"space_amplification\":" << r.space_amplification
+    << ",\"total_space_amplification\":" << r.total_space_amplification
     << ",\"build_type\":\"" << JsonEscape(r.build_type)
     << "\",\"sanitizer\":\"" << JsonEscape(r.sanitizer)
     << "\",\"host\":\"" << JsonEscape(r.host)

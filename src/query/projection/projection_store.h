@@ -56,6 +56,9 @@ struct ProjectionStoreOptions {
   std::optional<CommitSeq> visible_seq;
   std::optional<CommitSeq> oldest_readable_seq;
   bool defer_derived_load = false;
+  // Optional debug-profile bounds. Zero keeps the production behavior.
+  uint64_t page_bytes = 0;
+  uint32_t commits_per_generation = 0;
 };
 
 class ProjectionGeneration {

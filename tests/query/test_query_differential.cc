@@ -159,6 +159,14 @@ TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesMatchOracle) {
       event(15, 35, FactOperation::kPut, 5),
       event(16, 40, FactOperation::kDelete, 0),
   };
+  test::BitemporalFactOracle oracle;
+  oracle.Add({ref, ValidTime{0}, CommitSeq{10}, FactOperation::kPut, 1,
+              Value::Int64(1), std::nullopt});
+  oracle.Add({ref, ValidTime{10}, CommitSeq{10}, FactOperation::kPut, 1,
+              Value::Int64(2), std::nullopt});
+  oracle.Add({ref, ValidTime{20}, CommitSeq{10}, FactOperation::kDelete, 1,
+              std::nullopt, std::nullopt});
+  for (const auto& fact : tail) oracle.Add(fact);
 
   auto store_result = internal::QueryProjectionStore::Open(
       internal::ProjectionStoreOptions{projection_path.string(), "topology-db", {}});
@@ -303,6 +311,12 @@ TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesMatchOracle) {
             (ValidTimeInterval{ValidTime{35}, ValidTime{40}}));
   EXPECT_EQ(std::get<int64_t>(long_intervals[3].value->data()), 4);
   EXPECT_EQ(std::get<int64_t>(long_intervals[4].value->data()), 5);
+  const auto oracle_rows = oracle.Evaluate({{ref}, std::nullopt}, CommitSeq{16});
+  ASSERT_EQ(oracle_rows.size(), long_intervals.size());
+  for (size_t i = 0; i < oracle_rows.size(); ++i) {
+    EXPECT_EQ(oracle_rows[i].interval, long_intervals[i].interval);
+    EXPECT_EQ(oracle_rows[i].value, long_intervals[i].value);
+  }
 
   FactStore facts(FactStoreOptions{facts_path.string()});
   ASSERT_TRUE(facts.Open().ok());
@@ -486,6 +500,73 @@ TEST(QueryDifferentialTest, ProductionPathAndJourneyMatchIndependentOracle) {
   snapshot = StatusOr<Snapshot>(Status::InvalidArgument("test", "release"));
   EXPECT_TRUE(database->Close().ok());
   std::filesystem::remove_all(pattern);
+}
+
+TEST(QueryDifferentialTest, BoundedRandomizedProductionPathJourneyMatchOracle) {
+  for (uint32_t seed = 0; seed < 8; ++seed) {
+    char pattern[] = "/tmp/cedar_query_bounded_graph_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    const VertexRef source{PartId{0}, VertexId{1}};
+    const VertexRef target{PartId{0}, VertexId{2 + seed}};
+    const EdgeIdentity edge{{PartId{0}, EdgeId{1000 + seed}}, source, target,
+                             seed % 3 + 1};
+    auto opened = Database::Open(DatabaseOptions{.path = pattern});
+    ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+    auto database = std::move(opened).ConsumeValueOrDie();
+    auto tx = database->BeginTransaction();
+    ASSERT_TRUE(tx.ok());
+    ASSERT_TRUE(tx.ValueOrDie()->Assert(EntityFact::Vertex(source), ValidTime{0}).ok());
+    ASSERT_TRUE(tx.ValueOrDie()->Assert(EntityFact::Vertex(target), ValidTime{0}).ok());
+    const Status edge_status = tx.ValueOrDie()->Assert(edge, ValidTime{0});
+    ASSERT_TRUE(edge_status.ok()) << edge_status.ToString() << " seed=" << seed;
+    ASSERT_TRUE(tx.ValueOrDie()->Retract(EntityFact::Edge(edge.edge_ref()),
+                                         ValidTime{50}).ok());
+    auto committed = tx.ValueOrDie()->Commit();
+    ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+    const CommitSeq cut = committed.ValueOrDie().commit_seq;
+    test::BitemporalFactOracle oracle;
+    oracle.Add({EntityFact::Vertex(source).ref(), ValidTime{0}, cut,
+                FactOperation::kPut, 0, std::nullopt, std::nullopt});
+    oracle.Add({EntityFact::Vertex(target).ref(), ValidTime{0}, cut,
+                FactOperation::kPut, 0, std::nullopt, std::nullopt});
+    oracle.Add({FactRef(edge.home_part_id, FactFamily::kEdgeIdentity,
+                        PropertyId{}, edge.edge_id.value), ValidTime{0}, cut,
+                FactOperation::kPut, 0, std::nullopt, edge});
+    oracle.Add({EntityFact::Edge(edge.edge_ref()).ref(), ValidTime{0}, cut,
+                FactOperation::kPut, 0, std::nullopt, std::nullopt});
+    oracle.Add({EntityFact::Edge(edge.edge_ref()).ref(), ValidTime{50}, cut,
+                FactOperation::kDelete, 0, std::nullopt, std::nullopt});
+    auto snapshot = database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    const test::OraclePathSpec path_spec{
+        source, target, {ValidTime{0}, ValidTime{50}}, ExpandDirection::kOut,
+        std::nullopt, 2};
+    const auto expected_path = oracle.CoexistingShortestPath(path_spec, cut);
+    auto actual_path = internal::CoexistingShortestPath(
+        snapshot.ValueOrDie(), {{source}, {ValidTime{0}, ValidTime{50}},
+                                ExpandDirection::kOut, std::nullopt},
+        target, internal::GraphFrontierOptions{.max_hops = 2});
+    ASSERT_TRUE(actual_path.ok()) << actual_path.status().ToString();
+    ASSERT_FALSE(actual_path.ValueOrDie().paths.empty());
+    EXPECT_EQ(actual_path.ValueOrDie().paths.front(), expected_path);
+    internal::JourneyRequest journey_request{
+        source, target, {ValidTime{0}, ValidTime{50}},
+        internal::JourneyObjective::kEarliestArrival, std::nullopt,
+        [](EdgeRef, ValidTime) {
+          return StatusOr<std::optional<ValidDuration>>(
+              std::optional<ValidDuration>{ValidDuration{1}});
+        },
+        std::nullopt, 2, ExpandDirection::kOut, std::nullopt};
+    auto actual_journey = internal::EarliestArrival(snapshot.ValueOrDie(),
+                                                    journey_request);
+    ASSERT_TRUE(actual_journey.ok()) << actual_journey.status().ToString();
+    EXPECT_EQ(actual_journey.ValueOrDie(), oracle.EarliestArrival(
+        {source, target, {ValidTime{0}, ValidTime{50}}, ExpandDirection::kOut,
+         std::nullopt, 2, std::nullopt}, cut));
+    snapshot = StatusOr<Snapshot>(Status::InvalidArgument("test", "release"));
+    ASSERT_TRUE(database->Close().ok());
+    std::filesystem::remove_all(pattern);
+  }
 }
 
 TEST(QueryDifferentialTest, OracleReplaySerializationIsStable) {
@@ -760,6 +841,16 @@ TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesRemainSnapshotCorrect) {
   const std::filesystem::path root(pattern);
   const std::filesystem::path projection_path = root / "projections";
 
+  const FactRef ref = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}},
+                                           PropertyId{1}).ref();
+  test::BitemporalFactOracle oracle;
+  oracle.Add({ref, ValidTime{0}, CommitSeq{1}, FactOperation::kPut, 1,
+              Value::Int64(10), std::nullopt});
+  oracle.Add({ref, ValidTime{5}, CommitSeq{2}, FactOperation::kPut, 1,
+              Value::Int64(20), std::nullopt});
+  oracle.Add({ref, ValidTime{10}, CommitSeq{3}, FactOperation::kDelete, 1,
+              std::nullopt, std::nullopt});
+
   internal::ProjectionBuild build;
   build.manifest.database_identity = root.string();
   build.manifest.generation_id = 1;
@@ -813,12 +904,19 @@ TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesRemainSnapshotCorrect) {
   ASSERT_EQ(base.ValueOrDie().size(), 1U);
   EXPECT_EQ(base.ValueOrDie().front().intervals.front().value,
             Value::Int64(10));
+  const auto base_rows = oracle.Evaluate({{ref}, std::nullopt}, CommitSeq{1});
+  ASSERT_EQ(base_rows.size(), base.ValueOrDie().front().intervals.size());
+  for (size_t i = 0; i < base_rows.size(); ++i) {
+    EXPECT_EQ(base_rows[i].ref, ref);
+    EXPECT_EQ(base_rows[i].interval,
+              base.ValueOrDie().front().intervals[i].effective);
+    EXPECT_EQ(base_rows[i].value,
+              base.ValueOrDie().front().intervals[i].value);
+  }
   covered.entity_min = 3;
   covered.entity_max_exclusive = 4;
   EXPECT_TRUE(store.ValueOrDie()->ReadChains(covered).status().IsNotFound());
 
-  const FactRef ref = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}},
-                                           PropertyId{1}).ref();
   internal::QueryDelta delta({.base_seq = CommitSeq{1}, .queue_capacity = 8,
                     .soft_memory_bytes = 1ULL << 20,
                     .hard_memory_bytes = 2ULL << 20,
@@ -837,10 +935,16 @@ TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesRemainSnapshotCorrect) {
       short_view.ValueOrDie().facts, CommitSeq{2});
   ASSERT_TRUE(short_merged.ok());
   auto short_intervals = MaterializePresentState(short_merged.ValueOrDie());
+  const auto short_rows = oracle.Evaluate({{ref}, std::nullopt}, CommitSeq{2});
+  ASSERT_EQ(short_rows.size(), short_intervals.size());
   ASSERT_EQ(short_intervals.size(), 2U);
   EXPECT_EQ(short_intervals[0].interval,
             (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
   EXPECT_EQ(short_intervals[1].value, Value::Int64(20));
+  for (size_t i = 0; i < short_rows.size(); ++i) {
+    EXPECT_EQ(short_rows[i].interval, short_intervals[i].interval);
+    EXPECT_EQ(short_rows[i].value, short_intervals[i].value);
+  }
 
   internal::QueryDeltaCommit long_commit{CommitSeq{3}};
   long_commit.facts.push_back(
@@ -855,11 +959,17 @@ TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesRemainSnapshotCorrect) {
       long_view.ValueOrDie().facts, CommitSeq{3});
   ASSERT_TRUE(long_merged.ok());
   auto long_intervals = MaterializePresentState(long_merged.ValueOrDie());
+  const auto long_rows = oracle.Evaluate({{ref}, std::nullopt}, CommitSeq{3});
+  ASSERT_EQ(long_rows.size(), long_intervals.size());
   ASSERT_EQ(long_intervals.size(), 2U);
   EXPECT_EQ(long_intervals[0].value, Value::Int64(10));
   EXPECT_EQ(long_intervals[1].value, Value::Int64(20));
   EXPECT_EQ(long_intervals[1].interval,
             (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
+  for (size_t i = 0; i < long_rows.size(); ++i) {
+    EXPECT_EQ(long_rows[i].interval, long_intervals[i].interval);
+    EXPECT_EQ(long_rows[i].value, long_intervals[i].value);
+  }
   ASSERT_TRUE(delta.RetireThrough(CommitSeq{3}).ok());
   ASSERT_TRUE(delta.ResetBase(CommitSeq{3}).ok());
   EXPECT_EQ(delta.base_seq(), CommitSeq{3});

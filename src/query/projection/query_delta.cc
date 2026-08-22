@@ -137,6 +137,10 @@ Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit) {
   const Status valid = commit.Validate();
   if (!valid.ok()) return valid;
   const uint64_t bytes = commit.EstimatedBytes();
+  if (options_.soft_lag_commits != 0 &&
+      commits_.size() >= options_.soft_lag_commits) {
+    soft_lag_reached_ = true;
+  }
   if (bytes > options_.hard_memory_bytes || memory_bytes_ > options_.hard_memory_bytes - bytes ||
       commits_.size() >= options_.max_lag_commits) {
     hard_limit_reached_ = true;
@@ -345,6 +349,7 @@ Status QueryDelta::ResetBase(CommitSeq base) {
   memory_bytes_ = 0;
   queue_size_ = 0;
   hard_limit_reached_ = false;
+  soft_lag_reached_ = false;
   commits_.clear();
   chains_.clear();
   edge_identities_.clear();
@@ -385,6 +390,7 @@ CommitSeq QueryDelta::first_missing() const { std::lock_guard<std::mutex> l(mute
 uint64_t QueryDelta::memory_bytes() const { std::lock_guard<std::mutex> l(mutex_); return memory_bytes_; }
 bool QueryDelta::mergeable() const { std::lock_guard<std::mutex> l(mutex_); return !hard_limit_reached_ && first_missing_.value == 0; }
 bool QueryDelta::hard_limit_reached() const { std::lock_guard<std::mutex> l(mutex_); return hard_limit_reached_; }
+bool QueryDelta::soft_lag_reached() const { std::lock_guard<std::mutex> l(mutex_); return soft_lag_reached_; }
 size_t QueryDelta::pending_commits() const { std::lock_guard<std::mutex> l(mutex_); return queue_size_; }
 
 std::vector<FactEvent> QueryDelta::EventsFor(const FactRef& ref, CommitSeq snapshot) const {

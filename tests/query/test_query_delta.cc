@@ -118,6 +118,23 @@ TEST(QueryDeltaTest, HardMemoryRetirementStopsMergeability) {
   EXPECT_FALSE(delta.mergeable());
 }
 
+TEST(QueryDeltaTest, SoftLagThresholdIsObservableBeforeHardRetirement) {
+  QueryDelta delta({.base_seq = CommitSeq{0},
+                    .queue_capacity = 8,
+                    .soft_memory_bytes = 1ULL << 20,
+                    .hard_memory_bytes = 2ULL << 20,
+                    .max_lag_commits = 8,
+                    .target_lag_seconds = 30,
+                    .crash_fault_injector = {},
+                    .soft_lag_commits = 2});
+  ASSERT_TRUE(delta.ObservePublished(QueryDeltaCommit{CommitSeq{1}}).ok());
+  EXPECT_FALSE(delta.soft_lag_reached());
+  ASSERT_TRUE(delta.ObservePublished(QueryDeltaCommit{CommitSeq{2}}).ok());
+  ASSERT_TRUE(delta.ObservePublished(QueryDeltaCommit{CommitSeq{3}}).ok());
+  EXPECT_TRUE(delta.soft_lag_reached());
+  EXPECT_FALSE(delta.hard_limit_reached());
+}
+
 TEST(FactStoreBatchReadTest, ReadsContiguousSequencesAndExactFactsInOrder) {
   char pattern[] = "/tmp/cedar_query_delta_store_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

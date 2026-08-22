@@ -115,6 +115,33 @@ TEST_F(ProjectionStoreTest, OldReaderPinsRetiredGeneration) {
   EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
 }
 
+TEST_F(ProjectionStoreTest, DebugBoundsPreserveRolloverCoverageAndCleanup) {
+  ProjectionStoreOptions options{path_, "test-db", {}};
+  options.page_bytes = 4ULL << 10;
+  options.commits_per_generation = 16;
+  options.visible_seq = CommitSeq{20};
+  auto opened = QueryProjectionStore::Open(std::move(options));
+  ASSERT_TRUE(opened.ok());
+  auto& store = *opened.ValueOrDie();
+  ASSERT_TRUE(store.Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  auto pin = store.Acquire(request);
+  ASSERT_TRUE(pin.has_value());
+  ASSERT_TRUE(store.Build(Build(20, "seg-b")).ok());
+  EXPECT_EQ(store.current_generation_id(), std::optional<uint64_t>(20));
+  EXPECT_TRUE(pin->exists());
+  pin.reset();
+  store.CollectRetired();
+  EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
+  EXPECT_TRUE(std::filesystem::exists(path_ + "/seg-b.csegment"));
+}
+
 TEST_F(ProjectionStoreTest, PinnedReaderRetainsRetiredGeneration) {
   auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
   ASSERT_TRUE(opened.ok());

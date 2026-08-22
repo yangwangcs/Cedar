@@ -24,6 +24,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/cedar_parquet/cedar_parquet_table_factory.h"
+#include "kernel/query_debug_thresholds.h"
 
 namespace cedar::internal {
 namespace {
@@ -134,11 +135,11 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
     const bool debug = options.storage_profile == StorageProfile::kDebugSmallThresholds;
     result.memory_budget_bytes = kKernelTestMemoryBudgetBytes;
     result.block_cache_bytes = kKernelTestBlockCacheBytes;
-    result.facts_write_buffer_bytes = debug ? 64ULL * 1024ULL
+    result.facts_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes
                                             : kKernelTestFactsWriteBufferBytes;
-    result.meta_write_buffer_bytes = debug ? 16ULL * 1024ULL
+    result.meta_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes / 4
                                            : kKernelTestMetaWriteBufferBytes;
-    result.default_write_buffer_bytes = debug ? 16ULL * 1024ULL
+    result.default_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes / 4
                                               : kKernelTestDefaultWriteBufferBytes;
     result.max_background_jobs = 2;
     result.max_subcompactions = 1;
@@ -327,7 +328,7 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
         store_options.storage_profile == StorageProfile::kDebugSmallThresholds;
     facts_options.write_buffer_size = kernel_test
                                          ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
-                                                ? 64ULL * 1024ULL
+                                                ? kQueryDebugThresholds.memtable_bytes
                                                 : kKernelTestFactsWriteBufferBytes)
                                          : 128 * kMiB;
     // Two buffers can be draining under Cedar flush credits, while bounded
@@ -335,7 +336,11 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
     facts_options.max_write_buffer_number = kernel_test ? 6 : 4;
     facts_options.min_write_buffer_number_to_merge = kernel_test ? 1 : 2;
     facts_options.level_compaction_dynamic_level_bytes = true;
-    facts_options.target_file_size_base = kernel_test ? 64ULL * 1024ULL : 128 * kMiB;
+    facts_options.target_file_size_base = kernel_test
+                                              ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
+                                                     ? kQueryDebugThresholds.memtable_bytes
+                                                     : 64ULL * 1024ULL)
+                                              : 128 * kMiB;
     facts_options.level0_file_num_compaction_trigger = kernel_test ? 2 : 8;
     facts_options.level0_slowdown_writes_trigger = kernel_test ? 12 : 24;
     facts_options.level0_stop_writes_trigger = kernel_test ? 24 : 36;
@@ -345,7 +350,7 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
         kernel_test ? 2ULL * kMiB : 32 * kGiB;
     meta_options.write_buffer_size = kernel_test
                                         ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
-                                                ? 16ULL * 1024ULL
+                                                ? kQueryDebugThresholds.memtable_bytes / 4
                                                 : kKernelTestMetaWriteBufferBytes)
                                         : 32 * kMiB;
     meta_options.max_write_buffer_number = kernel_test ? 6 : 3;

@@ -10,6 +10,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 #include "cedar/database.h"
 #include "cedar/core/crc32c.h"
@@ -58,6 +60,46 @@ void RunCrashChildIfRequested() {
       !transaction.ValueOrDie()->Commit().ok()) {
     _exit(121);
   }
+  // Exercise the real publication lanes concurrently before entering the
+  // selected fault boundary. This keeps the crash matrix meaningful when a
+  // hook is reached after ordinary commit/query activity.
+  std::atomic<bool> workload_done{false};
+  std::thread commit_thread([&] {
+    for (uint64_t id = 100; id < 108; ++id) {
+      auto tx = database->BeginTransaction();
+      if (!tx.ok() || !tx.ValueOrDie()
+                         ->Assert(cedar::EntityFact::Vertex(
+                                      cedar::VertexRef{cedar::PartId{0}, id}),
+                                  cedar::ValidTime{1})
+                         .ok() ||
+          !tx.ValueOrDie()->Commit().ok()) {
+        _exit(126);
+      }
+    }
+  });
+  std::thread query_thread([&] {
+    auto vertex = cedar::Slot<cedar::VertexRef>::Named("workload_vertex");
+    auto query = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{1}});
+    if (!query.ok()) _exit(127);
+    auto selected = query.ValueOrDie().Select({cedar::Project(vertex)});
+    auto prepared = selected.ok() ? database->PrepareQuery(selected.ValueOrDie())
+                                  : cedar::StatusOr<cedar::PreparedQuery>(selected.status());
+    if (!prepared.ok()) _exit(127);
+    auto snapshot = database->BeginSnapshot();
+    if (!snapshot.ok()) _exit(127);
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), cedar::Bindings{},
+        cedar::QueryOptions{});
+    if (!cursor.ok()) _exit(127);
+    for (;;) {
+      auto batch = cursor.ValueOrDie().Next();
+      if (!batch.ok() || !batch.ValueOrDie().has_value()) break;
+    }
+    workload_done.store(true, std::memory_order_release);
+  });
+  commit_thread.join();
+  query_thread.join();
+  if (!workload_done.load(std::memory_order_acquire)) _exit(128);
   // Exercise the actual Cedar publication owners. The callback pauses only
   // after the requested durable boundary has been reached.
   if (*phase == "cursor_cancel" || *phase == "cursor_close_before" ||

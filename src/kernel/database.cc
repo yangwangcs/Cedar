@@ -1600,6 +1600,11 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   projection_options.oldest_readable_seq = recovered_oldest;
   projection_options.crash_fault_injector =
       impl->query_crash_fault_injector_for_testing;
+  if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    projection_options.page_bytes = internal::kQueryDebugThresholds.projection_page_bytes;
+    projection_options.commits_per_generation =
+        internal::kQueryDebugThresholds.manifest_commits_per_generation;
+  }
   auto projections = internal::QueryProjectionStore::OpenDeferred(
       std::move(projection_options));
   if (!projections.ok()) {
@@ -1626,7 +1631,10 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
               ? internal::kQueryDebugThresholds.delta_lag_hard_commits
               : 262144,
           30,
-                                  impl->query_crash_fault_injector_for_testing});
+          impl->query_crash_fault_injector_for_testing,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? internal::kQueryDebugThresholds.delta_lag_soft_commits
+              : 0});
   // Reconstruct the derived tail from durable sequence metadata before any
   // new publication can be observed.  A derived rebuild failure must not make
   // authoritative Open fail; in that case start a fresh tail at the current

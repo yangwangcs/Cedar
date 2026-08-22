@@ -55,6 +55,7 @@ struct QueryDeltaOptions {
   uint64_t max_lag_commits = 262144;
   uint64_t target_lag_seconds = 30;
   std::function<Status(const char*)> crash_fault_injector;
+  uint64_t soft_lag_commits = 0;
 };
 
 struct QueryDeltaRepairLimits {
@@ -133,6 +134,7 @@ class QueryDelta {
   uint64_t memory_bytes() const;
   bool mergeable() const;
   bool hard_limit_reached() const;
+  bool soft_lag_reached() const;
   size_t pending_commits() const;
 
   std::vector<FactEvent> EventsFor(const FactRef& ref,
@@ -166,6 +168,7 @@ class QueryDelta {
   std::thread worker_;
   bool stopping_ = false;
   bool hard_limit_reached_ = false;
+  bool soft_lag_reached_ = false;
   std::vector<QueryDeltaCommit> commits_;
   std::unordered_map<FactRef, std::vector<FactEvent>, FactRefHash> chains_;
   std::vector<std::pair<CommitSeq, EdgeIdentity>> edge_identities_;

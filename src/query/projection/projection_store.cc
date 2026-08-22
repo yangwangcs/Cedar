@@ -336,6 +336,13 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   }
   const Status manifest_status = ValidateProjectionManifest(build.manifest, options_.database_identity);
   if (!manifest_status.ok()) return manifest_status;
+  if (options_.commits_per_generation != 0 && options_.visible_seq &&
+      options_.visible_seq->value >= build.manifest.base_seq.value &&
+      options_.visible_seq->value - build.manifest.base_seq.value >=
+          options_.commits_per_generation) {
+    return Status::ResourceExhausted(
+        "projection store", "projection generation commit span exceeds debug bound");
+  }
   if (build.manifest.generation_id == 0 || (current_ && build.manifest.generation_id <= current_->manifest.generation_id)) return Status::Conflict("projection store", "generation is not strictly newer");
   for (const auto& retired : retired_) if (build.manifest.generation_id <= retired->manifest.generation_id) return Status::Conflict("projection store", "generation is already retained");
   size_t manifest_segment_count = 0;
@@ -357,6 +364,14 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
     if (crc32c::Value(input.bytes.data(), input.bytes.size()) != input.descriptor.checksum) return Status::Corruption("projection store", "segment checksum mismatch");
     auto decoded = DecodeProjectionPage(input.bytes);
     if (!decoded.ok()) return decoded.status();
+    if (options_.page_bytes != 0) {
+      for (const auto& page : decoded.ValueOrDie().page_directory) {
+        if (page.compressed_bytes > options_.page_bytes) {
+          return Status::ResourceExhausted(
+              "projection store", "projection page exceeds debug bound");
+        }
+      }
+    }
     const auto& header = decoded.ValueOrDie().header;
     if (!(header == input.descriptor.header) || header.generation_id != build.manifest.generation_id || header.base_seq != build.manifest.base_seq) return Status::Corruption("projection store", "segment header differs from descriptor");
     const auto* region = expected_regions[input.descriptor.segment_id];

@@ -42,11 +42,11 @@ printf 'phase,case,exit_code,hard_gate_pass,terminal_status\n' > "$summary"
 overall=0
 
 run_case() {
-  local phase="$1" case_name="$2" cache="$3" projection_work="$4"
+  local phase="$1" case_name="$2" cache="$3" projection_work="$4" operation="${5:-state-at}" facts_per_txn="${6:-16}" writers="${7:-1}"
   local case_dir="$output/$phase/$case_name"
   mkdir -p "$case_dir"
   local db="$case_dir/database" csv="$case_dir/run.csv" json="$case_dir/run.json"
-  local -a cmd=("$build_dir/cedar_query_bench" "--path=$db" "--operation=state-at" "--projection-state=canonical-only" "--degree=10" "--selectivity-percent=1" "--readers=8" "--cache-state=$cache" "--projection-work=$projection_work" "--writers=1" "--facts-per-txn=16" "--seed=1" "--duration-seconds=$duration" "--reopen-verify=true")
+  local -a cmd=("$build_dir/cedar_query_bench" "--path=$db" "--operation=$operation" "--projection-state=canonical-only" "--degree=10" "--selectivity-percent=1" "--readers=8" "--cache-state=$cache" "--projection-work=$projection_work" "--writers=$writers" "--facts-per-txn=$facts_per_txn" "--seed=1" "--duration-seconds=$duration" "--reopen-verify=true")
   printf '%s,%s,' "$phase" "$case_name" >> "$manifest"
   printf '%q ' "${cmd[@]}" >> "$manifest"
   printf '\n' >> "$manifest"
@@ -66,14 +66,14 @@ run_case() {
 
 for phase in "${phases[@]}"; do
   case "$phase" in
-    release-calibration) run_case "$phase" calibration cold paused ;;
-    write-idle-five-repeats) for repeat in 1 2 3 4 5; do run_case "$phase" "repeat-$repeat" cold paused; done ;;
-    write-active-projection-five-repeats) for repeat in 1 2 3 4 5; do run_case "$phase" "repeat-$repeat" cold active; done ;;
-    read-cold) run_case "$phase" cold cold paused ;;
-    read-warm) run_case "$phase" warm warm paused ;;
-    mixed-30-minute) run_case "$phase" mixed cold active ;;
-    reopen-verification) run_case "$phase" reopen cold paused ;;
-    space-audit) run_case "$phase" audit cold paused ;;
+    release-calibration) run_case "$phase" calibration cold paused state-at 16 1 ;;
+    write-idle-five-repeats) for repeat in 1 2 3 4 5; do for facts in 1 16 64 256; do for writers in 1 8; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold paused state-at "$facts" "$writers"; done; done; done ;;
+    write-active-projection-five-repeats) for repeat in 1 2 3 4 5; do for facts in 16 64; do for writers in 1 8; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold active state-at "$facts" "$writers"; done; done; done ;;
+    read-cold) for operation in state-at events changes; do run_case "$phase" "cold-${operation}" cold paused "$operation" 16 1; done ;;
+    read-warm) for operation in state-at events changes; do run_case "$phase" "warm-${operation}" warm paused "$operation" 16 1; done ;;
+    mixed-30-minute) for operation in state-at events; do run_case "$phase" "mixed-${operation}" cold active "$operation" 64 8; done ;;
+    reopen-verification) run_case "$phase" reopen cold paused state-at 64 2 ;;
+    space-audit) for facts in 16 64 256; do run_case "$phase" "audit-f${facts}" cold paused state-at "$facts" 1; done ;;
   esac
 done
 

@@ -26,6 +26,23 @@ namespace {
 
 std::atomic<uint64_t> g_next_query_id{1};
 
+std::pair<uint32_t, internal::QueryMetricOperator> ProfileOperatorFor(
+    const internal::PreparedQueryPlan& plan) {
+  internal::PhysicalOpKind physical = internal::PhysicalOpKind::kCanonicalScan;
+  if (plan.physical_plan && !plan.physical_plan->operations.empty()) {
+    physical = plan.physical_plan->operations.back();
+  }
+  const uint32_t id = static_cast<uint32_t>(physical) + 1;
+  switch (physical) {
+    case internal::PhysicalOpKind::kFilter: return {id, internal::QueryMetricOperator::kFilter};
+    case internal::PhysicalOpKind::kProject: return {id, internal::QueryMetricOperator::kProject};
+    case internal::PhysicalOpKind::kAggregate: return {id, internal::QueryMetricOperator::kAggregate};
+    case internal::PhysicalOpKind::kSort: return {id, internal::QueryMetricOperator::kSort};
+    case internal::PhysicalOpKind::kAdjacencySeek: return {id, internal::QueryMetricOperator::kExpand};
+    default: return {id, internal::QueryMetricOperator::kScan};
+  }
+}
+
 struct RuntimeRow {
   FactRef ref;
   std::optional<ValidTimeInterval> effective;
@@ -1220,16 +1237,33 @@ QueryProfile QueryExecutionState::profile() const {
 }
 
 void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes,
-                                      bool capture_profile) {
+                                      bool capture_profile, uint64_t physical_bytes,
+                                      uint64_t pages, uint64_t interval_fragments,
+                                      uint32_t operator_id, uint8_t metric_operator) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (capture_profile) {
     if (profile_.operators.empty()) profile_.operators.push_back(QueryOperatorProfile{});
-    auto& op = profile_.operators.front();
+    auto it = std::find_if(profile_.operators.begin(), profile_.operators.end(),
+                           [operator_id](const QueryOperatorProfile& value) {
+                             return value.operator_id == operator_id;
+                           });
+    if (it == profile_.operators.end()) {
+      profile_.operators.push_back(QueryOperatorProfile{});
+      it = std::prev(profile_.operators.end());
+      it->operator_id = operator_id;
+    }
+    auto& op = *it;
     op.rows += rows;
     op.batches += 1;
+    op.physical_bytes += physical_bytes;
     op.decoded_bytes += decoded_bytes;
+    op.pages += pages;
+    op.interval_fragments += interval_fragments;
   }
-  if (metrics_) metrics_->AddBatch(internal::QueryMetricOperator::kScan, rows, 0, decoded_bytes);
+  if (metrics_) {
+    const auto bounded = static_cast<internal::QueryMetricOperator>(metric_operator);
+    metrics_->AddBatch(bounded, rows, physical_bytes, decoded_bytes, interval_fragments);
+  }
 }
 
 class QueryCursor::State {
@@ -1670,8 +1704,23 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     }
     // Global metrics are always batch-level and do not require profile clocks
     // or per-row instrumentation when capture_profile is disabled.
+    const auto profile_operator = ProfileOperatorFor(state_->plan);
+    uint64_t pages = 0;
+    uint64_t fragments = 0;
+    if (state_->plan.physical_plan) {
+      const auto& estimate = state_->plan.physical_plan->estimate;
+      pages = estimate.pages == 0 ? 1 : std::max<uint64_t>(1, estimate.pages * lease->backing->row_count() /
+          std::max<uint64_t>(1, estimate.rows));
+      fragments = estimate.interval_fragments == 0 ? 0 : std::max<uint64_t>(1, estimate.interval_fragments * lease->backing->row_count() /
+          std::max<uint64_t>(1, estimate.rows));
+    }
+    // A vector batch is the physical accounting boundary.  Decoded bytes are
+    // a lower bound for bytes consumed by Cedar's column decoder; projection
+    // estimates are used only to apportion pages/fragments across batches.
     state_->execution->RecordBatch(lease->backing->row_count(), decoded_bytes,
-                                   state_->options.capture_profile);
+                                   state_->options.capture_profile, decoded_bytes,
+                                   pages, fragments, profile_operator.first,
+                                   static_cast<uint8_t>(profile_operator.second));
     return std::optional<QueryBatch>{
         QueryBatch(lease->backing->row_count(), lease->backing->columns(), lease)};
   }

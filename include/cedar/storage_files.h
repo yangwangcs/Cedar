@@ -47,6 +47,7 @@ struct QueryFileMetadata {
   std::optional<uint64_t> base_seq;
   std::string coverage;
   bool checksum_valid = false;
+  bool available = true;
 };
 
 struct StorageFileInfo {

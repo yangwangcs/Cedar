@@ -236,7 +236,9 @@ class QueryExecutionState {
   void SetSnapshotSeq(CommitSeq seq);
   std::optional<CommitSeq> snapshot_seq() const;
   void RecordBatch(uint64_t rows, uint64_t decoded_bytes,
-                   bool capture_profile = true);
+                   bool capture_profile = true, uint64_t physical_bytes = 0,
+                   uint64_t pages = 0, uint64_t interval_fragments = 0,
+                   uint32_t operator_id = 0, uint8_t metric_operator = 0);
   void SetMetrics(internal::QueryMetrics* metrics) { metrics_ = metrics; }
 
  private:

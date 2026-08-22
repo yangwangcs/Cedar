@@ -14,6 +14,15 @@
 
 namespace cedar::internal {
 
+struct ScratchFileMetadata {
+  std::string query_id;
+  uint64_t payload_bytes = 0;
+  uint32_t checksum = 0;
+  bool checksum_valid = false;
+};
+
+StatusOr<ScratchFileMetadata> DecodeScratchFile(const std::string& bytes);
+
 class QueryScratch {
  public:
   QueryScratch(std::filesystem::path database_root, std::string instance,

@@ -127,6 +127,22 @@ TEST(QueryScratchTest, WritesAndReadsVerifiedRun) {
   EXPECT_FALSE(std::filesystem::exists(scratch.query_directory()));
 }
 
+TEST(QueryScratchTest, InspectionDecoderExposesCdrscrFramingAndChecksum) {
+  const auto root = std::filesystem::temp_directory_path() / "cedar-task11-scratch-inspect";
+  std::filesystem::remove_all(root);
+  QueryScratch scratch(root, "instance", "query", 1024);
+  auto run = scratch.WriteRun("run-0", "payload");
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  std::ifstream input(run.ValueOrDie(), std::ios::binary);
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  auto decoded = DecodeScratchFile(bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  EXPECT_EQ(decoded.ValueOrDie().query_id, "query");
+  EXPECT_EQ(decoded.ValueOrDie().payload_bytes, 7U);
+  EXPECT_TRUE(decoded.ValueOrDie().checksum_valid);
+  std::filesystem::remove_all(root);
+}
+
 TEST(QueryScratchTest, EnforcesReadAndWriteRateWindows) {
   const auto root = std::filesystem::temp_directory_path() /
                     "cedar-task11-scratch-rate";

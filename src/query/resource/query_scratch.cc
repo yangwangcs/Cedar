@@ -1,7 +1,9 @@
 #include "query/resource/query_scratch.h"
 
 #include <array>
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <limits>
 
@@ -23,6 +25,27 @@ bool Read(std::ifstream& in, T* value) {
   in.read(reinterpret_cast<char*>(value), sizeof(T));
   return in.good();
 }
+
+}  // namespace
+
+StatusOr<ScratchFileMetadata> DecodeScratchFile(const std::string& bytes) {
+  constexpr size_t kFixed = 8 + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t);
+  if (bytes.size() < kFixed || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
+    return Status::Corruption("query scratch", "scratch framing header is invalid");
+  size_t p = kMagic.size();
+  auto get32 = [&](uint32_t* v) { if (p + sizeof(*v) > bytes.size()) return false; std::memcpy(v, bytes.data()+p, sizeof(*v)); p += sizeof(*v); return true; };
+  auto get64 = [&](uint64_t* v) { if (p + sizeof(*v) > bytes.size()) return false; std::memcpy(v, bytes.data()+p, sizeof(*v)); p += sizeof(*v); return true; };
+  uint32_t id_len = 0; if (!get32(&id_len) || id_len > bytes.size() - p) return Status::Corruption("query scratch", "scratch framing metadata is truncated");
+  std::string id(bytes.data()+p, id_len); p += id_len;
+  uint64_t payload_len = 0; if (!get64(&payload_len) || bytes.size() - p < sizeof(uint32_t) || payload_len > bytes.size() - p - sizeof(uint32_t)) return Status::Corruption("query scratch", "scratch payload length is invalid");
+  const size_t payload_at = p; p += static_cast<size_t>(payload_len); uint32_t checksum = 0;
+  if (!get32(&checksum) || p != bytes.size()) return Status::Corruption("query scratch", "scratch framing has trailing bytes");
+  ScratchFileMetadata result; result.query_id = std::move(id); result.payload_bytes = payload_len; result.checksum = checksum; result.checksum_valid = checksum == crc32c::Extend(0, bytes.data()+payload_at, static_cast<size_t>(payload_len));
+  if (!result.checksum_valid) return Status::Corruption("query scratch", "scratch checksum mismatch");
+  return result;
+}
+
+namespace {
 template <typename T>
 void Write(std::ofstream& out, T value) {
   out.write(reinterpret_cast<const char*>(&value), sizeof(T));

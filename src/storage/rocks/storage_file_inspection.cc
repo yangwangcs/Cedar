@@ -19,6 +19,7 @@
 #include "storage/facts/fact_store.h"
 #include "storage/rocks/rocksdb_config.h"
 #include "query/observability/query_metrics.h"
+#include "query/resource/query_scratch.h"
 #include "query/projection/projection_format.h"
 #include "query/projection/projection_manifest.h"
 
@@ -136,7 +137,14 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
               (region.valid_time.to ? std::to_string(region.valid_time.to->value) : "inf") + ")";
         }
       }
-    } else if (format != StorageTableFormat::kCedarScratch) {
+    } else if (format == StorageTableFormat::kCedarScratch) {
+      const auto decoded = internal::DecodeScratchFile(bytes);
+      metadata.checksum_valid = decoded.ok();
+      if (decoded.ok()) {
+        metadata.coverage = "query=" + decoded.ValueOrDie().query_id +
+            ",payload_bytes=" + std::to_string(decoded.ValueOrDie().payload_bytes);
+      }
+    } else {
       const auto decoded = internal::DecodeProjectionPage(bytes);
       metadata.checksum_valid = decoded.ok();
       if (decoded.ok()) {

@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 
 #include "query/observability/query_metrics.h"
@@ -56,10 +57,20 @@ TEST(QueryObservabilityTest, StatisticsStorePublishesCstats) {
   auto store = QueryStatisticsStore(root.string(), root.string());
   ASSERT_TRUE(store.Refresh(manifest).ok());
   EXPECT_TRUE(std::filesystem::exists(root / "generation-3.cstats"));
+  auto encoded_manifest = EncodeProjectionManifest(manifest);
+  ASSERT_TRUE(encoded_manifest.ok()) << encoded_manifest.status().ToString();
+  std::filesystem::create_directories(root / "manifests");
+  {
+    std::ofstream out(root / "manifests" / "3.cmanifest", std::ios::binary);
+    ASSERT_TRUE(out);
+    out.write(encoded_manifest.ValueOrDie().data(), encoded_manifest.ValueOrDie().size());
+  }
   auto loaded = store.Load(3, CommitSeq{9});
   ASSERT_TRUE(loaded.ok()) << loaded.status().ToString();
   EXPECT_EQ(loaded.ValueOrDie().generation_id, 3U);
   EXPECT_TRUE(store.Load(2, CommitSeq{9}).status().IsNotFound());
+  std::filesystem::remove(root / "manifests" / "3.cmanifest");
+  EXPECT_TRUE(store.Load(3, CommitSeq{9}).status().IsNotFound());
   std::filesystem::remove_all(root);
 }
 

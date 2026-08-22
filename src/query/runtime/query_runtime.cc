@@ -2072,6 +2072,29 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
   auto state = std::make_unique<QueryCursor::State>(
       plan, std::move(snapshot), std::move(resolved_options),
       std::move(admitted).ConsumeValueOrDie(), std::move(scratch));
+  // Fallback counters describe the source selected for this query, rather
+  // than individual batches. Keep the labels fixed and charge each selected
+  // fallback at most once even when a plan has multiple coverage slices.
+  if (metrics != nullptr) {
+    bool canonical = plan.physical_plan == nullptr;
+    bool delta = false;
+    bool untrusted_statistics = false;
+    if (plan.physical_plan != nullptr) {
+      untrusted_statistics = plan.physical_plan->conservative ||
+                             plan.physical_plan->estimate.uncertain;
+      for (const auto& slice : plan.physical_plan->coverage_slices) {
+        canonical = canonical ||
+                    slice.source == internal::CoverageSource::kCanonical;
+        delta = delta ||
+                slice.source == internal::CoverageSource::kDeltaMerge;
+      }
+    }
+    if (canonical) metrics->AddFallback(internal::QueryMetricFallback::kCanonical);
+    if (delta) metrics->AddFallback(internal::QueryMetricFallback::kDelta);
+    if (untrusted_statistics) {
+      metrics->AddFallback(internal::QueryMetricFallback::kUntrustedStatistics);
+    }
+  }
   state->execution->SetMetrics(metrics);
   // Every cursor owns an engine Snapshot and therefore participates in the
   // ordered shutdown/pin registry. The mode only changes budgeting, never

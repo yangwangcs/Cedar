@@ -140,14 +140,17 @@ StatusOr<QueryStatisticsSnapshot> QueryStatisticsStore::Load(uint64_t generation
   size_t lp=4; uint64_t linked=0, linked_base=0; uint32_t payload_crc=0, manifest_crc=0, link_crc=0;
   if(!Get64(link,&lp,&linked)||!Get64(link,&lp,&linked_base)||!Get32(link,&lp,&payload_crc)||!Get32(link,&lp,&manifest_crc)||!Get32(link,&lp,&link_crc)||link_crc!=crc32c::Value(link.data(),28)) return Status::Corruption("query statistics","statistics linkage checksum mismatch");
   if(linked!=generation_id||linked_base!=base_seq.value)return Status::NotFound("query statistics","statistics unavailable");
+  // A CSC2 pointer is only valid when it can be bound to the immutable
+  // projection manifest that describes the same generation.  Treat a
+  // missing sibling as stale rather than accepting an unbound statistics
+  // payload after a crash or partial cleanup.
   const auto manifest_path = std::filesystem::path(directory_) / "manifests" / (std::to_string(generation_id) + ".cmanifest");
   std::ifstream manifest_in(manifest_path, std::ios::binary);
-  if (manifest_in) {
-    std::string manifest_bytes((std::istreambuf_iterator<char>(manifest_in)), std::istreambuf_iterator<char>());
-    if (crc32c::Value(manifest_bytes.data(), manifest_bytes.size()) != manifest_crc) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
-    auto decoded_manifest = DecodeProjectionManifest(manifest_bytes, database_identity_);
-    if (!decoded_manifest.ok() || decoded_manifest.ValueOrDie().generation_id != generation_id || decoded_manifest.ValueOrDie().base_seq != base_seq) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
-  }
+  if (!manifest_in) return Status::NotFound("query statistics", "statistics manifest linkage is unavailable");
+  std::string manifest_bytes((std::istreambuf_iterator<char>(manifest_in)), std::istreambuf_iterator<char>());
+  if (crc32c::Value(manifest_bytes.data(), manifest_bytes.size()) != manifest_crc) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
+  auto decoded_manifest = DecodeProjectionManifest(manifest_bytes, database_identity_);
+  if (!decoded_manifest.ok() || decoded_manifest.ValueOrDie().generation_id != generation_id || decoded_manifest.ValueOrDie().base_seq != base_seq) return Status::NotFound("query statistics", "statistics manifest linkage is stale");
   const auto path=std::filesystem::path(directory_)/FileName(generation_id);std::ifstream in(path,std::ios::binary);if(!in)return Status::NotFound("query statistics","statistics unavailable");std::string bytes((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
   if(crc32c::Value(bytes.data(),bytes.size())!=payload_crc)return Status::Corruption("query statistics","statistics payload checksum mismatch");
   auto decoded=DecodeQueryStatistics(bytes);if(!decoded.ok())return decoded.status();const auto& s=decoded.ValueOrDie();if(s.database_identity!=database_identity_||s.generation_id!=generation_id||s.base_seq!=base_seq||(s.complete&&s.schema_fingerprint.empty())||(!schema_fingerprint.empty()&&s.schema_fingerprint!=schema_fingerprint))return Status::Conflict("query statistics","statistics identity is stale");return decoded;

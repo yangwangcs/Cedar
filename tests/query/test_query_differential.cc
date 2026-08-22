@@ -508,8 +508,8 @@ TEST(QueryDifferentialTest, BoundedRandomizedProductionPathJourneyMatchOracle) {
     ASSERT_NE(mkdtemp(pattern), nullptr);
     const VertexRef source{PartId{0}, VertexId{1}};
     const VertexRef target{PartId{0}, VertexId{2 + seed}};
-    const EdgeIdentity edge{{PartId{0}, EdgeId{1000 + seed}}, source, target,
-                             seed % 3 + 1};
+    const EdgeIdentity edge{EdgeRef{PartId{0}, EdgeId{1000 + seed}}, source,
+                            target, seed % 3 + 1};
     auto opened = Database::Open(DatabaseOptions{.path = pattern});
     ASSERT_TRUE(opened.ok()) << opened.status().ToString();
     auto database = std::move(opened).ConsumeValueOrDie();

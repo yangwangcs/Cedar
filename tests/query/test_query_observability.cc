@@ -34,6 +34,14 @@ TEST(QueryObservabilityTest, StatisticsRoundTripIsGenerationBoundAndBounded) {
   EXPECT_EQ(decoded.ValueOrDie().generation_id, 7U);
   EXPECT_EQ(decoded.ValueOrDie().columns.front().histogram.size(), 1U);
   EXPECT_TRUE(DecodeQueryStatistics(encoded.ValueOrDie() + "x").status().IsCorruption());
+  QueryStatisticsSnapshot no_schema = input;
+  no_schema.schema_fingerprint.clear();
+  no_schema.complete = true;
+  auto normalized = EncodeQueryStatistics(no_schema);
+  ASSERT_TRUE(normalized.ok()) << normalized.status().ToString();
+  auto normalized_decoded = DecodeQueryStatistics(normalized.ValueOrDie());
+  ASSERT_TRUE(normalized_decoded.ok()) << normalized_decoded.status().ToString();
+  EXPECT_FALSE(normalized_decoded.ValueOrDie().complete);
 }
 
 TEST(QueryObservabilityTest, MetricsExposeOnlyBoundedEnumLabels) {
@@ -81,6 +89,50 @@ TEST(QueryObservabilityTest, StatisticsStorePublishesCstats) {
   std::filesystem::remove_all(root);
 }
 
+TEST(QueryObservabilityTest, RefreshRejectsOlderGenerationAfterCurrentAdvances) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar_stats_generation_guard_test";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "manifests");
+  ProjectionManifest current;
+  current.database_identity = root.string();
+  current.generation_id = 6;
+  current.base_seq = CommitSeq{12};
+  auto manifest_bytes = EncodeProjectionManifest(current);
+  ASSERT_TRUE(manifest_bytes.ok()) << manifest_bytes.status().ToString();
+  { std::ofstream out(root / "manifests" / "6.cmanifest", std::ios::binary);
+    out.write(manifest_bytes.ValueOrDie().data(), manifest_bytes.ValueOrDie().size()); }
+  std::string pointer("CPC1", 4);
+  for (int i = 0; i < 8; ++i) pointer.push_back(char(current.generation_id >> (i * 8)));
+  const uint32_t pointer_crc = crc32c::Value(pointer.data(), pointer.size());
+  for (int i = 0; i < 4; ++i) pointer.push_back(char(pointer_crc >> (i * 8)));
+  { std::ofstream out(root / "PROJECTION-CURRENT", std::ios::binary);
+    out.write(pointer.data(), pointer.size()); }
+  ProjectionManifest stale = current;
+  stale.generation_id = 5;
+  stale.base_seq = CommitSeq{11};
+  QueryStatisticsStore store(root.string(), root.string());
+  EXPECT_TRUE(store.Refresh(stale, "schema").IsConflict());
+  EXPECT_FALSE(std::filesystem::exists(root / "CSTATS-CURRENT"));
+  std::filesystem::remove_all(root);
+}
+
+TEST(QueryObservabilityTest, EmptySchemaNeverAdvertisesCompleteStatistics) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar_stats_empty_schema_test";
+  std::filesystem::remove_all(root);
+  ProjectionManifest manifest;
+  manifest.database_identity = root.string();
+  manifest.generation_id = 10;
+  manifest.base_seq = CommitSeq{14};
+  QueryStatisticsStore store(root.string(), root.string());
+  ASSERT_TRUE(store.Refresh(manifest, "").ok());
+  auto loaded = store.Load(10, CommitSeq{14});
+  ASSERT_TRUE(loaded.ok()) << loaded.status().ToString();
+  EXPECT_FALSE(loaded.ValueOrDie().complete);
+  std::filesystem::remove_all(root);
+}
+
 TEST(QueryObservabilityTest, RefreshDecodesReferencedSegmentsIntoCompleteStats) {
   const auto root = std::filesystem::temp_directory_path() / "cedar_stats_decode_test";
   std::filesystem::remove_all(root);
@@ -95,6 +147,7 @@ TEST(QueryObservabilityTest, RefreshDecodesReferencedSegmentsIntoCompleteStats) 
   chain.header.valid_from_min = ValidTime{10};
   chain.intervals.push_back({ValidTimeInterval{ValidTime{10}, ValidTime{20}}, Value::Int64(7), 1});
   chain.intervals.push_back({ValidTimeInterval{ValidTime{12}, std::nullopt}, Value::Int64(7), 2});
+  chain.intervals.push_back({ValidTimeInterval{ValidTime{14}, std::nullopt}, Value::Int64(8), 2});
   auto encoded = EncodeProjectionPage(chain, CompressionCodec::kNone);
   ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
   const auto segment_path = root / "segment-1.cadj";
@@ -123,10 +176,14 @@ TEST(QueryObservabilityTest, RefreshDecodesReferencedSegmentsIntoCompleteStats) 
   ASSERT_TRUE(loaded.ok()) << loaded.status().ToString();
   ASSERT_TRUE(loaded.ValueOrDie().complete);
   ASSERT_EQ(loaded.ValueOrDie().columns.size(), 1U);
-  EXPECT_EQ(loaded.ValueOrDie().columns.front().rows, 2U);
-  EXPECT_EQ(loaded.ValueOrDie().columns.front().interval_count, 2U);
-  EXPECT_EQ(loaded.ValueOrDie().columns.front().edge_count, 2U);
-  EXPECT_FALSE(loaded.ValueOrDie().columns.front().top_values.empty());
+  EXPECT_EQ(loaded.ValueOrDie().columns.front().rows, 3U);
+  EXPECT_EQ(loaded.ValueOrDie().columns.front().interval_count, 3U);
+  EXPECT_EQ(loaded.ValueOrDie().columns.front().edge_count, 3U);
+  ASSERT_EQ(loaded.ValueOrDie().columns.front().top_values.size(), 2U);
+  EXPECT_EQ(loaded.ValueOrDie().columns.front().top_values[0].value,
+            Value::Int64(7));
+  EXPECT_EQ(loaded.ValueOrDie().columns.front().top_values[1].value,
+            Value::Int64(8));
   std::filesystem::remove_all(root);
 }
 
@@ -151,6 +208,10 @@ TEST(QueryObservabilityTest, RefreshIsSerializedAndRepeatable) {
   auto loaded = store.Load(9, CommitSeq{13}, "schema");
   ASSERT_TRUE(loaded.ok()) << loaded.status().ToString();
   EXPECT_TRUE(loaded.ValueOrDie().complete);
+  ProjectionManifest stale = manifest;
+  stale.generation_id = 8;
+  stale.base_seq = CommitSeq{12};
+  EXPECT_TRUE(store.Refresh(stale, "schema").IsConflict());
   std::filesystem::remove_all(root);
 }
 

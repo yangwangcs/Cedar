@@ -71,9 +71,50 @@ Status SyncPath(const std::filesystem::path& path, bool directory) {
   ::close(fd);
   return result == 0 ? Status::OK() : Status::IOError("query statistics", "sync failed");
 }
+
+// The projection store owns PROJECTION-CURRENT.  Refresh only observes it so
+// an asynchronous statistics job cannot publish an older generation after a
+// newer projection has become current.  A missing pointer is allowed for the
+// standalone statistics tests and for databases without a derived projection.
+StatusOr<std::optional<ProjectionManifest>> ReadCurrentProjectionManifest(
+    const std::filesystem::path& directory, const std::string& identity) {
+  const auto current_path = directory / "PROJECTION-CURRENT";
+  std::ifstream current(current_path, std::ios::binary);
+  if (!current) return std::optional<ProjectionManifest>();
+  const std::string link((std::istreambuf_iterator<char>(current)),
+                         std::istreambuf_iterator<char>());
+  if (link.size() != 16 || link.compare(0, 4, "CPC1", 4) != 0)
+    return Status::Corruption("query statistics", "invalid PROJECTION-CURRENT");
+  size_t p = 4;
+  uint64_t generation = 0;
+  uint32_t checksum = 0;
+  if (!Get64(link, &p, &generation) || !Get32(link, &p, &checksum) ||
+      checksum != crc32c::Value(link.data(), 12)) {
+    return Status::Corruption("query statistics", "invalid PROJECTION-CURRENT checksum");
+  }
+  if (generation == 0) return std::optional<ProjectionManifest>();
+  const auto manifest_path = directory / "manifests" /
+      (std::to_string(generation) + ".cmanifest");
+  std::ifstream manifest_in(manifest_path, std::ios::binary);
+  if (!manifest_in)
+    return Status::Corruption("query statistics", "current projection manifest is missing");
+  const std::string bytes((std::istreambuf_iterator<char>(manifest_in)),
+                          std::istreambuf_iterator<char>());
+  auto manifest = DecodeProjectionManifest(bytes, identity);
+  if (!manifest.ok() || manifest.ValueOrDie().generation_id != generation)
+    return Status::Corruption("query statistics", "current projection manifest is invalid");
+  return std::optional<ProjectionManifest>(manifest.ConsumeValueOrDie());
+}
 }
 
 StatusOr<std::string> EncodeQueryStatistics(const QueryStatisticsSnapshot& snapshot) {
+  // Keep the on-disk trust bit consistent with Load's identity contract even
+  // for callers that construct snapshots directly (outside Refresh).
+  if (snapshot.complete && snapshot.schema_fingerprint.empty()) {
+    QueryStatisticsSnapshot normalized = snapshot;
+    normalized.complete = false;
+    return EncodeQueryStatistics(normalized);
+  }
   const Status valid = ValidateBounds(snapshot); if (!valid.ok()) return valid;
   std::string out("CDRSTS1\0", 8); PutBytes(&out, snapshot.database_identity); PutBytes(&out, snapshot.schema_fingerprint); PutBytes(&out, snapshot.coverage);
   Put64(&out, snapshot.generation_id); Put64(&out, snapshot.base_seq.value); out.push_back(static_cast<char>(snapshot.complete)); Put32(&out, static_cast<uint32_t>(snapshot.columns.size()));
@@ -116,12 +157,32 @@ std::string QueryStatisticsStore::FileName(uint64_t generation_id) { return "gen
 QueryStatisticsStore::QueryStatisticsStore(std::string directory, std::string database_identity):directory_(std::move(directory)),database_identity_(std::move(database_identity)){}
 Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const std::string& schema_fingerprint) {
   std::lock_guard<std::mutex> refresh_lock(refresh_mutex_);
+  if (latest_generation_id_ && manifest.generation_id < *latest_generation_id_) {
+    return Status::Conflict("query statistics", "statistics refresh generation is stale");
+  }
+  const auto validate_current = [&]() -> Status {
+    auto current = ReadCurrentProjectionManifest(directory_, database_identity_);
+    if (!current.ok()) return current.status();
+    if (!current.ValueOrDie()) return Status::OK();
+    const auto& current_manifest = *current.ValueOrDie();
+    if (current_manifest.generation_id > manifest.generation_id) {
+      return Status::Conflict("query statistics", "statistics refresh generation is stale");
+    }
+    if (current_manifest.generation_id == manifest.generation_id &&
+        current_manifest.base_seq != manifest.base_seq) {
+      return Status::Conflict("query statistics", "statistics refresh base is stale");
+    }
+    return Status::OK();
+  };
+  const Status initial_generation = validate_current();
+  if (!initial_generation.ok()) return initial_generation;
   QueryStatisticsSnapshot snapshot;
   snapshot.database_identity = database_identity_;
   snapshot.schema_fingerprint = schema_fingerprint;
   snapshot.generation_id = manifest.generation_id;
   snapshot.base_seq = manifest.base_seq;
-  snapshot.complete = true;
+  // A complete payload without a schema identity cannot be trusted by Load.
+  snapshot.complete = !schema_fingerprint.empty();
   for (const auto& region : manifest.regions) {
     if (!snapshot.coverage.empty()) snapshot.coverage.push_back('|');
     snapshot.coverage += "part=" + std::to_string(region.part_id.value) +
@@ -196,7 +257,10 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
     }
     std::vector<std::pair<Value, uint64_t>> top;
     for (const auto& entry : values) top.push_back(entry.second);
-    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+      if (a.second != b.second) return a.second > b.second;
+      return a.first.Encode() < b.first.Encode();
+    });
     if (top.size() > 64) top.erase(top.begin() + 64, top.end());
     for (const auto& entry : top) c.top_values.push_back({entry.first, entry.second});
     if (!fanout.empty()) {
@@ -220,6 +284,14 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
   const auto temp=path.string()+".tmp."+std::to_string(++refresh_counter_)+"."+std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
   {std::ofstream out(temp,std::ios::binary|std::ios::trunc);if(!out)return Status::IOError("query statistics","cannot create file");out.write(encoded.ValueOrDie().data(),encoded.ValueOrDie().size());out.flush();if(!out)return Status::IOError("query statistics","write failed");}
   auto synced=SyncPath(temp,false);if(!synced.ok()){std::filesystem::remove(temp);return synced;}
+  // Revalidate after the potentially long segment scan and before making the
+  // generation artifact visible.  A newer PROJECTION-CURRENT wins over this
+  // refresh, even when the refresh started first.
+  const Status pre_publish_generation = validate_current();
+  if (!pre_publish_generation.ok()) {
+    std::filesystem::remove(temp);
+    return pre_publish_generation;
+  }
   std::filesystem::rename(temp,path,ec);if(ec){std::filesystem::remove(temp);return Status::IOError("query statistics",ec.message());}
   if(!SyncPath(directory_,true).ok())return Status::IOError("query statistics","statistics directory sync failed");
 
@@ -242,6 +314,11 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
   const auto manifest_tmp = manifest_path.string() + ".tmp." + std::to_string(refresh_counter_);
   { std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc); if (!out) return Status::IOError("query statistics", "cannot create generation manifest"); out.write(manifest_bytes.ValueOrDie().data(), manifest_bytes.ValueOrDie().size()); out.flush(); if (!out) return Status::IOError("query statistics", "generation manifest write failed"); }
   if (!(SyncPath(manifest_tmp, false).ok())) return Status::IOError("query statistics", "generation manifest sync failed");
+  const Status pre_manifest_generation = validate_current();
+  if (!pre_manifest_generation.ok()) {
+    std::filesystem::remove(manifest_tmp);
+    return pre_manifest_generation;
+  }
   if (std::filesystem::rename(manifest_tmp, manifest_path, ec), ec) return Status::IOError("query statistics", ec.message());
   if (!SyncPath(std::filesystem::path(directory_) / "manifests", true).ok()) return Status::IOError("query statistics", "manifest directory sync failed");
 
@@ -256,7 +333,13 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
   const auto current_tmp = current_path.string() + ".tmp." + std::to_string(refresh_counter_);
   { std::ofstream out(current_tmp, std::ios::binary | std::ios::trunc); if (!out) return Status::IOError("query statistics", "cannot create current link"); out.write(current.data(), current.size()); out.flush(); if (!out) return Status::IOError("query statistics", "current link write failed"); }
   if (!(SyncPath(current_tmp, false).ok())) return Status::IOError("query statistics", "current link sync failed");
+  const Status pre_current_generation = validate_current();
+  if (!pre_current_generation.ok()) {
+    std::filesystem::remove(current_tmp);
+    return pre_current_generation;
+  }
   if (std::filesystem::rename(current_tmp, current_path, ec), ec) return Status::IOError("query statistics", ec.message());
+  latest_generation_id_ = manifest.generation_id;
   return SyncPath(directory_,true);
 }
 StatusOr<QueryStatisticsSnapshot> QueryStatisticsStore::Load(uint64_t generation_id, CommitSeq base_seq, const std::string& schema_fingerprint) const {

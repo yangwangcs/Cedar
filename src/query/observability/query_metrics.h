@@ -75,6 +75,10 @@ struct QueryStatisticsSnapshot {
   CommitSeq base_seq;
   std::vector<QueryColumnStatistics> columns;
   uint32_t checksum = 0;
+  // Refresh currently produces structural/page estimates only. Such a file
+  // is deliberately unavailable to the planner until a complete statistics
+  // builder sets this bit.
+  bool complete = false;
   bool operator==(const QueryStatisticsSnapshot&) const = default;
 };
 

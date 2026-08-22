@@ -98,6 +98,32 @@ TEST(TemporalJourneyTest, EarliestArrivalMaterializesOrderedJourney) {
   EXPECT_EQ(journey.ValueOrDie().final_arrival, (ValidTime{12}));
 }
 
+TEST(TemporalJourneyTest, EarliestArrivalRetainsLabelsAtDifferentHopDepths) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b); graph.Vertex(graph.c);
+  graph.Vertex(graph.d);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{51}}, graph.a, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{52}}, graph.a, graph.c, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{53}}, graph.c, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{54}}, graph.b, graph.d, 5, 100);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kEarliestArrival};
+  request.max_hops = 2;
+  request.duration_at = [](EdgeRef edge, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    uint64_t duration = edge.edge_id.value == 54 ? 1 :
+                        (edge.edge_id.value == 51 ? 5 : 1);
+    return std::optional<ValidDuration>{ValidDuration{duration}};
+  };
+  auto journey = EarliestArrival(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  EXPECT_EQ(journey.ValueOrDie().vertices,
+            (std::vector<VertexRef>{graph.a, graph.b, graph.d}));
+  EXPECT_EQ(journey.ValueOrDie().final_arrival, (ValidTime{6}));
+}
+
 TEST(TemporalJourneyTest, LatestDepartureUsesReverseSearch) {
   JourneyFixture graph;
   graph.Vertex(graph.a, 0, 1'000'000);
@@ -114,6 +140,25 @@ TEST(TemporalJourneyTest, LatestDepartureUsesReverseSearch) {
   auto journey = LatestDeparture(snapshot.ValueOrDie(), request);
   ASSERT_TRUE(journey.ok()) << journey.status().ToString();
   EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{499'995}));
+}
+
+TEST(TemporalJourneyTest, LatestDepartureAcceptsCallbackMissingAtLowerBound) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a, 0, 20); graph.Vertex(graph.b, 0, 20);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{55}}, graph.a, graph.b, 0, 20);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.b, {ValidTime{0}, ValidTime{20}},
+                         JourneyObjective::kLatestDeparture};
+  request.arrival_deadline = ValidTime{10};
+  request.duration_at = [](EdgeRef, ValidTime time)
+      -> StatusOr<std::optional<ValidDuration>> {
+    if (time.value < 5) return std::optional<ValidDuration>{};
+    return std::optional<ValidDuration>{ValidDuration{1}};
+  };
+  auto journey = LatestDeparture(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{9}));
 }
 
 TEST(TemporalJourneyTest, LatestDepartureReconstructsMultiHopOrder) {
@@ -185,6 +230,53 @@ TEST(TemporalJourneyTest, FastestDurationRetainsDepartureArrivalParetoLabels) {
   ASSERT_TRUE(journey.ok()) << journey.status().ToString();
   EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{500'000}));
   EXPECT_EQ(journey.ValueOrDie().duration, (ValidDuration{1}));
+}
+
+TEST(TemporalJourneyTest, FastestDurationRetainsLabelsAtDifferentHopDepths) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b); graph.Vertex(graph.c);
+  graph.Vertex(graph.d);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{61}}, graph.a, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{62}}, graph.a, graph.c, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{63}}, graph.c, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{64}}, graph.b, graph.d, 5, 100);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kFastestDuration};
+  request.max_hops = 2;
+  request.duration_at = [](EdgeRef edge, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{
+        static_cast<uint64_t>(edge.edge_id.value == 64 ? 1 :
+                              (edge.edge_id.value == 61 ? 5 : 1))}};
+  };
+  auto journey = FastestDuration(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  EXPECT_EQ(journey.ValueOrDie().vertices,
+            (std::vector<VertexRef>{graph.a, graph.b, graph.d}));
+  EXPECT_EQ(journey.ValueOrDie().duration, (ValidDuration{6}));
+}
+
+TEST(TemporalJourneyTest, IntervalFragmentBudgetAccumulatesAcrossExpansions) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b); graph.Vertex(graph.d);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{71}}, graph.a, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{72}}, graph.b, graph.d, 0, 100);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kEarliestArrival};
+  request.duration_at = [](EdgeRef, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{1}};
+  };
+  JourneyOptions options;
+  options.max_interval_fragments = 1;
+  auto journey = EarliestArrival(snapshot.ValueOrDie(), request, options);
+  ASSERT_FALSE(journey.ok());
+  EXPECT_TRUE(journey.status().IsResourceExhausted())
+      << journey.status().ToString();
 }
 
 TEST(TemporalJourneyTest, PrepareRejectsUnprovenRegisteredDurationFifo) {

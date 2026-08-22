@@ -18,6 +18,27 @@ struct VertexLess {
            std::tie(b.part_id.value, b.vertex_id.value);
   }
 };
+
+struct JourneyStateKey {
+  VertexRef vertex;
+  uint32_t depth = 0;
+};
+
+struct JourneyStateLess {
+  bool operator()(const JourneyStateKey& a, const JourneyStateKey& b) const {
+    VertexLess less;
+    if (less(a.vertex, b.vertex)) return true;
+    if (less(b.vertex, a.vertex)) return false;
+    return a.depth < b.depth;
+  }
+};
+
+// With no hop bound, FIFO/non-negative durations make a single state per
+// vertex sufficient and avoid admitting infinitely many zero-cost cycles.
+JourneyStateKey StateKey(VertexRef vertex, uint32_t depth,
+                         uint32_t max_hops) {
+  return {vertex, max_hops == 0 ? 0U : depth};
+}
 Status Check(const JourneyOptions& options) {
   if (options.check_abort) return options.check_abort();
   return Status::OK();
@@ -247,10 +268,17 @@ bool PathLess(const std::vector<JourneyTraversal>& a,
 }
 
 Status CheckFragmentBudget(const JourneyOptions& options, uint64_t count) {
+  if (!options.interval_fragments_used) return Status::OK();
+  uint64_t& used = *options.interval_fragments_used;
+  if (count > std::numeric_limits<uint64_t>::max() - used) {
+    return Status::ResourceExhausted("journey", "interval fragment budget overflow");
+  }
+  const uint64_t total = used + count;
   if (options.max_interval_fragments != 0 &&
-      count > options.max_interval_fragments) {
+      total > options.max_interval_fragments) {
     return Status::ResourceExhausted("journey", "interval fragment budget exceeded");
   }
+  used = total;
   return Status::OK();
 }
 
@@ -321,23 +349,27 @@ StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
       return TraversalFits(oriented.effective, ValidTime{point},
                            *duration.ValueOrDie());
     };
-    auto at_lower = feasible(lower);
-    if (!at_lower.ok()) return at_lower.status();
-    if (!at_lower.ValueOrDie()) continue;
-    uint64_t lo = lower;
-    uint64_t hi = upper;
-    while (lo < hi) {
-      const uint64_t mid = lo + (hi - lo + 1) / 2;
-      auto ok = feasible(mid);
+    // Feasibility is not generally monotone when a callback can be missing
+    // at the beginning of an edge's effective interval.  Search from the
+    // deadline backwards and choose the first valid departure instead of
+    // assuming lower is feasible and binary-searching a false predicate.
+    std::optional<uint64_t> latest;
+    for (uint64_t point = upper;; --point) {
+      auto ok = feasible(point);
       if (!ok.ok()) return ok.status();
-      if (ok.ValueOrDie()) lo = mid;
-      else hi = mid - 1;
+      if (ok.ValueOrDie()) {
+        latest = point;
+        break;
+      }
+      if (point == lower) break;
     }
-    auto duration = PropertyDuration(snapshot, oriented.edge, ValidTime{lo},
+    if (!latest) continue;
+    const uint64_t departure = *latest;
+    auto duration = PropertyDuration(snapshot, oriented.edge, ValidTime{departure},
                                      request, options.delta);
     if (!duration.ok()) return duration.status();
     if (!duration.ValueOrDie()) continue;
-    auto arrival = AddDuration(ValidTime{lo}, *duration.ValueOrDie());
+    auto arrival = AddDuration(ValidTime{departure}, *duration.ValueOrDie());
     if (!arrival.ok()) return arrival.status();
     auto target_intervals = VertexIntervals(snapshot, target, options.delta);
     if (!target_intervals.ok()) return target_intervals.status();
@@ -345,7 +377,7 @@ StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
                                arrival.ValueOrDie(), deadline)) {
       continue;
     }
-    JourneyTraversal candidate{oriented, ValidTime{lo}, arrival.ValueOrDie(),
+    JourneyTraversal candidate{oriented, ValidTime{departure}, arrival.ValueOrDie(),
                                *duration.ValueOrDie()};
     if (!best || candidate.departure.value > best->departure.value ||
         (candidate.departure == best->departure && TraversalLess(candidate, *best)))
@@ -399,35 +431,43 @@ StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
                                        const JourneyOptions& options) {
   if (!request.interval.Validate().ok())
     return Status::InvalidArgument("journey", "invalid interval");
+  JourneyOptions scoped = options;
+  scoped.interval_fragments_used = std::make_shared<uint64_t>(0);
   struct Label { VertexRef vertex; ValidTime arrival; uint32_t depth; uint64_t predecessor; JourneyTraversal edge; };
   std::vector<Label> labels;
-  std::map<VertexRef, ValidTime, VertexLess> best;
+  std::map<JourneyStateKey, ValidTime, JourneyStateLess> best;
   using HeapEntry = std::pair<uint64_t, uint64_t>;
   std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<>> heap;
   labels.push_back({request.source, request.interval.from, 0, std::numeric_limits<uint64_t>::max(), {}});
-  best[request.source] = request.interval.from;
+  best[StateKey(request.source, 0, request.max_hops)] = request.interval.from;
   heap.push({request.interval.from.value, 0});
   while (!heap.empty()) {
     if (Status status = Check(options); !status.ok()) return status;
     const auto [time, id] = heap.top(); heap.pop();
     const Label current = labels[id];
-    if (best[current.vertex].value != time) continue;
+    const auto current_key = StateKey(current.vertex, current.depth,
+                                      request.max_hops);
+    auto best_current = best.find(current_key);
+    if (best_current == best.end() || best_current->second.value != time)
+      continue;
     if (current.vertex == request.target)
       return BuildJourney([&] { std::vector<JourneyTraversal> path; for (uint64_t i = id; i != 0 && labels[i].predecessor != std::numeric_limits<uint64_t>::max(); i = labels[i].predecessor) path.push_back(labels[i].edge); std::reverse(path.begin(), path.end()); return path; }(), request.interval.from);
-    auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, options);
+    auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, scoped);
     if (!next.ok()) return next.status();
-    if (Status budget = CheckFragmentBudget(options, next.ValueOrDie().size());
+    if (Status budget = CheckFragmentBudget(scoped, next.ValueOrDie().size());
         !budget.ok())
       return budget;
     for (auto& edge : next.ValueOrDie()) {
       if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
-      auto found = best.find(edge.traversal.target);
+      const uint32_t depth = current.depth + 1;
+      auto found = best.find(StateKey(edge.traversal.target, depth,
+                                      request.max_hops));
       if (found != best.end() && found->second.value <= edge.arrival.value) continue;
       if (options.max_labels && labels.size() >= options.max_labels)
         return Status::ResourceExhausted("journey", "label budget exceeded");
-      if (Status status = Charge(options); !status.ok()) return status;
-      best[edge.traversal.target] = edge.arrival;
-      labels.push_back({edge.traversal.target, edge.arrival, current.depth + 1, id, edge});
+      if (Status status = Charge(scoped); !status.ok()) return status;
+      best[StateKey(edge.traversal.target, depth, request.max_hops)] = edge.arrival;
+      labels.push_back({edge.traversal.target, edge.arrival, depth, id, edge});
       heap.push({edge.arrival.value, labels.size() - 1});
     }
   }
@@ -443,6 +483,8 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
       request.interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}));
   if (deadline.value <= request.interval.from.value)
     return Status::NotFound("journey", "target is unreachable");
+  JourneyOptions scoped = options;
+  scoped.interval_fragments_used = std::make_shared<uint64_t>(0);
   struct Label {
     VertexRef vertex;
     ValidTime time;
@@ -451,19 +493,20 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
     JourneyTraversal edge;
   };
   std::vector<Label> labels;
-  std::map<VertexRef, uint64_t, VertexLess> best;
+  std::map<JourneyStateKey, uint64_t, JourneyStateLess> best;
   using HeapEntry = std::pair<uint64_t, uint64_t>;
   std::priority_queue<HeapEntry> heap;
   labels.push_back({request.target, deadline, 0,
                     std::numeric_limits<uint64_t>::max(), {}});
-  best[request.target] = 0;
+  best[StateKey(request.target, 0, request.max_hops)] = 0;
   heap.push({deadline.value, 0});
   while (!heap.empty()) {
     if (Status status = Check(options); !status.ok()) return status;
     const auto [time, id] = heap.top();
     heap.pop();
     const Label current = labels[id];
-    auto found = best.find(current.vertex);
+    auto found = best.find(StateKey(current.vertex, current.depth,
+                                    request.max_hops));
     if (found == best.end() || found->second != id || current.time.value != time)
       continue;
     if (current.vertex == request.source) {
@@ -476,13 +519,14 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
       return BuildJourney(path, current.time);
     }
     if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
-    auto edge = LatestIncoming(snapshot, request, options, current.vertex,
+    auto edge = LatestIncoming(snapshot, request, scoped, current.vertex,
                                current.time);
     if (!edge.ok()) return edge.status();
     if (!edge.ValueOrDie()) continue;
     const JourneyTraversal candidate = *edge.ValueOrDie();
     const VertexRef predecessor = candidate.traversal.source;
-    auto existing = best.find(predecessor);
+    const uint32_t depth = current.depth + 1;
+    auto existing = best.find(StateKey(predecessor, depth, request.max_hops));
     if (existing != best.end()) {
       const Label& prior = labels[existing->second];
       if (prior.time.value > candidate.departure.value ||
@@ -492,11 +536,11 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
     }
     if (options.max_labels && labels.size() >= options.max_labels)
       return Status::ResourceExhausted("journey", "label budget exceeded");
-    if (Status status = Charge(options); !status.ok()) return status;
+    if (Status status = Charge(scoped); !status.ok()) return status;
     const uint64_t next = labels.size();
-    labels.push_back({predecessor, candidate.departure, current.depth + 1,
+    labels.push_back({predecessor, candidate.departure, depth,
                       id, candidate});
-    best[predecessor] = next;
+    best[StateKey(predecessor, depth, request.max_hops)] = next;
     heap.push({candidate.departure.value, next});
   }
   return Status::NotFound("journey", "target is unreachable");
@@ -509,6 +553,8 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
     return Status::NotSupported("journey", "fastest duration requires a finite time bound");
   if (request.interval.to->value <= request.interval.from.value)
     return Status::NotFound("journey", "target is unreachable");
+  JourneyOptions scoped = options;
+  scoped.interval_fragments_used = std::make_shared<uint64_t>(0);
   struct Label {
     VertexRef vertex;
     ValidTime departure;
@@ -518,7 +564,7 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
     JourneyTraversal edge;
   };
   std::vector<Label> labels;
-  std::map<VertexRef, std::vector<uint64_t>, VertexLess> frontier;
+  std::map<JourneyStateKey, std::vector<uint64_t>, JourneyStateLess> frontier;
   auto dominates = [](const Label& a, const Label& b) {
     return a.departure.value >= b.departure.value &&
            a.arrival.value <= b.arrival.value &&
@@ -536,7 +582,7 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
   };
   labels.push_back({request.source, request.interval.from, request.interval.from,
                     0, std::numeric_limits<uint64_t>::max(), {}});
-  frontier[request.source].push_back(0);
+  frontier[StateKey(request.source, 0, request.max_hops)].push_back(0);
   std::queue<uint64_t> pending;
   pending.push(0);
   std::optional<uint64_t> answer;
@@ -561,17 +607,18 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
         answer = id;
     }
     if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
-    auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, options);
+    auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, scoped);
     if (!next.ok()) return next.status();
     std::sort(next.ValueOrDie().begin(), next.ValueOrDie().end(), TraversalLess);
-    if (Status budget = CheckFragmentBudget(options, next.ValueOrDie().size());
+    if (Status budget = CheckFragmentBudget(scoped, next.ValueOrDie().size());
         !budget.ok())
       return budget;
     for (const JourneyTraversal& edge : next.ValueOrDie()) {
       Label candidate{edge.traversal.target,
                       current.depth == 0 ? edge.departure : current.departure,
                       edge.arrival, current.depth + 1, id, edge};
-      auto& labels_at_vertex = frontier[candidate.vertex];
+      auto& labels_at_vertex = frontier[StateKey(candidate.vertex, candidate.depth,
+                                                  request.max_hops)];
       bool rejected = false;
       for (uint64_t prior_id : labels_at_vertex) {
         if (dominates(labels[prior_id], candidate) ||
@@ -588,7 +635,7 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
           labels_at_vertex.end());
       if (options.max_labels && labels.size() >= options.max_labels)
         return Status::ResourceExhausted("journey", "Pareto label budget exceeded");
-      if (Status status = Charge(options); !status.ok()) return status;
+      if (Status status = Charge(scoped); !status.ok()) return status;
       const uint64_t next_id = labels.size();
       labels.push_back(std::move(candidate));
       labels_at_vertex.push_back(next_id);

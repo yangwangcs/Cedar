@@ -39,6 +39,10 @@ struct JourneyOptions {
   std::function<Status()> check_abort;
   uint64_t max_labels = 0;
   uint64_t max_interval_fragments = 0;
+  // Internal state shared by all expansions in one journey execution.  A
+  // pointer keeps the public options aggregate backward-compatible while
+  // allowing the runtime to account fragments across the full query.
+  std::shared_ptr<uint64_t> interval_fragments_used;
 };
 
 struct JourneyTraversal {

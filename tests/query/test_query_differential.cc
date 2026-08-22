@@ -12,12 +12,16 @@
 #include <vector>
 
 #include "cedar/database.h"
+#include "cedar/core/crc32c.h"
 #include "cedar/query.h"
 #include "cedar/transaction.h"
 #include "cedar/storage_options.h"
+#include "query/projection/projection_store.h"
 #include "query/projection/query_delta.h"
+#include "query/temporal/corrected_chain.h"
 #include "query/runtime/graph_frontier.h"
 #include "query/runtime/journey.h"
+#include "storage/facts/fact_store.h"
 #include "tests/model/bitemporal_fact_oracle.h"
 
 namespace cedar {
@@ -123,6 +127,224 @@ TEST(QueryDifferentialTest, SmokeOracleMatchesDirectEnumeration) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows.front().interval, (ValidTimeInterval{ValidTime{0}, std::nullopt}));
   EXPECT_FALSE(rows.front().value.has_value());
+}
+
+TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesMatchOracle) {
+  char pattern[] = "/tmp/cedar_query_topology_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::filesystem::path root(pattern);
+  const std::filesystem::path projection_path = root / "projections";
+  const std::filesystem::path facts_path = root / "facts";
+
+  const FactRef ref = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}},
+                                           PropertyId{1})
+                           .ref();
+  const auto event = [&](uint64_t commit, uint64_t valid,
+                         FactOperation operation, int64_t value) {
+    return FactEvent{ref,
+                     ValidTime{valid},
+                     CommitSeq{commit},
+                     operation,
+                     1,
+                     operation == FactOperation::kPut
+                         ? std::optional<Value>(Value::Int64(value))
+                         : std::nullopt,
+                     std::nullopt};
+  };
+  const std::vector<FactEvent> tail = {
+      event(11, 5, FactOperation::kPut, 3),
+      event(12, 15, FactOperation::kDelete, 0),
+      event(13, 25, FactOperation::kPut, 4),
+      event(14, 30, FactOperation::kDelete, 0),
+      event(15, 35, FactOperation::kPut, 5),
+      event(16, 40, FactOperation::kDelete, 0),
+  };
+
+  auto store_result = internal::QueryProjectionStore::Open(
+      internal::ProjectionStoreOptions{projection_path.string(), "topology-db", {}});
+  ASSERT_TRUE(store_result.ok()) << store_result.status().ToString();
+  auto projection = std::move(store_result).ConsumeValueOrDie();
+  internal::ProjectionBuild build;
+  build.manifest.database_identity = "topology-db";
+  build.manifest.generation_id = 10;
+  build.manifest.base_seq = CommitSeq{10};
+  internal::CoverageRegion region;
+  region.kind = internal::ProjectionKind::kState;
+  region.part_id = PartId{0};
+  region.property_id = PropertyId{1};
+  region.schema_epoch = 1;
+  region.entity_min = 7;
+  region.entity_max_exclusive = 8;
+  region.valid_time = {ValidTime{0}, std::nullopt};
+  internal::SegmentDescriptor descriptor;
+  descriptor.segment_id = "topology-base";
+  descriptor.filename = "topology-base.csegment";
+  descriptor.header.kind = internal::ProjectionKind::kState;
+  descriptor.header.generation_id = 10;
+  descriptor.header.base_seq = CommitSeq{10};
+  descriptor.header.part_id = PartId{0};
+  descriptor.header.property_id = PropertyId{1};
+  descriptor.header.schema_epoch = 1;
+  descriptor.header.entity_min = 7;
+  descriptor.header.entity_max_exclusive = 8;
+  descriptor.header.valid_from_min = ValidTime{0};
+  internal::ProjectionChain chain;
+  chain.header = descriptor.header;
+  chain.intervals = {
+      {{ValidTime{0}, ValidTime{10}}, Value::Int64(1), 7},
+      {{ValidTime{10}, ValidTime{20}}, Value::Int64(2), 7},
+  };
+  chain.boundaries = {
+      {ValidTime{0}, FactOperation::kPut, Value::Int64(1), 7},
+      {ValidTime{10}, FactOperation::kPut, Value::Int64(2), 7},
+      {ValidTime{20}, FactOperation::kDelete, Value::Int64(0), 7},
+  };
+  auto encoded = internal::EncodeProjectionPage(
+      chain, internal::CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  descriptor.file_bytes = encoded.ValueOrDie().size();
+  descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(),
+                                      encoded.ValueOrDie().size());
+  region.segments.push_back(descriptor);
+  build.manifest.regions.push_back(region);
+  build.segments.push_back({descriptor, encoded.ValueOrDie()});
+  ASSERT_TRUE(projection->Build(build).ok());
+
+  internal::CoverageRequest covered;
+  covered.part_id = PartId{0};
+  covered.property_id = PropertyId{1};
+  covered.schema_epoch = 1;
+  covered.entity_min = 7;
+  covered.entity_max_exclusive = 8;
+  covered.valid_time = {ValidTime{0}, std::nullopt};
+  covered.snapshot_seq = CommitSeq{10};
+  covered.generation_id = 10;
+  covered.expected_base_seq = CommitSeq{10};
+  covered.database_identity = "topology-db";
+  auto pin = projection->Acquire(covered);
+  ASSERT_TRUE(pin.has_value());
+  auto base = projection->ReadChains(covered, *pin);
+  ASSERT_TRUE(base.ok()) << base.status().ToString();
+  ASSERT_EQ(base.ValueOrDie().size(), 1U);
+  ASSERT_EQ(base.ValueOrDie().front().boundaries.size(), 3U);
+  EXPECT_EQ(base.ValueOrDie().front().intervals, chain.intervals);
+
+  internal::CoverageRequest uncovered = covered;
+  uncovered.entity_min = 8;
+  uncovered.entity_max_exclusive = 9;
+  EXPECT_FALSE(projection->Acquire(uncovered).has_value());
+  EXPECT_TRUE(projection->ReadChains(uncovered).status().IsNotFound());
+  EXPECT_TRUE(projection->projections_enabled());
+
+  internal::QueryDelta delta({.base_seq = CommitSeq{10}, .queue_capacity = 64});
+  for (const FactEvent& fact : tail) {
+    internal::QueryDeltaCommit commit(fact.commit_seq);
+    commit.facts.push_back(fact);
+    const Status observed = delta.ObservePublished(commit);
+    ASSERT_TRUE(observed.ok()) << observed.ToString();
+  }
+  EXPECT_EQ(delta.indexed_through(), CommitSeq{16});
+  EXPECT_EQ(delta.first_missing(), CommitSeq{});
+  EXPECT_TRUE(delta.mergeable());
+
+  const auto merge = [&](const internal::QueryDeltaView& view) {
+    std::vector<internal::CorrectedBoundary> boundaries;
+    for (const auto& boundary : base.ValueOrDie().front().boundaries) {
+      boundaries.push_back({boundary.time, CommitSeq{10}, boundary.operation,
+                             0,
+                             boundary.operation == FactOperation::kPut
+                                 ? std::optional<Value>(boundary.value)
+                                 : std::nullopt,
+                             std::nullopt});
+    }
+    return internal::QueryDelta::MergeBoundaries(boundaries, view.facts,
+                                                  view.through);
+  };
+  auto short_view = delta.AcquireThrough(CommitSeq{11});
+  ASSERT_TRUE(short_view.ok()) << short_view.status().ToString();
+  ASSERT_EQ(short_view.ValueOrDie().facts.size(), 1U);
+  auto short_boundaries = merge(short_view.ValueOrDie());
+  ASSERT_TRUE(short_boundaries.ok()) << short_boundaries.status().ToString();
+  const auto short_intervals =
+      internal::MaterializePresentState(short_boundaries.ValueOrDie());
+  ASSERT_EQ(short_intervals.size(), 3U);
+  EXPECT_EQ(short_intervals[0].interval,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
+  EXPECT_EQ(short_intervals[1].interval,
+            (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
+  EXPECT_EQ(short_intervals[2].interval,
+            (ValidTimeInterval{ValidTime{10}, ValidTime{20}}));
+  EXPECT_EQ(std::get<int64_t>(short_intervals[1].value->data()), 3);
+
+  auto long_view = delta.AcquireThrough(CommitSeq{16});
+  ASSERT_TRUE(long_view.ok()) << long_view.status().ToString();
+  ASSERT_EQ(long_view.ValueOrDie().facts.size(), tail.size());
+  for (size_t i = 0; i < tail.size(); ++i) {
+    EXPECT_EQ(long_view.ValueOrDie().facts[i].ref, tail[i].ref);
+    EXPECT_EQ(long_view.ValueOrDie().facts[i].valid_from, tail[i].valid_from);
+    EXPECT_EQ(long_view.ValueOrDie().facts[i].commit_seq, tail[i].commit_seq);
+    EXPECT_EQ(long_view.ValueOrDie().facts[i].operation, tail[i].operation);
+    EXPECT_EQ(long_view.ValueOrDie().facts[i].value, tail[i].value);
+  }
+  auto long_boundaries = merge(long_view.ValueOrDie());
+  ASSERT_TRUE(long_boundaries.ok()) << long_boundaries.status().ToString();
+  const auto long_intervals =
+      internal::MaterializePresentState(long_boundaries.ValueOrDie());
+  ASSERT_EQ(long_intervals.size(), 5U);
+  EXPECT_EQ(long_intervals[0].interval,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
+  EXPECT_EQ(long_intervals[1].interval,
+            (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
+  EXPECT_EQ(long_intervals[2].interval,
+            (ValidTimeInterval{ValidTime{10}, ValidTime{15}}));
+  EXPECT_EQ(long_intervals[3].interval,
+            (ValidTimeInterval{ValidTime{25}, ValidTime{30}}));
+  EXPECT_EQ(long_intervals[4].interval,
+            (ValidTimeInterval{ValidTime{35}, ValidTime{40}}));
+  EXPECT_EQ(std::get<int64_t>(long_intervals[3].value->data()), 4);
+  EXPECT_EQ(std::get<int64_t>(long_intervals[4].value->data()), 5);
+
+  FactStore facts(FactStoreOptions{facts_path.string()});
+  ASSERT_TRUE(facts.Open().ok());
+  for (uint64_t commit = 1; commit <= 10; ++commit) {
+    const FactEvent fact = event(commit, commit, FactOperation::kPut, 1);
+    ASSERT_TRUE(facts.Commit(StoreCommitBatch{
+        TxnId{commit}, 100,
+        {PendingFactMutation{fact.ref, fact.valid_from, fact.operation,
+                              fact.schema_epoch, fact.value}},
+        {}})
+                    .ok());
+  }
+  for (const FactEvent& fact : tail) {
+    const PendingFactMutation mutation{fact.ref, fact.valid_from, fact.operation,
+                                       fact.schema_epoch, fact.value};
+    ASSERT_TRUE(facts.Commit(StoreCommitBatch{
+        TxnId{fact.commit_seq.value}, 100, {mutation}, {}})
+                    .ok());
+  }
+  internal::QueryDelta rebuilt({.base_seq = CommitSeq{10}, .queue_capacity = 64});
+  auto snapshot = facts.BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  ASSERT_TRUE(rebuilt.RepairThrough(facts, snapshot.ValueOrDie(), CommitSeq{16})
+                  .ok());
+  auto repaired = rebuilt.AcquireThrough(CommitSeq{16});
+  ASSERT_TRUE(repaired.ok()) << repaired.status().ToString();
+  ASSERT_EQ(repaired.ValueOrDie().facts.size(), tail.size());
+  for (size_t i = 0; i < tail.size(); ++i) {
+    EXPECT_EQ(repaired.ValueOrDie().facts[i].ref, tail[i].ref);
+    EXPECT_EQ(repaired.ValueOrDie().facts[i].valid_from, tail[i].valid_from);
+    EXPECT_EQ(repaired.ValueOrDie().facts[i].commit_seq, tail[i].commit_seq);
+    EXPECT_EQ(repaired.ValueOrDie().facts[i].operation, tail[i].operation);
+    EXPECT_EQ(repaired.ValueOrDie().facts[i].value, tail[i].value);
+  }
+  EXPECT_TRUE(rebuilt.mergeable());
+  ASSERT_TRUE(rebuilt.ResetBase(CommitSeq{16}).ok());
+  EXPECT_EQ(rebuilt.base_seq(), CommitSeq{16});
+  EXPECT_TRUE(rebuilt.AcquireThrough(CommitSeq{16}).ValueOrDie().facts.empty());
+  snapshot = StatusOr<StoreSnapshot>(Status::InvalidArgument("test", "release"));
+  ASSERT_TRUE(facts.Close().ok());
+  projection.reset();
+  std::filesystem::remove_all(root);
 }
 
 TEST(QueryDifferentialTest, OracleExpandUsesHalfOpenEdgeStateIntervals) {
@@ -530,6 +752,121 @@ TEST(QueryDifferentialTest, JourneySeedsAreDeterministic) {
     ASSERT_TRUE(journey.vertices.empty() || journey.final_arrival.value >= 1)
         << "seed=" << seed;
   }
+}
+
+TEST(QueryDifferentialTest, ProjectionAndDeltaTopologiesRemainSnapshotCorrect) {
+  char pattern[] = "/tmp/cedar_query_topology_components_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::filesystem::path root(pattern);
+  const std::filesystem::path projection_path = root / "projections";
+
+  internal::ProjectionBuild build;
+  build.manifest.database_identity = root.string();
+  build.manifest.generation_id = 1;
+  build.manifest.base_seq = CommitSeq{1};
+  internal::CoverageRegion region;
+  region.kind = internal::ProjectionKind::kState;
+  region.part_id = PartId{0};
+  region.schema_epoch = 1;
+  region.entity_min = 1;
+  region.entity_max_exclusive = 3;
+  region.valid_time = {ValidTime{0}, std::nullopt};
+  internal::SegmentDescriptor descriptor;
+  descriptor.segment_id = "topology-state";
+  descriptor.filename = "topology-state.csegment";
+  descriptor.header.kind = internal::ProjectionKind::kState;
+  descriptor.header.generation_id = 1;
+  descriptor.header.base_seq = CommitSeq{1};
+  descriptor.header.part_id = PartId{0};
+  descriptor.header.schema_epoch = 1;
+  descriptor.header.entity_min = 1;
+  descriptor.header.entity_max_exclusive = 3;
+  descriptor.header.valid_from_min = ValidTime{0};
+  internal::ProjectionChain chain;
+  chain.header = descriptor.header;
+  chain.intervals.push_back(
+      {{ValidTime{0}, std::nullopt}, Value::Int64(10), 1});
+  auto encoded = internal::EncodeProjectionPage(chain, internal::CompressionCodec::kNone);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  descriptor.file_bytes = encoded.ValueOrDie().size();
+  descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(),
+                                      encoded.ValueOrDie().size());
+  region.segments.push_back(descriptor);
+  build.manifest.regions.push_back(region);
+  build.segments.push_back({descriptor, encoded.ValueOrDie()});
+
+  auto store = internal::QueryProjectionStore::Open(
+      internal::ProjectionStoreOptions{projection_path.string(), root.string(), {}});
+  ASSERT_TRUE(store.ok()) << store.status().ToString();
+  ASSERT_TRUE(store.ValueOrDie()->Build(build).ok());
+  internal::CoverageRequest covered;
+  covered.kind = internal::ProjectionKind::kState;
+  covered.part_id = PartId{0};
+  covered.schema_epoch = 1;
+  covered.entity_min = 1;
+  covered.entity_max_exclusive = 2;
+  covered.valid_time = {ValidTime{0}, std::nullopt};
+  covered.snapshot_seq = CommitSeq{1};
+  covered.database_identity = root.string();
+  auto base = store.ValueOrDie()->ReadChains(covered);
+  ASSERT_TRUE(base.ok()) << base.status().ToString();
+  ASSERT_EQ(base.ValueOrDie().size(), 1U);
+  EXPECT_EQ(base.ValueOrDie().front().intervals.front().value,
+            Value::Int64(10));
+  covered.entity_min = 3;
+  covered.entity_max_exclusive = 4;
+  EXPECT_TRUE(store.ValueOrDie()->ReadChains(covered).status().IsNotFound());
+
+  const FactRef ref = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}},
+                                           PropertyId{1}).ref();
+  internal::QueryDelta delta({.base_seq = CommitSeq{1}, .queue_capacity = 8,
+                    .soft_memory_bytes = 1ULL << 20,
+                    .hard_memory_bytes = 2ULL << 20,
+                    .max_lag_commits = 8});
+  internal::QueryDeltaCommit short_commit{CommitSeq{2}};
+  short_commit.facts.push_back(
+      {ref, ValidTime{5}, CommitSeq{2}, FactOperation::kPut, 1,
+       Value::Int64(20), std::nullopt});
+  const Status short_status = delta.ObservePublished(short_commit);
+  ASSERT_TRUE(short_status.ok()) << short_status.ToString();
+  auto short_view = delta.AcquireThrough(CommitSeq{2});
+  ASSERT_TRUE(short_view.ok());
+  auto short_merged = internal::QueryDelta::MergeBoundaries(
+      {{ValidTime{0}, CommitSeq{1}, FactOperation::kPut, 0,
+        Value::Int64(10), std::nullopt}},
+      short_view.ValueOrDie().facts, CommitSeq{2});
+  ASSERT_TRUE(short_merged.ok());
+  auto short_intervals = MaterializePresentState(short_merged.ValueOrDie());
+  ASSERT_EQ(short_intervals.size(), 2U);
+  EXPECT_EQ(short_intervals[0].interval,
+            (ValidTimeInterval{ValidTime{0}, ValidTime{5}}));
+  EXPECT_EQ(short_intervals[1].value, Value::Int64(20));
+
+  internal::QueryDeltaCommit long_commit{CommitSeq{3}};
+  long_commit.facts.push_back(
+      {ref, ValidTime{10}, CommitSeq{3}, FactOperation::kDelete, 1,
+       std::nullopt, std::nullopt});
+  ASSERT_TRUE(delta.ObservePublished(long_commit).ok());
+  auto long_view = delta.AcquireThrough(CommitSeq{3});
+  ASSERT_TRUE(long_view.ok());
+  auto long_merged = internal::QueryDelta::MergeBoundaries(
+      {{ValidTime{0}, CommitSeq{1}, FactOperation::kPut, 0,
+        Value::Int64(10), std::nullopt}},
+      long_view.ValueOrDie().facts, CommitSeq{3});
+  ASSERT_TRUE(long_merged.ok());
+  auto long_intervals = MaterializePresentState(long_merged.ValueOrDie());
+  ASSERT_EQ(long_intervals.size(), 2U);
+  EXPECT_EQ(long_intervals[0].value, Value::Int64(10));
+  EXPECT_EQ(long_intervals[1].value, Value::Int64(20));
+  EXPECT_EQ(long_intervals[1].interval,
+            (ValidTimeInterval{ValidTime{5}, ValidTime{10}}));
+  ASSERT_TRUE(delta.RetireThrough(CommitSeq{3}).ok());
+  ASSERT_TRUE(delta.ResetBase(CommitSeq{3}).ok());
+  EXPECT_EQ(delta.base_seq(), CommitSeq{3});
+  EXPECT_TRUE(delta.mergeable());
+
+  store.ValueOrDie().reset();
+  std::filesystem::remove_all(root);
 }
 
 }  // namespace

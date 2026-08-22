@@ -1739,25 +1739,13 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     // Global metrics are always batch-level and do not require profile clocks
     // or per-row instrumentation when capture_profile is disabled.
     const auto profile_operator = ProfileOperatorFor(state_->plan);
-    uint64_t pages = 0;
-    uint64_t fragments = 0;
-    if (state_->plan.physical_plan) {
-      const auto& estimate = state_->plan.physical_plan->estimate;
-      pages = estimate.pages == 0 ? 1 : std::max<uint64_t>(1, estimate.pages * lease->backing->row_count() /
-          std::max<uint64_t>(1, estimate.rows));
-      fragments = estimate.interval_fragments == 0 ? 0 : std::max<uint64_t>(1, estimate.interval_fragments * lease->backing->row_count() /
-          std::max<uint64_t>(1, estimate.rows));
-    }
-    uint64_t physical_bytes = decoded_bytes;
-    if (state_->plan.physical_plan) {
-      const auto& estimate = state_->plan.physical_plan->estimate;
-      if (estimate.physical_bytes != 0 && estimate.rows != 0) {
-        physical_bytes = std::max<uint64_t>(1, estimate.physical_bytes *
-            lease->backing->row_count() / estimate.rows);
-      }
-    }
-    // A vector batch is the physical accounting boundary.  The byte estimate
-    // is computed for every query; profile capture only adds clocks.
+    // The output batch owns decoded-byte accounting. Physical file bytes,
+    // page counts, and interval fragments require decoder-level counters that
+    // are not retained by this materialized batch; leave them unavailable
+    // rather than relabeling planner estimates as execution actuals.
+    const uint64_t physical_bytes = 0;
+    const uint64_t pages = 0;
+    const uint64_t fragments = 0;
     state_->execution->RecordBatch(lease->backing->row_count(), decoded_bytes,
                                    state_->options.capture_profile, physical_bytes,
                                    pages, fragments, profile_operator.first,

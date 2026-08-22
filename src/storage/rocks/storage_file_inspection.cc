@@ -107,6 +107,7 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
     if (format == StorageTableFormat::kCedarStatistics) {
       const auto decoded = internal::DecodeQueryStatistics(bytes);
       metadata.checksum_valid = decoded.ok();
+      metadata.available = decoded.ok();
       if (decoded.ok()) {
         metadata.generation_id = decoded.ValueOrDie().generation_id;
         metadata.base_seq = decoded.ValueOrDie().base_seq.value;
@@ -115,6 +116,7 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
     } else if (format == StorageTableFormat::kCedarManifest) {
       const auto decoded = internal::DecodeProjectionManifest(bytes, root);
       metadata.checksum_valid = decoded.ok();
+      metadata.available = decoded.ok();
       if (decoded.ok()) {
         const auto& manifest = decoded.ValueOrDie();
         metadata.generation_id = manifest.generation_id;
@@ -132,6 +134,7 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
     } else if (format == StorageTableFormat::kCedarScratch) {
       const auto decoded = internal::DecodeScratchFile(bytes);
       metadata.checksum_valid = decoded.ok();
+      metadata.available = decoded.ok();
       if (decoded.ok()) {
         metadata.coverage = "query=" + decoded.ValueOrDie().query_id +
             ",payload_bytes=" + std::to_string(decoded.ValueOrDie().payload_bytes);
@@ -139,6 +142,7 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
     } else {
       const auto decoded = internal::DecodeProjectionPage(bytes);
       metadata.checksum_valid = decoded.ok();
+      metadata.available = decoded.ok();
       if (decoded.ok()) {
         const auto& header = decoded.ValueOrDie().header;
         metadata.generation_id = header.generation_id;

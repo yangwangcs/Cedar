@@ -133,6 +133,7 @@ void PrintJson(const std::vector<cedar::StorageFileInfo>& files) {
     if (file.query_file) {
       std::cout << ",\"query_file\":{";
       std::cout << "\"authority\":"; WriteJsonString(AuthorityName(file.query_file->authority));
+      std::cout << ",\"available\":" << (file.query_file->available ? "true" : "false");
       std::cout << ",\"checksum_valid\":" << (file.query_file->checksum_valid ? "true" : "false");
       if (file.query_file->generation_id) std::cout << ",\"generation_id\":" << *file.query_file->generation_id;
       if (file.query_file->base_seq) std::cout << ",\"base_seq\":" << *file.query_file->base_seq;
@@ -157,6 +158,7 @@ void PrintText(const std::vector<cedar::StorageFileInfo>& files) {
               << FormatBytes(file.size_bytes) << SequenceRange(file);
     if (file.query_file) {
       std::cout << " authority=" << AuthorityName(file.query_file->authority)
+                << " available=" << (file.query_file->available ? "yes" : "no")
                 << " generation=" << (file.query_file->generation_id ? std::to_string(*file.query_file->generation_id) : "-")
                 << " base=" << (file.query_file->base_seq ? std::to_string(*file.query_file->base_seq) : "-")
                 << " checksum=" << (file.query_file->checksum_valid ? "valid" : "invalid/unavailable")

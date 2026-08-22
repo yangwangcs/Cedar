@@ -11,6 +11,9 @@
 #include <cmath>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <thread>
+#include <unordered_map>
+#include <algorithm>
 
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_manifest.h"
@@ -112,14 +115,109 @@ StatusOr<QueryStatisticsSnapshot> DecodeQueryStatistics(const std::string& in) {
 std::string QueryStatisticsStore::FileName(uint64_t generation_id) { return "generation-" + std::to_string(generation_id) + ".cstats"; }
 QueryStatisticsStore::QueryStatisticsStore(std::string directory, std::string database_identity):directory_(std::move(directory)),database_identity_(std::move(database_identity)){}
 Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const std::string& schema_fingerprint) {
-  QueryStatisticsSnapshot snapshot; snapshot.database_identity=database_identity_; snapshot.schema_fingerprint=schema_fingerprint; snapshot.generation_id=manifest.generation_id; snapshot.base_seq=manifest.base_seq; for(const auto& region:manifest.regions){if(!snapshot.coverage.empty())snapshot.coverage.push_back('|');snapshot.coverage += "part="+std::to_string(region.part_id.value)+",entity=["+std::to_string(region.entity_min)+","+std::to_string(region.entity_max_exclusive)+"),valid=["+std::to_string(region.valid_time.from.value)+","+(region.valid_time.to?std::to_string(region.valid_time.to->value):"inf")+")";}
-  snapshot.columns.reserve(manifest.regions.size()); for(const auto& region:manifest.regions){QueryColumnStatistics c;c.distinct.registers.assign(size_t{1} << c.distinct.precision, 0);for(const auto& segment:region.segments){c.pages++;c.bytes+=segment.file_bytes;c.rows+=segment.header.entity_max_exclusive-segment.header.entity_min;}c.interval_count=c.rows;c.edge_count=(region.kind==ProjectionKind::kAdjacency?c.rows:0);c.entity_range=EntityRange{region.entity_min,region.entity_max_exclusive};c.valid_time_range=region.valid_time;if(c.rows!=0){c.histogram.push_back({Value::Int64(static_cast<int64_t>(c.rows)),c.rows});c.fanout.push_back({0.5,c.edge_count});c.interval_length.push_back({0.5,region.valid_time.to?region.valid_time.to->value-region.valid_time.from.value:0});c.top_values.push_back({Value::Int64(static_cast<int64_t>(region.entity_min)),c.rows});}snapshot.columns.push_back(std::move(c));} snapshot.complete=false;
+  std::lock_guard<std::mutex> refresh_lock(refresh_mutex_);
+  QueryStatisticsSnapshot snapshot;
+  snapshot.database_identity = database_identity_;
+  snapshot.schema_fingerprint = schema_fingerprint;
+  snapshot.generation_id = manifest.generation_id;
+  snapshot.base_seq = manifest.base_seq;
+  snapshot.complete = true;
+  for (const auto& region : manifest.regions) {
+    if (!snapshot.coverage.empty()) snapshot.coverage.push_back('|');
+    snapshot.coverage += "part=" + std::to_string(region.part_id.value) +
+        ",entity=[" + std::to_string(region.entity_min) + "," +
+        std::to_string(region.entity_max_exclusive) + "),valid=[" +
+        std::to_string(region.valid_time.from.value) + "," +
+        (region.valid_time.to ? std::to_string(region.valid_time.to->value) : "inf") + ")";
+  }
+  snapshot.columns.reserve(manifest.regions.size());
+  const auto update_hll = [](HllSketch* sketch, uint64_t key) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (int i = 0; i < 8; ++i) { hash ^= uint8_t(key >> (i * 8)); hash *= 1099511628211ULL; }
+    const uint64_t mask = (uint64_t{1} << sketch->precision) - 1;
+    const size_t index = static_cast<size_t>(hash & mask);
+    uint64_t rest = hash >> sketch->precision;
+    uint8_t rank = 1;
+    while (rank < 64 - sketch->precision && (rest & 1) == 0) { ++rank; rest >>= 1; }
+    sketch->registers[index] = std::max(sketch->registers[index], rank);
+  };
+  for (const auto& region : manifest.regions) {
+    QueryColumnStatistics c;
+    c.distinct.registers.assign(size_t{1} << c.distinct.precision, 0);
+    c.entity_range = EntityRange{region.entity_min, region.entity_max_exclusive};
+    c.valid_time_range = region.valid_time;
+    std::unordered_map<std::string, std::pair<Value, uint64_t>> values;
+    std::unordered_map<uint64_t, uint64_t> fanout;
+    std::vector<uint64_t> lengths;
+    std::vector<uint64_t> numeric_values;
+    for (const auto& segment : region.segments) {
+      const auto path = std::filesystem::path(directory_) / segment.filename;
+      std::ifstream in(path, std::ios::binary);
+      if (!in) { snapshot.complete = false; continue; }
+      const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      if (bytes.size() != segment.file_bytes || crc32c::Value(bytes.data(), bytes.size()) != segment.checksum) {
+        snapshot.complete = false;
+        continue;
+      }
+      auto decoded = DecodeProjectionPage(bytes);
+      if (!decoded.ok()) { snapshot.complete = false; continue; }
+      const auto& chain = decoded.ValueOrDie();
+      c.bytes += bytes.size();
+      c.pages += chain.page_directory.size();
+      for (const auto& page : chain.page_directory) c.rows += page.row_count;
+      c.interval_count += chain.intervals.size();
+      c.edge_count += region.kind == ProjectionKind::kAdjacency ? chain.intervals.size() : 0;
+      for (const auto& row : chain.intervals) {
+        update_hll(&c.distinct, row.entity_id);
+        update_hll(&c.distinct, row.entity_id ^ row.effective.from.value);
+        ++fanout[row.entity_id];
+        if (row.effective.to && row.effective.to->value >= row.effective.from.value)
+          lengths.push_back(row.effective.to->value - row.effective.from.value);
+        const std::string encoded = row.value.Encode();
+        auto it = values.find(encoded);
+        if (it == values.end()) values.emplace(encoded, std::make_pair(row.value, 1));
+        else ++it->second.second;
+        if (row.value.type() == PhysicalType::kInt32) numeric_values.push_back(static_cast<uint64_t>(std::get<int32_t>(row.value.data())));
+        else if (row.value.type() == PhysicalType::kInt64) numeric_values.push_back(static_cast<uint64_t>(std::get<int64_t>(row.value.data())));
+        else if (row.value.type() == PhysicalType::kTimestamp64) numeric_values.push_back(std::get<uint64_t>(row.value.data()));
+      }
+      for (const auto& row : chain.boundaries) {
+        update_hll(&c.distinct, row.entity_id);
+        update_hll(&c.distinct, row.entity_id ^ row.time.value);
+      }
+    }
+    if (!numeric_values.empty()) {
+      std::sort(numeric_values.begin(), numeric_values.end());
+      const size_t buckets = std::min<size_t>(128, numeric_values.size());
+      for (size_t i = 0; i < buckets; ++i) {
+        const size_t at = ((i + 1) * numeric_values.size() - 1) / buckets;
+        c.histogram.push_back({Value::Int64(static_cast<int64_t>(numeric_values[at])), at + 1});
+      }
+    }
+    std::vector<std::pair<Value, uint64_t>> top;
+    for (const auto& entry : values) top.push_back(entry.second);
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (top.size() > 64) top.erase(top.begin() + 64, top.end());
+    for (const auto& entry : top) c.top_values.push_back({entry.first, entry.second});
+    if (!fanout.empty()) {
+      std::vector<uint64_t> sample; for (const auto& entry : fanout) sample.push_back(entry.second);
+      std::sort(sample.begin(), sample.end());
+      c.fanout.push_back({0.5, sample[(sample.size() - 1) / 2]});
+      c.fanout.push_back({0.95, sample[(sample.size() * 95) / 100 < sample.size() ? (sample.size() * 95) / 100 : sample.size() - 1]});
+    }
+    if (!lengths.empty()) {
+      std::sort(lengths.begin(), lengths.end());
+      c.interval_length.push_back({0.5, lengths[(lengths.size() - 1) / 2]});
+      c.interval_length.push_back({0.95, lengths[(lengths.size() * 95) / 100 < lengths.size() ? (lengths.size() * 95) / 100 : lengths.size() - 1]});
+    }
+    snapshot.columns.push_back(std::move(c));
+  }
   auto encoded=EncodeQueryStatistics(snapshot);if(!encoded.ok())return encoded.status();
   std::error_code ec;
   std::filesystem::create_directories(std::filesystem::path(directory_) / "manifests", ec);
   if(ec)return Status::IOError("query statistics",ec.message());
   const auto path=std::filesystem::path(directory_)/FileName(manifest.generation_id);
-  const auto temp=path.string()+".tmp";
+  const auto temp=path.string()+".tmp."+std::to_string(++refresh_counter_)+"."+std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
   {std::ofstream out(temp,std::ios::binary|std::ios::trunc);if(!out)return Status::IOError("query statistics","cannot create file");out.write(encoded.ValueOrDie().data(),encoded.ValueOrDie().size());out.flush();if(!out)return Status::IOError("query statistics","write failed");}
   auto synced=SyncPath(temp,false);if(!synced.ok()){std::filesystem::remove(temp);return synced;}
   std::filesystem::rename(temp,path,ec);if(ec){std::filesystem::remove(temp);return Status::IOError("query statistics",ec.message());}
@@ -141,7 +239,7 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
   if (!manifest_bytes.ok()) return manifest_bytes.status();
   const auto manifest_path = std::filesystem::path(directory_) / "manifests" /
       (std::to_string(manifest.generation_id) + ".cmanifest");
-  const auto manifest_tmp = manifest_path.string() + ".tmp";
+  const auto manifest_tmp = manifest_path.string() + ".tmp." + std::to_string(refresh_counter_);
   { std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc); if (!out) return Status::IOError("query statistics", "cannot create generation manifest"); out.write(manifest_bytes.ValueOrDie().data(), manifest_bytes.ValueOrDie().size()); out.flush(); if (!out) return Status::IOError("query statistics", "generation manifest write failed"); }
   if (!(SyncPath(manifest_tmp, false).ok())) return Status::IOError("query statistics", "generation manifest sync failed");
   if (std::filesystem::rename(manifest_tmp, manifest_path, ec), ec) return Status::IOError("query statistics", ec.message());
@@ -155,7 +253,7 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
   Put32(&current, crc32c::Value(manifest_bytes.ValueOrDie().data(), manifest_bytes.ValueOrDie().size()));
   Put32(&current, crc32c::Value(current.data(), current.size()));
   const auto current_path = std::filesystem::path(directory_) / "CSTATS-CURRENT";
-  const auto current_tmp = current_path.string() + ".tmp";
+  const auto current_tmp = current_path.string() + ".tmp." + std::to_string(refresh_counter_);
   { std::ofstream out(current_tmp, std::ios::binary | std::ios::trunc); if (!out) return Status::IOError("query statistics", "cannot create current link"); out.write(current.data(), current.size()); out.flush(); if (!out) return Status::IOError("query statistics", "current link write failed"); }
   if (!(SyncPath(current_tmp, false).ok())) return Status::IOError("query statistics", "current link sync failed");
   if (std::filesystem::rename(current_tmp, current_path, ec), ec) return Status::IOError("query statistics", ec.message());

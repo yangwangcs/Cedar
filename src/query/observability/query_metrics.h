@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -76,9 +77,9 @@ struct QueryStatisticsSnapshot {
   CommitSeq base_seq;
   std::vector<QueryColumnStatistics> columns;
   uint32_t checksum = 0;
-  // Refresh currently produces structural/page estimates only. Such a file
-  // is deliberately unavailable to the planner until a complete statistics
-  // builder sets this bit.
+  // A snapshot is planner-usable only when every manifest-referenced segment
+  // was decoded successfully. Partial/corrupt generations remain observable
+  // but conservative.
   bool complete = false;
   bool operator==(const QueryStatisticsSnapshot&) const = default;
 };
@@ -99,6 +100,8 @@ class QueryStatisticsStore {
  private:
   std::string directory_;
   std::string database_identity_;
+  mutable std::mutex refresh_mutex_;
+  uint64_t refresh_counter_ = 0;
 };
 
 enum class QueryMetricOperator : uint8_t {

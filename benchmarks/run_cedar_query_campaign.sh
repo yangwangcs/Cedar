@@ -214,23 +214,36 @@ write_idle_overhead_artifact() {
 compare_active_overhead() {
   local baseline="$output/../write-idle-overhead.csv"
   if [[ ! -f "$baseline" ]]; then
-    baseline="${input:+$input/write-idle-overhead.csv}"
+    baseline=""
+    if [[ -n "$input" && -f "$input/write-idle-overhead.csv" ]]; then
+      baseline="$input/write-idle-overhead.csv"
+    fi
   fi
-  local idle_rate=0 idle_p99=0
-  if [[ -f "$baseline" ]]; then
+  local idle_rate="" idle_p99="" baseline_reason=""
+  if [[ -z "$baseline" ]]; then
+    baseline_reason="missing_baseline"
+  else
     idle_rate=$(awk -F, '$1=="avg_facts_per_second" {print $2}' "$baseline")
     idle_p99=$(awk -F, '$1=="avg_end_to_end_p99_us" {print $2}' "$baseline")
+    if ! awk -v value="$idle_rate" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }'; then
+      baseline_reason="invalid_avg_facts_per_second"
+    elif ! awk -v value="$idle_p99" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }'; then
+      baseline_reason="invalid_avg_end_to_end_p99_us"
+    fi
   fi
   local active_rate active_p99
   active_rate=$(awk -F, '$1=="write-active-projection-five-repeats" && $4=="true" {sum+=$6; n++} END {print n ? sum/n : 0}' "$summary")
   active_p99=$(awk -F, '$1=="write-active-projection-five-repeats" && $4=="true" {sum+=$7; n++} END {print n ? sum/n : 0}' "$summary")
-  if [[ "$idle_rate" != 0 && "$active_rate" != 0 ]] &&
+  if [[ -z "$baseline_reason" ]] &&
+     awk -v value="$active_rate" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }' &&
+     awk -v value="$active_p99" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }' &&
      awk -v i="$idle_rate" -v a="$active_rate" 'BEGIN {exit !(a >= i*0.90)}' &&
-     awk -v i="$idle_p99" -v a="$active_p99" 'BEGIN {exit !(i == 0 || a <= i*1.15)}'; then
+     awk -v i="$idle_p99" -v a="$active_p99" 'BEGIN {exit !(a <= i*1.15)}'; then
     return 0
   fi
   overall=1
-  printf '{"gate":"active_projection_overhead","pass":false,"idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s}\n' "$idle_rate" "$active_rate" "$idle_p99" "$active_p99" >> "$summary_json"
+  printf '{"gate":"active_projection_overhead","pass":false,"reason":"%s","baseline":"%s","idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s}\n' \
+    "${baseline_reason:-threshold_or_active_metric_failure}" "${baseline:-missing}" "${idle_rate:-null}" "${active_rate:-null}" "${idle_p99:-null}" "${active_p99:-null}" >> "$summary_json"
   return 1
 }
 

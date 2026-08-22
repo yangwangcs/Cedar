@@ -133,6 +133,38 @@ if(REOPEN_RC EQUAL 0 OR NOT REOPEN_SUMMARY MATCHES "reopen-verification,input-ar
 endif()
 
 execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase write-active-projection-five-repeats --duration-seconds 1
+    --facts-per-txn 1 --writers 1 --output "${OUTPUT}/active-missing-root/active-missing-baseline"
+  RESULT_VARIABLE ACTIVE_MISSING_RC)
+file(READ "${OUTPUT}/active-missing-root/active-missing-baseline/summary.jsonl" ACTIVE_MISSING_SUMMARY)
+if(ACTIVE_MISSING_RC EQUAL 0 OR NOT ACTIVE_MISSING_SUMMARY MATCHES "active_projection_overhead.*missing_baseline")
+  message(FATAL_ERROR "active phase accepted a missing baseline: ${ACTIVE_MISSING_RC}\n${ACTIVE_MISSING_SUMMARY}")
+endif()
+
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase write-idle-five-repeats --duration-seconds 1
+    --facts-per-txn 1 --writers 1 --output "${OUTPUT}/active-valid-baseline-source"
+  RESULT_VARIABLE ACTIVE_BASELINE_RC)
+if(NOT ACTIVE_BASELINE_RC MATCHES "^[01]$" OR NOT EXISTS "${OUTPUT}/write-idle-overhead.csv")
+  message(FATAL_ERROR "active baseline source campaign did not produce a usable artifact: ${ACTIVE_BASELINE_RC}")
+endif()
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase write-active-projection-five-repeats --duration-seconds 1
+    --facts-per-txn 1 --writers 1 --input "${OUTPUT}/active-valid-baseline-source"
+    --output "${OUTPUT}/active-valid-baseline"
+  RESULT_VARIABLE ACTIVE_VALID_RC)
+file(READ "${OUTPUT}/active-valid-baseline/summary.jsonl" ACTIVE_VALID_SUMMARY)
+if(NOT ACTIVE_VALID_RC MATCHES "^[01]$")
+  message(FATAL_ERROR "active phase did not complete its actual gate: ${ACTIVE_VALID_RC}\n${ACTIVE_VALID_SUMMARY}")
+endif()
+if(ACTIVE_VALID_SUMMARY MATCHES "missing_baseline" OR ACTIVE_VALID_SUMMARY MATCHES "invalid_avg_")
+  message(FATAL_ERROR "valid baseline was rejected as missing or malformed: ${ACTIVE_VALID_SUMMARY}")
+endif()
+
+execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}"
     --build-dir "${BUILD_DIR}" --phase release-calibration
     --duration-seconds 1 --unknown-option value --output "${OUTPUT}/unknown"

@@ -62,6 +62,7 @@ struct RuntimeMetrics {
   uint64_t projected_scan_pages_read = 0;
   uint64_t projected_scan_physical_bytes_read = 0;
   uint64_t canonical_scan_bytes_read = 0;
+  uint64_t canonical_read_physical_bytes = 0;
   uint64_t logical_facts_bytes = 0;
   uint64_t obsolete_fact_bytes = 0;
   uint64_t temporary_output_bytes = 0;

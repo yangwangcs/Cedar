@@ -149,6 +149,8 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.projected_scan_physical_bytes_read =
       source.projected_scan_physical_bytes_read;
   metrics.canonical_scan_bytes_read = source.canonical_scan_bytes_read;
+  metrics.canonical_read_physical_bytes =
+      source.canonical_read_physical_bytes;
   metrics.logical_facts_bytes = source.logical_facts_bytes;
   metrics.obsolete_fact_bytes = source.obsolete_sst_bytes;
   metrics.temporary_output_bytes = source.temporary_output_bytes;

@@ -26,6 +26,7 @@
 #include <rocksdb/cedar_maintenance.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <rocksdb/perf_context.h>
 #include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/statistics.h>
@@ -107,6 +108,44 @@ bool StartsWith(const rocksdb::Slice& value, const std::string& prefix) {
   return value.size() >= prefix.size() &&
          std::equal(prefix.begin(), prefix.end(), value.data());
 }
+
+uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
+  return right > UINT64_MAX - left ? UINT64_MAX : left + right;
+}
+
+uint64_t CounterDelta(uint64_t current, uint64_t before) {
+  // PerfContext counters are monotonic for the lifetime of a thread. Treat a
+  // reset defensively as zero rather than allowing unsigned underflow into a
+  // bogus physical-read total.
+  return current >= before ? current - before : 0;
+}
+
+class CanonicalReadPerfTracker {
+ public:
+  explicit CanonicalReadPerfTracker(std::atomic<uint64_t>* destination)
+      : destination_(destination), context_(rocksdb::get_perf_context()) {
+    get_read_bytes_ = context_->get_read_bytes;
+    multiget_read_bytes_ = context_->multiget_read_bytes;
+    iter_read_bytes_ = context_->iter_read_bytes;
+  }
+
+  ~CanonicalReadPerfTracker() {
+    if (destination_ == nullptr) return;
+    uint64_t delta = CounterDelta(context_->get_read_bytes, get_read_bytes_);
+    delta = SaturatingAdd(
+        delta, CounterDelta(context_->multiget_read_bytes, multiget_read_bytes_));
+    delta = SaturatingAdd(
+        delta, CounterDelta(context_->iter_read_bytes, iter_read_bytes_));
+    if (delta != 0) destination_->fetch_add(delta, std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t>* destination_;
+  rocksdb::PerfContext* context_;
+  uint64_t get_read_bytes_ = 0;
+  uint64_t multiget_read_bytes_ = 0;
+  uint64_t iter_read_bytes_ = 0;
+};
 
 bool SamePropertyDefinition(const PropertyDefinition& left,
                             const PropertyDefinition& right) {
@@ -366,6 +405,7 @@ class FactStoreImpl {
   std::atomic<uint64_t> projected_scan_pages_read{0};
   std::atomic<uint64_t> projected_scan_physical_bytes_read{0};
   std::atomic<uint64_t> canonical_scan_bytes_read{0};
+  std::atomic<uint64_t> canonical_read_physical_bytes{0};
   std::atomic<uint64_t> logical_facts_bytes{0};
   IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
   IdAllocatorState edge_allocator{IdKind::kEdge, 1};
@@ -606,6 +646,7 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
   store->point_read_operations.fetch_add(1, std::memory_order_relaxed);
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   const std::string seek = EncodeFactKey(
       ref, valid_time, CommitSeq{std::numeric_limits<uint64_t>::max()});
   if (seek.empty()) {
@@ -1465,6 +1506,7 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
       ref, valid_time, CommitSeq{std::numeric_limits<uint64_t>::max()});
   if (seek.empty()) return Status::InvalidArgument("fact read", "invalid fact key");
   const std::string prefix = seek.substr(0, kFactIdentityPrefixBytes);
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
@@ -1521,6 +1563,7 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
       return Status::InvalidArgument("fact scan", "snapshot belongs to another store");
   }
   if (!visitor) return Status::InvalidArgument("fact scan", "missing visitor");
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
@@ -1572,6 +1615,7 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
       prefix.part_id(), prefix.family(), prefix.property_id(), prefix.entity_id());
   const std::string seek_key = EncodeFactIdentityPrefix(
       prefix.part_id(), prefix.family(), prefix.property_id(), seek_entity);
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
@@ -1888,6 +1932,7 @@ StatusOr<FactEvent> FactStore::ReadExactFact(
     return Status::InvalidArgument("scan fact", "outside snapshot range");
   }
   std::string encoded;
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   const rocksdb::Status got = store->db->Get(options, store->facts_cf,
@@ -1924,6 +1969,7 @@ StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
   }
   std::vector<rocksdb::ColumnFamilyHandle*> families(keys.size(), store->facts_cf);
   std::vector<std::string> values;
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   const std::vector<rocksdb::Status> statuses =
@@ -3740,6 +3786,8 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
       store->projected_scan_physical_bytes_read.load(std::memory_order_relaxed);
   metrics.canonical_scan_bytes_read =
       store->canonical_scan_bytes_read.load(std::memory_order_relaxed);
+  metrics.canonical_read_physical_bytes =
+      store->canonical_read_physical_bytes.load(std::memory_order_relaxed);
   metrics.logical_facts_bytes =
       store->logical_facts_bytes.load(std::memory_order_relaxed);
   std::unordered_set<std::string> live_files;

@@ -118,6 +118,10 @@ CommitGroupFillMetrics GroupFillDelta(const CommitGroupFillMetrics& before,
   return delta;
 }
 
+uint64_t NondecreasingDelta(uint64_t after, uint64_t before) {
+  return after >= before ? after - before : 0;
+}
+
 std::string CsvEscape(const std::string& value) {
   std::string escaped;
   escaped.reserve(value.size() + 2);
@@ -705,7 +709,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.cache_conditioned = true;
   }
   const auto query_start = Clock::now();
-  const QueryMetricsSnapshot query_metrics_before = database->SampleQueryMetrics();
+  const auto runtime_metrics_before = database->SampleRuntimeMetrics();
   const auto query_deadline = query_start +
                               std::chrono::seconds(options.duration_seconds);
   std::vector<uint64_t> query_samples;
@@ -750,14 +754,34 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   }
   readers.clear();
   const auto query_done = Clock::now();
-  const QueryMetricsSnapshot query_metrics_after = database->SampleQueryMetrics();
+  const auto runtime_metrics_after = database->SampleRuntimeMetrics();
   result.elapsed_seconds = std::chrono::duration<double>(query_done - run_start).count();
   result.write_elapsed_seconds = std::chrono::duration<double>(write_done - write_start).count();
   result.query_elapsed_seconds = std::chrono::duration<double>(query_done - query_start).count();
-  if (query_metrics_after.physical_bytes >= query_metrics_before.physical_bytes) {
-    result.query_physical_bytes = query_metrics_after.physical_bytes -
-                                  query_metrics_before.physical_bytes;
-    result.query_bytes_complete = result.query_physical_bytes != 0;
+  if (runtime_metrics_before.ok() && runtime_metrics_after.ok()) {
+    const RuntimeMetrics& before = runtime_metrics_before.ValueOrDie();
+    const RuntimeMetrics& after = runtime_metrics_after.ValueOrDie();
+    const bool counters_monotonic =
+        after.canonical_read_physical_bytes >=
+            before.canonical_read_physical_bytes &&
+        after.projected_scan_physical_bytes_read >=
+            before.projected_scan_physical_bytes_read;
+    if (counters_monotonic) {
+      result.query_physical_bytes = NondecreasingDelta(
+          after.canonical_read_physical_bytes,
+          before.canonical_read_physical_bytes);
+      result.query_physical_bytes =
+          result.query_physical_bytes >
+                  std::numeric_limits<uint64_t>::max() -
+                      NondecreasingDelta(after.projected_scan_physical_bytes_read,
+                                         before.projected_scan_physical_bytes_read)
+              ? std::numeric_limits<uint64_t>::max()
+              : result.query_physical_bytes +
+                    NondecreasingDelta(after.projected_scan_physical_bytes_read,
+                                       before.projected_scan_physical_bytes_read);
+      // A successful sample with a zero delta is a valid cache-resident query.
+      result.query_bytes_complete = true;
+    }
   }
   result.dataset_checksum = dataset_checksum.load();
   result.transactions = transactions.load();

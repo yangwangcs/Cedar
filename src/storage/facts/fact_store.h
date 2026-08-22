@@ -173,6 +173,10 @@ struct RocksDbRuntimeMetrics {
   uint64_t projected_scan_pages_read = 0;
   uint64_t projected_scan_physical_bytes_read = 0;
   uint64_t canonical_scan_bytes_read = 0;
+  // Foreground physical bytes decoded by canonical RocksDB Get, MultiGet,
+  // and iterator reads. This is sampled from the storage adapter and does
+  // not expose the backing engine's metric types to Cedar callers.
+  uint64_t canonical_read_physical_bytes = 0;
   uint64_t logical_facts_bytes = 0;
   uint64_t obsolete_sst_bytes = 0;
   uint64_t temporary_output_bytes = 0;

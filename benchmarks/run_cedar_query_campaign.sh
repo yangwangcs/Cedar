@@ -70,7 +70,7 @@ for phase in "${phases[@]}"; do
   case "$phase" in
     release-calibration) run_case "$phase" calibration cold paused state-at 16 1 ;;
     write-idle-five-repeats) for repeat in 1 2 3 4 5; do for facts in 1 16 64 256; do for writers in 1 8; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold paused state-at "$facts" "$writers"; done; done; done ;;
-    write-active-projection-five-repeats) for repeat in 1 2 3 4 5; do for facts in 16 64; do for writers in 1 8; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold active state-at "$facts" "$writers"; done; done; done ;;
+    write-active-projection-five-repeats) for repeat in 1 2 3 4 5; do for facts in 1 16 64 256; do for writers in 1 8; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold active state-at "$facts" "$writers"; done; done; done ;;
     read-cold) for operation in state-at events changes; do run_case "$phase" "cold-${operation}" cold paused "$operation" 16 1; done ;;
     read-warm) for operation in state-at events changes; do run_case "$phase" "warm-${operation}" warm paused "$operation" 16 1; done ;;
     mixed-30-minute) for operation in state-at events; do run_case "$phase" "mixed-${operation}" cold active "$operation" 64 8; done ;;

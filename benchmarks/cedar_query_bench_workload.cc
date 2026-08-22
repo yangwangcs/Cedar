@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -15,6 +16,24 @@
 namespace cedar::benchmark {
 namespace {
 using Clock = std::chrono::steady_clock;
+constexpr uint64_t kChecksumSalt = 0x9e3779b97f4a7c15ULL;
+
+StatusOr<std::pair<uint64_t, uint64_t>> ScanFactChecksum(
+    const Snapshot& snapshot) {
+  FactScanSpec spec{PartId{1}, FactFamily::kVertexState, PropertyId{},
+                    ValidTime{1}, std::numeric_limits<uint32_t>::max()};
+  uint64_t count = 0;
+  uint64_t checksum = 0;
+  const Status status = snapshot.StateScan(spec, [&](const FactEventBatch& batch) {
+    for (const auto& event : batch.events) {
+      ++count;
+      checksum ^= event.ref.entity_id() * kChecksumSalt;
+    }
+    return Status::OK();
+  });
+  if (!status.ok()) return status;
+  return std::make_pair(count, checksum);
+}
 
 uint64_t Percentile(std::vector<uint64_t> values, uint32_t p) {
   if (values.empty()) return 0;
@@ -107,7 +126,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   auto database = std::move(opened).ConsumeValueOrDie();
   QueryBenchmarkResult result;
   result.seed = options.seed;
-  result.dataset_checksum = options.seed;
+  result.dataset_checksum = 0;
   if (!QueryBenchmarkOperationSupported(options.operation)) {
     result.operation_supported = false;
     result.terminal_status = std::string("unsupported operation: ") +
@@ -131,7 +150,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   }
 
   std::atomic<uint64_t> next_id{1}, transactions{0}, facts{0};
-  std::atomic<uint64_t> dataset_checksum{options.seed};
+  std::atomic<uint64_t> dataset_checksum{0};
   std::atomic<bool> failed{false};
   std::mutex failure_mutex, sample_mutex;
   std::string failure;
@@ -146,7 +165,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     if (!s.ok()) return s;
     transactions.fetch_add(1);
     facts.fetch_add(committed);
-    dataset_checksum.fetch_xor(first + committed * 0x9e3779b97f4a7c15ULL);
+    for (uint64_t id = first; id < first + committed; ++id)
+      dataset_checksum.fetch_xor(id * kChecksumSalt);
   }
   const auto deadline = Clock::now() +
                         std::chrono::seconds(options.duration_seconds);
@@ -165,7 +185,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       }
       transactions.fetch_add(1);
       facts.fetch_add(committed);
-      dataset_checksum.fetch_xor(first + committed * 0x9e3779b97f4a7c15ULL);
+      for (uint64_t id = first; id < first + committed; ++id)
+        dataset_checksum.fetch_xor(id * kChecksumSalt);
       const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
           Clock::now() - start).count();
       std::lock_guard<std::mutex> lock(sample_mutex);
@@ -223,6 +244,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   result.dataset_checksum = dataset_checksum.load();
   result.transactions = transactions.load();
   result.facts = facts.load();
+  result.dataset_checksum = dataset_checksum.load();
   result.rows = rows.load();
   result.query_samples = query_samples.size();
   result.query_p50_us = Percentile(query_samples, 50);
@@ -250,12 +272,12 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
         result.terminal_status = reopened.status().ToString();
       } else {
         auto snapshot = reopened.ValueOrDie()->BeginSnapshot();
-        auto found = snapshot.ok()
-                         ? snapshot.ValueOrDie().Exists(
-                               EntityFact::Vertex({PartId{1}, VertexId{1}}),
-                               ValidTime{1})
-                         : StatusOr<bool>(snapshot.status());
-        result.reopen_verified = found.ok() && found.ValueOrDie();
+        auto scanned = snapshot.ok()
+                           ? ScanFactChecksum(snapshot.ValueOrDie())
+                           : StatusOr<std::pair<uint64_t, uint64_t>>(snapshot.status());
+        result.reopen_verified = scanned.ok() &&
+                                 scanned.ValueOrDie().first == result.facts &&
+                                 scanned.ValueOrDie().second == result.dataset_checksum;
         if (!result.reopen_verified) result.terminal_status = "reopen verification failed";
         reopened.ValueOrDie()->Close().IgnoreError();
       }

@@ -1,5 +1,9 @@
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
+#include <sys/file.h>
+#include <unistd.h>
+#include <atomic>
 #include <thread>
 #include <gtest/gtest.h>
 
@@ -55,6 +59,32 @@ TEST(QueryObservabilityTest, MetricsExposeOnlyBoundedEnumLabels) {
   EXPECT_EQ(snapshot.operator_rows[static_cast<size_t>(QueryMetricOperator::kScan)], 4U);
   EXPECT_EQ(snapshot.batches, 1U);
   EXPECT_EQ(snapshot.spill_bytes, 8U);
+}
+
+TEST(QueryObservabilityTest, MetricsCoverRequiredDimensionsWithFixedStorage) {
+  QueryMetrics metrics;
+  metrics.AddAdmission(QueryMetricAdmission::kQueued);
+  metrics.AddProjection(QueryMetricProjection::kHit);
+  metrics.AddProjectionHealth(QueryMetricProjectionHealth::kHealthy);
+  metrics.AddAdjacencyPruning(QueryMetricAdjacencyPruning::kPruned);
+  metrics.AddLabelDominance(QueryMetricLabelDominance::kDominant);
+  metrics.AddMemoryBytes(32);
+  metrics.AddScratchBytes(16);
+  metrics.ObserveLatencyUs(1000);
+  metrics.ObserveAdmissionWaitUs(4);
+  metrics.ObserveWorkerWaitUs(8);
+  metrics.ObserveIoWaitUs(16);
+  metrics.ObserveDeltaLag(2);
+  const auto snapshot = metrics.Snapshot();
+  EXPECT_EQ(snapshot.admission[static_cast<size_t>(QueryMetricAdmission::kQueued)], 1U);
+  EXPECT_EQ(snapshot.projection[static_cast<size_t>(QueryMetricProjection::kHit)], 1U);
+  EXPECT_EQ(snapshot.projection_health[static_cast<size_t>(QueryMetricProjectionHealth::kHealthy)], 1U);
+  EXPECT_EQ(snapshot.adjacency_pruning[static_cast<size_t>(QueryMetricAdjacencyPruning::kPruned)], 1U);
+  EXPECT_EQ(snapshot.label_dominance[static_cast<size_t>(QueryMetricLabelDominance::kDominant)], 1U);
+  EXPECT_EQ(snapshot.memory_bytes, 32U);
+  EXPECT_EQ(snapshot.scratch_bytes, 16U);
+  EXPECT_EQ(snapshot.latency_us[9], 1U);
+  EXPECT_EQ(snapshot.admission_wait_us[2], 1U);
 }
 
 TEST(QueryObservabilityTest, StatisticsStorePublishesCstats) {
@@ -113,6 +143,78 @@ TEST(QueryObservabilityTest, RefreshRejectsOlderGenerationAfterCurrentAdvances) 
   stale.base_seq = CommitSeq{11};
   QueryStatisticsStore store(root.string(), root.string());
   EXPECT_TRUE(store.Refresh(stale, "schema").IsConflict());
+  EXPECT_FALSE(std::filesystem::exists(root / "CSTATS-CURRENT"));
+  std::filesystem::remove_all(root);
+}
+
+TEST(QueryObservabilityTest, RefreshRejectsForeignOrSchemaMismatchedManifest) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar_stats_manifest_identity_test";
+  std::filesystem::remove_all(root);
+  QueryStatisticsStore store(root.string(), root.string());
+
+  ProjectionManifest foreign;
+  foreign.database_identity = root.string() + ".foreign";
+  foreign.generation_id = 21;
+  foreign.base_seq = CommitSeq{30};
+  EXPECT_TRUE(store.Refresh(foreign, "schema").IsIdentityConflict());
+  EXPECT_FALSE(std::filesystem::exists(root / "CSTATS-CURRENT"));
+
+  ProjectionManifest mismatched;
+  mismatched.database_identity = root.string();
+  mismatched.generation_id = 22;
+  mismatched.base_seq = CommitSeq{31};
+  mismatched.schema_fingerprints = {"schema-v1"};
+  EXPECT_TRUE(store.Refresh(mismatched, "schema-v2").IsConflict());
+  EXPECT_FALSE(std::filesystem::exists(root / "CSTATS-CURRENT"));
+
+  std::filesystem::remove_all(root);
+}
+
+TEST(QueryObservabilityTest, RefreshPublicationLockSerializesProjectionAdvance) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar_stats_publication_lock_test";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "manifests");
+  ProjectionManifest stale;
+  stale.database_identity = root.string();
+  stale.generation_id = 31;
+  stale.base_seq = CommitSeq{40};
+  auto stale_bytes = EncodeProjectionManifest(stale);
+  ASSERT_TRUE(stale_bytes.ok()) << stale_bytes.status().ToString();
+  { std::ofstream out(root / "manifests" / "31.cmanifest", std::ios::binary);
+    out.write(stale_bytes.ValueOrDie().data(), stale_bytes.ValueOrDie().size()); }
+
+  const int lock_fd = ::open((root / "CQUERY-PUBLISH.lock").c_str(), O_RDWR | O_CREAT, 0644);
+  ASSERT_GE(lock_fd, 0);
+  ASSERT_EQ(::flock(lock_fd, LOCK_EX), 0);
+  std::atomic<bool> done{false};
+  Status refresh_status;
+  QueryStatisticsStore store(root.string(), root.string());
+  std::thread refresh_thread([&] {
+    refresh_status = store.Refresh(stale, "schema");
+    done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_FALSE(done.load(std::memory_order_acquire));
+
+  ProjectionManifest newer = stale;
+  newer.generation_id = 32;
+  newer.base_seq = CommitSeq{41};
+  auto newer_bytes = EncodeProjectionManifest(newer);
+  ASSERT_TRUE(newer_bytes.ok()) << newer_bytes.status().ToString();
+  { std::ofstream out(root / "manifests" / "32.cmanifest", std::ios::binary);
+    out.write(newer_bytes.ValueOrDie().data(), newer_bytes.ValueOrDie().size()); }
+  std::string pointer("CPC1", 4);
+  for (int i = 0; i < 8; ++i) pointer.push_back(char(newer.generation_id >> (i * 8)));
+  const uint32_t crc = crc32c::Value(pointer.data(), pointer.size());
+  for (int i = 0; i < 4; ++i) pointer.push_back(char(crc >> (i * 8)));
+  { std::ofstream out(root / "PROJECTION-CURRENT", std::ios::binary | std::ios::trunc);
+    out.write(pointer.data(), pointer.size()); }
+  ASSERT_EQ(::flock(lock_fd, LOCK_UN), 0);
+  ::close(lock_fd);
+  refresh_thread.join();
+  EXPECT_TRUE(refresh_status.IsConflict()) << refresh_status.ToString();
   EXPECT_FALSE(std::filesystem::exists(root / "CSTATS-CURRENT"));
   std::filesystem::remove_all(root);
 }

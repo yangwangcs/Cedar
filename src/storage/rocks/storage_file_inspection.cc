@@ -135,10 +135,10 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
       const auto decoded = internal::DecodeScratchFile(bytes);
       metadata.checksum_valid = decoded.ok();
       metadata.available = decoded.ok();
-      if (decoded.ok()) {
-        metadata.coverage = "query=" + decoded.ValueOrDie().query_id +
-            ",payload_bytes=" + std::to_string(decoded.ValueOrDie().payload_bytes);
-      }
+      // Scratch files are query-instance artifacts.  Their framing carries
+      // a query id and payload length for integrity/budget accounting, but
+      // neither is canonical coverage and must not become an inspection
+      // label.  Leave coverage empty until a manifest-derived range exists.
     } else {
       const auto decoded = internal::DecodeProjectionPage(bytes);
       metadata.checksum_valid = decoded.ok();

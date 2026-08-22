@@ -1,6 +1,7 @@
 #include "query/projection/projection_store.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -14,6 +15,47 @@
 namespace cedar::internal {
 namespace {
 namespace fs = std::filesystem;
+
+class PublicationFileLock {
+ public:
+  explicit PublicationFileLock(int fd) : fd_(fd) {}
+  PublicationFileLock(const PublicationFileLock&) = delete;
+  PublicationFileLock& operator=(const PublicationFileLock&) = delete;
+  PublicationFileLock(PublicationFileLock&& other) noexcept : fd_(other.fd_) {
+    other.fd_ = -1;
+  }
+  PublicationFileLock& operator=(PublicationFileLock&& other) noexcept {
+    if (this != &other) {
+      if (fd_ >= 0) {
+        ::flock(fd_, LOCK_UN);
+        ::close(fd_);
+      }
+      fd_ = other.fd_;
+      other.fd_ = -1;
+    }
+    return *this;
+  }
+  ~PublicationFileLock() {
+    if (fd_ >= 0) {
+      ::flock(fd_, LOCK_UN);
+      ::close(fd_);
+    }
+  }
+
+ private:
+  int fd_ = -1;
+};
+
+StatusOr<PublicationFileLock> AcquirePublicationFileLock(const fs::path& directory) {
+  const int fd = ::open((directory / "CQUERY-PUBLISH.lock").c_str(),
+                        O_RDWR | O_CREAT, 0644);
+  if (fd < 0) return Status::IOError("projection store", "cannot open publication lock");
+  if (::flock(fd, LOCK_EX) != 0) {
+    ::close(fd);
+    return Status::IOError("projection store", "cannot acquire publication lock");
+  }
+  return PublicationFileLock(fd);
+}
 
 Status SyncFile(const fs::path& path) {
   const int fd = ::open(path.c_str(), O_RDONLY);
@@ -259,6 +301,8 @@ Status QueryProjectionStore::PublishCurrent(uint64_t generation) {
 
 Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   std::lock_guard<std::mutex> build_lock(mutex_);
+  auto publication_lock = AcquirePublicationFileLock(projections_path_);
+  if (!publication_lock.ok()) return publication_lock.status();
   const Status manifest_status = ValidateProjectionManifest(build.manifest, options_.database_identity);
   if (!manifest_status.ok()) return manifest_status;
   if (build.manifest.generation_id == 0 || (current_ && build.manifest.generation_id <= current_->manifest.generation_id)) return Status::Conflict("projection store", "generation is not strictly newer");

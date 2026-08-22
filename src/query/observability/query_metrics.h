@@ -102,6 +102,7 @@ class QueryStatisticsStore {
   std::string database_identity_;
   mutable std::mutex refresh_mutex_;
   uint64_t refresh_counter_ = 0;
+  std::optional<uint64_t> latest_generation_id_;
 };
 
 enum class QueryMetricOperator : uint8_t {
@@ -114,16 +115,47 @@ enum class QueryMetricTerminal : uint8_t {
 enum class QueryMetricFallback : uint8_t {
   kNone = 0, kCanonical, kDelta, kUntrustedStatistics, kCount,
 };
+enum class QueryMetricAdmission : uint8_t {
+  kAdmitted = 0, kQueued, kRejected, kCount,
+};
+enum class QueryMetricProjection : uint8_t {
+  kHit = 0, kFallback, kCount,
+};
+enum class QueryMetricProjectionHealth : uint8_t {
+  kHealthy = 0, kHole, kCorrupt, kStale, kCount,
+};
+enum class QueryMetricAdjacencyPruning : uint8_t {
+  kPruned = 0, kExpanded, kCount,
+};
+enum class QueryMetricLabelDominance : uint8_t {
+  kBalanced = 0, kDominant, kCount,
+};
+
+constexpr size_t kQueryMetricHistogramBuckets = 16;
+
+using QueryMetricHistogram = std::array<uint64_t, kQueryMetricHistogramBuckets>;
 
 struct QueryMetricsSnapshot {
   std::array<uint64_t, static_cast<size_t>(QueryMetricOperator::kCount)> operator_rows{};
   std::array<uint64_t, static_cast<size_t>(QueryMetricTerminal::kCount)> terminal{};
   std::array<uint64_t, static_cast<size_t>(QueryMetricFallback::kCount)> fallback{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricAdmission::kCount)> admission{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricProjection::kCount)> projection{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricProjectionHealth::kCount)> projection_health{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricAdjacencyPruning::kCount)> adjacency_pruning{};
+  std::array<uint64_t, static_cast<size_t>(QueryMetricLabelDominance::kCount)> label_dominance{};
+  QueryMetricHistogram latency_us{};
+  QueryMetricHistogram admission_wait_us{};
+  QueryMetricHistogram worker_wait_us{};
+  QueryMetricHistogram io_wait_us{};
+  QueryMetricHistogram delta_lag{};
   uint64_t batches = 0;
   uint64_t physical_bytes = 0;
   uint64_t decoded_bytes = 0;
   uint64_t interval_fragments = 0;
   uint64_t spill_bytes = 0;
+  uint64_t memory_bytes = 0;
+  uint64_t scratch_bytes = 0;
 };
 
 class QueryMetrics {
@@ -133,6 +165,18 @@ class QueryMetrics {
   void AddTerminal(QueryMetricTerminal terminal);
   void AddFallback(QueryMetricFallback fallback);
   void AddSpillBytes(uint64_t bytes);
+  void AddAdmission(QueryMetricAdmission admission);
+  void AddProjection(QueryMetricProjection projection);
+  void AddProjectionHealth(QueryMetricProjectionHealth health);
+  void AddAdjacencyPruning(QueryMetricAdjacencyPruning pruning);
+  void AddLabelDominance(QueryMetricLabelDominance dominance);
+  void AddMemoryBytes(uint64_t bytes);
+  void AddScratchBytes(uint64_t bytes);
+  void ObserveLatencyUs(uint64_t microseconds);
+  void ObserveAdmissionWaitUs(uint64_t microseconds);
+  void ObserveWorkerWaitUs(uint64_t microseconds);
+  void ObserveIoWaitUs(uint64_t microseconds);
+  void ObserveDeltaLag(uint64_t commits);
   QueryMetricsSnapshot Snapshot() const;
   // Labels are fixed Cedar enums. There is intentionally no string-label API:
   // query ids, text, properties, parameters, and user values cannot enter
@@ -140,16 +184,34 @@ class QueryMetrics {
   Status RegisterLabel(QueryMetricOperator);
   Status RegisterLabel(QueryMetricTerminal);
   Status RegisterLabel(QueryMetricFallback);
+  Status RegisterLabel(QueryMetricAdmission);
+  Status RegisterLabel(QueryMetricProjection);
+  Status RegisterLabel(QueryMetricProjectionHealth);
+  Status RegisterLabel(QueryMetricAdjacencyPruning);
+  Status RegisterLabel(QueryMetricLabelDominance);
 
  private:
+  static size_t HistogramBucket(uint64_t value);
   std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricOperator::kCount)> operator_rows_{};
   std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricTerminal::kCount)> terminal_{};
   std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricFallback::kCount)> fallback_{};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricAdmission::kCount)> admission_{};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricProjection::kCount)> projection_{};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricProjectionHealth::kCount)> projection_health_{};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricAdjacencyPruning::kCount)> adjacency_pruning_{};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(QueryMetricLabelDominance::kCount)> label_dominance_{};
+  std::array<std::atomic<uint64_t>, kQueryMetricHistogramBuckets> latency_us_{};
+  std::array<std::atomic<uint64_t>, kQueryMetricHistogramBuckets> admission_wait_us_{};
+  std::array<std::atomic<uint64_t>, kQueryMetricHistogramBuckets> worker_wait_us_{};
+  std::array<std::atomic<uint64_t>, kQueryMetricHistogramBuckets> io_wait_us_{};
+  std::array<std::atomic<uint64_t>, kQueryMetricHistogramBuckets> delta_lag_{};
   std::atomic<uint64_t> batches_{0};
   std::atomic<uint64_t> physical_bytes_{0};
   std::atomic<uint64_t> decoded_bytes_{0};
   std::atomic<uint64_t> interval_fragments_{0};
   std::atomic<uint64_t> spill_bytes_{0};
+  std::atomic<uint64_t> memory_bytes_{0};
+  std::atomic<uint64_t> scratch_bytes_{0};
 };
 }  // namespace internal
 }  // namespace cedar

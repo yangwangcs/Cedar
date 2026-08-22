@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <fstream>
 #include <limits>
 #include <cstring>
@@ -20,6 +21,48 @@
 
 namespace cedar::internal {
 namespace {
+class PublicationFileLock {
+ public:
+  explicit PublicationFileLock(int fd) : fd_(fd) {}
+  PublicationFileLock(const PublicationFileLock&) = delete;
+  PublicationFileLock& operator=(const PublicationFileLock&) = delete;
+  PublicationFileLock(PublicationFileLock&& other) noexcept : fd_(other.fd_) {
+    other.fd_ = -1;
+  }
+  PublicationFileLock& operator=(PublicationFileLock&& other) noexcept {
+    if (this != &other) {
+      if (fd_ >= 0) {
+        ::flock(fd_, LOCK_UN);
+        ::close(fd_);
+      }
+      fd_ = other.fd_;
+      other.fd_ = -1;
+    }
+    return *this;
+  }
+  ~PublicationFileLock() {
+    if (fd_ >= 0) {
+      ::flock(fd_, LOCK_UN);
+      ::close(fd_);
+    }
+  }
+
+ private:
+  int fd_ = -1;
+};
+
+StatusOr<PublicationFileLock> AcquirePublicationFileLock(
+    const std::filesystem::path& directory) {
+  const auto path = directory / "CQUERY-PUBLISH.lock";
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  if (fd < 0) return Status::IOError("query statistics", "cannot open publication lock");
+  if (::flock(fd, LOCK_EX) != 0) {
+    ::close(fd);
+    return Status::IOError("query statistics", "cannot acquire publication lock");
+  }
+  return PublicationFileLock(fd);
+}
+
 void Put32(std::string* out, uint32_t value) {
   for (int i = 0; i < 4; ++i) out->push_back(static_cast<char>(value >> (i * 8)));
 }
@@ -157,6 +200,19 @@ std::string QueryStatisticsStore::FileName(uint64_t generation_id) { return "gen
 QueryStatisticsStore::QueryStatisticsStore(std::string directory, std::string database_identity):directory_(std::move(directory)),database_identity_(std::move(database_identity)){}
 Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const std::string& schema_fingerprint) {
   std::lock_guard<std::mutex> refresh_lock(refresh_mutex_);
+  const Status manifest_status = ValidateProjectionManifest(manifest, database_identity_);
+  if (!manifest_status.ok()) return manifest_status;
+  if (!manifest.schema_fingerprints.empty() &&
+      (schema_fingerprint.empty() ||
+       std::find(manifest.schema_fingerprints.begin(), manifest.schema_fingerprints.end(),
+                 schema_fingerprint) == manifest.schema_fingerprints.end())) {
+    return Status::Conflict("query statistics", "statistics schema does not match projection manifest");
+  }
+  std::error_code directory_error;
+  std::filesystem::create_directories(directory_, directory_error);
+  if (directory_error) return Status::IOError("query statistics", directory_error.message());
+  auto publication_lock = AcquirePublicationFileLock(directory_);
+  if (!publication_lock.ok()) return publication_lock.status();
   if (latest_generation_id_ && manifest.generation_id < *latest_generation_id_) {
     return Status::Conflict("query statistics", "statistics refresh generation is stale");
   }
@@ -170,6 +226,13 @@ Status QueryStatisticsStore::Refresh(const ProjectionManifest& manifest, const s
     }
     if (current_manifest.base_seq != manifest.base_seq) {
       return Status::Conflict("query statistics", "statistics refresh base is stale");
+    }
+    if (!current_manifest.schema_fingerprints.empty() &&
+        (schema_fingerprint.empty() ||
+         std::find(current_manifest.schema_fingerprints.begin(),
+                   current_manifest.schema_fingerprints.end(), schema_fingerprint) ==
+             current_manifest.schema_fingerprints.end())) {
+      return Status::Conflict("query statistics", "current projection schema does not match");
     }
     return Status::OK();
   };
@@ -367,12 +430,120 @@ StatusOr<QueryStatisticsSnapshot> QueryStatisticsStore::Load(uint64_t generation
   auto decoded=DecodeQueryStatistics(bytes);if(!decoded.ok())return decoded.status();const auto& s=decoded.ValueOrDie();if(s.database_identity!=database_identity_||s.generation_id!=generation_id||s.base_seq!=base_seq||s.complete!=reference.complete||(s.complete&&s.schema_fingerprint.empty())||(!schema_fingerprint.empty()&&s.schema_fingerprint!=schema_fingerprint))return Status::Conflict("query statistics","statistics identity is stale");return decoded;
 }
 
-void QueryMetrics::AddBatch(QueryMetricOperator op,uint64_t rows,uint64_t physical_bytes,uint64_t decoded_bytes,uint64_t interval_fragments){const auto i=static_cast<size_t>(op);if(i>=operator_rows_.size())return;operator_rows_[i].fetch_add(rows);batches_.fetch_add(1);physical_bytes_.fetch_add(physical_bytes);decoded_bytes_.fetch_add(decoded_bytes);interval_fragments_.fetch_add(interval_fragments);}
-void QueryMetrics::AddTerminal(QueryMetricTerminal t){const auto i=static_cast<size_t>(t);if(i<terminal_.size())terminal_[i].fetch_add(1);}
-void QueryMetrics::AddFallback(QueryMetricFallback f){const auto i=static_cast<size_t>(f);if(i<fallback_.size())fallback_[i].fetch_add(1);}
-void QueryMetrics::AddSpillBytes(uint64_t b){spill_bytes_.fetch_add(b);}
-QueryMetricsSnapshot QueryMetrics::Snapshot() const {QueryMetricsSnapshot s;for(size_t i=0;i<s.operator_rows.size();++i)s.operator_rows[i]=operator_rows_[i].load();for(size_t i=0;i<s.terminal.size();++i)s.terminal[i]=terminal_[i].load();for(size_t i=0;i<s.fallback.size();++i)s.fallback[i]=fallback_[i].load();s.batches=batches_.load();s.physical_bytes=physical_bytes_.load();s.decoded_bytes=decoded_bytes_.load();s.interval_fragments=interval_fragments_.load();s.spill_bytes=spill_bytes_.load();return s;}
-Status QueryMetrics::RegisterLabel(QueryMetricOperator op){return static_cast<size_t>(op)<operator_rows_.size()?Status::OK():Status::InvalidArgument("query metrics","operator label is out of bounds");}
-Status QueryMetrics::RegisterLabel(QueryMetricTerminal t){return static_cast<size_t>(t)<terminal_.size()?Status::OK():Status::InvalidArgument("query metrics","terminal label is out of bounds");}
-Status QueryMetrics::RegisterLabel(QueryMetricFallback f){return static_cast<size_t>(f)<fallback_.size()?Status::OK():Status::InvalidArgument("query metrics","fallback label is out of bounds");}
+void QueryMetrics::AddBatch(QueryMetricOperator op, uint64_t rows,
+                            uint64_t physical_bytes, uint64_t decoded_bytes,
+                            uint64_t interval_fragments) {
+  const auto i = static_cast<size_t>(op);
+  if (i >= operator_rows_.size()) return;
+  operator_rows_[i].fetch_add(rows);
+  batches_.fetch_add(1);
+  physical_bytes_.fetch_add(physical_bytes);
+  decoded_bytes_.fetch_add(decoded_bytes);
+  interval_fragments_.fetch_add(interval_fragments);
+}
+void QueryMetrics::AddTerminal(QueryMetricTerminal t) {
+  const auto i = static_cast<size_t>(t);
+  if (i < terminal_.size()) terminal_[i].fetch_add(1);
+}
+void QueryMetrics::AddFallback(QueryMetricFallback f) {
+  const auto i = static_cast<size_t>(f);
+  if (i < fallback_.size()) fallback_[i].fetch_add(1);
+}
+void QueryMetrics::AddSpillBytes(uint64_t b) { spill_bytes_.fetch_add(b); }
+void QueryMetrics::AddAdmission(QueryMetricAdmission value) {
+  const auto i = static_cast<size_t>(value);
+  if (i < admission_.size()) admission_[i].fetch_add(1);
+}
+void QueryMetrics::AddProjection(QueryMetricProjection value) {
+  const auto i = static_cast<size_t>(value);
+  if (i < projection_.size()) projection_[i].fetch_add(1);
+}
+void QueryMetrics::AddProjectionHealth(QueryMetricProjectionHealth value) {
+  const auto i = static_cast<size_t>(value);
+  if (i < projection_health_.size()) projection_health_[i].fetch_add(1);
+}
+void QueryMetrics::AddAdjacencyPruning(QueryMetricAdjacencyPruning value) {
+  const auto i = static_cast<size_t>(value);
+  if (i < adjacency_pruning_.size()) adjacency_pruning_[i].fetch_add(1);
+}
+void QueryMetrics::AddLabelDominance(QueryMetricLabelDominance value) {
+  const auto i = static_cast<size_t>(value);
+  if (i < label_dominance_.size()) label_dominance_[i].fetch_add(1);
+}
+void QueryMetrics::AddMemoryBytes(uint64_t bytes) { memory_bytes_.fetch_add(bytes); }
+void QueryMetrics::AddScratchBytes(uint64_t bytes) { scratch_bytes_.fetch_add(bytes); }
+size_t QueryMetrics::HistogramBucket(uint64_t value) {
+  size_t bucket = 0;
+  while (value > 1 && bucket + 1 < kQueryMetricHistogramBuckets) {
+    value >>= 1;
+    ++bucket;
+  }
+  return bucket;
+}
+void QueryMetrics::ObserveLatencyUs(uint64_t value) {
+  latency_us_[HistogramBucket(value)].fetch_add(1);
+}
+void QueryMetrics::ObserveAdmissionWaitUs(uint64_t value) {
+  admission_wait_us_[HistogramBucket(value)].fetch_add(1);
+}
+void QueryMetrics::ObserveWorkerWaitUs(uint64_t value) {
+  worker_wait_us_[HistogramBucket(value)].fetch_add(1);
+}
+void QueryMetrics::ObserveIoWaitUs(uint64_t value) {
+  io_wait_us_[HistogramBucket(value)].fetch_add(1);
+}
+void QueryMetrics::ObserveDeltaLag(uint64_t value) {
+  delta_lag_[HistogramBucket(value)].fetch_add(1);
+}
+
+QueryMetricsSnapshot QueryMetrics::Snapshot() const {
+  QueryMetricsSnapshot s;
+  for (size_t i = 0; i < s.operator_rows.size(); ++i) s.operator_rows[i] = operator_rows_[i].load();
+  for (size_t i = 0; i < s.terminal.size(); ++i) s.terminal[i] = terminal_[i].load();
+  for (size_t i = 0; i < s.fallback.size(); ++i) s.fallback[i] = fallback_[i].load();
+  for (size_t i = 0; i < s.admission.size(); ++i) s.admission[i] = admission_[i].load();
+  for (size_t i = 0; i < s.projection.size(); ++i) s.projection[i] = projection_[i].load();
+  for (size_t i = 0; i < s.projection_health.size(); ++i) s.projection_health[i] = projection_health_[i].load();
+  for (size_t i = 0; i < s.adjacency_pruning.size(); ++i) s.adjacency_pruning[i] = adjacency_pruning_[i].load();
+  for (size_t i = 0; i < s.label_dominance.size(); ++i) s.label_dominance[i] = label_dominance_[i].load();
+  for (size_t i = 0; i < s.latency_us.size(); ++i) {
+    s.latency_us[i] = latency_us_[i].load();
+    s.admission_wait_us[i] = admission_wait_us_[i].load();
+    s.worker_wait_us[i] = worker_wait_us_[i].load();
+    s.io_wait_us[i] = io_wait_us_[i].load();
+    s.delta_lag[i] = delta_lag_[i].load();
+  }
+  s.batches = batches_.load();
+  s.physical_bytes = physical_bytes_.load();
+  s.decoded_bytes = decoded_bytes_.load();
+  s.interval_fragments = interval_fragments_.load();
+  s.spill_bytes = spill_bytes_.load();
+  s.memory_bytes = memory_bytes_.load();
+  s.scratch_bytes = scratch_bytes_.load();
+  return s;
+}
+Status QueryMetrics::RegisterLabel(QueryMetricOperator value) {
+  return static_cast<size_t>(value) < operator_rows_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "operator label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricTerminal value) {
+  return static_cast<size_t>(value) < terminal_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "terminal label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricFallback value) {
+  return static_cast<size_t>(value) < fallback_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "fallback label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricAdmission value) {
+  return static_cast<size_t>(value) < admission_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "admission label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricProjection value) {
+  return static_cast<size_t>(value) < projection_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "projection label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricProjectionHealth value) {
+  return static_cast<size_t>(value) < projection_health_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "projection health label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricAdjacencyPruning value) {
+  return static_cast<size_t>(value) < adjacency_pruning_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "adjacency pruning label is out of bounds");
+}
+Status QueryMetrics::RegisterLabel(QueryMetricLabelDominance value) {
+  return static_cast<size_t>(value) < label_dominance_.size() ? Status::OK() : Status::InvalidArgument("query metrics", "label dominance label is out of bounds");
+}
 }  // namespace cedar::internal

@@ -98,6 +98,64 @@ uint64_t Percentile(std::vector<uint64_t> values, uint32_t p) {
   return values[std::min(values.size() - 1, rank - 1)];
 }
 
+CommitGroupFillMetrics GroupFillDelta(const CommitGroupFillMetrics& before,
+                                      const CommitGroupFillMetrics& after) {
+  CommitGroupFillMetrics delta;
+  delta.groups = after.groups >= before.groups ? after.groups - before.groups : 0;
+  delta.total_transactions =
+      after.total_transactions >= before.total_transactions
+          ? after.total_transactions - before.total_transactions
+          : 0;
+  for (size_t index = 0; index < delta.buckets.size(); ++index) {
+    delta.buckets[index] = after.buckets[index] >= before.buckets[index]
+                               ? after.buckets[index] - before.buckets[index]
+                               : 0;
+  }
+  // The cumulative max cannot be subtracted.  Bound it by the timed
+  // transaction count so seed/setup groups cannot become the timed maximum.
+  delta.max_transactions = std::min(after.max_transactions,
+                                    delta.total_transactions);
+  return delta;
+}
+
+std::string CsvEscape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('"');
+  for (const char c : value) {
+    if (c == '"') escaped.push_back('"');
+    escaped.push_back(c);
+  }
+  escaped.push_back('"');
+  return escaped;
+}
+
+std::string JsonEscape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (const unsigned char c : value) {
+    switch (c) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\f': escaped += "\\f"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          constexpr char kHex[] = "0123456789abcdef";
+          escaped += "\\u00";
+          escaped.push_back(kHex[c >> 4]);
+          escaped.push_back(kHex[c & 0x0f]);
+        } else {
+          escaped.push_back(static_cast<char>(c));
+        }
+    }
+  }
+  return escaped;
+}
+
 Status CommitFacts(Database* db, uint64_t first, uint64_t count,
                    uint64_t* committed) {
   auto txn = db->BeginTransaction();
@@ -278,11 +336,13 @@ Status ExecuteOperation(Database* database, Snapshot& snapshot,
       for (int64_t entity = 1; entity <= 4; ++entity) {
         internal::RelationalRow row;
         row.cells.push_back(
-            internal::RelationalCell::Present(QueryType::kInt64, entity));
+            internal::RelationalCell::Present(QueryType::kInt64, 1));
         row.cells.push_back(
             internal::RelationalCell::Present(QueryType::kInt64, entity));
         row.effective = ValidTimeInterval{
-            ValidTime{0}, std::optional<ValidTime>{ValidTime{100}}};
+            ValidTime{static_cast<uint64_t>(entity * 10)},
+            std::optional<ValidTime>{
+                ValidTime{static_cast<uint64_t>(entity * 10 + 10)}}};
         input_rows.push_back(std::move(row));
       }
       internal::QueryReservation reservation(32ULL << 20);
@@ -596,6 +656,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.maintenance_status = "refresh-complete";
     result.maintenance_observed = true;
   }
+  const CommitPipelineMetrics pipeline_before_write =
+      database->GetCommitPipelineMetrics();
   const auto write_start = Clock::now();
   const auto deadline = write_start +
                         std::chrono::seconds(options.duration_seconds);
@@ -627,6 +689,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   for (uint32_t i = 0; i < options.writers; ++i) writers.emplace_back(writer);
   writers.clear();
   const auto write_done = Clock::now();
+  const CommitPipelineMetrics pipeline_after_write =
+      database->GetCommitPipelineMetrics();
   if (failed.load()) result.terminal_status = failure;
 
   if (options.cache == QueryCacheState::kWarm) {
@@ -716,6 +780,9 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   result.write_p95_us = Percentile(write_samples, 95);
   result.write_p99_us = Percentile(write_samples, 99);
   const CommitPipelineMetrics pipeline = database->GetCommitPipelineMetrics();
+  const CommitGroupFillMetrics timed_group_fill =
+      GroupFillDelta(pipeline_before_write.group_fill,
+                     pipeline_after_write.group_fill);
   result.wal_sync_p99_us =
       pipeline.latency.wal_sync.ApproximatePercentile(99);
   result.end_to_end_p99_us =
@@ -728,7 +795,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                                ? static_cast<double>(result.rows) /
                                      result.query_elapsed_seconds
                                : 0.0;
-  result.group_fill_p50 = pipeline.group_fill.ApproximatePercentile(50);
+  result.group_fill_p50 = timed_group_fill.ApproximatePercentile(50);
   result.metrics_complete = pipeline.latency.wal_sync.count > 0 &&
                             pipeline.latency.end_to_end.count > 0 &&
                             !query_samples.empty() && result.rows > 0;
@@ -808,9 +875,10 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
   std::ostringstream x;
   const double t = r.write_elapsed_seconds ? r.measured_transactions / r.write_elapsed_seconds : 0;
   const double f = r.write_elapsed_seconds ? r.measured_facts / r.write_elapsed_seconds : 0;
-  x << QueryBenchmarkOperationName(o.operation) << ',' << ProjectionStateName(o.projection)
+  x << CsvEscape(QueryBenchmarkOperationName(o.operation)) << ','
+    << CsvEscape(ProjectionStateName(o.projection))
     << ',' << o.degree << ',' << o.selectivity_percent << ',' << o.readers << ','
-    << (o.cache == QueryCacheState::kCold ? "cold" : "warm") << ',' << o.writers << ','
+    << CsvEscape(o.cache == QueryCacheState::kCold ? "cold" : "warm") << ',' << o.writers << ','
     << o.facts_per_txn << ',' << o.seed << ',' << r.dataset_checksum << ','
     << r.transactions << ',' << r.facts << ',' << r.measured_transactions << ','
     << r.measured_facts << ',' << r.rows << ','
@@ -828,28 +896,30 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.derived_bytes << ',' << r.scratch_bytes << ',' << r.engine_internal_bytes << ','
     << r.wal_manifest_bytes << ',' << r.total_bytes << ','
     << r.write_amplification << ',' << r.space_amplification << ','
-    << r.projection_lag << ',' << (r.projection_active ? "active" : "paused") << ','
-    << r.maintenance_status << ',' << (r.maintenance_observed ? "true" : "false") << ','
+    << r.projection_lag << ',' << CsvEscape(r.projection_active ? "active" : "paused") << ','
+    << CsvEscape(r.maintenance_status) << ',' << (r.maintenance_observed ? "true" : "false") << ','
     << (r.cache_conditioned ? "true" : "false") << ','
     << (r.operation_supported ? "true" : "false") << ','
     << (r.projection_state_supported ? "true" : "false") << ','
     << (r.metrics_complete ? "true" : "false") << ','
-    << r.build_type << ',' << r.sanitizer << ',' << r.host << ','
-    << r.plan_fingerprint << ',' << r.raw_sample_path << ','
-    << r.storage_inspection_status << ','
-    << r.terminal_status << ',' << (r.reopen_verified ? "true" : "false") << ','
-    << r.gate_classification << ',' << (r.hard_gate_pass ? "true" : "false");
+    << CsvEscape(r.build_type) << ',' << CsvEscape(r.sanitizer) << ','
+    << CsvEscape(r.host) << ',' << CsvEscape(r.plan_fingerprint) << ','
+    << CsvEscape(r.raw_sample_path) << ','
+    << CsvEscape(r.storage_inspection_status) << ','
+    << CsvEscape(r.terminal_status) << ',' << (r.reopen_verified ? "true" : "false") << ','
+    << CsvEscape(r.gate_classification) << ',' << (r.hard_gate_pass ? "true" : "false");
   return x.str();
 }
 
 std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
                                const QueryBenchmarkResult& r) {
   std::ostringstream x;
-  x << "{\"operation\":\"" << QueryBenchmarkOperationName(o.operation)
-    << "\",\"projection_state\":\"" << ProjectionStateName(o.projection)
+  x << "{\"operation\":\"" << JsonEscape(QueryBenchmarkOperationName(o.operation))
+    << "\",\"projection_state\":\"" << JsonEscape(ProjectionStateName(o.projection))
     << "\",\"writers\":" << o.writers << ",\"facts_per_txn\":"
     << o.facts_per_txn << ",\"transactions\":" << r.transactions
     << ",\"facts\":" << r.facts << ",\"rows\":" << r.rows
+    << ",\"query_operations\":" << r.query_operations
     << ",\"measured_transactions\":" << r.measured_transactions
     << ",\"measured_facts\":" << r.measured_facts
     << ",\"query_p50_us\":" << r.query_p50_us << ",\"query_p95_us\":"
@@ -873,11 +943,11 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"group_fill_p50\":" << r.group_fill_p50
     << ",\"write_amplification\":" << r.write_amplification
     << ",\"space_amplification\":" << r.space_amplification
-    << ",\"build_type\":\"" << r.build_type
-    << "\",\"sanitizer\":\"" << r.sanitizer
-    << "\",\"host\":\"" << r.host
-    << "\",\"plan_fingerprint\":\"" << r.plan_fingerprint
-    << "\",\"raw_sample_path\":\"" << r.raw_sample_path
+    << ",\"build_type\":\"" << JsonEscape(r.build_type)
+    << "\",\"sanitizer\":\"" << JsonEscape(r.sanitizer)
+    << "\",\"host\":\"" << JsonEscape(r.host)
+    << "\",\"plan_fingerprint\":\"" << JsonEscape(r.plan_fingerprint)
+    << "\",\"raw_sample_path\":\"" << JsonEscape(r.raw_sample_path)
     << "\",\"seed\":" << o.seed << ",\"dataset_checksum\":"
     << r.dataset_checksum << ",\"cache_conditioned\":"
     << (r.cache_conditioned ? "true" : "false")
@@ -885,13 +955,13 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"projection_state_supported\":"
     << (r.projection_state_supported ? "true" : "false")
     << ",\"metrics_complete\":" << (r.metrics_complete ? "true" : "false")
-    << ",\"maintenance_status\":\"" << r.maintenance_status
+    << ",\"maintenance_status\":\"" << JsonEscape(r.maintenance_status)
     << "\",\"maintenance_observed\":"
     << (r.maintenance_observed ? "true" : "false")
-    << ",\"storage_inspection_status\":\"" << r.storage_inspection_status << "\""
-    << ",\"terminal_status\":\"" << r.terminal_status
+    << ",\"storage_inspection_status\":\"" << JsonEscape(r.storage_inspection_status) << "\""
+    << ",\"terminal_status\":\"" << JsonEscape(r.terminal_status)
     << "\",\"reopen_verified\":" << (r.reopen_verified ? "true" : "false")
-    << ",\"gate_classification\":\"" << r.gate_classification
+    << ",\"gate_classification\":\"" << JsonEscape(r.gate_classification)
     << "\",\"hard_gate_pass\":" << (r.hard_gate_pass ? "true" : "false") << '}';
   return x.str();
 }

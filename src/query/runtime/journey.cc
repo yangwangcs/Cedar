@@ -85,6 +85,15 @@ bool CoversWaitingInterval(const std::vector<StateInterval>& intervals,
   return false;
 }
 
+bool VisibleAt(const std::vector<StateInterval>& intervals, ValidTime time) {
+  for (const StateInterval& interval : intervals) {
+    if (time.value < interval.interval.from.value) continue;
+    if (!interval.interval.to || time.value < interval.interval.to->value)
+      return true;
+  }
+  return false;
+}
+
 Status ValidateCallbackFifo(const JourneyRequest& request,
                             const TemporalTraversal& traversal) {
   if (!request.duration_at) return Status::OK();
@@ -282,9 +291,10 @@ Status CheckFragmentBudget(const JourneyOptions& options, uint64_t count) {
   return Status::OK();
 }
 
-StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
+StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     Snapshot& snapshot, const JourneyRequest& request,
-    const JourneyOptions& options, VertexRef target, ValidTime deadline) {
+    const JourneyOptions& options, VertexRef target, ValidTime deadline,
+    bool final_target) {
   const ExpandDirection reverse_direction =
       request.direction == ExpandDirection::kOut ? ExpandDirection::kIn
       : request.direction == ExpandDirection::kIn ? ExpandDirection::kOut
@@ -305,7 +315,7 @@ StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
       !budget.ok())
     return budget;
 
-  std::optional<JourneyTraversal> best;
+  std::vector<JourneyTraversal> candidates;
   for (const TemporalTraversal& raw : expanded.ValueOrDie()) {
     if (Status status = Check(options); !status.ok()) return status;
     TemporalTraversal oriented = raw;
@@ -373,17 +383,30 @@ StatusOr<std::optional<JourneyTraversal>> LatestIncoming(
     if (!arrival.ok()) return arrival.status();
     auto target_intervals = VertexIntervals(snapshot, target, options.delta);
     if (!target_intervals.ok()) return target_intervals.status();
-    if (!CoversWaitingInterval(target_intervals.ValueOrDie(),
-                               arrival.ValueOrDie(), deadline)) {
+    // The requested destination only needs to be visible at the instant the
+    // journey arrives.  A reverse search's deadline is a bound on the
+    // predecessor departure and must not force the destination to remain
+    // visible after arrival. Intermediate vertices, however, may need to
+    // wait until the next reverse expansion and therefore remain continuously
+    // visible over [arrival, deadline).
+    if (final_target) {
+      if (!VisibleAt(target_intervals.ValueOrDie(), arrival.ValueOrDie()))
+        continue;
+    } else if (!CoversWaitingInterval(target_intervals.ValueOrDie(),
+                                      arrival.ValueOrDie(), deadline)) {
       continue;
     }
     JourneyTraversal candidate{oriented, ValidTime{departure}, arrival.ValueOrDie(),
                                *duration.ValueOrDie()};
-    if (!best || candidate.departure.value > best->departure.value ||
-        (candidate.departure == best->departure && TraversalLess(candidate, *best)))
-      best = candidate;
+    candidates.push_back(std::move(candidate));
   }
-  return best;
+  std::sort(candidates.begin(), candidates.end(),
+            [](const JourneyTraversal& a, const JourneyTraversal& b) {
+              if (a.departure.value != b.departure.value)
+                return a.departure.value > b.departure.value;
+              return TraversalLess(a, b);
+            });
+  return candidates;
 }
 
 JourneyValue BuildJourney(const std::vector<JourneyTraversal>& edges,
@@ -519,29 +542,29 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
       return BuildJourney(path, current.time);
     }
     if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
-    auto edge = LatestIncoming(snapshot, request, scoped, current.vertex,
-                               current.time);
-    if (!edge.ok()) return edge.status();
-    if (!edge.ValueOrDie()) continue;
-    const JourneyTraversal candidate = *edge.ValueOrDie();
-    const VertexRef predecessor = candidate.traversal.source;
-    const uint32_t depth = current.depth + 1;
-    auto existing = best.find(StateKey(predecessor, depth, request.max_hops));
-    if (existing != best.end()) {
-      const Label& prior = labels[existing->second];
-      if (prior.time.value > candidate.departure.value ||
-          (prior.time == candidate.departure &&
-           !TraversalLess(candidate, prior.edge)))
-        continue;
+    auto incoming = LatestIncoming(snapshot, request, scoped, current.vertex,
+                                   current.time, current.depth == 0);
+    if (!incoming.ok()) return incoming.status();
+    for (const JourneyTraversal& candidate : incoming.ValueOrDie()) {
+      const VertexRef predecessor = candidate.traversal.source;
+      const uint32_t depth = current.depth + 1;
+      auto existing = best.find(StateKey(predecessor, depth, request.max_hops));
+      if (existing != best.end()) {
+        const Label& prior = labels[existing->second];
+        if (prior.time.value > candidate.departure.value ||
+            (prior.time == candidate.departure &&
+             !TraversalLess(candidate, prior.edge)))
+          continue;
+      }
+      if (options.max_labels && labels.size() >= options.max_labels)
+        return Status::ResourceExhausted("journey", "label budget exceeded");
+      if (Status status = Charge(scoped); !status.ok()) return status;
+      const uint64_t next = labels.size();
+      labels.push_back({predecessor, candidate.departure, depth,
+                        id, candidate});
+      best[StateKey(predecessor, depth, request.max_hops)] = next;
+      heap.push({candidate.departure.value, next});
     }
-    if (options.max_labels && labels.size() >= options.max_labels)
-      return Status::ResourceExhausted("journey", "label budget exceeded");
-    if (Status status = Charge(scoped); !status.ok()) return status;
-    const uint64_t next = labels.size();
-    labels.push_back({predecessor, candidate.departure, depth,
-                      id, candidate});
-    best[StateKey(predecessor, depth, request.max_hops)] = next;
-    heap.push({candidate.departure.value, next});
   }
   return Status::NotFound("journey", "target is unreachable");
 }

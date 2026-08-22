@@ -178,7 +178,25 @@ resolve_turning_point() {
     exit 2
   fi
   local value
-  value=$(awk -F: '/"facts_per_txn"/ {gsub(/[^0-9]/, "", $2); print $2; exit}' "$artifact")
+  # Parse the complete artifact shape.  Do not normalize malformed tokens:
+  # a negative value, trailing text, duplicate key, or invalid JSON must fail.
+  value=$(awk '
+    BEGIN {
+      object = "^[[:space:]]*\\{[[:space:]]*\"facts_per_txn\"[[:space:]]*:[[:space:]]*(1|4|8|16|32|64|128|256|512|1024|2048)[[:space:]]*(,[[:space:]]*\"source_summary\"[[:space:]]*:[[:space:]]*\"([^\"\\\\[:cntrl:]]|\\\\([\"\\\\/bfnrt]|u[0-9A-Fa-f]{4}))*\"[[:space:]]*)?\\}[[:space:]]*$"
+      prefix = "^[[:space:]]*\\{[[:space:]]*\"facts_per_txn\"[[:space:]]*:[[:space:]]*"
+    }
+    {
+      if (text != "") text = text "\n"
+      text = text $0
+    }
+    END {
+      if (text !~ object) exit 1
+      value = text
+      sub(prefix, "", value)
+      if (match(value, /^[0-9]+/)) print substr(value, RSTART, RLENGTH)
+      else exit 1
+    }
+  ' "$artifact")
   [[ "$value" =~ ^(1|4|8|16|32|64|128|256|512|1024|2048)$ ]] || {
     echo "invalid turning-point artifact: $artifact" >&2
     exit 2
@@ -231,10 +249,36 @@ compare_active_overhead() {
       baseline_reason="invalid_avg_end_to_end_p99_us"
     fi
   fi
-  local active_rate active_p99
+  local active_rate active_p99 active_reason=""
+  if ! active_reason=$(awk -F, '
+    BEGIN { number = "^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$" }
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "phase") phase = i
+        if ($i == "hard_gate_pass") gate = i
+        if ($i == "facts_per_second") rate = i
+        if ($i == "end_to_end_p99_us") p99 = i
+      }
+      next
+    }
+    $phase == "write-active-projection-five-repeats" && $gate == "true" {
+      samples++
+      if (!rate || !p99 || $rate !~ number || ($rate + 0) <= 0 || !($rate + 0 < 1e308)) {
+        reason = "invalid_active_facts_per_second"
+      } else if ($p99 !~ number || ($p99 + 0) <= 0 || !($p99 + 0 < 1e308)) {
+        reason = "invalid_active_end_to_end_p99_us"
+      }
+    }
+    END {
+      if (!samples) { print "no_active_samples"; exit 1 }
+      if (reason != "") { print reason; exit 1 }
+    }
+  ' "$summary"); then
+    active_reason="${active_reason:-invalid_active_sample}"
+  fi
   active_rate=$(awk -F, '$1=="write-active-projection-five-repeats" && $4=="true" {sum+=$6; n++} END {print n ? sum/n : 0}' "$summary")
   active_p99=$(awk -F, '$1=="write-active-projection-five-repeats" && $4=="true" {sum+=$7; n++} END {print n ? sum/n : 0}' "$summary")
-  if [[ -z "$baseline_reason" ]] &&
+  if [[ -z "$baseline_reason" && -z "$active_reason" ]] &&
      awk -v value="$active_rate" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }' &&
      awk -v value="$active_p99" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }' &&
      awk -v i="$idle_rate" -v a="$active_rate" 'BEGIN {exit !(a >= i*0.90)}' &&
@@ -243,7 +287,7 @@ compare_active_overhead() {
   fi
   overall=1
   printf '{"gate":"active_projection_overhead","pass":false,"reason":"%s","baseline":"%s","idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s}\n' \
-    "${baseline_reason:-threshold_or_active_metric_failure}" "${baseline:-missing}" "${idle_rate:-null}" "${active_rate:-null}" "${idle_p99:-null}" "${active_p99:-null}" >> "$summary_json"
+    "${baseline_reason:-${active_reason:-threshold_or_active_metric_failure}}" "${baseline:-missing}" "${idle_rate:-null}" "${active_rate:-null}" "${idle_p99:-null}" "${active_p99:-null}" >> "$summary_json"
   return 1
 }
 

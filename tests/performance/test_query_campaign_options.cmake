@@ -77,6 +77,42 @@ if(MIXED_RC EQUAL 0 OR NOT MIXED_ERR MATCHES "turning-point")
   message(FATAL_ERROR "mixed auto turning-point must fail without an artifact: ${MIXED_ERR}\n${MIXED_OUT}")
 endif()
 
+file(MAKE_DIRECTORY "${OUTPUT}/turning-point-input")
+file(WRITE "${OUTPUT}/turning-point-input/turning-point.json"
+  "{ \"facts_per_txn\" : 64, \"source_summary\" : \"peak-candidate\" }\n")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase mixed-30-minute --duration-seconds 1 --facts-per-txn auto-turning-point
+    --writers 1 --readers 1 --degrees 1 --selectivities 1
+    --input "${OUTPUT}/turning-point-input" --output "${OUTPUT}/mixed-valid"
+  RESULT_VARIABLE MIXED_VALID_RC OUTPUT_VARIABLE MIXED_VALID_OUT ERROR_VARIABLE MIXED_VALID_ERR)
+if(NOT MIXED_VALID_RC MATCHES "^[01]$")
+  message(FATAL_ERROR "mixed auto turning-point rejected a valid artifact: ${MIXED_VALID_ERR}\n${MIXED_VALID_OUT}")
+endif()
+file(READ "${OUTPUT}/mixed-valid/commands.manifest" MIXED_VALID_MANIFEST)
+if(NOT MIXED_VALID_MANIFEST MATCHES "--facts-per-txn=64")
+  message(FATAL_ERROR "mixed campaign did not consume the selected turning point: ${MIXED_VALID_MANIFEST}")
+endif()
+
+foreach(MALFORMED_TURNING_POINT IN ITEMS
+    "{\"facts_per_txn\":-64}"
+    "{\"facts_per_txn\":64} trailing"
+    "{\"facts_per_txn\":64,\"facts_per_txn\":128}"
+    "{\"facts_per_txn\":64,}")
+  string(RANDOM LENGTH 4 ALPHABET 0123456789 TURNING_POINT_TOKEN)
+  set(TURNING_POINT_DIR "${OUTPUT}/turning-point-invalid-${TURNING_POINT_TOKEN}")
+  file(MAKE_DIRECTORY "${TURNING_POINT_DIR}")
+  file(WRITE "${TURNING_POINT_DIR}/turning-point.json" "${MALFORMED_TURNING_POINT}\n")
+  execute_process(
+    COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+      --phase mixed-30-minute --duration-seconds 1 --facts-per-txn auto-turning-point
+      --input "${TURNING_POINT_DIR}" --output "${TURNING_POINT_DIR}/run"
+    RESULT_VARIABLE TURNING_POINT_RC ERROR_VARIABLE TURNING_POINT_ERR)
+  if(TURNING_POINT_RC EQUAL 0 OR NOT TURNING_POINT_ERR MATCHES "invalid turning-point")
+    message(FATAL_ERROR "malformed turning-point artifact was accepted: ${MALFORMED_TURNING_POINT} (${TURNING_POINT_RC}) ${TURNING_POINT_ERR}")
+  endif()
+endforeach()
+
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase read-cold
     --duration-seconds 1 --readers 1 --degrees 1 --selectivities 1
@@ -123,14 +159,16 @@ endif()
 
 file(MAKE_DIRECTORY "${OUTPUT}/input")
 file(WRITE "${OUTPUT}/input/run.csv" "header\nrow\n")
-execute_process(
-  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase reopen-verification
-    --duration-seconds 1 --input "${OUTPUT}/input" --output "${OUTPUT}/reopen"
-  RESULT_VARIABLE REOPEN_RC OUTPUT_VARIABLE REOPEN_OUT ERROR_VARIABLE REOPEN_ERR)
-file(READ "${OUTPUT}/reopen/summary.csv" REOPEN_SUMMARY)
-if(REOPEN_RC EQUAL 0 OR NOT REOPEN_SUMMARY MATCHES "reopen-verification,input-artifacts,1,false,unsupported,")
-  message(FATAL_ERROR "reopen phase did not fail explicitly for unsupported cross-artifact verification: ${REOPEN_RC} ${REOPEN_ERR}\n${REOPEN_OUT}\n${REOPEN_SUMMARY}")
-endif()
+foreach(UNSUPPORTED_PHASE IN ITEMS reopen-verification space-audit)
+  execute_process(
+    COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase "${UNSUPPORTED_PHASE}"
+      --duration-seconds 1 --input "${OUTPUT}/input" --output "${OUTPUT}/${UNSUPPORTED_PHASE}"
+    RESULT_VARIABLE UNSUPPORTED_RC OUTPUT_VARIABLE UNSUPPORTED_OUT ERROR_VARIABLE UNSUPPORTED_ERR)
+  file(READ "${OUTPUT}/${UNSUPPORTED_PHASE}/summary.csv" UNSUPPORTED_SUMMARY)
+  if(UNSUPPORTED_RC EQUAL 0 OR NOT UNSUPPORTED_SUMMARY MATCHES "${UNSUPPORTED_PHASE},input-artifacts,1,false,unsupported,")
+    message(FATAL_ERROR "${UNSUPPORTED_PHASE} did not fail explicitly for unsupported cross-artifact verification: ${UNSUPPORTED_RC} ${UNSUPPORTED_ERR}\n${UNSUPPORTED_OUT}\n${UNSUPPORTED_SUMMARY}")
+  endif()
+endforeach()
 
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"

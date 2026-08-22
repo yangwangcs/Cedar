@@ -68,6 +68,9 @@ struct ProjectionGeneration::State {
   std::atomic<bool> present{true};
   std::atomic<bool> retired{false};
   mutable std::set<std::string> unavailable_segments;
+  mutable std::set<std::string> corrupt_segments;
+  mutable bool coverage_hole = false;
+  mutable bool rebuild_enqueued = false;
 };
 
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGeneration(
@@ -90,6 +93,8 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
     return Status::NotFound("projection store", "coverage is unavailable");
   }
   std::vector<ProjectionChain> result;
+  bool matched_region = false;
+  bool coverage_hole = false;
   for (const auto& region : state->manifest.regions) {
     if (region.kind != request.kind || region.part_id != request.part_id ||
         region.property_id != request.property_id || region.schema_epoch != request.schema_epoch ||
@@ -99,23 +104,36 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
                                   region.valid_time.to->value < request.valid_time.to->value))) {
       continue;
     }
+    matched_region = true;
     for (const auto& segment : region.segments) {
       if (state->unavailable_segments.count(segment.filename) != 0) {
+        coverage_hole = true;
         continue;
       }
       std::ifstream in(fs::path(state->directory) / segment.filename, std::ios::binary);
       if (!in) {
         state->unavailable_segments.insert(segment.filename);
+        state->corrupt_segments.insert(segment.filename);
+        coverage_hole = true;
         continue;
       }
       std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
       auto decoded = DecodeProjectionPage(bytes);
       if (!decoded.ok()) {
         state->unavailable_segments.insert(segment.filename);
+        state->corrupt_segments.insert(segment.filename);
+        coverage_hole = true;
         continue;
       }
       result.push_back(std::move(decoded).ConsumeValueOrDie());
     }
+  }
+  if (!matched_region || coverage_hole) {
+    // Never return a partial chain set: the runtime must use the canonical
+    // Cedar facts for the complete requested slice. Record the exact damaged
+    // generation so it can be quarantined after its leases drain.
+    state->coverage_hole = coverage_hole;
+    return Status::NotFound("projection store", "coverage has an unavailable region");
   }
   if (result.empty()) return Status::NotFound("projection store", "coverage is unavailable");
   return result;
@@ -307,7 +325,8 @@ std::optional<ProjectionGeneration> QueryProjectionStore::Acquire(const Coverage
   return std::nullopt;
 }
 Status QueryProjectionStore::RetireBefore(CommitSeq seq) { std::lock_guard<std::mutex> lock(mutex_); if (current_ && current_->manifest.base_seq.value < seq.value) { auto published = PublishCurrent(0); if (!published.ok()) return published; current_->retired=true; retired_.push_back(current_); current_.reset(); enabled_=false; } for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; fs::remove(fs::path((*it)->directory) / file, ec); } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } return Status::OK(); }
-void QueryProjectionStore::CollectRetired() { std::lock_guard<std::mutex> lock(mutex_); for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; fs::remove(fs::path((*it)->directory) / file, ec); } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } }
+void QueryProjectionStore::CollectRetired() { std::lock_guard<std::mutex> lock(mutex_); for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { for (const auto& file : (*it)->segment_files) { std::error_code ec; const fs::path source = fs::path((*it)->directory) / file; if ((*it)->corrupt_segments.count(file) != 0 && fs::exists(source)) { fs::create_directories(fs::path((*it)->directory) / "quarantine", ec); if (!ec) { fs::rename(source, fs::path((*it)->directory) / "quarantine" / file, ec); } } else { fs::remove(source, ec); } } if (!(*it)->manifest_file.empty()) { std::error_code ec; fs::remove((*it)->manifest_file, ec); } (*it)->present=false; it=retired_.erase(it); } else ++it; } }
+size_t QueryProjectionStore::pending_rebuild_requests() const { std::lock_guard<std::mutex> lock(mutex_); return rebuild_requests_.size(); }
 Status QueryProjectionStore::Quarantine(const std::string& filename) { std::lock_guard<std::mutex> lock(mutex_); if (!SafeName(filename) || filename == "PROJECTION-CURRENT") return Status::InvalidArgument("projection store", "invalid quarantine filename"); auto referenced = [&](const std::shared_ptr<ProjectionGeneration::State>& generation) { if (!generation) return false; for (const auto& file : generation->segment_files) if (file == filename) return true; return generation->manifest_file == (fs::path(projections_path_) / filename).string(); }; if (referenced(current_)) return Status::Conflict("projection store", "cannot quarantine referenced current file"); for (const auto& generation : retired_) if (referenced(generation) && generation->pins.load() != 0) return Status::Conflict("projection store", "cannot quarantine pinned file"); std::error_code ec; fs::create_directories(fs::path(projections_path_) / "quarantine", ec); if (ec) return Status::IOError("projection store", ec.message()); fs::rename(fs::path(projections_path_) / filename, fs::path(projections_path_) / "quarantine" / filename, ec); if (ec) return Status::IOError("projection store", ec.message()); return SyncDirectory(fs::path(projections_path_) / "quarantine"); }
 bool QueryProjectionStore::projections_enabled() const { std::lock_guard<std::mutex> lock(mutex_); return enabled_; }
 std::optional<uint64_t> QueryProjectionStore::current_generation_id() const { std::lock_guard<std::mutex> lock(mutex_); return current_ ? std::optional<uint64_t>(current_->manifest.generation_id) : std::nullopt; }
@@ -336,6 +355,16 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     return Status::IdentityConflict("projection store", "projection identity changed");
   }
   auto chains = ReadChainsForGeneration(current_, request);
+  if (current_->coverage_hole) {
+    if (!current_->rebuild_enqueued) {
+      current_->rebuild_enqueued = true;
+      rebuild_requests_.push_back("generation=" + std::to_string(current_->manifest.generation_id));
+    }
+    current_->retired = true;
+    retired_.push_back(current_);
+    current_.reset();
+    enabled_ = false;
+  }
   if (!chains.ok() && (chains.status().IsCorruption() || chains.status().IsIOError())) {
     // A derived page is never authoritative. Disable the affected generation
     // immediately so subsequent readers fall back to CedarParquet facts; the
@@ -355,6 +384,10 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     return Status::NotFound("projection store", "projection generation is no longer available");
   }
   auto chains = ReadChainsForGeneration(generation.state_, request);
+  if (generation.state_->coverage_hole && !generation.state_->rebuild_enqueued) {
+    generation.state_->rebuild_enqueued = true;
+    rebuild_requests_.push_back("generation=" + std::to_string(generation.state_->manifest.generation_id));
+  }
   return chains;
 }
 }  // namespace cedar::internal

@@ -205,6 +205,28 @@ TEST_F(ProjectionStoreTest, RejectsGenerationFilenameCollisionAndPinnedQuarantin
   EXPECT_TRUE(opened.ValueOrDie()->Build(Build(20, "seg-a")).IsConflict());
 }
 
+TEST_F(ProjectionStoreTest, PartialCorruptionFallsBackAndQueuesRebuild) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  auto& store = *opened.ValueOrDie();
+  ASSERT_TRUE(store.Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  ASSERT_TRUE(std::filesystem::remove(path_ + "/seg-a.csegment"));
+
+  auto chains = store.ReadChains(request);
+  EXPECT_TRUE(chains.status().IsNotFound());
+  EXPECT_FALSE(store.projections_enabled());
+  EXPECT_EQ(store.pending_rebuild_requests(), 1U);
+  store.CollectRetired();
+  EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
+}
+
 TEST_F(ProjectionStoreTest, FaultAfterSegmentSyncLeavesCurrentUnchanged) {
   bool fail = true;
   auto opened = QueryProjectionStore::Open({path_, "test-db", [&](ProjectionStoreFaultPoint point) {

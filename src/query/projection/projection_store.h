@@ -98,6 +98,10 @@ class QueryProjectionStore {
   Status RetireBefore(CommitSeq seq);
   Status Quarantine(const std::string& filename);
   void CollectRetired();
+  // Number of derived coverage regions that requested a Cedar rebuild after
+  // being found incomplete or corrupt. This is intentionally observable for
+  // maintenance and recovery tests; canonical facts remain authoritative.
+  size_t pending_rebuild_requests() const;
   bool projections_enabled() const;
   std::optional<uint64_t> current_generation_id() const;
   std::optional<CommitSeq> current_base_seq() const;
@@ -122,6 +126,7 @@ class QueryProjectionStore {
   mutable std::vector<std::shared_ptr<ProjectionGeneration::State>> retired_;
   mutable bool enabled_ = false;
   bool closed_ = false;
+  mutable std::vector<std::string> rebuild_requests_;
 };
 
 }  // namespace cedar::internal

@@ -1251,6 +1251,10 @@ class QueryCursor::State {
       // ordered after every engine read and before Database closes RocksDB.
       std::lock_guard<std::mutex> lock(call_mutex);
       this->snapshot.reset();
+      // A cursor close releases the physical projection-generation lease as
+      // part of the same terminal transition. Returned QueryBatch values own
+      // their decoded storage independently and remain readable.
+      this->plan.projection_generation.reset();
       this->materialized_output_lease.reset();
       this->batches.clear();
       CleanupScratch();
@@ -1908,7 +1912,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             const Bindings&,
                                             const QueryOptions& options,
                                             QueryResourcePool* resource_pool,
-                                            std::function<void(const std::shared_ptr<QueryExecutionState>&)>
+                                            std::function<Status(const std::shared_ptr<QueryExecutionState>&)>
                                                 register_query_state,
                                             std::function<void(const std::shared_ptr<QueryExecutionState>&)>
                                                 unregister_query_state) {
@@ -1975,7 +1979,15 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
             if (auto locked = weak_state.lock()) unregister_query_state(locked);
           });
     }
-    register_query_state(state->execution);
+    const Status registered = register_query_state(state->execution);
+    if (!registered.ok()) {
+      // Registration is the atomic lifecycle admission point. Close the
+      // just-created state before returning so its snapshot, scratch files,
+      // output leases, and any other Cedar-owned resources are released while
+      // the caller still owns the cursor state.
+      state->execution->Close().IgnoreError();
+      return registered;
+    }
   }
   return QueryCursor(std::move(state));
 }

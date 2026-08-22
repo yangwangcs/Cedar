@@ -291,7 +291,7 @@ class Database::Impl {
   Status ValidatePreparedQuery(
       CommitSeq snapshot_seq,
       const std::vector<PropertyDefinition>& schema_fingerprint) const;
-  void RegisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
+  Status RegisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
   void UnregisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
   bool HasActiveQueries() const;
   void CancelActiveQueries();

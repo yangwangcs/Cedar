@@ -1751,10 +1751,13 @@ Status Database::Impl::ValidatePreparedQuery(
   return Status::OK();
 }
 
-void Database::Impl::RegisterQueryState(
+Status Database::Impl::RegisterQueryState(
     const std::shared_ptr<QueryExecutionState>& state) {
-  if (!state) return;
+  if (!state) return Status::InvalidArgument("query", "query execution state is null");
   std::lock_guard<std::mutex> lock(mutex);
+  if (closed || closing) {
+    return Status::ShutdownInProgress("query", "database is closing or closed");
+  }
   active_query_states.erase(
       std::remove_if(active_query_states.begin(), active_query_states.end(),
                      [](const std::shared_ptr<QueryExecutionState>& candidate) {
@@ -1762,6 +1765,7 @@ void Database::Impl::RegisterQueryState(
                      }),
       active_query_states.end());
   active_query_states.emplace_back(state);
+  return Status::OK();
 }
 
 void Database::Impl::UnregisterQueryState(

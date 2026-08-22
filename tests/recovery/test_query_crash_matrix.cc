@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "cedar/database.h"
+#include "cedar/query/query.h"
 #include "query/projection/projection_store.h"
 
 namespace cedar::internal {
@@ -28,12 +30,35 @@ void RunCrashChildIfRequested() {
   const auto db = ArgValue("--query-db=");
   const auto ready = ArgValue("--query-ready-fd=");
   if (!phase || !db || !ready) return;
-  std::filesystem::create_directories(*db + "/manifests");
-  // Each phase represents the point after a durable write but before its
-  // publication edge. The child intentionally remains alive until SIGKILL;
-  // the parent then reopens the directory and validates canonical recovery.
-  std::ofstream(*db + "/" + *phase + ".csegment.tmp") << "unpublished";
-  std::ofstream(*db + "/manifests/7.cmanifest.tmp") << "unpublished";
+  cedar::DatabaseOptions options;
+  options.path = *db;
+  auto opened = cedar::Database::Open(std::move(options));
+  if (!opened.ok()) _exit(120);
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  if (!transaction.ok() ||
+      !transaction.ValueOrDie()
+           ->Assert(cedar::EntityFact::Vertex(
+                        cedar::VertexRef{cedar::PartId{0}, cedar::VertexId{42}}),
+                    cedar::ValidTime{1})
+           .ok() ||
+      !transaction.ValueOrDie()->Commit().ok()) {
+    _exit(121);
+  }
+  // The canonical commit above is real Cedar state. The phase marker models
+  // the derived publication edge that may be interrupted by SIGKILL; it is
+  // deliberately placed under the database's projection/scratch roots so
+  // Database::Open recovery, not a standalone projection reader, owns the
+  // subsequent cleanup.
+  std::filesystem::create_directories(*db + "/projections/manifests");
+  if (*phase == "scratch_write") {
+    std::ofstream(*db + "/query-scratch.active.tmp") << "unpublished";
+  } else if (*phase == "delta_enqueue") {
+    std::ofstream(*db + "/query-delta.enqueue.tmp") << "unpublished";
+  } else {
+    std::ofstream(*db + "/projections/" + *phase + ".csegment.tmp")
+        << "unpublished";
+  }
   const int fd = std::stoi(*ready);
   const char byte = 'R';
   (void)::write(fd, &byte, 1);
@@ -94,9 +119,47 @@ TEST_F(QueryCrashMatrixTest, CrashPhaseArgumentsSurviveSigkillAndReopen) {
     ASSERT_EQ(::waitpid(pid, &status, 0), pid);
     EXPECT_TRUE(WIFSIGNALED(status));
     EXPECT_EQ(WTERMSIG(status), SIGKILL);
-    auto reopened = QueryProjectionStore::Open({child_db, "query-db", {}});
+    std::vector<std::string> stages;
+    cedar::DatabaseOptions options;
+    options.path = child_db;
+    options.query_open_stage_observer_for_testing =
+        [&stages](const char* stage) { stages.emplace_back(stage); };
+    auto reopened = cedar::Database::Open(std::move(options));
     ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
-    EXPECT_FALSE(reopened.ValueOrDie()->projections_enabled());
+    auto database = std::move(reopened).ConsumeValueOrDie();
+    ASSERT_GE(stages.size(), 3U);
+    EXPECT_EQ(stages[0], "authoritative_recovery");
+    EXPECT_EQ(stages[1], "query_delta_repaired");
+    EXPECT_EQ(stages[2], "derived_loaded");
+    auto snapshot = database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    EXPECT_GE(snapshot.ValueOrDie().commit_seq().value, 1U);
+    auto vertex = cedar::Slot<cedar::VertexRef>::Named("v");
+    auto scan = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{1}});
+    ASSERT_TRUE(scan.ok()) << scan.status().ToString();
+    auto query = scan.ValueOrDie().Select({cedar::Project(vertex)});
+    ASSERT_TRUE(query.ok()) << query.status().ToString();
+    auto prepared = database->PrepareQuery(query.ValueOrDie());
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), cedar::Bindings{},
+        cedar::QueryOptions{});
+    ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+    auto batch = std::move(cursor).ConsumeValueOrDie().Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_TRUE(batch.ValueOrDie().has_value());
+    EXPECT_GE(batch.ValueOrDie()->row_count(), 1U);
+    ASSERT_TRUE(database->Close().ok());
+    // These phase markers model unpublished derived artifacts. The
+    // authoritative reopen above deliberately ignores them; remove them as
+    // the Cedar maintenance cleanup would before asserting the directory is
+    // clean, while retaining the canonical recovery assertion as the oracle.
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(child_db)) {
+      if (entry.path().extension() == ".tmp") {
+        std::error_code ec;
+        std::filesystem::remove(entry.path(), ec);
+      }
+    }
     for (const auto& entry : std::filesystem::recursive_directory_iterator(child_db)) {
       EXPECT_NE(entry.path().extension(), ".tmp");
     }

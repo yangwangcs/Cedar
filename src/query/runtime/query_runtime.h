@@ -159,7 +159,7 @@ class QueryRuntime {
                                        const Bindings& bindings,
                                        const QueryOptions& options,
                                        QueryResourcePool* resource_pool = nullptr,
-                                       std::function<void(const std::shared_ptr<QueryExecutionState>&)>
+                                       std::function<Status(const std::shared_ptr<QueryExecutionState>&)>
                                            register_query_state = {},
                                        std::function<void(const std::shared_ptr<QueryExecutionState>&)>
                                            unregister_query_state = {});

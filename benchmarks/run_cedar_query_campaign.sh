@@ -424,14 +424,18 @@ verify_artifact_database() {
     printf 'FAIL\tfacts/dataset_checksum are not unsigned integers\t-\tfalse\tartifact verification failed\tfalse\t-\t-\t-\t-\t-\n' >> "$records"
     return 0
   fi
+  local verify_case="verify-existing-$(basename "$(dirname "$file")")"
+  local -a verify_cmd=("$build_dir/cedar_query_bench" "--path=$raw_path"
+    --operation=state-at --duration-seconds=1 --verify-existing=true
+    "--expected-facts=$expected_facts" "--expected-checksum=$expected_checksum"
+    --reopen-verify=true)
+  printf '%s,%s,' "$phase" "$verify_case" >> "$manifest"
+  printf '%q ' "${verify_cmd[@]}" >> "$manifest"
+  printf '\n' >> "$manifest"
   local csv="$verification_dir/verify.csv" json="$verification_dir/verify.json" rc
   mkdir -p "$verification_dir"
   set +e
-  "$build_dir/cedar_query_bench" \
-    "--path=$raw_path" --operation=state-at --duration-seconds=1 \
-    --verify-existing=true --expected-facts="$expected_facts" \
-    --expected-checksum="$expected_checksum" --reopen-verify=true \
-    > "$csv" 2> "$json"
+  "${verify_cmd[@]}" > "$csv" 2> "$json"
   rc=$?
   set -e
   local gate reopen terminal auth derived stats scratch amplification

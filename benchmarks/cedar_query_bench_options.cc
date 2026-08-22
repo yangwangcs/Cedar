@@ -58,6 +58,8 @@ bool QueryBenchmarkOperationSupported(QueryBenchmarkOperation operation) {
 StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(
     const std::vector<std::string>& args) {
   QueryBenchmarkOptions options;
+  bool expected_facts_seen = false;
+  bool expected_checksum_seen = false;
   for (size_t i = 0; i < args.size();) {
     const std::string& arg = args[i++];
     const auto equal = arg.find('=');
@@ -100,9 +102,16 @@ StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(
     } else if (name == "--duration-seconds") { if (!ParseU(value, &options.duration_seconds) || options.duration_seconds == 0) return Invalid("duration must be positive");
     } else if (name == "--facts-per-txn") { uint64_t v=0; if (!ParseU(value, &v) || (v!=1&&v!=4&&v!=8&&v!=16&&v!=32&&v!=64&&v!=128&&v!=256&&v!=512&&v!=1024&&v!=2048)) return Invalid("facts-per-txn has an unsupported value"); options.facts_per_txn=v;
     } else if (name == "--reopen-verify") { if (value == "true") options.verify_reopen = true; else if (value == "false") options.verify_reopen = false; else return Invalid("reopen-verify must be true or false");
+    } else if (name == "--verify-existing") { if (value == "true") options.verify_existing = true; else if (value == "false") options.verify_existing = false; else return Invalid("verify-existing must be true or false");
+    } else if (name == "--expected-facts") { if (!ParseU(value, &options.expected_facts)) return Invalid("expected-facts must be unsigned"); expected_facts_seen = true;
+    } else if (name == "--expected-checksum") { if (!ParseU(value, &options.expected_checksum)) return Invalid("expected-checksum must be unsigned"); expected_checksum_seen = true;
     } else return Invalid("unknown option " + name);
   }
   if (options.path.empty()) return Invalid("--path is required");
+  if (options.verify_existing &&
+      (!expected_facts_seen || !expected_checksum_seen)) {
+    return Invalid("verify-existing requires expected-facts and expected-checksum");
+  }
   return options;
 }
 }  // namespace cedar::benchmark

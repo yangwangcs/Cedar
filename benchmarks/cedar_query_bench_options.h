@@ -36,6 +36,9 @@ struct QueryBenchmarkOptions {
   uint64_t duration_seconds = 10;
   uint64_t facts_per_txn = 16;
   bool verify_reopen = true;
+  bool verify_existing = false;
+  uint64_t expected_facts = 0;
+  uint64_t expected_checksum = 0;
   uint32_t writers = 1;
   ProjectionWork projection_work = ProjectionWork::kPaused;
 };

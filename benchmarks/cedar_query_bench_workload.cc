@@ -521,11 +521,41 @@ Status AddWalManifestBytes(const std::string& root,
   }
   return Status::OK();
 }
+
+Status InspectAndAccountStorage(const std::string& path,
+                                const ProductionStorageOptions& production,
+                                QueryBenchmarkResult* result) {
+  auto files = InspectStorageFiles(
+      {path, StorageProfile::kProductionAppend, production});
+  if (!files.ok()) return files.status();
+  AddFileBytes(files.ValueOrDie(), result);
+  return AddWalManifestBytes(path, files.ValueOrDie(), result);
+}
+
+void ComputeSpaceMetrics(QueryBenchmarkResult* result) {
+  result->space_amplification = result->authoritative_bytes == 0
+                                    ? 0.0
+                                    : static_cast<double>(result->total_bytes) /
+                                          result->authoritative_bytes;
+  result->write_amplification = result->authoritative_bytes == 0
+                                    ? 0.0
+                                    : static_cast<double>(result->authoritative_bytes +
+                                                          result->derived_bytes) /
+                                          result->authoritative_bytes;
+}
 }  // namespace
 
 StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     const QueryBenchmarkOptions& options) {
-  std::filesystem::remove_all(options.path);
+  if (!options.verify_existing) {
+    std::filesystem::remove_all(options.path);
+  } else {
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path(options.path) / "CURRENT", ec)) {
+      if (ec) return Status::IOError("benchmark", ec.message());
+      return Status::NotFound("benchmark", "verify-existing path is not an existing database");
+    }
+  }
   DatabaseOptions db_options;
   db_options.path = options.path;
   db_options.storage_profile = StorageProfile::kProductionAppend;
@@ -546,6 +576,69 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 #endif
   result.seed = options.seed;
   result.dataset_checksum = 0;
+  if (options.verify_existing) {
+    StatusOr<std::pair<uint64_t, uint64_t>> initial(
+        Status::InvalidArgument("benchmark", "initial checksum not attempted"));
+    {
+      auto snapshot = database->BeginSnapshot();
+      if (!snapshot.ok()) return snapshot.status();
+      initial = ScanFactChecksum(snapshot.ValueOrDie());
+    }
+    if (!initial.ok()) return initial.status();
+    result.facts = initial.ValueOrDie().first;
+    result.dataset_checksum = initial.ValueOrDie().second;
+    const bool initial_match = result.facts == options.expected_facts &&
+                               result.dataset_checksum == options.expected_checksum;
+
+    result.terminal_status = initial_match ? "OK" : "existing verification failed";
+    Status closed = database->Close();
+    database.reset();
+    if (!closed.ok()) {
+      result.terminal_status = closed.ToString();
+    } else {
+      auto reopened = Database::Open(db_options);
+      if (!reopened.ok()) {
+        result.terminal_status = reopened.status().ToString();
+      } else {
+        database = std::move(reopened).ConsumeValueOrDie();
+        StatusOr<std::pair<uint64_t, uint64_t>> rescanned(
+            Status::InvalidArgument("benchmark", "reopen checksum not attempted"));
+        {
+          auto reopened_snapshot = database->BeginSnapshot();
+          if (!reopened_snapshot.ok()) {
+            result.terminal_status = reopened_snapshot.status().ToString();
+          } else {
+            rescanned = ScanFactChecksum(reopened_snapshot.ValueOrDie());
+          }
+        }
+        if (rescanned.ok()) {
+          const bool reopen_match = rescanned.ok() &&
+                                    rescanned.ValueOrDie().first == options.expected_facts &&
+                                    rescanned.ValueOrDie().second == options.expected_checksum;
+          result.reopen_verified = initial_match && reopen_match;
+          if (!result.reopen_verified) result.terminal_status = "reopen verification failed";
+        } else {
+          result.terminal_status = rescanned.status().ToString();
+        }
+        database->Close().IgnoreError();
+        database.reset();
+      }
+    }
+    result.metrics_complete = true;
+    const Status inspected = InspectAndAccountStorage(options.path,
+                                                       db_options.production, &result);
+    if (!inspected.ok()) {
+      result.storage_inspection_status = inspected.ToString();
+      result.terminal_status = inspected.ToString();
+    }
+    ComputeSpaceMetrics(&result);
+    result.hard_gate_pass = result.terminal_status == "OK" &&
+                            result.reopen_verified && inspected.ok() &&
+                            (result.authoritative_bytes == 0 ||
+                             result.derived_bytes <= result.authoritative_bytes * 3 / 2);
+    result.gate_classification = result.hard_gate_pass ? "pass" : "incomplete";
+    return result;
+  }
   if (!QueryBenchmarkOperationSupported(options.operation)) {
     result.operation_supported = false;
     result.terminal_status = std::string("unsupported operation: ") +
@@ -824,6 +917,23 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                             pipeline.latency.end_to_end.count > 0 &&
                             !query_samples.empty() && result.rows > 0;
 
+  // The incremental writer checksum is an execution aid; publish the
+  // canonical scan answer so artifacts can be reopened and verified later.
+  {
+    auto final_snapshot = database->BeginSnapshot();
+    if (!final_snapshot.ok()) {
+      result.terminal_status = final_snapshot.status().ToString();
+    } else {
+      const auto final_scan = ScanFactChecksum(final_snapshot.ValueOrDie());
+      if (!final_scan.ok()) {
+        result.terminal_status = final_scan.status().ToString();
+      } else {
+        result.facts = final_scan.ValueOrDie().first;
+        result.dataset_checksum = final_scan.ValueOrDie().second;
+      }
+    }
+  }
+
   if (options.verify_reopen && result.terminal_status == "OK") {
     const Status closed = database->Close();
     if (!closed.ok()) result.terminal_status = closed.ToString();
@@ -845,18 +955,12 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       }
     }
   }
-  auto files = InspectStorageFiles({options.path, StorageProfile::kProductionAppend,
-                                    db_options.production});
-  if (!files.ok()) {
-    result.storage_inspection_status = files.status().ToString();
+  const Status inspected = InspectAndAccountStorage(options.path,
+                                                     db_options.production, &result);
+  if (!inspected.ok()) {
+    const Status& status = inspected;
+    result.storage_inspection_status = status.ToString();
     result.terminal_status = result.storage_inspection_status;
-  } else {
-    AddFileBytes(files.ValueOrDie(), &result);
-    const Status wal_status = AddWalManifestBytes(options.path, files.ValueOrDie(), &result);
-    if (!wal_status.ok()) {
-      result.storage_inspection_status = wal_status.ToString();
-      result.terminal_status = wal_status.ToString();
-    }
   }
   result.mib_per_second = result.elapsed_seconds > 0
                               ? static_cast<double>(result.total_bytes) /
@@ -868,17 +972,9 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                                     ? static_cast<double>(result.query_physical_bytes) /
                                           (1024.0 * 1024.0 * result.query_elapsed_seconds)
                                     : 0.0;
-  result.space_amplification = result.authoritative_bytes == 0
-                                   ? 0.0
-                                   : static_cast<double>(result.total_bytes) /
-                                         result.authoritative_bytes;
-  result.write_amplification = result.authoritative_bytes == 0
-                                   ? 0.0
-                                   : static_cast<double>(result.authoritative_bytes +
-                                                         result.derived_bytes) /
-                                         result.authoritative_bytes;
+  ComputeSpaceMetrics(&result);
   result.hard_gate_pass = result.metrics_complete &&
-                          files.ok() &&
+                          inspected.ok() &&
                           result.operation_supported &&
                           result.projection_state_supported &&
                           (!result.projection_active || result.maintenance_observed) &&
@@ -891,7 +987,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -903,7 +999,9 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << CsvEscape(ProjectionStateName(o.projection))
     << ',' << o.degree << ',' << o.selectivity_percent << ',' << o.readers << ','
     << CsvEscape(o.cache == QueryCacheState::kCold ? "cold" : "warm") << ',' << o.writers << ','
-    << o.facts_per_txn << ',' << o.seed << ',' << r.dataset_checksum << ','
+    << o.facts_per_txn << ',' << o.seed << ','
+    << (o.verify_existing ? "true" : "false") << ',' << o.expected_facts << ','
+    << o.expected_checksum << ',' << r.dataset_checksum << ','
     << r.transactions << ',' << r.facts << ',' << r.measured_transactions << ','
     << r.measured_facts << ',' << r.rows << ','
     << r.elapsed_seconds << ',' << r.write_elapsed_seconds << ',' << r.query_elapsed_seconds << ','
@@ -941,7 +1039,10 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
   x << "{\"operation\":\"" << JsonEscape(QueryBenchmarkOperationName(o.operation))
     << "\",\"projection_state\":\"" << JsonEscape(ProjectionStateName(o.projection))
     << "\",\"writers\":" << o.writers << ",\"facts_per_txn\":"
-    << o.facts_per_txn << ",\"transactions\":" << r.transactions
+    << o.facts_per_txn << ",\"verify_existing\":"
+    << (o.verify_existing ? "true" : "false") << ",\"expected_facts\":"
+    << o.expected_facts << ",\"expected_checksum\":" << o.expected_checksum
+    << ",\"transactions\":" << r.transactions
     << ",\"facts\":" << r.facts << ",\"rows\":" << r.rows
     << ",\"query_operations\":" << r.query_operations
     << ",\"measured_transactions\":" << r.measured_transactions

@@ -305,6 +305,14 @@ audit_run_csv() {
     function integer(value) {
       return value ~ /^[0-9]+$/
     }
+    function unquote(value) {
+      if (value ~ /^".*"$/) {
+        sub(/^"/, "", value)
+        sub(/"$/, "", value)
+        gsub(/""/, "\"", value)
+      }
+      return value
+    }
     function emit(status, message, exit_value, gate_value, terminal_value,
                   reopen_value, auth_value, derived_value, stats_value,
                   scratch_value, amplification_value) {
@@ -361,7 +369,7 @@ audit_run_csv() {
       amplification = $(column["space_amplification"])
       reopen = $(column["reopen_verified"])
       gate = $(column["hard_gate_pass"])
-      terminal = $(column["terminal_status"])
+      terminal = unquote($(column["terminal_status"]))
       exit_value = "0"
       if ("exit_code" in column) exit_value = $(column["exit_code"])
       if ("exit_code" in column && exit_value != "0") fail("exit_code is not zero")
@@ -395,6 +403,62 @@ audit_run_csv() {
   ' "$file" >> "$records"
 }
 
+verify_artifact_database() {
+  local phase="$1" file="$2" records="$3" verification_dir="$4"
+  local raw_path expected_facts expected_checksum
+  read -r raw_path expected_facts expected_checksum < <(awk -F, '
+    NR == 1 { for (i = 1; i <= NF; i++) column[$i] = i; have_path = ("raw_sample_path" in column) && ("facts" in column) && ("dataset_checksum" in column); next }
+    NR == 2 { if (have_path) print $(column["raw_sample_path"]), $(column["facts"]), $(column["dataset_checksum"]); exit }
+  ' "$file")
+  # Legacy synthetic artifacts have no database path.  They remain useful for
+  # schema-only audit tests; real campaign artifacts always carry this field.
+  [[ -n "$raw_path" ]] || return 0
+  raw_path="${raw_path#\"}"
+  raw_path="${raw_path%\"}"
+  raw_path="${raw_path//\"\"/\"}"
+  if [[ ! "$raw_path" = /* || ! -f "$raw_path/CURRENT" ]]; then
+    printf 'FAIL\traw_sample_path is not an existing database\t-\tfalse\tartifact verification failed\tfalse\t-\t-\t-\t-\t-\n' >> "$records"
+    return 0
+  fi
+  if [[ ! "$expected_facts" =~ ^[0-9]+$ || ! "$expected_checksum" =~ ^[0-9]+$ ]]; then
+    printf 'FAIL\tfacts/dataset_checksum are not unsigned integers\t-\tfalse\tartifact verification failed\tfalse\t-\t-\t-\t-\t-\n' >> "$records"
+    return 0
+  fi
+  local csv="$verification_dir/verify.csv" json="$verification_dir/verify.json" rc
+  mkdir -p "$verification_dir"
+  set +e
+  "$build_dir/cedar_query_bench" \
+    "--path=$raw_path" --operation=state-at --duration-seconds=1 \
+    --verify-existing=true --expected-facts="$expected_facts" \
+    --expected-checksum="$expected_checksum" --reopen-verify=true \
+    > "$csv" 2> "$json"
+  rc=$?
+  set -e
+  local gate reopen terminal auth derived stats scratch amplification
+  if [[ -s "$csv" ]]; then
+    gate=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["hard_gate_pass"])}' "$csv")
+    reopen=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["reopen_verified"])}' "$csv")
+    terminal=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {v=$(c["terminal_status"]); sub(/^"/,"",v); sub(/"$/, "", v); gsub(/""/, "\"", v); print v}' "$csv")
+    auth=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["authoritative_bytes"])}' "$csv")
+    derived=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["derived_bytes"])}' "$csv")
+    stats=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["statistics_bytes"])}' "$csv")
+    scratch=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["scratch_bytes"])}' "$csv")
+    amplification=$(awk -F, 'NR==1 {for(i=1;i<=NF;i++) c[$i]=i; next} NR==2 {print $(c["space_amplification"])}' "$csv")
+  fi
+  if [[ "$rc" -ne 0 || "$gate" != true || "$reopen" != true || "$terminal" != OK ]]; then
+    printf 'FAIL\tverify-existing command failed\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$rc" "${gate:-false}" "${terminal:-artifact verification failed}" "${reopen:-false}" \
+      "${auth:--}" "${derived:--}" "${stats:--}" "${scratch:--}" "${amplification:--}" >> "$records"
+    return 0
+  fi
+  if [[ "$phase" == space-audit ]]; then
+    if [[ "$scratch" != 0 ]] || ! awk -v value="$amplification" 'BEGIN {exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 <= 1.5)}'; then
+      printf 'FAIL\tactual storage space bound failed\t0\tfalse\tspace audit failed\ttrue\t%s\t%s\t%s\t%s\t%s\n' \
+        "$auth" "$derived" "$stats" "$scratch" "$amplification" >> "$records"
+    fi
+  fi
+}
+
 run_artifact_audit() {
   local phase="$1"
   [[ -n "$input" && -d "$input" ]] || {
@@ -409,6 +473,7 @@ run_artifact_audit() {
   while IFS= read -r run_file; do
     input_run_count=$((input_run_count + 1))
     audit_run_csv "$phase" "$run_file" "$records"
+    verify_artifact_database "$phase" "$run_file" "$records" "$output/.verify-${input_run_count}"
   done < <(find "$input" -type f -name run.csv -print)
   if ((input_run_count == 0)); then
     echo "$phase input contains no run.csv artifacts" >&2

@@ -426,28 +426,34 @@ void AddFileBytes(const std::vector<StorageFileInfo>& files,
   }
 }
 
-void AddWalManifestBytes(const std::string& root,
-                         const std::vector<StorageFileInfo>& inspected,
-                         QueryBenchmarkResult* result) {
+Status AddWalManifestBytes(const std::string& root,
+                           const std::vector<StorageFileInfo>& inspected,
+                           QueryBenchmarkResult* result) {
   std::unordered_set<std::string> known;
   for (const auto& file : inspected) known.insert(file.relative_filename);
   std::error_code ec;
   for (std::filesystem::recursive_directory_iterator it(root, ec), end;
-       it != end && !ec; it.increment(ec)) {
-    if (!it->is_regular_file(ec)) continue;
+       it != end; it.increment(ec)) {
+    if (ec) return Status::IOError("benchmark storage", ec.message());
+    if (!it->is_regular_file(ec)) {
+      if (ec) return Status::IOError("benchmark storage", ec.message());
+      continue;
+    }
     const auto name = it->path().filename().string();
     const bool wal = name == "CURRENT" || name == "LOG" ||
                      name.rfind("MANIFEST-", 0) == 0 ||
                      it->path().extension() == ".log";
     if (!wal) continue;
     const auto relative = std::filesystem::relative(it->path(), root, ec).string();
-    if (ec || known.count(relative) != 0) continue;
+    if (ec) return Status::IOError("benchmark storage", ec.message());
+    if (known.count(relative) != 0) continue;
     const uint64_t bytes = it->file_size(ec);
-    if (ec) continue;
+    if (ec) return Status::IOError("benchmark storage", ec.message());
     result->total_bytes += bytes;
     result->engine_internal_bytes += bytes;
     result->wal_manifest_bytes += bytes;
   }
+  return Status::OK();
 }
 }  // namespace
 
@@ -527,7 +533,6 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   std::mutex failure_mutex, sample_mutex;
   std::string failure;
   std::vector<uint64_t> write_samples;
-  std::vector<uint64_t> group_fill_samples;
   StatusOr<std::pair<uint64_t, uint64_t>> seeded_checksum(
       Status::InvalidArgument("benchmark", "seed checksum not attempted"));
   {
@@ -613,7 +618,6 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
           Clock::now() - start).count();
       std::lock_guard<std::mutex> lock(sample_mutex);
       write_samples.push_back(static_cast<uint64_t>(us));
-      group_fill_samples.push_back(committed);
     }
   };
   std::vector<std::jthread> writers;
@@ -711,6 +715,11 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                         ? static_cast<double>(result.query_operations) /
                               result.query_elapsed_seconds
                         : 0.0;
+  result.rows_per_second = result.query_elapsed_seconds > 0
+                               ? static_cast<double>(result.rows) /
+                                     result.query_elapsed_seconds
+                               : 0.0;
+  result.group_fill_p50 = pipeline.group_fill.ApproximatePercentile(50);
   result.metrics_complete = pipeline.latency.wal_sync.count > 0 &&
                             pipeline.latency.end_to_end.count > 0 &&
                             !query_samples.empty() && result.rows > 0;
@@ -743,21 +752,18 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.terminal_status = result.storage_inspection_status;
   } else {
     AddFileBytes(files.ValueOrDie(), &result);
-    AddWalManifestBytes(options.path, files.ValueOrDie(), &result);
+    const Status wal_status = AddWalManifestBytes(options.path, files.ValueOrDie(), &result);
+    if (!wal_status.ok()) {
+      result.storage_inspection_status = wal_status.ToString();
+      result.terminal_status = wal_status.ToString();
+    }
   }
   result.mib_per_second = result.elapsed_seconds > 0
                               ? static_cast<double>(result.total_bytes) /
                                     (1024.0 * 1024.0 * result.elapsed_seconds)
                               : 0.0;
-  result.write_mib_per_second = result.write_elapsed_seconds > 0
-                                    ? static_cast<double>(result.authoritative_bytes) /
-                                          (1024.0 * 1024.0 * result.write_elapsed_seconds)
-                                    : 0.0;
-  result.query_mib_per_second = result.query_elapsed_seconds > 0
-                                    ? static_cast<double>(result.total_bytes) /
-                                          (1024.0 * 1024.0 * result.query_elapsed_seconds)
-                                    : 0.0;
-  result.group_fill_p50 = Percentile(group_fill_samples, 50);
+  result.write_mib_per_second = 0.0;
+  result.query_mib_per_second = 0.0;
   result.space_amplification = result.authoritative_bytes == 0
                                    ? 0.0
                                    : static_cast<double>(result.total_bytes) /
@@ -774,6 +780,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                           (!result.projection_active || result.maintenance_observed) &&
                           result.terminal_status == "OK" &&
                           (!options.verify_reopen || result.reopen_verified) &&
+                          result.query_bytes_complete &&
                           (result.authoritative_bytes == 0 ||
                            result.derived_bytes <= result.authoritative_bytes * 3 / 2);
   result.gate_classification = result.hard_gate_pass ? "pass" : "incomplete";
@@ -781,7 +788,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,mib_per_second,write_mib_per_second,query_mib_per_second,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -796,8 +803,9 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.transactions << ',' << r.facts << ',' << r.measured_transactions << ','
     << r.measured_facts << ',' << r.rows << ','
     << r.elapsed_seconds << ',' << r.write_elapsed_seconds << ',' << r.query_elapsed_seconds << ','
-    << t << ',' << f << ',' << r.query_qps << ',' << r.mib_per_second << ','
+    << t << ',' << f << ',' << r.query_qps << ',' << r.rows_per_second << ',' << r.mib_per_second << ','
     << r.write_mib_per_second << ',' << r.query_mib_per_second << ','
+    << (r.query_bytes_complete ? "true" : "false") << ','
     << r.group_fill_p50 << ',' << r.query_samples << ','
     << r.query_p50_us << ',' << r.query_p95_us << ',' << r.query_p99_us << ','
     << r.first_result_p50_us << ','
@@ -835,6 +843,7 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << r.query_p95_us << ",\"query_p99_us\":" << r.query_p99_us
     << ",\"first_result_p50_us\":" << r.first_result_p50_us
     << ",\"query_qps\":" << r.query_qps
+    << ",\"rows_per_second\":" << r.rows_per_second
     << ",\"authoritative_bytes\":" << r.authoritative_bytes
     << ",\"derived_bytes\":" << r.derived_bytes
     << ",\"adjacency_bytes\":" << r.adjacency_bytes
@@ -846,6 +855,7 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << ",\"mib_per_second\":" << r.mib_per_second
     << ",\"write_mib_per_second\":" << r.write_mib_per_second
     << ",\"query_mib_per_second\":" << r.query_mib_per_second
+    << ",\"query_bytes_complete\":" << (r.query_bytes_complete ? "true" : "false")
     << ",\"group_fill_p50\":" << r.group_fill_p50
     << ",\"write_amplification\":" << r.write_amplification
     << ",\"space_amplification\":" << r.space_amplification

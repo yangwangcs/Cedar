@@ -65,14 +65,15 @@ StatusOr<std::pair<uint64_t, uint64_t>> ScanFactChecksum(
     const Snapshot& snapshot) {
   uint64_t count = 0;
   uint64_t checksum = 0;
-  const std::array<std::pair<FactFamily, PropertyId>, 5> families = {{
+  const std::array<std::pair<FactFamily, PropertyId>, 6> families = {{
       {FactFamily::kVertexState, PropertyId{}},
       {FactFamily::kEdgeIdentity, PropertyId{}},
       {FactFamily::kEdgeState, PropertyId{}},
       {FactFamily::kVertexProperty, BenchmarkGraph::kDuration},
       {FactFamily::kEdgeProperty, BenchmarkGraph::kDuration},
+      {FactFamily::kVertexProperty, BenchmarkGraph::kScore},
   }};
-  for (const PartId part : {PartId{1}, PartId{2}}) {
+  for (const PartId part : {PartId{0}, PartId{1}, PartId{2}}) {
     for (const auto [family, property] : families) {
       FactScanSpec spec{part, family, property, ValidTime{1},
                         std::numeric_limits<uint32_t>::max()};
@@ -502,6 +503,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   std::mutex failure_mutex, sample_mutex;
   std::string failure;
   std::vector<uint64_t> write_samples;
+  std::vector<uint64_t> group_fill_samples;
   StatusOr<std::pair<uint64_t, uint64_t>> seeded_checksum(
       Status::InvalidArgument("benchmark", "seed checksum not attempted"));
   {
@@ -554,7 +556,13 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       return result;
     }
     maintenance = std::move(refreshed).ConsumeValueOrDie();
-    result.maintenance_status = "refresh-submitted";
+    const Status awaited = maintenance->Await();
+    if (!awaited.ok()) {
+      result.terminal_status = awaited.ToString();
+      result.gate_classification = "incomplete";
+      return result;
+    }
+    result.maintenance_status = "refresh-complete";
     result.maintenance_observed = true;
   }
   const auto write_start = Clock::now();
@@ -581,6 +589,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
           Clock::now() - start).count();
       std::lock_guard<std::mutex> lock(sample_mutex);
       write_samples.push_back(static_cast<uint64_t>(us));
+      group_fill_samples.push_back(committed);
     }
   };
   std::vector<std::jthread> writers;
@@ -715,7 +724,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                               ? static_cast<double>(result.total_bytes) /
                                     (1024.0 * 1024.0 * result.elapsed_seconds)
                               : 0.0;
-  result.group_fill_p50 = Percentile(write_samples, 50);
+  result.group_fill_p50 = Percentile(group_fill_samples, 50);
   result.space_amplification = result.authoritative_bytes == 0
                                    ? 0.0
                                    : static_cast<double>(result.total_bytes) /

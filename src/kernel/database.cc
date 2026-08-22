@@ -1547,6 +1547,9 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       return finalized.status();
     }
   }
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("authoritative_recovery");
+  }
   auto projections = internal::QueryProjectionStore::Open(
       internal::ProjectionStoreOptions{database_path + "/projections", database_path, {}});
   if (!projections.ok()) {
@@ -1554,6 +1557,9 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
     return projections.status();
   }
   impl->projection_store = projections.ConsumeValueOrDie();
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("derived_loaded");
+  }
   const CommitSeq projection_base =
       impl->projection_store->current_base_seq().value_or(CommitSeq{0});
   impl->query_delta = std::make_unique<internal::QueryDelta>(
@@ -1577,6 +1583,9 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       impl->query_delta = std::make_unique<internal::QueryDelta>(
           internal::QueryDeltaOptions{recovered_visible});
     }
+  }
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("query_delta_repaired");
   }
   const Status pipeline_started = impl->StartAppendCommitPipeline();
   if (!pipeline_started.ok()) {

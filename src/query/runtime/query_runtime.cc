@@ -554,7 +554,8 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     internal::QueryReservation* reservation,
     QueryExecutionMode mode,
     const std::function<Status()>& check_abort = {},
-    uint64_t max_journey_labels = 0) {
+    uint64_t max_journey_labels = 0,
+    uint64_t max_journey_interval_fragments = 0) {
   if (!plan.graph_expand) {
     return Status::InvalidArgument("graph expansion", "missing graph specification");
   }
@@ -610,7 +611,8 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
                                                                      snapshot.adjacency_index(),
                                                                      options.projection_generation,
                                                                      check_abort,
-                                                                     max_journey_labels});
+                                                                     max_journey_labels,
+                                                                     max_journey_interval_fragments});
         if (!journey.ok()) {
           if (journey.status().IsNotFound()) continue;
           return journey.status();
@@ -1301,7 +1303,8 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                                                return Status::DeadlineExceeded("query", "deadline_us budget exhausted");
                                              return Status::OK();
                                            },
-                                           state_->options.budget.graph_labels)
+                                           state_->options.budget.graph_labels,
+                                           state_->options.budget.interval_fragments)
                     : MaterializeRows(*state_->snapshot, state_->plan,
                                       &state_->reservation);
     // The lease owns the pre-materialization reservation. Reset it now that

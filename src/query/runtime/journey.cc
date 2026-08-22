@@ -33,6 +33,23 @@ struct JourneyStateLess {
   }
 };
 
+struct JourneyTimedStateKey {
+  VertexRef vertex;
+  uint32_t depth = 0;
+  uint64_t time = 0;
+};
+
+struct JourneyTimedStateLess {
+  bool operator()(const JourneyTimedStateKey& a,
+                  const JourneyTimedStateKey& b) const {
+    VertexLess less;
+    if (less(a.vertex, b.vertex)) return true;
+    if (less(b.vertex, a.vertex)) return false;
+    if (a.depth != b.depth) return a.depth < b.depth;
+    return a.time < b.time;
+  }
+};
+
 // With no hop bound, FIFO/non-negative durations make a single state per
 // vertex sufficient and avoid admitting infinitely many zero-cost cycles.
 JourneyStateKey StateKey(VertexRef vertex, uint32_t depth,
@@ -516,20 +533,26 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
     JourneyTraversal edge;
   };
   std::vector<Label> labels;
-  std::map<JourneyStateKey, uint64_t, JourneyStateLess> best;
+  // A later reverse departure is not generally dominant over an earlier one:
+  // the intermediate vertex may disappear during the waiting interval. Keep
+  // one label per exact (vertex, depth, departure) state, while still
+  // collapsing exact duplicates (including zero-duration cycles when hops
+  // are unbounded).
+  std::map<JourneyTimedStateKey, uint64_t, JourneyTimedStateLess> best;
   using HeapEntry = std::pair<uint64_t, uint64_t>;
   std::priority_queue<HeapEntry> heap;
   labels.push_back({request.target, deadline, 0,
                     std::numeric_limits<uint64_t>::max(), {}});
-  best[StateKey(request.target, 0, request.max_hops)] = 0;
+  best[{request.target, 0, deadline.value}] = 0;
   heap.push({deadline.value, 0});
   while (!heap.empty()) {
     if (Status status = Check(options); !status.ok()) return status;
     const auto [time, id] = heap.top();
     heap.pop();
     const Label current = labels[id];
-    auto found = best.find(StateKey(current.vertex, current.depth,
-                                    request.max_hops));
+    auto found = best.find({current.vertex,
+                            request.max_hops == 0 ? 0U : current.depth,
+                            current.time.value});
     if (found == best.end() || found->second != id || current.time.value != time)
       continue;
     if (current.vertex == request.source) {
@@ -548,12 +571,14 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
     for (const JourneyTraversal& candidate : incoming.ValueOrDie()) {
       const VertexRef predecessor = candidate.traversal.source;
       const uint32_t depth = current.depth + 1;
-      auto existing = best.find(StateKey(predecessor, depth, request.max_hops));
+      const uint32_t state_depth = request.max_hops == 0 ? 0U : depth;
+      auto existing = best.find(
+          {predecessor, state_depth, candidate.departure.value});
       if (existing != best.end()) {
         const Label& prior = labels[existing->second];
-        if (prior.time.value > candidate.departure.value ||
-            (prior.time == candidate.departure &&
-             !TraversalLess(candidate, prior.edge)))
+        // Same time/state has the same future search space. Keep the first
+        // deterministic edge selected by LatestIncoming's ordering.
+        if (prior.time == candidate.departure)
           continue;
       }
       if (options.max_labels && labels.size() >= options.max_labels)
@@ -562,7 +587,7 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
       const uint64_t next = labels.size();
       labels.push_back({predecessor, candidate.departure, depth,
                         id, candidate});
-      best[StateKey(predecessor, depth, request.max_hops)] = next;
+      best[{predecessor, state_depth, candidate.departure.value}] = next;
       heap.push({candidate.departure.value, next});
     }
   }

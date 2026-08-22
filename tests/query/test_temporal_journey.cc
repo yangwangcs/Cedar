@@ -346,6 +346,43 @@ TEST(TemporalJourneyTest, LatestDepartureRejectsWaitingAcrossTargetGap) {
   EXPECT_TRUE(journey.status().IsNotFound()) << journey.status().ToString();
 }
 
+TEST(TemporalJourneyTest, LatestDepartureRetainsLabelsAcrossVisibilityGap) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a, 0, 100);
+  graph.Vertex(graph.d, 0, 100);
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{0});
+    if (!status.ok()) return status;
+    status = txn.Retract(EntityFact::Vertex(graph.b), ValidTime{18});
+    if (!status.ok()) return status;
+    status = txn.Assert(EntityFact::Vertex(graph.b), ValidTime{20});
+    if (!status.ok()) return status;
+    return txn.Retract(EntityFact::Vertex(graph.b), ValidTime{100});
+  });
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{71}}, graph.a, graph.b, 0, 18);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{72}}, graph.b, graph.d, 20, 100);
+  // The half-open edge interval must contain the full positive-duration
+  // traversal, so [15,17) admits departure 15 and arrival 16.
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{73}}, graph.b, graph.d, 15, 17);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kLatestDeparture};
+  request.arrival_deadline = ValidTime{100};
+  request.max_hops = 2;
+  request.duration_at = [](EdgeRef, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{1}};
+  };
+  auto journey = LatestDeparture(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  ASSERT_EQ(journey.ValueOrDie().edges.size(), 2U);
+  EXPECT_EQ(journey.ValueOrDie().edges[0].edge_id.value, 71U);
+  EXPECT_EQ(journey.ValueOrDie().edges[1].edge_id.value, 73U);
+  EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{14}));
+  EXPECT_EQ(journey.ValueOrDie().final_arrival, (ValidTime{16}));
+}
+
 TEST(TemporalJourneyTest, FastestDurationRetainsDepartureArrivalParetoLabels) {
   JourneyFixture graph;
   graph.Vertex(graph.a, 0, 1'000'000);

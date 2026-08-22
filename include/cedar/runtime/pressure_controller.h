@@ -11,7 +11,7 @@ namespace cedar {
 enum class PressureState : uint8_t { kNormal, kSoft, kHard };
 
 // Values are deliberately expressed as monotonic samples so the controller is
-// usable with RocksDB properties as well as deterministic unit-test inputs.
+// usable with Cedar storage properties as well as deterministic unit-test inputs.
 struct PressureSample {
   uint64_t arrival_rate = 0;
   uint64_t l0_files = 0;
@@ -36,8 +36,8 @@ struct PressureSample {
   uint64_t columnar_backlog_buffers = 0;
   uint64_t columnar_builder_bytes = 0;
   uint64_t columnar_flush_pending_bytes = 0;
-  // Sum of RocksDB WAL files retained for recovery. This is sampled by Cedar
-  // and is a hard admission signal independent of RocksDB's write-stop path.
+  // Sum of recovery-log files retained for recovery. This is sampled by Cedar
+  // and is a hard admission signal independent of the storage engine's write-stop path.
   uint64_t retained_wal_bytes = 0;
 };
 

@@ -140,11 +140,6 @@ if(BUILD_BENCHMARKS)
     add_executable(cedar_kernel_bench benchmarks/cedar_kernel_bench.cc)
     target_link_libraries(cedar_kernel_bench PRIVATE cedar_kernel_bench_options
         cedar_kernel_bench_workload)
-    add_executable(cedar_kernel_columnar_bench
-        benchmarks/cedar_kernel_columnar_bench.cc)
-    target_include_directories(cedar_kernel_columnar_bench PRIVATE
-        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
-    target_link_libraries(cedar_kernel_columnar_bench PRIVATE cedar_core)
     add_executable(cedar_query_bench benchmarks/cedar_query_bench.cc)
     target_link_libraries(cedar_query_bench PRIVATE cedar_query_bench_options cedar_query_bench_workload)
 endif()
@@ -154,8 +149,10 @@ install(TARGETS cedar_core EXPORT CedarTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS cedar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES "${CEDAR_ROCKSDB_LIBRARY}"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal"
+    RENAME "libcedar_engine.a")
 install(FILES
-    "${CEDAR_ROCKSDB_LIBRARY}"
     "${CEDAR_ROCKSDB_LZ4_LIBRARY}"
     "${CEDAR_ROCKSDB_ZSTD_LIBRARY}"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal")

@@ -147,3 +147,42 @@ const bool exists = snapshot.Exists(
 a restart are intentional and IDs are never reused. `Close()` rejects new
 operations, waits for active commits, and returns `SnapshotPinned` until caller
 owned Snapshots have been released.
+
+### Typed bitemporal queries
+
+The installed package exposes the query builder through Cedar headers only.
+Prepare a logical query once, then execute it against a consumed Cedar
+`Snapshot`; the snapshot fixes system time while `At`, `History`, `Events`,
+and the other temporal scopes select valid time. Typed slots preserve the
+property's declared physical type through planning and result decoding.
+
+```cpp
+#include <cedar/database.h>
+#include <cedar/query.h>
+#include <cedar/transaction.h>
+
+cedar::Slot<cedar::VertexRef> vertex =
+    cedar::Slot<cedar::VertexRef>::Named("vertex");
+cedar::OptionalSlot<int64_t> score =
+    cedar::OptionalSlot<int64_t>::Named("score");
+auto source = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{15}});
+auto bound = source.ValueOrDie().BindVertexProperty(
+    vertex, cedar::PropertyId{7}, score);
+auto query = bound.ValueOrDie().Select(
+    {cedar::Project(vertex), cedar::Project(score)});
+auto prepared = database->PrepareQuery(query.ValueOrDie());
+auto snapshot = database->BeginSnapshot();
+auto cursor = prepared.ValueOrDie().Execute(
+    std::move(snapshot).ConsumeValueOrDie(), cedar::Bindings{},
+    cedar::QueryOptions{});
+auto batch = cursor.ValueOrDie().Next().ConsumeValueOrDie();
+if (batch && batch->row_count() != 0) {
+  const cedar::VertexRef row_vertex = batch->Get<cedar::VertexRef>(vertex, 0);
+  const int64_t row_score = batch->Get<int64_t>(score, 0);
+}
+```
+
+`ctest -R CedarInstallConsumer` builds this example from the installed prefix,
+then closes and reopens the database before running the same typed query. The
+consumer links only `Cedar::cedar`; implementation archives are package-owned
+details and no implementation headers are installed.

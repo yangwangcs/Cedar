@@ -9,7 +9,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/CedarTargets.cmake")
 # resolve the Cedar static library, but no implementation headers or CMake
 # targets are exported to consumers.
 set_property(TARGET Cedar::cedar APPEND PROPERTY INTERFACE_LINK_LIBRARIES
-  "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/librocksdb.a"
+  "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/libcedar_engine.a"
   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/liblz4.a"
   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/cedar/internal/libzstd.a"
   Threads::Threads)

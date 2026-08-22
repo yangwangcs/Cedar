@@ -5,3 +5,4 @@ find_package(Cedar CONFIG REQUIRED)
 
 add_executable(cedar_install_consumer main.cc)
 target_link_libraries(cedar_install_consumer PRIVATE Cedar::cedar)
+target_compile_features(cedar_install_consumer PRIVATE cxx_std_20)

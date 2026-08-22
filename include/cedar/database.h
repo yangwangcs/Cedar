@@ -296,7 +296,7 @@ class Database {
   Status Close();
   // Creates an openable, point-in-time database snapshot owned by the
   // underlying storage engine. The snapshot uses Cedar's normal recovery
-  // contract and does not expose engine handles.
+  // contract and does not expose implementation handles.
   Status CreateCheckpoint(const std::string& checkpoint_path) const;
   StatusOr<VertexId> AllocateVertexId();
   StatusOr<EdgeId> AllocateEdgeId();

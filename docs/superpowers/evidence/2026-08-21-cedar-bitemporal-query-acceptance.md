@@ -11,7 +11,7 @@ a sustained-capability claim because the complete Release matrices and the
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `bb9d87e` (`codex/cedar-bitemporal-query-execution`)
+- Source snapshot: `c5ee3f1` (`codex/cedar-bitemporal-query-execution`)
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
 - Build: `build/query-debug`, C++20, Debug
 - Install prefix: `build-install-consumer-prefix`
@@ -118,11 +118,13 @@ identify a production turning point. No cold/warm read matrix, active
 projection matrix, 1,800-second mixed campaign, reopen verification, or space
 audit passed in this evidence point.
 
-The campaign runner now rejects unsupported cross-artifact reopen/space
-verification explicitly because `cedar_query_bench` has no interface to reopen
-and checksum databases from a prior campaign input. Those phases return a
-nonzero status and write `unsupported` to their summary; they must not be
-treated as passed evidence.
+The campaign runner now audits supplied `run.csv` artifacts for
+`reopen_verified`, terminal status, hard-gate status, byte accounting, scratch,
+space amplification, and statistics bounds. It writes `audit-summary.csv/json`
+and fails closed on malformed or mismatching rows. This is an audit of the
+benchmark's recorded close/reopen and inspection evidence; it does not itself
+reopen the database or recompute a checksum. A true database-level reopen and
+checksum implementation remains required before Step 7 can be called complete.
 
 The current runner summary schema reports facts/s and end-to-end p99 for these
 campaign cases. It does not yet enforce the complete WAL-sync p99 and

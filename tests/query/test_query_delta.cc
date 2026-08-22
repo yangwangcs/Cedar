@@ -130,9 +130,16 @@ TEST(QueryDeltaTest, SoftLagThresholdIsObservableBeforeHardRetirement) {
   ASSERT_TRUE(delta.ObservePublished(QueryDeltaCommit{CommitSeq{1}}).ok());
   EXPECT_FALSE(delta.soft_lag_reached());
   ASSERT_TRUE(delta.ObservePublished(QueryDeltaCommit{CommitSeq{2}}).ok());
-  ASSERT_TRUE(delta.ObservePublished(QueryDeltaCommit{CommitSeq{3}}).ok());
   EXPECT_TRUE(delta.soft_lag_reached());
   EXPECT_FALSE(delta.hard_limit_reached());
+
+  QueryDelta memory_delta({.base_seq = CommitSeq{0},
+                           .queue_capacity = 8,
+                           .soft_memory_bytes = 1,
+                           .hard_memory_bytes = 2ULL << 20,
+                           .max_lag_commits = 8});
+  ASSERT_TRUE(memory_delta.ObservePublished(QueryDeltaCommit{CommitSeq{1}}).ok());
+  EXPECT_TRUE(memory_delta.soft_memory_reached());
 }
 
 TEST(FactStoreBatchReadTest, ReadsContiguousSequencesAndExactFactsInOrder) {

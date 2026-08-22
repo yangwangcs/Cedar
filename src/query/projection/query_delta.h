@@ -135,6 +135,7 @@ class QueryDelta {
   bool mergeable() const;
   bool hard_limit_reached() const;
   bool soft_lag_reached() const;
+  bool soft_memory_reached() const;
   size_t pending_commits() const;
 
   std::vector<FactEvent> EventsFor(const FactRef& ref,
@@ -169,6 +170,7 @@ class QueryDelta {
   bool stopping_ = false;
   bool hard_limit_reached_ = false;
   bool soft_lag_reached_ = false;
+  bool soft_memory_reached_ = false;
   std::vector<QueryDeltaCommit> commits_;
   std::unordered_map<FactRef, std::vector<FactEvent>, FactRefHash> chains_;
   std::vector<std::pair<CommitSeq, EdgeIdentity>> edge_identities_;

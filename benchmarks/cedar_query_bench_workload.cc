@@ -432,7 +432,9 @@ Status AddWalManifestBytes(const std::string& root,
   std::unordered_set<std::string> known;
   for (const auto& file : inspected) known.insert(file.relative_filename);
   std::error_code ec;
-  for (std::filesystem::recursive_directory_iterator it(root, ec), end;
+  std::filesystem::recursive_directory_iterator it(root, ec), end;
+  if (ec) return Status::IOError("benchmark storage", ec.message());
+  for (;
        it != end; it.increment(ec)) {
     if (ec) return Status::IOError("benchmark storage", ec.message());
     if (!it->is_regular_file(ec)) {

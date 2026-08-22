@@ -10,12 +10,14 @@ struct QueryBenchmarkResult {
   uint64_t measured_transactions = 0;
   uint64_t measured_facts = 0;
   uint64_t rows = 0;
+  uint64_t query_operations = 0;
   uint64_t query_samples = 0;
   uint64_t query_p50_us = 0;
   uint64_t query_p95_us = 0;
   uint64_t query_p99_us = 0;
   uint64_t first_result_p50_us = 0;
   double query_qps = 0;
+  double rows_per_second = 0;
   uint64_t write_p50_us = 0;
   uint64_t write_p95_us = 0;
   uint64_t write_p99_us = 0;

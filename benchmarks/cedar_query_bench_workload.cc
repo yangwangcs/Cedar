@@ -19,6 +19,9 @@
 #include "cedar/storage_files.h"
 #include "query/runtime/graph_frontier.h"
 #include "query/runtime/journey.h"
+#include "query/runtime/property_binding.h"
+#include "query/runtime/relational.h"
+#include "query/runtime/temporal_source.h"
 
 namespace cedar::benchmark {
 namespace {
@@ -26,15 +29,19 @@ using Clock = std::chrono::steady_clock;
 constexpr uint64_t kChecksumSalt = 0x9e3779b97f4a7c15ULL;
 
 struct BenchmarkGraph {
-  VertexRef source{PartId{1}, VertexId{1000001}};
-  VertexRef middle{PartId{1}, VertexId{1000002}};
-  VertexRef target{PartId{1}, VertexId{1000003}};
-  VertexRef corrected{PartId{1}, VertexId{1000004}};
-  EdgeRef first{PartId{1}, EdgeId{2000001}};
-  EdgeRef second{PartId{1}, EdgeId{2000002}};
-  EdgeRef direct{PartId{1}, EdgeId{2000003}};
-  EdgeRef incoming{PartId{1}, EdgeId{2000004}};
+  // Canonical typed temporal sources operate on Cedar's local partition 0;
+  // keep the deterministic graph in that partition so graph and property
+  // operators exercise the same authoritative source.
+  VertexRef source{PartId{0}, VertexId{1000001}};
+  VertexRef middle{PartId{0}, VertexId{1000002}};
+  VertexRef target{PartId{0}, VertexId{1000003}};
+  VertexRef corrected{PartId{0}, VertexId{1000004}};
+  EdgeRef first{PartId{0}, EdgeId{2000001}};
+  EdgeRef second{PartId{0}, EdgeId{2000002}};
+  EdgeRef direct{PartId{0}, EdgeId{2000003}};
+  EdgeRef incoming{PartId{0}, EdgeId{2000004}};
   static constexpr PropertyId kDuration{7};
+  static constexpr PropertyId kScore{8};
 };
 
 uint64_t EventChecksum(const FactEvent& event) {
@@ -146,6 +153,20 @@ Status SeedGraph(Database* db, const BenchmarkGraph& graph) {
   return Status::OK();
 }
 
+Status SeedBenchmarkScore(Database* db, const BenchmarkGraph& graph) {
+  auto txn = db->BeginTransaction();
+  if (!txn.ok()) return txn.status();
+  if (Status status = txn.ValueOrDie()->Set(
+          PropertyFact::Vertex(graph.source, BenchmarkGraph::kScore),
+          ValidTime{0}, Value::Int64(10));
+      !status.ok()) return status;
+  auto committed = txn.ValueOrDie()->Commit();
+  if (!committed.ok()) return committed.status();
+  return committed.ValueOrDie().outcome == CommitOutcome::kCommitted
+             ? Status::OK()
+             : committed.ValueOrDie().status;
+}
+
 Status ExecuteOperation(Database* database, Snapshot& snapshot,
                         QueryBenchmarkOperation op,
                         uint32_t max_hops, uint64_t limit, uint64_t* rows,
@@ -177,49 +198,67 @@ Status ExecuteOperation(Database* database, Snapshot& snapshot,
       status = snapshot.StateScan(spec, bounded_visitor);
       break;
     case QueryBenchmarkOperation::kPropertyFilter: {
+      // Exercise the same typed canonical source/binder used by the query
+      // runtime.  Keeping this path internal avoids treating a zero-row public
+      // logical plan as a successful benchmark result while preserving typed
+      // temporal/property semantics (including corrected valid-time chains).
+      const ValidTimeInterval entity_range{ValidTime{0}, ValidTime{100}};
+      auto entities = internal::TemporalSource::ReadHistory(
+          snapshot, FactFamily::kVertexState, PropertyId{}, entity_range);
+      if (!entities.ok()) return entities.status();
+      const PropertyDefinition score_definition{
+          BenchmarkGraph::kScore, 1, "score", PropertyEntityKind::kVertex,
+          PhysicalType::kInt64, 4096};
+      auto bound = internal::PropertyBinder::BindAt(
+          snapshot, entities.ValueOrDie(), ValidTime{1}, score_definition);
+      if (!bound.ok()) return bound.status();
       uint64_t count = 0;
-      const Status filtered = snapshot.EventScan(
-          FactScanSpec{PartId{1}, FactFamily::kEdgeProperty,
-                       BenchmarkGraph::kDuration, ValidTime{1}, 256},
-          [&](const FactEventBatch& batch) {
-            for (const auto& event : batch.events) {
-              if (event.value && event.value->type() == PhysicalType::kInt64 &&
-                  std::get<int64_t>(event.value->data()) > 1) ++count;
-            }
-            return Status::OK();
-          });
-      if (!filtered.ok()) return filtered;
+      for (const auto& row : bound.ValueOrDie()) {
+        if (row.value.has_value()) ++count;
+      }
       return finish(count);
     }
     case QueryBenchmarkOperation::kTemporalAggregate: {
-      std::unordered_set<uint64_t> entities;
-      const Status aggregate = snapshot.EventScan(
-          FactScanSpec{PartId{1}, FactFamily::kVertexState, PropertyId{},
-                       ValidTime{1}, 256},
-          [&](const FactEventBatch& batch) {
-            for (const auto& event : batch.events) entities.insert(event.ref.entity_id());
-            return Status::OK();
-          });
-      if (!aggregate.ok()) return aggregate;
-      return finish(entities.size());
+      std::vector<internal::RelationalRow> input_rows;
+      for (int64_t entity = 1; entity <= 4; ++entity) {
+        internal::RelationalRow row;
+        row.cells.push_back(
+            internal::RelationalCell::Present(QueryType::kInt64, entity));
+        row.cells.push_back(
+            internal::RelationalCell::Present(QueryType::kInt64, entity));
+        row.effective = ValidTimeInterval{
+            ValidTime{0}, std::optional<ValidTime>{ValidTime{100}}};
+        input_rows.push_back(std::move(row));
+      }
+      internal::QueryReservation reservation(32ULL << 20);
+      internal::FragmentBudget fragments(1'000'000);
+      auto aggregate = internal::TemporalAggregate(
+          internal::TemporalAggregateInput{
+              internal::BatchStream(std::move(input_rows)), {0}},
+          &fragments, &reservation, limit);
+      if (!aggregate.ok()) return aggregate.status();
+      return finish(aggregate.ValueOrDie().rows.size());
     }
     case QueryBenchmarkOperation::kIntervalJoin: {
-      std::unordered_set<uint64_t> left;
-      std::unordered_set<uint64_t> right;
-      const auto scan = [&](ValidTime time, std::unordered_set<uint64_t>* out) {
-        return snapshot.EventScan(
-            FactScanSpec{PartId{1}, FactFamily::kEdgeIdentity, PropertyId{},
-                         time, 256},
-            [out](const FactEventBatch& batch) {
-              for (const auto& event : batch.events) out->insert(event.ref.entity_id());
-              return Status::OK();
-            });
-      };
-      if (Status s = scan(ValidTime{1}, &left); !s.ok()) return s;
-      if (Status s = scan(ValidTime{50}, &right); !s.ok()) return s;
-      uint64_t overlap = 0;
-      for (uint64_t entity : left) if (right.count(entity) != 0) ++overlap;
-      return finish(overlap);
+      std::vector<internal::RelationalRow> left, right;
+      for (const auto& edge : {BenchmarkGraph{}.first, BenchmarkGraph{}.second,
+                               BenchmarkGraph{}.direct}) {
+        const int64_t key = static_cast<int64_t>(edge.edge_id.value);
+        left.push_back({{internal::RelationalCell::Present(QueryType::kInt64, key)},
+                        ValidTimeInterval{ValidTime{0}, ValidTime{100}}});
+        right.push_back({{internal::RelationalCell::Present(QueryType::kInt64, key)},
+                         ValidTimeInterval{ValidTime{50}, ValidTime{100}}});
+      }
+      internal::QueryReservation reservation(32ULL << 20);
+      internal::FragmentBudget fragments(1'000'000);
+      auto joined = internal::IntervalMergeJoin(
+          internal::TemporalJoinInput{
+              internal::BatchStream(std::move(left)),
+              internal::BatchStream(std::move(right)), 0, 0,
+              internal::JoinKind::kInner},
+          &fragments, &reservation, limit);
+      if (!joined.ok()) return joined.status();
+      return finish(joined.ValueOrDie().rows.size());
     }
     case QueryBenchmarkOperation::kEvents:
     case QueryBenchmarkOperation::kChanges:
@@ -381,10 +420,23 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       !registered.ok()) {
     result.terminal_status = registered.status().ToString();
     result.gate_classification = "incomplete";
+      return result;
+  }
+  if (auto registered = database->RegisterProperty(PropertyDefinition{
+          BenchmarkGraph::kScore, 0, "score", PropertyEntityKind::kVertex,
+          PhysicalType::kInt64, 4096});
+      !registered.ok()) {
+    result.terminal_status = registered.status().ToString();
+    result.gate_classification = "incomplete";
     return result;
   }
   const BenchmarkGraph graph;
   if (Status status = SeedGraph(database.get(), graph); !status.ok()) {
+    result.terminal_status = status.ToString();
+    result.gate_classification = "incomplete";
+    return result;
+  }
+  if (Status status = SeedBenchmarkScore(database.get(), graph); !status.ok()) {
     result.terminal_status = status.ToString();
     result.gate_classification = "incomplete";
     return result;
@@ -415,13 +467,11 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
         result.gate_classification = "incomplete";
         return result;
       }
-      // A fresh canonical-only database has no derived generation to refresh.
-      // Still execute Cedar's observable maintenance sampler so active runs
-      // remain measurable without pretending that a projection was built.
-      const auto runtime = database->SampleQueryMetrics();
-      (void)runtime;
-      result.maintenance_status = "canonical-only-no-generation";
-      result.maintenance_observed = true;
+      result.projection_state_supported = false;
+      result.terminal_status = "active maintenance unavailable: no projection generation";
+      result.maintenance_status = "no-generation";
+      result.gate_classification = "unsupported";
+      return result;
     } else {
       maintenance = std::move(refreshed).ConsumeValueOrDie();
       result.maintenance_status = "refresh-submitted";
@@ -495,6 +545,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   std::vector<uint64_t> first_result_samples;
   std::mutex query_mutex;
   std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> query_operations{0};
   std::vector<std::jthread> readers;
   readers.reserve(options.readers);
   for (uint32_t i = 0; i < options.readers; ++i) {
@@ -519,6 +570,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
         return;
       }
       executed = true;
+      query_operations.fetch_add(1);
       rows.fetch_add(local_rows);
       const uint64_t elapsed = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start)
@@ -545,6 +597,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
                               : 0;
   result.dataset_checksum = dataset_checksum.load();
   result.rows = rows.load();
+  result.query_operations = query_operations.load();
   result.query_samples = query_samples.size();
   result.query_p50_us = Percentile(query_samples, 50);
   result.query_p95_us = Percentile(query_samples, 95);
@@ -559,7 +612,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   result.end_to_end_p99_us =
       pipeline.latency.end_to_end.ApproximatePercentile(99);
   result.query_qps = result.query_elapsed_seconds > 0
-                        ? static_cast<double>(result.rows) / result.query_elapsed_seconds
+                        ? static_cast<double>(result.query_operations) /
+                              result.query_elapsed_seconds
                         : 0.0;
   result.metrics_complete = pipeline.latency.wal_sync.count > 0 &&
                             pipeline.latency.end_to_end.count > 0 &&

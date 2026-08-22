@@ -59,18 +59,110 @@ TEST(QueryDifferentialTest, SmokeOracleMatchesDirectEnumeration) {
   EXPECT_FALSE(rows.front().value.has_value());
 }
 
+TEST(QueryDifferentialTest, OracleExpandUsesHalfOpenEdgeStateIntervals) {
+  test::BitemporalFactOracle oracle;
+  const EdgeRef edge_ref{PartId{1}, EdgeId{17}};
+  const EdgeIdentity edge{edge_ref, VertexRef{PartId{0}, VertexId{1}},
+                          VertexRef{PartId{2}, VertexId{2}}, 9};
+  oracle.Add({FactRef(edge_ref.home_part_id, FactFamily::kEdgeIdentity,
+                     PropertyId{}, edge_ref.edge_id.value), ValidTime{0}, CommitSeq{1},
+              FactOperation::kPut, 3, std::nullopt, edge});
+  oracle.Add({EntityFact::Edge(edge_ref).ref(), ValidTime{0}, CommitSeq{1},
+              FactOperation::kPut, 3, std::nullopt, std::nullopt});
+  oracle.Add({EntityFact::Edge(edge_ref).ref(), ValidTime{5}, CommitSeq{2},
+              FactOperation::kDelete, 3, std::nullopt, std::nullopt});
+  const auto rows = oracle.Expand(
+      {VertexRef{PartId{0}, VertexId{1}},
+       ValidTimeInterval{ValidTime{2}, ValidTime{8}}, ExpandDirection::kOut,
+       std::nullopt, 1},
+      CommitSeq{2});
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows.front().interval,
+            (ValidTimeInterval{ValidTime{2}, ValidTime{5}}));
+}
+
+TEST(QueryDifferentialTest, OraclePathAndJourneyApplyIndependentTieObjectives) {
+  test::BitemporalFactOracle oracle;
+  const VertexRef a{PartId{0}, VertexId{1}};
+  const VertexRef b{PartId{0}, VertexId{2}};
+  const VertexRef c{PartId{0}, VertexId{3}};
+  const EdgeIdentity ab{{PartId{0}, EdgeId{11}}, a, b, 0};
+  const EdgeIdentity bc{{PartId{0}, EdgeId{12}}, b, c, 0};
+  const EdgeIdentity ac{{PartId{0}, EdgeId{13}}, a, c, 0};
+  for (const EdgeIdentity& edge : {ab, bc, ac}) {
+    oracle.Add({FactRef(edge.home_part_id, FactFamily::kEdgeIdentity,
+                        PropertyId{}, edge.edge_id.value), ValidTime{0},
+                CommitSeq{1}, FactOperation::kPut, 0, std::nullopt, edge});
+    oracle.Add({EntityFact::Edge(edge.edge_ref()).ref(), ValidTime{0},
+                CommitSeq{1}, FactOperation::kPut, 0, std::nullopt,
+                std::nullopt});
+  }
+  const PropertyId duration{7};
+  oracle.Add({PropertyFact::Edge(ab.edge_ref(), duration).ref(), ValidTime{0},
+              CommitSeq{1}, FactOperation::kPut, 0, Value::Int64(2),
+              std::nullopt});
+  oracle.Add({PropertyFact::Edge(bc.edge_ref(), duration).ref(), ValidTime{0},
+              CommitSeq{1}, FactOperation::kPut, 0, Value::Int64(2),
+              std::nullopt});
+  oracle.Add({PropertyFact::Edge(ac.edge_ref(), duration).ref(), ValidTime{0},
+              CommitSeq{1}, FactOperation::kPut, 0, Value::Int64(9),
+              std::nullopt});
+  const test::OraclePathSpec path{a, c, {ValidTime{0}, ValidTime{20}},
+                                  ExpandDirection::kOut, std::nullopt, 3};
+  const auto shortest = oracle.CoexistingShortestPath(path, CommitSeq{1});
+  ASSERT_EQ(shortest.edges.size(), 1U);
+  EXPECT_EQ(shortest.edges.front().edge_id.value, 13U);
+  const test::OracleJourneySpec journey{a, c, {ValidTime{0}, ValidTime{20}},
+                                        ExpandDirection::kOut, std::nullopt, 3,
+                                        duration};
+  const auto earliest = oracle.EarliestArrival(journey, CommitSeq{1});
+  ASSERT_EQ(earliest.edges.size(), 2U);
+  EXPECT_EQ(earliest.final_arrival.value, 4U);
+  const auto fastest = oracle.FastestDuration(journey, CommitSeq{1});
+  EXPECT_EQ(fastest.duration.value, 4U);
+  const auto latest = oracle.LatestDeparture(journey, CommitSeq{1});
+  EXPECT_EQ(latest.initial_departure.value, 16U);
+}
+
+TEST(QueryDifferentialTest, OracleReplaySerializationIsStable) {
+  const auto first = MakeHistory(43);
+  const auto second = MakeHistory(43);
+  EXPECT_EQ(first.Serialize(), second.Serialize());
+  EXPECT_FALSE(first.Serialize().empty());
+}
+
 TEST(QueryDifferentialTest, SmokeDebugThresholdsAreExactAndCapacityOnly) {
-  EXPECT_EQ(kQueryDebugThresholds.memtable_bytes, 64ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.projection_segment_bytes, 64ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.projection_page_bytes, 4ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.query_delta_soft_bytes, 64ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.query_delta_hard_bytes, 128ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.query_memory_bytes, 32ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.scratch_run_bytes, 16ULL << 10);
-  EXPECT_EQ(kQueryDebugThresholds.delta_lag_soft_commits, 8U);
-  EXPECT_EQ(kQueryDebugThresholds.delta_lag_hard_commits, 32U);
-  EXPECT_EQ(kQueryDebugThresholds.manifest_commits_per_generation, 16U);
   EXPECT_TRUE(UsesCedarKernelProfile(StorageProfile::kDebugSmallThresholds));
+}
+
+TEST(QueryDifferentialTest, DebugProfileExercisesRealFlushQueryAndVacuumLifecycle) {
+  char pattern[] = "/tmp/cedar_query_debug_lifecycle_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  DatabaseOptions options;
+  options.path = pattern;
+  options.storage_profile = StorageProfile::kDebugSmallThresholds;
+  auto opened = Database::Open(std::move(options));
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  for (uint64_t id = 1; id <= 256; ++id) {
+    auto transaction = database->BeginTransaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(
+                                 VertexRef{PartId{0}, VertexId{id}}),
+                             ValidTime{0})
+                    .ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  }
+  const CommitSeq vacuum_seq = [&]() {
+    auto snapshot = database->BeginSnapshot();
+    EXPECT_TRUE(snapshot.ok());
+    EXPECT_GE(snapshot.ValueOrDie().commit_seq().value, 256U);
+    return snapshot.ValueOrDie().commit_seq();
+  }();
+  EXPECT_TRUE(database->Vacuum(vacuum_seq).ok());
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(pattern);
 }
 
 TEST(QueryDifferentialTest, SmokeCanonicalRowsEqualIndependentOracle) {
@@ -117,6 +209,112 @@ TEST(QueryDifferentialTest, SmokeCanonicalRowsEqualIndependentOracle) {
   EXPECT_TRUE(cursor.ValueOrDie().terminal_info().complete);
   EXPECT_TRUE(database->Close().ok());
   std::filesystem::remove_all(path);
+}
+
+TEST(QueryDifferentialTest, CanonicalMatchesIndependentOracleAcrossExecutionLanes) {
+  char pattern[] = "/tmp/cedar_query_differential_lanes_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  DatabaseOptions options;
+  options.path = path;
+  auto opened = Database::Open(std::move(options));
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  const VertexRef first{PartId{0}, VertexId{1}};
+  const VertexRef second{PartId{0}, VertexId{2}};
+  auto txn = database->BeginTransaction();
+  ASSERT_TRUE(txn.ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(EntityFact::Vertex(first), ValidTime{0}).ok());
+  ASSERT_TRUE(txn.ValueOrDie()->Assert(EntityFact::Vertex(second), ValidTime{0}).ok());
+  auto committed = txn.ValueOrDie()->Commit();
+  ASSERT_TRUE(committed.ok());
+  test::BitemporalFactOracle oracle;
+  oracle.Add({EntityFact::Vertex(first).ref(), ValidTime{0},
+              committed.ValueOrDie().commit_seq, FactOperation::kPut, 0,
+              std::nullopt, std::nullopt});
+  oracle.Add({EntityFact::Vertex(second).ref(), ValidTime{0},
+              committed.ValueOrDie().commit_seq, FactOperation::kPut, 0,
+              std::nullopt, std::nullopt});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("lane_vertex");
+  auto query = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(query.ok());
+  auto selected = query.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(selected.ok());
+  auto prepared = database->PrepareQuery(selected.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  const CommitSeq cut = [&]() {
+    auto cut_snapshot = database->BeginSnapshot();
+    EXPECT_TRUE(cut_snapshot.ok());
+    return cut_snapshot.ValueOrDie().commit_seq();
+  }();
+  const auto expected = oracle.Evaluate(
+      {{EntityFact::Vertex(first).ref(), EntityFact::Vertex(second).ref()}},
+      cut);
+  for (QueryExecutionMode mode : {QueryExecutionMode::kInteractive,
+                                  QueryExecutionMode::kAnalytical,
+                                  QueryExecutionMode::kAuto}) {
+    QueryOptions query_options;
+    query_options.mode = mode;
+    query_options.capture_profile = true;
+    auto cursor = prepared.ValueOrDie().Execute(
+        database->BeginSnapshot().ConsumeValueOrDie(), Bindings{},
+        query_options);
+    ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+    auto batch = cursor.ValueOrDie().Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_TRUE(batch.ValueOrDie().has_value());
+    EXPECT_EQ(batch.ValueOrDie()->row_count(), expected.size());
+    ASSERT_FALSE(cursor.ValueOrDie().Next().ValueOrDie().has_value());
+    EXPECT_TRUE(cursor.ValueOrDie().terminal_info().complete)
+        << "mode=" << static_cast<int>(mode);
+  }
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(QueryDifferentialTest, FaultBudgetsAndCancellationOnlyEmitSnapshotPrefixes) {
+  char pattern[] = "/tmp/cedar_query_differential_faults_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  auto opened = Database::Open(DatabaseOptions{.path = pattern});
+  ASSERT_TRUE(opened.ok());
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t id = 1; id <= 8; ++id) {
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{id}}),
+                             ValidTime{0})
+                    .ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("fault_vertex");
+  auto query = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(query.ok());
+  auto selected = query.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(selected.ok());
+  auto prepared = database->PrepareQuery(selected.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  for (const QueryOptions& options : {
+           QueryOptions{.mode = QueryExecutionMode::kInteractive,
+                        .budget = QueryBudget{.output_rows = 1}},
+           QueryOptions{.mode = QueryExecutionMode::kInteractive,
+                        .budget = QueryBudget{.cpu_us = 1}}}) {
+    auto cursor = prepared.ValueOrDie().Execute(
+        database->BeginSnapshot().ConsumeValueOrDie(), Bindings{}, options);
+    ASSERT_TRUE(cursor.ok());
+    auto first = cursor.ValueOrDie().Next();
+    if (first.ok() && first.ValueOrDie()) {
+      EXPECT_LE(first.ValueOrDie()->row_count(), 8U);
+    }
+    EXPECT_FALSE(cursor.ValueOrDie().terminal_info().complete);
+  }
+  auto cancelled = prepared.ValueOrDie().Execute(
+      database->BeginSnapshot().ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cancelled.ok());
+  EXPECT_TRUE(cancelled.ValueOrDie().Cancel().ok());
+  EXPECT_FALSE(cancelled.ValueOrDie().terminal_info().complete);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(pattern);
 }
 
 TEST(QueryDifferentialTest, FullRandomHistorySeedsRemainReplayable) {

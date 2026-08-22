@@ -1614,16 +1614,16 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       internal::QueryDeltaOptions{
           projection_base,
           options.storage_profile == StorageProfile::kDebugSmallThresholds
-              ? kQueryDebugThresholds.delta_lag_hard_commits * 2
+              ? internal::kQueryDebugThresholds.delta_lag_hard_commits * 2
               : 262144,
           options.storage_profile == StorageProfile::kDebugSmallThresholds
-              ? kQueryDebugThresholds.query_delta_soft_bytes
+              ? internal::kQueryDebugThresholds.query_delta_soft_bytes
               : 256ULL << 20,
           options.storage_profile == StorageProfile::kDebugSmallThresholds
-              ? kQueryDebugThresholds.query_delta_hard_bytes
+              ? internal::kQueryDebugThresholds.query_delta_hard_bytes
               : 512ULL << 20,
           options.storage_profile == StorageProfile::kDebugSmallThresholds
-              ? kQueryDebugThresholds.delta_lag_hard_commits
+              ? internal::kQueryDebugThresholds.delta_lag_hard_commits
               : 262144,
           30,
                                   impl->query_crash_fault_injector_for_testing});

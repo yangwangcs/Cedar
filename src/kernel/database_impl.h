@@ -34,6 +34,7 @@
 #include "query/projection/query_delta.h"
 #include "query/resource/query_resource_pool.h"
 #include "query/observability/query_metrics.h"
+#include "kernel/query_debug_thresholds.h"
 
 namespace cedar {
 
@@ -44,7 +45,7 @@ class AdjacencyIndex;
 inline QueryRuntimeOptions ResolveQueryRuntimeOptions(const DatabaseOptions& options) {
   QueryRuntimeOptions resolved = options.query_runtime;
   if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
-    const auto& t = kQueryDebugThresholds;
+    const auto& t = internal::kQueryDebugThresholds;
     resolved.query_workers = 1;
     resolved.reserved_interactive_workers = 1;
     resolved.query_memory_bytes = t.query_memory_bytes;

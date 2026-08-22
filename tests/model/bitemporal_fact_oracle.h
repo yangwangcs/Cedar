@@ -73,9 +73,60 @@ struct OracleJourneySpec : OraclePathSpec {
 using OraclePath = PathValue;
 using OracleJourney = JourneyValue;
 
+inline bool EdgeRefLess(const EdgeRef& a, const EdgeRef& b) {
+  if (a.home_part_id.value != b.home_part_id.value) {
+    return a.home_part_id.value < b.home_part_id.value;
+  }
+  return a.edge_id.value < b.edge_id.value;
+}
+
+inline bool IntervalLess(const ValidTimeInterval& a,
+                         const ValidTimeInterval& b) {
+  if (a.from != b.from) return a.from.value < b.from.value;
+  const uint64_t ae = a.to ? a.to->value : UINT64_MAX;
+  const uint64_t be = b.to ? b.to->value : UINT64_MAX;
+  return ae < be;
+}
+
 class BitemporalFactOracle {
  public:
   void Add(FactEvent event) { events_.push_back(std::move(event)); }
+
+  // Stable, lossless replay text used by randomized failures.  It deliberately
+  // serializes the event log rather than any production query/planner state.
+  std::string Serialize() const {
+    std::vector<FactEvent> ordered = events_;
+    std::sort(ordered.begin(), ordered.end(), [](const FactEvent& a, const FactEvent& b) {
+      if (a.commit_seq != b.commit_seq) return a.commit_seq.value < b.commit_seq.value;
+      if (a.valid_from != b.valid_from) return a.valid_from.value < b.valid_from.value;
+      if (a.ref.part_id().value != b.ref.part_id().value) return a.ref.part_id().value < b.ref.part_id().value;
+      return a.ref.entity_id() < b.ref.entity_id();
+    });
+    std::string out;
+    for (const FactEvent& event : ordered) {
+      out += std::to_string(event.ref.part_id().value) + ":" +
+             std::to_string(static_cast<uint8_t>(event.ref.family())) + ":" +
+             std::to_string(event.ref.property_id().value) + ":" +
+             std::to_string(event.ref.entity_id()) + ":" +
+             std::to_string(event.valid_from.value) + ":" +
+             std::to_string(event.commit_seq.value) + ":" +
+             std::to_string(static_cast<uint8_t>(event.operation)) + ":" +
+             std::to_string(event.schema_epoch) + ":" +
+             (event.value ? event.value->Encode() : "-");
+      if (event.edge_identity) {
+        const auto& e = *event.edge_identity;
+        out += ":" + std::to_string(e.home_part_id.value) + ":" +
+               std::to_string(e.edge_id.value) + ":" +
+               std::to_string(e.source_part_id.value) + ":" +
+               std::to_string(e.source_vertex_id.value) + ":" +
+               std::to_string(e.target_part_id.value) + ":" +
+               std::to_string(e.target_vertex_id.value) + ":" +
+               std::to_string(e.edge_type);
+      }
+      out.push_back('\n');
+    }
+    return out;
+  }
 
   std::optional<FactEvent> Read(const FactRef& ref, ValidTime valid_time,
                                 CommitSeq snapshot_seq) const {
@@ -206,7 +257,11 @@ class BitemporalFactOracle {
   OracleRows Expand(const OracleExpandSpec& spec,
                     CommitSeq snapshot_seq) const {
     OracleRows rows;
-    for (const EdgeIdentity& edge : Edges(snapshot_seq)) {
+    if (spec.interval.to && spec.interval.from.value >= spec.interval.to->value) {
+      return rows;
+    }
+    for (const auto& edge_state : Edges(snapshot_seq)) {
+      const EdgeIdentity& edge = edge_state.identity;
       const VertexRef source = edge.source_ref();
       const VertexRef target = edge.target_ref();
       const bool matches =
@@ -215,15 +270,16 @@ class BitemporalFactOracle {
           (spec.direction == ExpandDirection::kBoth &&
            (source == spec.source || target == spec.source));
       if (!matches || (spec.edge_type && *spec.edge_type != edge.edge_type)) continue;
+      const auto interval = Intersect(spec.interval, edge_state.interval);
+      if (!interval) continue;
       rows.push_back({FactRef(edge.home_part_id, FactFamily::kEdgeIdentity,
-                              PropertyId{}, edge.edge_id.value),
-                      spec.interval, std::nullopt, edge});
+                              PropertyId{}, edge.edge_id.value), *interval,
+                      std::nullopt, edge});
     }
     std::sort(rows.begin(), rows.end(), [](const OracleRow& a, const OracleRow& b) {
       const auto& x = *a.edge_identity;
       const auto& y = *b.edge_identity;
-      if (x.source_ref() != y.source_ref()) return x.source_ref().vertex_id.value < y.source_ref().vertex_id.value;
-      return x.edge_id.value < y.edge_id.value;
+      return EdgeRefLess(x.edge_ref(), y.edge_ref());
     });
     return rows;
   }
@@ -236,39 +292,23 @@ class BitemporalFactOracle {
       result.common = spec.interval;
       return result;
     }
-    std::vector<VertexRef> vertices{spec.source};
-    std::vector<EdgeRef> edges;
-    std::vector<VertexRef> seen{spec.source};
-    OraclePath best;
-    std::function<void(VertexRef)> visit = [&](VertexRef current) {
-      if (edges.size() >= spec.max_hops) return;
-      OracleExpandSpec expand{current, spec.interval, spec.direction,
-                              spec.edge_type, 1};
-      for (const OracleRow& row : Expand(expand, snapshot_seq)) {
-        const EdgeIdentity& identity = *row.edge_identity;
-        VertexRef next = identity.target_ref();
-        if (spec.direction == ExpandDirection::kIn) next = identity.source_ref();
-        if (spec.direction == ExpandDirection::kBoth && current == identity.target_ref()) {
-          next = identity.source_ref();
-        }
-        if (std::find(seen.begin(), seen.end(), next) != seen.end()) continue;
-        seen.push_back(next);
-        vertices.push_back(next);
-        edges.push_back(identity.edge_ref());
-        if (next == spec.target && (best.vertices.empty() || edges.size() < best.edges.size())) {
-          best.vertices = vertices;
-          best.edges = edges;
-          best.common = spec.interval;
-        } else {
-          visit(next);
-        }
-        edges.pop_back();
-        vertices.pop_back();
-        seen.pop_back();
+    std::vector<PathCandidate> candidates;
+    EnumeratePaths(spec, snapshot_seq, &candidates);
+    if (candidates.empty()) return {};
+    std::sort(candidates.begin(), candidates.end(), [](const PathCandidate& a,
+                                                       const PathCandidate& b) {
+      if (a.edges.size() != b.edges.size()) return a.edges.size() < b.edges.size();
+      if (a.edges != b.edges) {
+        return std::lexicographical_compare(a.edges.begin(), a.edges.end(),
+                                            b.edges.begin(), b.edges.end(),
+                                            EdgeRefLess);
       }
-    };
-    visit(spec.source);
-    return best;
+      return IntervalLess(a.interval, b.interval);
+    });
+    result.vertices = candidates.front().vertices;
+    result.edges = candidates.front().edges;
+    result.common = candidates.front().interval;
+    return result;
   }
 
   OracleJourney EarliestArrival(const OracleJourneySpec& spec,
@@ -285,67 +325,140 @@ class BitemporalFactOracle {
   }
 
  private:
-  std::vector<EdgeIdentity> Edges(CommitSeq snapshot_seq) const {
-    std::vector<std::pair<CommitSeq, EdgeIdentity>> latest;
+  struct EdgeState {
+    EdgeIdentity identity;
+    ValidTimeInterval interval;
+  };
+  struct PathCandidate {
+    std::vector<VertexRef> vertices;
+    std::vector<EdgeRef> edges;
+    ValidTimeInterval interval;
+  };
+
+  static std::optional<ValidTimeInterval> Intersect(
+      const ValidTimeInterval& a, const ValidTimeInterval& b) {
+    const uint64_t a_end = a.to ? a.to->value : UINT64_MAX;
+    const uint64_t b_end = b.to ? b.to->value : UINT64_MAX;
+    const uint64_t from = std::max(a.from.value, b.from.value);
+    const uint64_t end = std::min(a_end, b_end);
+    if (from >= end) return std::nullopt;
+    return ValidTimeInterval{ValidTime{from},
+                             end == UINT64_MAX ? std::nullopt
+                                               : std::optional<ValidTime>(ValidTime{end})};
+  }
+
+  std::vector<EdgeState> Edges(CommitSeq snapshot_seq) const {
+    std::vector<EdgeIdentity> identities;
+    std::set<EdgeRef, decltype(&EdgeRefLess)> seen(&EdgeRefLess);
     for (const FactEvent& event : events_) {
       if (event.commit_seq.value > snapshot_seq.value ||
           event.ref.family() != FactFamily::kEdgeIdentity ||
           !event.edge_identity.has_value()) continue;
-      const EdgeRef ref = event.edge_identity->edge_ref();
-      auto it = std::find_if(latest.begin(), latest.end(), [&](const auto& value) {
-        return value.second.edge_ref() == ref;
-      });
-      if (it == latest.end() || it->first.value < event.commit_seq.value) {
-        if (event.operation == FactOperation::kDelete) {
-          if (it != latest.end()) latest.erase(it);
-        } else if (it == latest.end()) {
-          latest.push_back({event.commit_seq, *event.edge_identity});
-        } else {
-          *it = {event.commit_seq, *event.edge_identity};
-        }
+      const EdgeRef edge_ref = event.edge_identity->edge_ref();
+      if (seen.contains(edge_ref)) continue;
+      const auto current = Read(event.ref, ValidTime{UINT64_MAX}, snapshot_seq);
+      if (!current || current->operation == FactOperation::kDelete ||
+          !current->edge_identity) continue;
+      identities.push_back(*current->edge_identity);
+      seen.insert(edge_ref);
+    }
+    std::vector<EdgeState> result;
+    for (const EdgeIdentity& identity : identities) {
+      const FactRef state_ref = EntityFact::Edge(identity.edge_ref()).ref();
+      for (const OracleStateInterval& state : History(state_ref, snapshot_seq)) {
+        result.push_back({identity, state.interval});
       }
     }
-    std::vector<EdgeIdentity> result;
-    for (const auto& entry : latest) result.push_back(entry.second);
+    std::sort(result.begin(), result.end(), [](const EdgeState& a, const EdgeState& b) {
+      return EdgeRefLess(a.identity.edge_ref(), b.identity.edge_ref());
+    });
     return result;
+  }
+
+  void EnumeratePaths(const OraclePathSpec& spec, CommitSeq snapshot_seq,
+                      std::vector<PathCandidate>* output) const {
+    if (spec.interval.to && spec.interval.from.value >= spec.interval.to->value) return;
+    std::vector<VertexRef> vertices{spec.source};
+    std::vector<EdgeRef> edges;
+    std::vector<VertexRef> seen{spec.source};
+    std::function<void(VertexRef, ValidTimeInterval)> visit =
+        [&](VertexRef current, ValidTimeInterval interval) {
+          if (edges.size() >= spec.max_hops) return;
+          for (const OracleRow& row : Expand(
+                   {current, interval, spec.direction, spec.edge_type, 1},
+                   snapshot_seq)) {
+            const EdgeIdentity& identity = *row.edge_identity;
+            VertexRef next = identity.target_ref();
+            if (spec.direction == ExpandDirection::kIn) next = identity.source_ref();
+            if (spec.direction == ExpandDirection::kBoth && current == identity.target_ref()) {
+              next = identity.source_ref();
+            }
+            if (std::find(seen.begin(), seen.end(), next) != seen.end()) continue;
+            const auto common = Intersect(interval, row.interval);
+            if (!common) continue;
+            seen.push_back(next); vertices.push_back(next); edges.push_back(identity.edge_ref());
+            if (next == spec.target) output->push_back({vertices, edges, *common});
+            else visit(next, *common);
+            edges.pop_back(); vertices.pop_back(); seen.pop_back();
+          }
+        };
+    visit(spec.source, spec.interval);
   }
 
   OracleJourney Journey(const OracleJourneySpec& spec, CommitSeq snapshot_seq,
                         int objective) const {
     OracleJourney result;
-    OraclePath path = CoexistingShortestPath(spec, snapshot_seq);
-    if (path.vertices.empty()) return result;
-    result.vertices = path.vertices;
-    result.edges = path.edges;
-    result.departures.reserve(path.edges.size());
-    result.arrivals.reserve(path.edges.size());
-    uint64_t departure = spec.interval.from.value;
-    uint64_t total = 0;
-    for (const EdgeRef& edge : path.edges) {
-      uint64_t duration = 1;
-      if (spec.duration_property) {
-        auto value = Read(PropertyFact::Edge(edge, *spec.duration_property).ref(),
-                          ValidTime{departure}, snapshot_seq);
-        if (value && value->value.has_value() &&
-            value->value->type() == PhysicalType::kInt64) {
-          const int64_t raw = std::get<int64_t>(value->value->data());
-          if (raw >= 0) duration = static_cast<uint64_t>(raw);
+    std::vector<PathCandidate> candidates;
+    EnumeratePaths(spec, snapshot_seq, &candidates);
+    std::vector<OracleJourney> journeys;
+    for (const PathCandidate& path : candidates) {
+      OracleJourney candidate;
+      candidate.vertices = path.vertices; candidate.edges = path.edges;
+      candidate.departures.resize(path.edges.size()); candidate.arrivals.resize(path.edges.size());
+      uint64_t departure = spec.interval.from.value;
+      if (objective == 1 && spec.interval.to) departure = spec.interval.to->value;
+      uint64_t total = 0;
+      bool valid = true;
+      for (size_t i = 0; i < path.edges.size(); ++i) {
+        const size_t edge_index = objective == 1 ? path.edges.size() - 1 - i : i;
+        uint64_t duration = DurationAt(path.edges[edge_index], ValidTime{departure}, spec, snapshot_seq);
+        if (objective == 1) {
+          if (duration > departure) { valid = false; break; }
+          departure -= duration;
+          candidate.departures[path.edges.size() - 1 - i] = ValidTime{departure};
+          candidate.arrivals[path.edges.size() - 1 - i] = ValidTime{departure + duration};
+        } else {
+          candidate.departures[i] = ValidTime{departure};
+          if (duration > UINT64_MAX - departure) { valid = false; break; }
+          departure += duration; total += duration;
+          candidate.arrivals[i] = ValidTime{departure};
         }
       }
-      result.departures.push_back(ValidTime{departure});
-      if (duration > UINT64_MAX - departure) return OracleJourney{};
-      departure += duration;
-      total += duration;
-      result.arrivals.push_back(ValidTime{departure});
+      if (!valid || candidate.edges.empty()) continue;
+      candidate.initial_departure = objective == 1 ? ValidTime{departure} : spec.interval.from;
+      candidate.final_arrival = objective == 1 ? spec.interval.to.value_or(ValidTime{departure}) : ValidTime{departure};
+      candidate.departure = candidate.initial_departure; candidate.arrival = candidate.final_arrival;
+      candidate.duration = ValidDuration{objective == 1 ? candidate.final_arrival.value - candidate.initial_departure.value : total};
+      journeys.push_back(std::move(candidate));
     }
-    if (result.arrivals.empty()) return OracleJourney{};
-    result.initial_departure = spec.interval.from;
-    result.final_arrival = ValidTime{departure};
-    result.departure = result.initial_departure;
-    result.arrival = result.final_arrival;
-    result.duration = ValidDuration{total};
-    (void)objective;
-    return result;
+    if (journeys.empty()) return {};
+    std::sort(journeys.begin(), journeys.end(), [objective](const OracleJourney& a, const OracleJourney& b) {
+      if (objective == 0 && a.final_arrival != b.final_arrival) return a.final_arrival.value < b.final_arrival.value;
+      if (objective == 1 && a.initial_departure != b.initial_departure) return a.initial_departure.value > b.initial_departure.value;
+      if (objective == 2 && a.duration != b.duration) return a.duration.value < b.duration.value;
+      if (a.edges.size() != b.edges.size()) return a.edges.size() < b.edges.size();
+      return std::lexicographical_compare(a.edges.begin(), a.edges.end(), b.edges.begin(), b.edges.end(), EdgeRefLess);
+    });
+    return journeys.front();
+  }
+
+  uint64_t DurationAt(const EdgeRef& edge, ValidTime at,
+                      const OracleJourneySpec& spec, CommitSeq snapshot_seq) const {
+    if (!spec.duration_property) return 1;
+    auto value = Read(PropertyFact::Edge(edge, *spec.duration_property).ref(), at, snapshot_seq);
+    if (!value || !value->value || value->value->type() != PhysicalType::kInt64) return 1;
+    const int64_t raw = std::get<int64_t>(value->value->data());
+    return raw >= 0 ? static_cast<uint64_t>(raw) : 1;
   }
 
   std::vector<FactEvent> events_;

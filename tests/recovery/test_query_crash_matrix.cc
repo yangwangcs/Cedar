@@ -59,7 +59,26 @@ void RunCrashChildIfRequested() {
   }
   // Exercise the actual Cedar publication owners. The callback pauses only
   // after the requested durable boundary has been reached.
-  if (*phase == "scratch_write") {
+  if (*phase == "cursor_cancel" || *phase == "cursor_close_before" ||
+      *phase == "cursor_close_after") {
+    auto vertex = cedar::Slot<cedar::VertexRef>::Named("crash_vertex");
+    auto query = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{1}});
+    if (!query.ok()) _exit(125);
+    auto selected = query.ValueOrDie().Select({cedar::Project(vertex)});
+    if (!selected.ok()) _exit(125);
+    auto prepared = database->PrepareQuery(selected.ValueOrDie());
+    auto snapshot = database->BeginSnapshot();
+    if (!prepared.ok() || !snapshot.ok()) _exit(125);
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), cedar::Bindings{},
+        cedar::QueryOptions{});
+    if (!cursor.ok()) _exit(125);
+    if (*phase == "cursor_cancel") {
+      (void)cursor.ValueOrDie().Cancel();
+    } else {
+      (void)cursor.ValueOrDie().Close();
+    }
+  } else if (phase->rfind("scratch_", 0) == 0 || *phase == "scratch_write") {
     QueryScratch scratch(*db, "active", "crash", 1 << 20);
     scratch.SetCrashFaultInjector(crash_injector);
     (void)scratch.WriteRun("run-0", "payload");
@@ -137,9 +156,16 @@ TEST_F(QueryCrashMatrixTest, CorruptCurrentDisablesDerivedReaders) {
 
 TEST_F(QueryCrashMatrixTest, CrashPhaseArgumentsSurviveSigkillAndReopen) {
   RunCrashChildIfRequested();
-  const std::vector<std::string> phases = {"segment_sync", "manifest_sync",
-                                           "current_replace", "delta_enqueue",
-                                           "scratch_write"};
+  const std::vector<std::string> phases = {
+      "segment_write_before", "segment_write_after", "segment_sync_before",
+      "segment_sync_after", "segment_rename_before", "segment_rename_after",
+      "manifest_write_before", "manifest_write_after", "manifest_sync_before",
+      "manifest_sync_after", "manifest_rename_before", "manifest_rename_after",
+      "current_write_before", "current_write_after", "current_rename_before",
+      "current_rename_after", "current_replace", "delta_enqueue",
+      "scratch_write_before", "scratch_write_after", "scratch_rename_before",
+      "scratch_rename_after", "cursor_cancel", "cursor_close_before",
+      "cursor_close_after"};
   const auto argv = ::testing::internal::GetArgvs();
   ASSERT_FALSE(argv.empty());
   for (const std::string& phase : phases) {
@@ -212,6 +238,43 @@ TEST_F(QueryCrashMatrixTest, UnpublishedTemporaryFilesAreIgnoredOnOpen) {
   auto opened = QueryProjectionStore::Open({path_, "query-db", {}});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   EXPECT_FALSE(opened.ValueOrDie()->projections_enabled());
+}
+
+TEST_F(QueryCrashMatrixTest, CloseAndVacuumRemainIdempotentAcrossRepeatedPins) {
+  const std::string database_path = path_ + "/lifecycle";
+  auto opened = cedar::Database::Open(cedar::DatabaseOptions{.path = database_path});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(cedar::EntityFact::Vertex(
+                               cedar::VertexRef{cedar::PartId{0}, cedar::VertexId{9}}),
+                           cedar::ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  auto vertex = cedar::Slot<cedar::VertexRef>::Named("lifecycle_vertex");
+  auto query = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{1}});
+  ASSERT_TRUE(query.ok());
+  auto selected = query.ValueOrDie().Select({cedar::Project(vertex)});
+  ASSERT_TRUE(selected.ok());
+  auto prepared = database->PrepareQuery(selected.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    auto snapshot = database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), cedar::Bindings{},
+        cedar::QueryOptions{});
+    ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+    if ((iteration & 1) == 0) {
+      EXPECT_TRUE(cursor.ValueOrDie().Cancel().ok());
+    }
+    EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+    EXPECT_TRUE(database->Vacuum(cedar::CommitSeq{1}).ok())
+        << "iteration=" << iteration;
+  }
+  EXPECT_TRUE(database->Close().ok());
 }
 
 TEST_F(QueryCrashMatrixTest, ProjectionBitFlipDeletionAndTruncationFailClosed) {

@@ -1125,6 +1125,7 @@ StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
 void QueryExecutionState::RequestCancel() {
   cancelled_.store(true, std::memory_order_release);
   std::function<void()> callback;
+  std::function<Status(const char*)> crash_fault_injector;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (terminal_.state == QueryCursorState::kRunning) {
@@ -1134,7 +1135,9 @@ void QueryExecutionState::RequestCancel() {
       if (metrics_) metrics_->AddTerminal(internal::QueryMetricTerminal::kCancelled);
     }
     callback = cancel_callback_;
+    crash_fault_injector = crash_fault_injector_;
   }
+  if (crash_fault_injector) crash_fault_injector("cursor_cancel").IgnoreError();
   if (callback) callback();
 }
 
@@ -1189,6 +1192,12 @@ void QueryExecutionState::WaitForOperations() {
 }
 
 Status QueryExecutionState::Close() {
+  std::function<Status(const char*)> crash_fault_injector;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    crash_fault_injector = crash_fault_injector_;
+  }
+  if (crash_fault_injector) crash_fault_injector("cursor_close_before").IgnoreError();
   RequestCancel();
   std::function<void()> close_callback;
   {
@@ -1201,12 +1210,19 @@ Status QueryExecutionState::Close() {
     }
   }
   if (close_callback) close_callback();
+  if (crash_fault_injector) crash_fault_injector("cursor_close_after").IgnoreError();
   return Status::OK();
 }
 
 void QueryExecutionState::SetCancelCallback(std::function<void()> callback) {
   std::lock_guard<std::mutex> lock(mutex_);
   cancel_callback_ = std::move(callback);
+}
+
+void QueryExecutionState::SetCrashFaultInjector(
+    std::function<Status(const char*)> callback) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  crash_fault_injector_ = std::move(callback);
 }
 
 void QueryExecutionState::SetCloseCallback(std::function<void()> callback) {
@@ -2052,6 +2068,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                                 crash_fault_injector,
                                             QueryMetrics* metrics) {
   QueryOptions resolved_options = options;
+  const auto lifecycle_fault_injector = crash_fault_injector;
   if (resolved_options.mode == QueryExecutionMode::kAuto &&
       plan.physical_plan != nullptr) {
     resolved_options.mode = plan.physical_plan->lane;
@@ -2125,6 +2142,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
     }
   }
   state->execution->SetMetrics(metrics);
+  state->execution->SetCrashFaultInjector(lifecycle_fault_injector);
   // Every cursor owns an engine Snapshot and therefore participates in the
   // ordered shutdown/pin registry. The mode only changes budgeting, never
   // snapshot lifetime.

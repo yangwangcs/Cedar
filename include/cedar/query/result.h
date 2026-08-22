@@ -234,6 +234,7 @@ class QueryExecutionState {
   void WaitForOperations();
   void SetCancelCallback(std::function<void()> callback);
   void SetCloseCallback(std::function<void()> callback);
+  void SetCrashFaultInjector(std::function<Status(const char*)> callback);
   void ClearCancelCallback();
   void SetSnapshotSeq(CommitSeq seq);
   std::optional<CommitSeq> snapshot_seq() const;
@@ -255,6 +256,7 @@ class QueryExecutionState {
   QueryProfile profile_;
   std::function<void()> cancel_callback_;
   std::function<void()> close_callback_;
+  std::function<Status(const char*)> crash_fault_injector_;
   internal::QueryMetrics* metrics_ = nullptr;
   std::chrono::steady_clock::time_point profile_started_at_;
   std::chrono::steady_clock::time_point profile_last_at_;

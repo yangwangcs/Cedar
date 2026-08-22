@@ -346,6 +346,10 @@ if(TARGET cedar_query_bench)
   add_test(NAME QueryBenchmarkCsvContract COMMAND ${CMAKE_COMMAND}
       -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_benchmark_csv.cmake)
+  add_test(NAME QueryCampaignOptionsContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_CAMPAIGN=${CMAKE_SOURCE_DIR}/benchmarks/run_cedar_query_campaign.sh
+      -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_campaign_options.cmake)
 endif()
 
 add_executable(test_kernel_bounded_benchmark performance/test_kernel_bounded_benchmark.cc)

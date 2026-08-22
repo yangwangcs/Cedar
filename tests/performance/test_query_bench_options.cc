@@ -9,6 +9,8 @@ TEST(QueryBenchOptions, ReportsUnsupportedOperationsExplicitly){
   EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kEvents));
   EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kExpandOut));
   EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kEarliestArrival));
-  EXPECT_FALSE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kPropertyFilter));
+  EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kPropertyFilter));
+  EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kTemporalAggregate));
+  EXPECT_TRUE(QueryBenchmarkOperationSupported(QueryBenchmarkOperation::kIntervalJoin));
 }
 }

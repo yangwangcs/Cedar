@@ -46,6 +46,9 @@ bool QueryBenchmarkOperationSupported(QueryBenchmarkOperation operation) {
     case QueryBenchmarkOperation::kEarliestArrival:
     case QueryBenchmarkOperation::kLatestDeparture:
     case QueryBenchmarkOperation::kFastestDuration:
+    case QueryBenchmarkOperation::kPropertyFilter:
+    case QueryBenchmarkOperation::kTemporalAggregate:
+    case QueryBenchmarkOperation::kIntervalJoin:
       return true;
     default:
       return false;

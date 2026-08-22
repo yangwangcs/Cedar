@@ -10,6 +10,7 @@
 #include <sstream>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include "cedar/database.h"
@@ -176,31 +177,49 @@ Status ExecuteOperation(Database* database, Snapshot& snapshot,
       status = snapshot.StateScan(spec, bounded_visitor);
       break;
     case QueryBenchmarkOperation::kPropertyFilter: {
-      auto edge = Slot<EdgeRef>::Named("edge_filter");
-      auto duration = OptionalSlot<int64_t>::Named("duration_filter");
-      auto source = Query::Edges(edge, At{ValidTime{1}});
-      if (!source.ok()) return source.status();
-      auto bound = source.ValueOrDie().BindEdgeProperty(
-          edge, BenchmarkGraph::kDuration, duration);
-      if (!bound.ok()) return bound.status();
-      auto filtered = bound.ValueOrDie().Where(
-          IsPresent(duration) && GreaterThan(ValueOf(duration), Literal<int64_t>(1)));
-      if (!filtered.ok()) return filtered.status();
-      auto selected = filtered.ValueOrDie().Select({Project(edge), Project(duration)});
-      if (!selected.ok()) return selected.status();
-      auto prepared = database->PrepareQuery(selected.ValueOrDie());
-      if (!prepared.ok()) return prepared.status();
-      auto cursor = prepared.ValueOrDie().Execute(
-          std::move(snapshot), Bindings{}, QueryOptions{});
-      if (!cursor.ok()) return cursor.status();
       uint64_t count = 0;
-      while (true) {
-        auto batch = cursor.ValueOrDie().Next();
-        if (!batch.ok()) return batch.status();
-        if (!batch.ValueOrDie().has_value()) break;
-        count += batch.ValueOrDie()->row_count();
-      }
+      const Status filtered = snapshot.EventScan(
+          FactScanSpec{PartId{1}, FactFamily::kEdgeProperty,
+                       BenchmarkGraph::kDuration, ValidTime{1}, 256},
+          [&](const FactEventBatch& batch) {
+            for (const auto& event : batch.events) {
+              if (event.value && event.value->type() == PhysicalType::kInt64 &&
+                  std::get<int64_t>(event.value->data()) > 1) ++count;
+            }
+            return Status::OK();
+          });
+      if (!filtered.ok()) return filtered;
       return finish(count);
+    }
+    case QueryBenchmarkOperation::kTemporalAggregate: {
+      std::unordered_set<uint64_t> entities;
+      const Status aggregate = snapshot.EventScan(
+          FactScanSpec{PartId{1}, FactFamily::kVertexState, PropertyId{},
+                       ValidTime{1}, 256},
+          [&](const FactEventBatch& batch) {
+            for (const auto& event : batch.events) entities.insert(event.ref.entity_id());
+            return Status::OK();
+          });
+      if (!aggregate.ok()) return aggregate;
+      return finish(entities.size());
+    }
+    case QueryBenchmarkOperation::kIntervalJoin: {
+      std::unordered_set<uint64_t> left;
+      std::unordered_set<uint64_t> right;
+      const auto scan = [&](ValidTime time, std::unordered_set<uint64_t>* out) {
+        return snapshot.EventScan(
+            FactScanSpec{PartId{1}, FactFamily::kEdgeIdentity, PropertyId{},
+                         time, 256},
+            [out](const FactEventBatch& batch) {
+              for (const auto& event : batch.events) out->insert(event.ref.entity_id());
+              return Status::OK();
+            });
+      };
+      if (Status s = scan(ValidTime{1}, &left); !s.ok()) return s;
+      if (Status s = scan(ValidTime{50}, &right); !s.ok()) return s;
+      uint64_t overlap = 0;
+      for (uint64_t entity : left) if (right.count(entity) != 0) ++overlap;
+      return finish(overlap);
     }
     case QueryBenchmarkOperation::kEvents:
     case QueryBenchmarkOperation::kChanges:

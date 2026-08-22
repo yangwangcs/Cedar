@@ -106,9 +106,9 @@ class QueryProjectionStore {
   std::string projections_path_;
   std::string manifests_path_;
   mutable std::mutex mutex_;
-  std::shared_ptr<ProjectionGeneration::State> current_;
-  std::vector<std::shared_ptr<ProjectionGeneration::State>> retired_;
-  bool enabled_ = false;
+  mutable std::shared_ptr<ProjectionGeneration::State> current_;
+  mutable std::vector<std::shared_ptr<ProjectionGeneration::State>> retired_;
+  mutable bool enabled_ = false;
   bool closed_ = false;
 };
 

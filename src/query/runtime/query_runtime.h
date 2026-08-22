@@ -158,7 +158,9 @@ class QueryRuntime {
                                        Snapshot snapshot,
                                        const Bindings& bindings,
                                        const QueryOptions& options,
-                                       QueryResourcePool* resource_pool = nullptr);
+                                       QueryResourcePool* resource_pool = nullptr,
+                                       std::function<void(const std::shared_ptr<QueryExecutionState>&)>
+                                           register_query_state = {});
 };
 
 }  // namespace cedar::internal

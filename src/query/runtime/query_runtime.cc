@@ -1097,6 +1097,75 @@ StatusOr<std::vector<QueryColumn>> BuildRelationalColumns(
 
 }  // namespace
 
+void QueryExecutionState::RequestCancel() {
+  cancelled_.store(true, std::memory_order_release);
+  std::function<void()> callback;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (terminal_.state == QueryCursorState::kRunning) {
+      terminal_.state = QueryCursorState::kCancelled;
+      terminal_.complete = false;
+      terminal_.status = Status::QueryCancelled("query", "query cancelled");
+    }
+    callback = cancel_callback_;
+  }
+  if (callback) callback();
+}
+
+bool QueryExecutionState::cancelled() const {
+  return cancelled_.load(std::memory_order_acquire);
+}
+
+Status QueryExecutionState::FinishClean() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (terminal_.state != QueryCursorState::kRunning) return terminal_.status;
+  terminal_.state = QueryCursorState::kCleanEnd;
+  terminal_.complete = true;
+  terminal_.status = Status::OK();
+  return Status::OK();
+}
+
+Status QueryExecutionState::FinishCancelled() {
+  RequestCancel();
+  return terminal_info().status;
+}
+
+Status QueryExecutionState::FinishFailed(Status status) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (terminal_.state != QueryCursorState::kRunning) return terminal_.status;
+  terminal_.state = QueryCursorState::kFailed;
+  terminal_.complete = false;
+  terminal_.status = std::move(status);
+  return terminal_.status;
+}
+
+QueryTerminalInfo QueryExecutionState::terminal_info() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return terminal_;
+}
+
+Status QueryExecutionState::Close() { return Status::OK(); }
+
+void QueryExecutionState::SetCancelCallback(std::function<void()> callback) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  cancel_callback_ = std::move(callback);
+}
+
+void QueryExecutionState::ClearCancelCallback() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  cancel_callback_ = {};
+}
+
+void QueryExecutionState::SetSnapshotSeq(CommitSeq seq) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  snapshot_seq_ = seq;
+}
+
+std::optional<CommitSeq> QueryExecutionState::snapshot_seq() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return snapshot_seq_;
+}
+
 class QueryCursor::State {
  public:
   State(internal::PreparedQueryPlan plan, Snapshot snapshot,
@@ -1106,7 +1175,19 @@ class QueryCursor::State {
         options(std::move(options)),
         reservation(std::move(reservation)),
         fragments(this->options.budget.interval_fragments),
-        started_at(std::chrono::steady_clock::now()), scratch(std::move(scratch)) {
+        started_at(std::chrono::steady_clock::now()), scratch(std::move(scratch)),
+        execution(std::make_shared<QueryExecutionState>()) {
+    execution->SetSnapshotSeq(this->snapshot->commit_seq());
+    execution->SetCancelCallback([this] {
+      cancelled.store(true, std::memory_order_release);
+      // Database shutdown uses this callback to release the query-owned
+      // snapshot before closing the authoritative store. Query reads already
+      // observe the cancellation flag and stop at their next abort check.
+      this->snapshot.reset();
+      this->materialized_output_lease.reset();
+      this->batches.clear();
+      CleanupScratch();
+    });
     if (this->scratch) this->scratch->SetReservation(&this->reservation);
     if (this->scratch) {
       this->scratch->SetAbortCheck([this] {
@@ -1144,6 +1225,7 @@ class QueryCursor::State {
   std::atomic<bool> cancelled{false};
   std::chrono::steady_clock::time_point started_at;
   std::unique_ptr<internal::QueryScratch> scratch;
+  std::shared_ptr<QueryExecutionState> execution;
 };
 
 struct BatchLease {
@@ -1156,9 +1238,36 @@ struct BatchLease {
 
 QueryCursor::QueryCursor(std::unique_ptr<State> state)
     : state_(std::move(state)) {}
-QueryCursor::~QueryCursor() = default;
+QueryCursor::~QueryCursor() {
+  if (state_ && state_->execution) {
+    state_->execution->RequestCancel();
+    state_->execution->ClearCancelCallback();
+  }
+}
 QueryCursor::QueryCursor(QueryCursor&&) noexcept = default;
 QueryCursor& QueryCursor::operator=(QueryCursor&&) noexcept = default;
+
+QueryTerminalInfo QueryCursor::terminal_info() const {
+  if (!state_) {
+    return QueryTerminalInfo{QueryCursorState::kFailed, false,
+                             Status::InvalidArgument("query cursor",
+                                                     "moved-from cursor")};
+  }
+  if (state_->terminal_error.has_value()) {
+    return QueryTerminalInfo{state_->cancelled.load(std::memory_order_acquire)
+                                 ? QueryCursorState::kCancelled
+                                 : QueryCursorState::kFailed,
+                             false, *state_->terminal_error};
+  }
+  if (state_->clean_terminal) {
+    return QueryTerminalInfo{QueryCursorState::kCleanEnd, true, Status::OK()};
+  }
+  if (state_->cancelled.load(std::memory_order_acquire)) {
+    return QueryTerminalInfo{QueryCursorState::kCancelled, false,
+                             Status::QueryCancelled("query", "query cancelled")};
+  }
+  return QueryTerminalInfo{};
+}
 
 StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   if (!state_) {
@@ -1430,6 +1539,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
   state_->snapshot.reset();
   state_->CleanupScratch();
   state_->clean_terminal = true;
+  state_->execution->FinishClean();
   return std::optional<QueryBatch>{};
 }
 
@@ -1441,13 +1551,19 @@ Status QueryCursor::Close() {
   state_->materialized_output_lease.reset();
   state_->snapshot.reset();
   state_->CleanupScratch();
-  state_->terminal_error.reset();
-  state_->clean_terminal = true;
+  if (!state_->clean_terminal && !state_->terminal_error.has_value()) {
+    state_->execution->RequestCancel();
+    state_->cancelled.store(true, std::memory_order_release);
+    state_->terminal_error =
+        Status::QueryCancelled("query", "query cursor closed");
+  }
+  state_->execution->Close();
   return Status::OK();
 }
 
 Status QueryCursor::Cancel() {
   if (!state_) return Status::InvalidArgument("query cursor", "moved-from cursor");
+  state_->execution->RequestCancel();
   state_->cancelled.store(true, std::memory_order_release);
   return Status::OK();
 }
@@ -1713,7 +1829,9 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             Snapshot snapshot,
                                             const Bindings&,
                                             const QueryOptions& options,
-                                            QueryResourcePool* resource_pool) {
+                                            QueryResourcePool* resource_pool,
+                                            std::function<void(const std::shared_ptr<QueryExecutionState>&)>
+                                                register_query_state) {
   QueryOptions resolved_options = options;
   if (resolved_options.mode == QueryExecutionMode::kAuto &&
       plan.physical_plan != nullptr) {
@@ -1760,9 +1878,16 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
       });
     }
   }
-  return QueryCursor(std::make_unique<QueryCursor::State>(
+  auto state = std::make_unique<QueryCursor::State>(
       plan, std::move(snapshot), std::move(resolved_options),
-      std::move(admitted).ConsumeValueOrDie(), std::move(scratch)));
+      std::move(admitted).ConsumeValueOrDie(), std::move(scratch));
+  // Analytical executions are long-lived and participate in the ordered
+  // database shutdown registry. Interactive cursors retain the historical
+  // snapshot-pinning behavior until their caller closes them explicitly.
+  if (register_query_state && resolved_options.mode == QueryExecutionMode::kAnalytical) {
+    register_query_state(state->execution);
+  }
+  return QueryCursor(std::move(state));
 }
 
 }  // namespace internal

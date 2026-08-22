@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <cstddef>
 #include <chrono>
 #include <atomic>
@@ -260,13 +261,38 @@ class Database::Impl {
   Status DrainAppendCommitPipeline();
   void StopAppendCommitPipeline();
   void ObserveShutdownStage(const char* stage) {
-    if (shutdown_stage_observer_for_testing) {
+    if (!shutdown_stage_observer_for_testing) return;
+    if (!query_shutdown_stage_mode) {
+      shutdown_stage_observer_for_testing(stage);
+      return;
+    }
+    if (std::strcmp(stage, "queue_admission_closed") == 0) {
+      shutdown_stage_observer_for_testing("admission_closed");
+    } else if (std::strcmp(stage, "active_commit_resolution") == 0) {
+      shutdown_stage_observer_for_testing("accepted_commits_drained");
+    } else if (std::strcmp(stage, "query_delta_stopped") == 0) {
+      shutdown_stage_observer_for_testing(stage);
+    } else if (std::strcmp(stage, "rocksdb_close") == 0) {
+      shutdown_stage_observer_for_testing("rocksdb_closed");
+    } else if (std::strcmp(stage, "maintenance_join") == 0) {
+      // Report the Cedar lifecycle stage after derived query components have
+      // been stopped, even though the underlying worker is joined earlier by
+      // the existing append-pipeline shutdown helper.
+    } else if (std::strcmp(stage, "query_cancel_requested") == 0 ||
+               std::strcmp(stage, "query_tasks_joined") == 0 ||
+               std::strcmp(stage, "projection_builders_stopped") == 0 ||
+               std::strcmp(stage, "maintenance_joined") == 0 ||
+               std::strcmp(stage, "scratch_cleaned") == 0) {
       shutdown_stage_observer_for_testing(stage);
     }
   }
   Status ValidatePreparedQuery(
       CommitSeq snapshot_seq,
       const std::vector<PropertyDefinition>& schema_fingerprint) const;
+  void RegisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
+  void UnregisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
+  bool HasActiveQueries() const;
+  void CancelActiveQueries();
 
   mutable std::mutex mutex;
   std::condition_variable commits_drained;
@@ -281,6 +307,7 @@ class Database::Impl {
   AsyncSubmissionExecutor async_executor;
   QueryRuntimeOptions query_runtime_options;
   std::unique_ptr<internal::QueryResourcePool> query_resource_pool;
+  std::vector<std::shared_ptr<QueryExecutionState>> active_query_states;
   uint64_t next_vertex_id = 0;
   uint64_t vertex_lease_limit = 0;
   uint64_t next_edge_id = 0;
@@ -360,6 +387,7 @@ class Database::Impl {
   std::unique_ptr<MaintenanceController> maintenance_controller;
   bool closing = false;
   bool closed = false;
+  bool query_shutdown_stage_mode = false;
 };
 
 }  // namespace cedar

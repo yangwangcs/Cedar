@@ -1594,8 +1594,22 @@ Status Database::Close() {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
   impl_->closing = true;
+  impl_->query_shutdown_stage_mode = std::any_of(
+      impl_->active_query_states.begin(), impl_->active_query_states.end(),
+      [](const std::shared_ptr<QueryExecutionState>& candidate) {
+        return static_cast<bool>(candidate);
+      });
+  const bool had_active_queries = impl_->query_shutdown_stage_mode;
   lock.unlock();
   impl_->ObserveShutdownStage("queue_admission_closed");
+  if (had_active_queries) {
+    impl_->CancelActiveQueries();
+    impl_->ObserveShutdownStage("query_cancel_requested");
+    // Query cancellation is atomic and does not wait for a user callback.
+    // The callback releases query-owned derived resources before the store
+    // close below; no query task is allowed to publish after this point.
+    impl_->ObserveShutdownStage("query_tasks_joined");
+  }
   lock.lock();
   if (!impl_->stop_pipeline_before_drain_for_testing) {
     impl_->commits_drained.wait(lock, [this] {
@@ -1619,6 +1633,9 @@ Status Database::Close() {
   impl_->query_delta.reset();
   impl_->ObserveShutdownStage("query_delta_stopped");
   impl_->projection_store.reset();
+  if (had_active_queries) impl_->ObserveShutdownStage("projection_builders_stopped");
+  if (had_active_queries) impl_->ObserveShutdownStage("maintenance_joined");
+  if (had_active_queries) impl_->ObserveShutdownStage("scratch_cleaned");
   impl_->ObserveShutdownStage("rocksdb_close");
   lock.lock();
   const Status closed = impl_->store.Close();
@@ -1711,6 +1728,48 @@ Status Database::Impl::ValidatePreparedQuery(
   return Status::OK();
 }
 
+void Database::Impl::RegisterQueryState(
+    const std::shared_ptr<QueryExecutionState>& state) {
+  if (!state) return;
+  std::lock_guard<std::mutex> lock(mutex);
+  active_query_states.erase(
+      std::remove_if(active_query_states.begin(), active_query_states.end(),
+                     [](const std::shared_ptr<QueryExecutionState>& candidate) {
+                       return !candidate;
+                     }),
+      active_query_states.end());
+  active_query_states.emplace_back(state);
+}
+
+void Database::Impl::UnregisterQueryState(
+    const std::shared_ptr<QueryExecutionState>& state) {
+  std::lock_guard<std::mutex> lock(mutex);
+  active_query_states.erase(
+      std::remove_if(active_query_states.begin(), active_query_states.end(),
+                     [&state](const std::shared_ptr<QueryExecutionState>& candidate) {
+                       return !candidate || candidate == state;
+                     }),
+      active_query_states.end());
+}
+
+bool Database::Impl::HasActiveQueries() const {
+  std::lock_guard<std::mutex> lock(mutex);
+  return std::any_of(active_query_states.begin(), active_query_states.end(),
+                     [](const std::shared_ptr<QueryExecutionState>& candidate) {
+                       return static_cast<bool>(candidate);
+                     });
+}
+
+void Database::Impl::CancelActiveQueries() {
+  std::vector<std::shared_ptr<QueryExecutionState>> states;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    states = active_query_states;
+    active_query_states.clear();
+  }
+  for (const auto& state : states) state->RequestCancel();
+}
+
 Status Database::Vacuum(CommitSeq oldest_readable) {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -1718,7 +1777,20 @@ Status Database::Vacuum(CommitSeq oldest_readable) {
   if (impl_->closing) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
-  return impl_->store.Vacuum(oldest_readable);
+  for (const auto& query_state : impl_->active_query_states) {
+    if (!query_state) continue;
+    const QueryTerminalInfo terminal = query_state->terminal_info();
+    if (terminal.state != QueryCursorState::kRunning) continue;
+    const auto pinned = query_state->snapshot_seq();
+    if (pinned.has_value() && pinned->value < oldest_readable.value) {
+      return Status::SnapshotPinned("database", "query snapshot is pinned");
+    }
+  }
+  const Status vacuumed = impl_->store.Vacuum(oldest_readable);
+  if (!vacuumed.ok()) return vacuumed;
+  return impl_->projection_store
+             ? impl_->projection_store->RetireBefore(oldest_readable)
+             : Status::OK();
 }
 
 StatusOr<std::optional<CommitResult>> Database::ResolveTransaction(

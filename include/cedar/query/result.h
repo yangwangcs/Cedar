@@ -6,7 +6,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -173,6 +176,43 @@ struct QueryColumn {
   std::shared_ptr<const JourneyColumn> journey_values;
 };
 
+enum class QueryCursorState : uint8_t {
+  kRunning,
+  kCleanEnd,
+  kCancelled,
+  kFailed,
+};
+
+struct QueryTerminalInfo {
+  QueryCursorState state = QueryCursorState::kRunning;
+  bool complete = false;
+  Status status = Status::OK();
+};
+
+// Shared lifecycle state lets Database shutdown request cancellation without
+// holding a query/runtime mutex or waiting for a blocked read callback.
+class QueryExecutionState {
+ public:
+  void RequestCancel();
+  bool cancelled() const;
+  Status FinishClean();
+  Status FinishCancelled();
+  Status FinishFailed(Status status);
+  QueryTerminalInfo terminal_info() const;
+  Status Close();
+  void SetCancelCallback(std::function<void()> callback);
+  void ClearCancelCallback();
+  void SetSnapshotSeq(CommitSeq seq);
+  std::optional<CommitSeq> snapshot_seq() const;
+
+ private:
+  mutable std::mutex mutex_;
+  std::atomic<bool> cancelled_{false};
+  QueryTerminalInfo terminal_;
+  std::optional<CommitSeq> snapshot_seq_;
+  std::function<void()> cancel_callback_;
+};
+
 class QueryBatch {
  public:
   size_t row_count() const { return row_count_; }
@@ -236,6 +276,7 @@ class QueryCursor {
   StatusOr<std::optional<QueryBatch>> Next();
   Status Cancel();
   Status Close();
+  QueryTerminalInfo terminal_info() const;
 
  private:
   class State;

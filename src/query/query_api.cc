@@ -276,7 +276,10 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       };
       return internal::QueryRuntime::Execute(
           execution_plan, std::move(snapshot), bindings, options,
-          database->query_resource_pool.get());
+          database->query_resource_pool.get(),
+          [database](const std::shared_ptr<QueryExecutionState>& state) {
+            database->RegisterQueryState(state);
+          });
     }
   }
   if (!state_->plan.canonical_temporal) {
@@ -285,7 +288,10 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
   }
   return internal::QueryRuntime::Execute(
       state_->plan, std::move(snapshot), bindings, options,
-      database->query_resource_pool.get());
+      database->query_resource_pool.get(),
+      [database](const std::shared_ptr<QueryExecutionState>& state) {
+        database->RegisterQueryState(state);
+      });
 }
 
 StatusOr<std::string> PreparedQuery::ExplainLogical() const {

@@ -272,7 +272,17 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
       request.database_identity != current_->manifest.database_identity) {
     return Status::IdentityConflict("projection store", "projection identity changed");
   }
-  return ReadChainsForGeneration(current_, request);
+  auto chains = ReadChainsForGeneration(current_, request);
+  if (!chains.ok() && (chains.status().IsCorruption() || chains.status().IsIOError())) {
+    // A derived page is never authoritative. Disable the affected generation
+    // immediately so subsequent readers fall back to CedarParquet facts; the
+    // generation remains pinned until existing leases release it.
+    current_->retired = true;
+    retired_.push_back(current_);
+    current_.reset();
+    enabled_ = false;
+  }
+  return chains;
 }
 
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
@@ -281,6 +291,7 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
   if (closed_ || !generation.state_) {
     return Status::NotFound("projection store", "projection generation is no longer available");
   }
-  return ReadChainsForGeneration(generation.state_, request);
+  auto chains = ReadChainsForGeneration(generation.state_, request);
+  return chains;
 }
 }  // namespace cedar::internal

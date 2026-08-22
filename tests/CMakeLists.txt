@@ -32,6 +32,11 @@ target_include_directories(test_query_canonical PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_query_canonical PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_canonical)
 
+add_executable(test_query_lifecycle query/test_query_lifecycle.cc)
+target_include_directories(test_query_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_lifecycle PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_lifecycle TEST_PREFIX "QueryLifecycle.")
+
 add_executable(test_query_relational query/test_query_relational.cc)
 target_include_directories(test_query_relational PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_query_relational PRIVATE cedar_core ${GTEST_MAIN_TARGET})
@@ -381,6 +386,11 @@ target_include_directories(test_recovery_crash_matrix PRIVATE ${CMAKE_SOURCE_DIR
 target_link_libraries(test_recovery_crash_matrix
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_recovery_crash_matrix)
+
+add_executable(test_query_crash_matrix recovery/test_query_crash_matrix.cc)
+target_include_directories(test_query_crash_matrix PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_crash_matrix PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_crash_matrix TEST_PREFIX "QueryCrashMatrix.")
 
 add_executable(test_recovery_format recovery/test_format.cc)
 target_include_directories(test_recovery_format PRIVATE ${CMAKE_SOURCE_DIR}/src)

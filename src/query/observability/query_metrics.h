@@ -71,6 +71,7 @@ struct QueryColumnStatistics {
 struct QueryStatisticsSnapshot {
   std::string database_identity;
   std::string schema_fingerprint;
+  std::string coverage;
   uint64_t generation_id = 0;
   CommitSeq base_seq;
   std::vector<QueryColumnStatistics> columns;

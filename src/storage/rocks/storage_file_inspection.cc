@@ -113,8 +113,9 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
           const auto& column = decoded.ValueOrDie().columns[i];
           if (!column.entity_range) continue;
           if (!metadata.coverage.empty()) metadata.coverage.push_back('|');
-          metadata.coverage += "entity=[" + std::to_string(column.entity_range->min) + "," +
+          metadata.coverage += "part=" + std::to_string(i) + ",entity=[" + std::to_string(column.entity_range->min) + "," +
               std::to_string(column.entity_range->max_exclusive) + ")";
+          if (column.valid_time_range) metadata.coverage += ",valid=[" + std::to_string(column.valid_time_range->from.value) + "," + (column.valid_time_range->to ? std::to_string(column.valid_time_range->to->value) : "inf") + ")";
         }
       }
     } else if (format == StorageTableFormat::kCedarManifest) {
@@ -134,7 +135,7 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
               (region.valid_time.to ? std::to_string(region.valid_time.to->value) : "inf") + ")";
         }
       }
-    } else {
+    } else if (format != StorageTableFormat::kCedarScratch) {
       const auto decoded = internal::DecodeProjectionPage(bytes);
       metadata.checksum_valid = decoded.ok();
       if (decoded.ok()) {

@@ -92,3 +92,16 @@ string(FIND "${ESCAPED_JSON}" "${ESCAPED_JSON_PATH}" ESCAPED_JSON_FOUND)
 if(ESCAPED_JSON_FOUND LESS 0)
   message(FATAL_ERROR "JSON path escaping failed: ${ESCAPED_JSON}")
 endif()
+
+string(ASCII 10 NEWLINE)
+set(NEWLINE_DB "/tmp/cedar-query-bench-${TOKEN}-line${NEWLINE}path")
+execute_process(COMMAND "${CEDAR_BENCHMARK}" "--path=${NEWLINE_DB}"
+  "--operation=state-at" "--duration-seconds=1" "--reopen-verify=true"
+  OUTPUT_VARIABLE NEWLINE_OUT ERROR_VARIABLE NEWLINE_JSON RESULT_VARIABLE NEWLINE_RC)
+if(NOT NEWLINE_RC EQUAL 0)
+  message(FATAL_ERROR "newline path benchmark failed: ${NEWLINE_JSON}\n${NEWLINE_OUT}")
+endif()
+string(FIND "${NEWLINE_JSON}" "\\n" NEWLINE_JSON_FOUND)
+if(NEWLINE_JSON_FOUND LESS 0)
+  message(FATAL_ERROR "JSON newline escaping failed: ${NEWLINE_JSON}")
+endif()

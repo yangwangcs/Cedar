@@ -274,10 +274,16 @@ TEST_F(QueryCanonicalTest, PinsSnapshotUntilEndOfStreamOrExplicitClose) {
   auto cursor = prepared.ValueOrDie().Execute(
       std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
   ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
-  EXPECT_TRUE(database_->Close().IsSnapshotPinned());
-  ASSERT_TRUE(cursor.ValueOrDie().Next().ok());
-  EXPECT_TRUE(database_->Close().IsSnapshotPinned());
-  ASSERT_FALSE(cursor.ValueOrDie().Next().ValueOrDie().has_value());
+  // Task 15 orders shutdown by cancelling and joining active queries before
+  // closing the authoritative store. The cursor remains a valid object, but
+  // cannot perform further reads after the database has closed.
+  EXPECT_TRUE(database_->Close().ok());
+  auto cancelled = cursor.ValueOrDie().Next();
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_TRUE(cancelled.status().IsQueryCancelled());
+  EXPECT_EQ(cursor.ValueOrDie().terminal_info().state,
+            QueryCursorState::kCancelled);
+  EXPECT_FALSE(cursor.ValueOrDie().terminal_info().complete);
   EXPECT_TRUE(database_->Close().ok());
 
   auto other = OpenOtherDatabase();

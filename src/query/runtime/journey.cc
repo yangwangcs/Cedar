@@ -395,6 +395,9 @@ StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
       return BuildJourney([&] { std::vector<JourneyTraversal> path; for (uint64_t i = id; i != 0 && labels[i].predecessor != std::numeric_limits<uint64_t>::max(); i = labels[i].predecessor) path.push_back(labels[i].edge); std::reverse(path.begin(), path.end()); return path; }(), request.interval.from);
     auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, options);
     if (!next.ok()) return next.status();
+    if (Status budget = CheckFragmentBudget(options, next.ValueOrDie().size());
+        !budget.ok())
+      return budget;
     for (auto& edge : next.ValueOrDie()) {
       if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
       auto found = best.find(edge.traversal.target);
@@ -449,7 +452,6 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
         path.push_back(labels[cursor].edge);
         cursor = labels[cursor].successor;
       }
-      std::reverse(path.begin(), path.end());
       return BuildJourney(path, current.time);
     }
     if (request.max_hops != 0 && current.depth >= request.max_hops) continue;

@@ -116,6 +116,29 @@ TEST(TemporalJourneyTest, LatestDepartureUsesReverseSearch) {
   EXPECT_EQ(journey.ValueOrDie().initial_departure, (ValidTime{499'995}));
 }
 
+TEST(TemporalJourneyTest, LatestDepartureReconstructsMultiHopOrder) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a, 0, 100);
+  graph.Vertex(graph.b, 0, 100);
+  graph.Vertex(graph.d, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{32}}, graph.a, graph.b, 0, 100);
+  graph.Edge(EdgeRef{PartId{0}, EdgeId{33}}, graph.b, graph.d, 0, 100);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  JourneyRequest request{graph.a, graph.d, {ValidTime{0}, ValidTime{100}},
+                         JourneyObjective::kLatestDeparture};
+  request.arrival_deadline = ValidTime{20};
+  request.duration_at = [](EdgeRef, ValidTime)
+      -> StatusOr<std::optional<ValidDuration>> {
+    return std::optional<ValidDuration>{ValidDuration{5}};
+  };
+  auto journey = LatestDeparture(snapshot.ValueOrDie(), request);
+  ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+  ASSERT_EQ(journey.ValueOrDie().edges.size(), 2U);
+  EXPECT_EQ(journey.ValueOrDie().edges[0].edge_id.value, 32U);
+  EXPECT_EQ(journey.ValueOrDie().edges[1].edge_id.value, 33U);
+}
+
 TEST(TemporalJourneyTest, FastestDurationRetainsDepartureArrivalParetoLabels) {
   JourneyFixture graph;
   graph.Vertex(graph.a, 0, 1'000'000);

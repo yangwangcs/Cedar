@@ -340,13 +340,19 @@ audit_run_csv() {
       for (i = 1; i <= 9; i++) {
         if (!(required[i] in column)) fail("missing header field: " required[i])
       }
+      header_invalid = invalid
+      header_reason = reason
       next
     }
     {
       rows++
-      invalid = 0
-      reason = ""
-      if (NF != header_fields) fail("row field count does not match header")
+      # Preserve header violations across all rows so malformed schemas cannot
+      # be reset to PASS by a later row-level validation.
+      invalid = header_invalid
+      reason = header_reason
+      if (NF != header_fields) {
+        fail("row field count does not match header")
+      }
       dataset = $(column["dataset_checksum"])
       auth = $(column["authoritative_bytes"])
       derived = $(column["derived_bytes"])

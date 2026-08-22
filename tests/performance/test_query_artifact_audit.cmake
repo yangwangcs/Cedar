@@ -49,6 +49,17 @@ if(SPACE_RC EQUAL 0)
   message(FATAL_ERROR "space violation was accepted")
 endif()
 
+file(MAKE_DIRECTORY "${OUTPUT}/duplicate-header")
+set(DUPLICATE_HEADER "exit_code,dataset_checksum,dataset_checksum,authoritative_bytes,derived_bytes,statistics_bytes,scratch_bytes,space_amplification,reopen_verified,hard_gate_pass,terminal_status${LF}")
+file(WRITE "${OUTPUT}/duplicate-header/run.csv" "${DUPLICATE_HEADER}${PASS_ROW}")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase reopen-verification --input "${OUTPUT}/duplicate-header" --output "${OUTPUT}/duplicate-header-out"
+  RESULT_VARIABLE DUPLICATE_HEADER_RC)
+if(DUPLICATE_HEADER_RC EQUAL 0)
+  message(FATAL_ERROR "duplicate header was accepted")
+endif()
+
 foreach(OUTPUT_ROOT IN ITEMS "${OUTPUT}/pass-out" "${OUTPUT}/pass-space-out")
   if(NOT EXISTS "${OUTPUT_ROOT}/audit-summary.csv" OR NOT EXISTS "${OUTPUT_ROOT}/audit-summary.json")
     message(FATAL_ERROR "audit output missing under ${OUTPUT_ROOT}")

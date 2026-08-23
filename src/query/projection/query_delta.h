@@ -172,6 +172,7 @@ class QueryDelta {
   CommitSeq enqueued_through_;
   std::condition_variable published_cv_;
   bool worker_indexing_ = false;
+  bool lifecycle_transition_ = false;
   std::thread worker_;
   bool stopping_ = false;
   bool hard_limit_reached_ = false;

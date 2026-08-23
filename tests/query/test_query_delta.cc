@@ -321,5 +321,62 @@ TEST(QueryDeltaTest, ResetWaitsForPoppedDescriptorBeforeClearingState) {
   EXPECT_TRUE(delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{2}}).ok());
 }
 
+TEST(QueryDeltaTest, LifecycleTransitionBlocksAdmissionUntilResetCompletes) {
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool popped = false;
+  bool release_worker = false;
+  QueryDeltaOptions options;
+  options.base_seq = CommitSeq{0};
+  options.queue_capacity = 8;
+  options.worker_after_pop_observer_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    popped = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_worker; });
+  };
+  QueryDelta delta(std::move(options));
+  ASSERT_TRUE(delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{1}}).ok());
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return popped; }));
+  }
+
+  std::atomic<bool> reset_done{false};
+  std::thread resetter([&] {
+    ASSERT_TRUE(delta.ResetBase(CommitSeq{1}).ok());
+    reset_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  std::atomic<bool> enqueue_done{false};
+  std::atomic<bool> enqueue_ok{false};
+  std::thread publisher([&] {
+    enqueue_ok.store(
+        delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{2}}).ok(),
+        std::memory_order_release);
+    enqueue_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_FALSE(reset_done.load(std::memory_order_acquire));
+  EXPECT_FALSE(enqueue_done.load(std::memory_order_acquire));
+
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_worker = true;
+  }
+  gate_cv.notify_all();
+  resetter.join();
+  publisher.join();
+  EXPECT_TRUE(enqueue_ok.load(std::memory_order_acquire));
+  for (int attempt = 0; attempt < 1000 &&
+       delta.indexed_through() != CommitSeq{2}; ++attempt) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(delta.indexed_through(), CommitSeq{2});
+  EXPECT_TRUE(delta.AcquireThrough(CommitSeq{2}).ok());
+}
+
 }  // namespace
 }  // namespace cedar::internal

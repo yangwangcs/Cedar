@@ -229,7 +229,8 @@ Status QueryDelta::ObservePublished(const QueryDeltaCommit& commit) {
 Status QueryDelta::EnqueuePublished(const QueryDeltaCommit& commit) {
   const Status valid = commit.Validate();
   if (!valid.ok()) return valid;
-  std::lock_guard<std::mutex> lock(queue_mutex_);
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  published_cv_.wait(lock, [this] { return !lifecycle_transition_; });
   if (commit.commit_seq.value <= options_.base_seq.value) {
     return Status::InvalidArgument("query delta", "commit is not after projection base");
   }
@@ -292,24 +293,41 @@ Status QueryDelta::RepairThrough(const FactStore& store,
                                  CommitSeq target,
                                  QueryDeltaRepairLimits limits) {
   std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+  published_cv_.wait(queue_lock, [this] { return !lifecycle_transition_; });
+  lifecycle_transition_ = true;
   published_cv_.wait(queue_lock, [this] { return !worker_indexing_; });
+  const auto finish_transition = [this] {
+    lifecycle_transition_ = false;
+    published_cv_.notify_all();
+  };
   std::lock_guard<std::mutex> lock(mutex_);
-  if (target.value <= indexed_through_.value) return Status::OK();
+  if (target.value <= indexed_through_.value) {
+    finish_transition();
+    return Status::OK();
+  }
   if (target.value > snapshot.commit_seq().value) {
+    finish_transition();
     return Status::InvalidArgument("query delta repair", "target exceeds snapshot");
   }
   const uint64_t first_value = indexed_through_.value + 1;
   if (target.value - indexed_through_.value > limits.max_commits) {
+    finish_transition();
     return Status::ResourceExhausted("query delta repair", "commit repair budget exceeded");
   }
   const auto sequences = store.ReadSequenceRange(snapshot, CommitSeq{first_value}, target);
-  if (!sequences.ok()) return sequences.status();
+  if (!sequences.ok()) {
+    finish_transition();
+    return sequences.status();
+  }
   std::vector<QueryDeltaCommit> repaired;
   repaired.reserve(sequences.ValueOrDie().size());
   uint64_t bytes = 0;
   for (const SequenceRecord& sequence : sequences.ValueOrDie()) {
     auto events = store.ReadExactFacts(snapshot, sequence.fact_keys);
-    if (!events.ok()) return events.status();
+    if (!events.ok()) {
+      finish_transition();
+      return events.status();
+    }
     QueryDeltaCommit descriptor(sequence.commit_seq);
     descriptor.facts = events.ConsumeValueOrDie();
     for (const FactEvent& event : descriptor.facts) {
@@ -317,13 +335,17 @@ Status QueryDelta::RepairThrough(const FactStore& store,
     }
     bytes += descriptor.EstimatedBytes();
     if (bytes > limits.max_bytes) {
+      finish_transition();
       return Status::ResourceExhausted("query delta repair", "byte repair budget exceeded");
     }
     repaired.push_back(std::move(descriptor));
   }
   for (const QueryDeltaCommit& descriptor : repaired) {
     const Status indexed = IndexLocked(descriptor);
-    if (!indexed.ok()) return indexed;
+    if (!indexed.ok()) {
+      finish_transition();
+      return indexed;
+    }
   }
   queue_size_ = 0;
   published_queue_.clear();
@@ -332,6 +354,7 @@ Status QueryDelta::RepairThrough(const FactStore& store,
       first_missing_value_.load(std::memory_order_acquire) <= indexed_through_.value) {
     first_missing_value_.store(0, std::memory_order_release);
   }
+  finish_transition();
   return Status::OK();
 }
 
@@ -346,10 +369,17 @@ Status QueryDelta::ConsumeThrough(CommitSeq through) {
 
 Status QueryDelta::RetireThrough(CommitSeq through) {
   std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+  published_cv_.wait(queue_lock, [this] { return !lifecycle_transition_; });
+  lifecycle_transition_ = true;
   published_cv_.wait(queue_lock, [this] { return !worker_indexing_; });
+  const auto finish_transition = [this] {
+    lifecycle_transition_ = false;
+    published_cv_.notify_all();
+  };
   std::lock_guard<std::mutex> lock(mutex_);
   if (through.value < options_.base_seq.value ||
       through.value > indexed_through_.value) {
+    finish_transition();
     return Status::InvalidArgument("query delta", "retirement is outside indexed coverage");
   }
   std::vector<QueryDeltaCommit> retained;
@@ -377,11 +407,14 @@ Status QueryDelta::RetireThrough(CommitSeq through) {
       first_missing_value_.load(std::memory_order_acquire) <= through.value) {
     first_missing_value_.store(0, std::memory_order_release);
   }
+  finish_transition();
   return Status::OK();
 }
 
 Status QueryDelta::ResetBase(CommitSeq base) {
   std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+  published_cv_.wait(queue_lock, [this] { return !lifecycle_transition_; });
+  lifecycle_transition_ = true;
   published_cv_.wait(queue_lock, [this] { return !worker_indexing_; });
   std::lock_guard<std::mutex> lock(mutex_);
   options_.base_seq = base;
@@ -398,6 +431,8 @@ Status QueryDelta::ResetBase(CommitSeq base) {
   edge_identities_.clear();
   published_queue_.clear();
   enqueued_through_ = base;
+  lifecycle_transition_ = false;
+  published_cv_.notify_all();
   return Status::OK();
 }
 

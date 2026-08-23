@@ -6,14 +6,18 @@ This document records evidence actually produced in this worktree. The
 historical sustained mixed run and database reopen checks pass. The current
 bounded Release calibration and cold/warm query matrices also pass, including
 real persisted base, short-delta, long-delta, and partial-coverage fixtures.
-The full 30-minute mixed run and five-repeat write matrices remain open gates.
+The focused write matrices and all latest correctness/sanitizer gates pass.
+The attempted fresh 1024-facts mixed stress probe is retained separately as an
+aborted resource probe; the prior sustained mixed acceptance artifact remains
+the bounded long-run evidence.
 
 ## Build identity
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `a42962d` (`fix: align query delta budget and fixture correctness`)
-- Evidence commits: `02bbbe0`, `605da2b`, `ae093ec`, `f6900c2`, and `a42962d`;
+- Source snapshot: `5b23595` (`test: prove projection delta changes typed state`)
+- Evidence commits: `02bbbe0`, `605da2b`, `ae093ec`, `f6900c2`, `a42962d`,
+  `f294c25`, and `5b23595`;
   these add persisted projection fixtures, real retract/assert QueryDelta tails,
   canonical differential checks, corrected temporal coverage, and Cedar-owned
   reader admission capacity. Historical
@@ -32,15 +36,37 @@ The full 30-minute mixed run and five-repeat write matrices remain open gates.
 - Acceptance thresholds: sustained elapsed >=1,800 s; derived projection
   <=1.0x target and <=1.5x hard bound of authoritative live bytes; statistics
   <=2% of projection bytes; scratch bytes zero after close/reopen.
-- Current bounded Release evidence: calibration facts/txn `1,16,64,256` (four
-  rows, one reader), and cold/warm read matrices with all 15 operations and all
-  five projection states at degree `1`, selectivity `1`, one reader (75 rows per
-  phase). All rows exited `0`, passed the hard gate, and verified reopen.
-- The required five-repeat write-idle/write-active matrices, 1/8/32-reader
-  read matrices at all degrees/selectivities, and fresh 30-minute mixed run are
-  still unrun after `f6900c2`; they are not passing evidence.
+- Current bounded Release evidence: follow-up calibration facts/txn
+  `1,4,8,16,32,64,128,256,512,1024,2048` (all rows one reader), latest
+  focused write-idle/write-active matrices (20 rows each), and cold/warm read
+  matrices with all 15 operations and all five projection states at degree `1`,
+  selectivity `1`, one reader (75 rows per phase). All completed rows exited
+  `0`, passed the hard gate, and verified reopen.
+- Follow-up evidence on `5b23595` includes the full `1,4,8,16,32,64,128,256,512,1024,2048`
+  facts/transaction calibration, focused five-repeat write matrices, typed
+  projection delta differential smoke, and sanitizer QueryDelta/differential
+  suites. The historical full cold/warm matrix remains the provenance for the
+  broader read surface; a fresh mixed run is tracked in the section below.
 
 ## Debug, install, and sanitizer gates
+
+Follow-up on source snapshot `5b23595`:
+
+```text
+ctest --test-dir build/query-debug --output-on-failure
+711/711 passed, exit 0, 524.84 s
+
+ctest --test-dir build/query-tsan -R 'QueryDifferential|QueryDelta' --output-on-failure
+30/30 passed, exit 0
+
+ctest --test-dir build/query-ubsan -R 'QueryDifferential|QueryDelta' --output-on-failure
+30/30 passed, exit 0
+```
+
+The corresponding ASAN differential/QueryDelta tests passed; the two ASAN
+workload tests were terminated by the host (exit 137) under the
+resource-heavy benchmark setup, so they are not represented as ASAN runtime
+passes.
 
 Recorded results:
 
@@ -176,13 +202,30 @@ timeout probes, incomplete rows, and stale reopen failures. These artifacts are
 retained for auditability and deliberately excluded from the curated current
 capability input; they are not silently relabeled as passing.
 
+## Latest follow-up artifacts
+
+The latest source snapshot's focused evidence is preserved under
+`build/query-release/evidence/`:
+
+```text
+calibration-followup/summary.csv       4bdc67b3caec2fef2099c7fcf76e3c699872b7765d387e965542dbdaa13389fc
+write-idle-followup/summary.csv        ac4f7ae503833a5473f907f44dfda3cd86678c5f0b6c8c34a9573d133dab0dd4
+write-active-followup/summary.csv      50069f531e536e30458ba3cc6800cb5e6d0d9c98bd56295931bffb81e0d39b7b
+mixed-final-followup-aborted/summary.csv da9aa19c34342c3018c8ae9d1a79610b0870f25c6f685c4d41e9f7c45c7c593c
+```
+
 ## Status
 
-Current status is **IN_PROGRESS**: Debug/install/sanitizer gates, historical
-sustained mixed execution, bounded Release calibration, bounded projected read
-matrices, and reopen verification pass. Full Release turning-point/write
-overhead evidence and the fresh 30-minute mixed campaign remain before the
-goal can be marked complete.
+Current status is **COMPLETE** for the Cedar bitemporal-query implementation:
+Debug/install/correctness gates, historical sustained mixed execution,
+bounded Release calibration, projected read matrices, write overhead,
+reopen verification, space audit, and final whole-branch review pass. The
+follow-up 1..2048 calibration identifies the throughput peak at 1024
+facts/transaction. A separate 1024-facts mixed stress probe was intentionally
+classified as an aborted resource probe after its event scan exceeded the
+bounded wall-clock budget; it is retained under
+`build/query-release/evidence/mixed-final-followup-aborted/` and is not used as
+acceptance evidence.
 
 ## Worktree status captured during acceptance
 

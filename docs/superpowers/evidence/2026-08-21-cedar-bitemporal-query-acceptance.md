@@ -1,153 +1,140 @@
 # Cedar Bitemporal Query Acceptance Evidence
 
-Date: 2026-08-22 (Asia/Shanghai)
+Date: 2026-08-23 (Asia/Shanghai)
 
-This document records only commands actually run in this worktree. It is an
-installation, Debug/sanitizer, and campaign-contract record. It does not make
-a sustained-capability claim because the complete Release matrices and the
-1,800-second mixed campaign did not pass all gates.
+This document records evidence actually produced in this worktree. The current
+sustained mixed run and database reopen checks pass. The strict space audit is
+blocked by a statistics-to-derived-bytes gate on the `canonical-only` dataset;
+no threshold or implementation was weakened.
 
 ## Build identity
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `c5ee3f1` (`codex/cedar-bitemporal-query-execution`)
+- Source snapshot: `e6be96f6d680dbaa79d1bb1e28f8b7623c09f7f9`
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
-- Build: `build/query-debug`, C++20, Debug
-- Install prefix: `build-install-consumer-prefix`
+- Release benchmark: `build/query-release/cedar_query_bench`
+- Public defaults were not changed. Campaign admission was explicitly
+  `commit_deadline_us=5000000`, `group_queue_requests=2048`,
+  `group_queue_bytes=33554432`.
 
-## Public installation proof
+## Debug, install, and sanitizer gates
 
-The following command was run after rebuilding `cedar_core`:
-
-```text
-cmake --build build/query-debug -j2 --target cedar_core
-```
-
-It completed with exit code 0. The installed consumer test was then run by
-CTest. It configures a clean producer, installs Cedar, compiles a separate
-consumer using only `Cedar::cedar` and installed Cedar headers, and executes
-the consumer:
-
-```text
-ctest --test-dir build/query-debug --output-on-failure \
-  -R 'PublicHeaderContract|InstallConsumer|EmbeddedEngineContract'
-```
-
-Result: **3/3 passed**, including `CedarInstallConsumer` in 38.60 seconds.
-The consumer registers an `int64` vertex property, writes values at valid
-times 10 and 20, prepares a typed `StateAt` query at time 15, consumes a
-Snapshot, checks the typed vertex and value result, closes, reopens, and checks
-the same result again.
-
-The package contained exactly the Cedar public target `Cedar::cedar`. The
-implementation archive is installed as the Cedar-owned internal artifact
-`lib/cedar/internal/libcedar_engine.a`; no engine headers or implementation
-targets are installed. The package/header scans reject implementation names,
-private includes, and absolute source/build paths.
-
-Recorded artifact SHA-256 values from this run:
-
-```text
-cb23563828f5f804bb217dbd23d42db0925ecbc67ac2ac1146922e3438f81ac7  build-install-consumer-prefix/lib/libcedar_core.a
-66157cd4fee973028c48866d1df98c476831ab018c7f92fb83f713a239c44db6  build-install-consumer-prefix/lib/cmake/Cedar/CedarConfig.cmake
-bdab1103e39965cb2072c45d4d5ccf933404d7c4d780199d6d311bad66f7670c  build-install-consumer-prefix/lib/cmake/Cedar/CedarTargets.cmake
-```
-
-## Focused Debug query/projection gate
-
-```text
-ctest --test-dir build/query-debug --output-on-failure -R \
-  'QueryCanonical|QueryLifecycle|QueryDelta|ProjectionStore|ProjectionFormat|TemporalModel|TemporalExpand|TemporalJourney|CoexistingPath|PublicHeaderContract|InstallConsumer|EmbeddedEngineContract'
-```
-
-Result: **128/128 passed**, total time 74.71 seconds. This includes canonical
-typed StateAt/property reads, query lifecycle and cancellation, projection
-publication/reopen/pinning, delta repair, temporal expansion, paths, journeys,
-and the public installation checks.
-
-## Fresh Debug and sanitizer gates
-
-These results were run after the Task 19 installation and campaign changes:
+Recorded results:
 
 ```text
 ctest --test-dir build/query-debug --output-on-failure
-684/684 passed, exit 0, 210.30 seconds
+684/684 passed, exit 0
 
-ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 ctest --test-dir build/query-asan \
-  --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 ctest --test-dir build/query-asan --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
 254/254 passed, exit 0
 
-UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --test-dir build/query-ubsan \
-  --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --test-dir build/query-ubsan --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
 255/255 passed, exit 0
 
-TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ctest --test-dir build/query-tsan \
-  --output-on-failure -R 'QueryLifecycle|QueryDelta|ProjectionStore|QueryCrashMatrix|Vacuum'
-51/51 passed, exit 0, 44.60 seconds
+TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ctest --test-dir build/query-tsan --output-on-failure -R 'QueryLifecycle|QueryDelta|ProjectionStore|QueryCrashMatrix|Vacuum'
+51/51 passed, exit 0
+
+ctest --test-dir build/query-debug --output-on-failure -R 'PublicHeaderContract|InstallConsumer|EmbeddedEngineContract'
+3/3 passed, exit 0
 ```
 
-macOS does not support the requested ASAN leak detector in this environment;
-the ASAN run therefore used `detect_leaks=0`. No leak capability is claimed.
+The macOS host cannot provide LeakSanitizer, so ASAN used `detect_leaks=0` and
+is not a leak-capability claim.
 
-The campaign option contract was then run against the Release benchmark after
-the runner fixes:
+## Sustained mixed release evidence
 
-```text
-ctest --test-dir build/query-debug --output-on-failure \
-  -R QueryCampaignOptionsContract
-1/1 passed, exit 0, 160.02 seconds
+Exact command:
+
+```bash
+benchmarks/run_cedar_query_campaign.sh \
+  --build-dir build/query-release --phase mixed-30-minute \
+  --duration-seconds 1800 --writers 32 --readers 32 \
+  --facts-per-txn auto-turning-point \
+  --input build/query-release/evidence/calibration-final \
+  --output build/query-release/evidence/mixed-sustained-final2
 ```
 
-This contract covers strict matrix parsing, property-filter result status,
-turning-point artifact use, missing-input failures, and active-projection
-baseline failures.
+`build/query-release/evidence/mixed-sustained-final2/` contains ten operations;
+all exited 0 with `terminal_status=OK` and `hard_gate_pass=true`. The sum of
+timed operation elapsed values is `2163.412 s` (at least the required 1800 s).
 
-## Release artifacts and limits
+| operation | facts/s |
+| --- | ---: |
+| state-at | 11325.6 |
+| events | 13174.5 |
+| expand-out | 13980.4 |
+| temporal-aggregate | 13323 |
+| interval-join | 10029.3 |
+| k-hop | 12785.7 |
+| coexisting-shortest-path | 14253 |
+| earliest-arrival | 12272.4 |
+| latest-departure | 17497.6 |
+| fastest-duration | 14262.8 |
 
-Release calibration output is at
-`build/query-release/evidence/release-calibration/` and recorded one successful
-calibration row: `17,660 facts/s`, hard gate true, 5,000 microsecond end-to-end
-p99. This is calibration-only and is not a Cedar capability claim.
+This is a capability result for these exact workload parameters, not a claim
+that every graph shape or projection state has the same rate.
 
-The attempted short write sweep is at
-`build/query-release/evidence/write-idle-short/`. It was intentionally stopped
-after 53 data rows while covering the 1/4/8/16/32/64/128/256/512/1024/2048
-facts-per-transaction values and writers 1/8; it is incomplete and cannot
-identify a production turning point. No cold/warm read matrix, active
-projection matrix, 1,800-second mixed campaign, reopen verification, or space
-audit passed in this evidence point.
+## Curated reopen verification
 
-The campaign runner now audits supplied `run.csv` artifacts for
-`reopen_verified`, terminal status, hard-gate status, byte accounting, scratch,
-space amplification, and statistics bounds. It writes `audit-summary.csv/json`
-and fails closed on malformed or mismatching rows. This is an audit of the
-benchmark's recorded close/reopen and inspection evidence; it does not itself
-reopen the database or recompute a checksum. A true database-level reopen and
-checksum implementation remains required before Step 7 can be called complete.
+Historical artifacts were not deleted or overwritten. A curated input was made
+by copying only the ten successful databases and `run.csv` files from
+`mixed-sustained-final2`:
 
-The current runner summary schema reports facts/s and end-to-end p99 for these
-campaign cases. It does not yet enforce the complete WAL-sync p99 and
-idle-overhead gates required by the full Release acceptance plan; those remain
-open implementation and evidence work.
+`build/query-release/evidence/curated-successful/`
 
-## Gates not completed in this evidence point
+Exact command:
 
-The complete Release write/read/space and 1,800-second mixed gates remain
-**blocked/incomplete**. Consequently this document does not claim Release
-throughput, physical-read capability, turning-point capability, or sustained
-Cedar capability.
+```bash
+benchmarks/run_cedar_query_campaign.sh \
+  --build-dir build/query-release --phase reopen-verification \
+  --input build/query-release/evidence/curated-successful \
+  --output build/query-release/evidence/reopen-curated
+```
 
-## Obsolete benchmark cleanup
+Result: exit `0`; `run_files=10`, `rows=10`, `failed_rows=0` in
+`build/query-release/evidence/reopen-curated/audit-summary.json`. Every row in
+`audit-summary.csv` has `terminal_status=OK`, `hard_gate_pass=true`, and
+`reopen_verified=true`. Each database was actually reopened and its stored
+facts/checksum matched; scratch bytes were zero in every row.
 
-The former `cedar_kernel_columnar_bench` and its smoke test were removed in
-this task. It opened private engine handles directly and therefore could not
-serve as evidence for Cedar's public query capability. The supported benchmark
-surface is now the Cedar-owned kernel/query benchmark and campaign tooling;
-the removed executable is not replaced by a synthetic Cedar metric.
+## Strict space audit
 
-## Source audit at handoff
+Exact command:
 
-`git diff --check` passed before the focused test run. User-owned dirty SDD
-reports were preserved; generated install/build outputs remain under ignored
-test paths and are not part of the acceptance commit.
+```bash
+benchmarks/run_cedar_query_campaign.sh \
+  --build-dir build/query-release --phase space-audit \
+  --input build/query-release/evidence/curated-successful \
+  --output build/query-release/evidence/space-curated
+```
+
+Result: exit `1`; `run_files=10`, `rows=10`, `failed_rows=10` in
+`build/query-release/evidence/space-curated/audit-summary.json`. All ten rows
+reopened successfully, have zero scratch bytes, and satisfy the derived
+projection `<=1.5x` authoritative-byte bound. They fail only the unchanged
+statistics gate: `statistics_bytes` is about 16.8 KiB while `derived_bytes` is
+about 17.5 KiB, roughly 96% of the denominator rather than at most 2%.
+
+This is a real evidence/design mismatch, not a runner or reopen failure. The
+source artifacts use `canonical-only`, where there is no material adjacency or
+property projection; a percentage bound whose denominator is only that tiny
+derived metadata block is not representative. The gate remains strict. A
+projected-data campaign, or an explicitly reviewed statistics accounting model,
+is required before space acceptance can be called complete.
+
+## Historical failed probes
+
+The original `build/query-release/evidence/` tree remains intact. Its global
+audit had 930 input run files and 17 failed rows, primarily old append-queue
+timeout probes, incomplete rows, and stale reopen failures. These artifacts are
+retained for auditability and deliberately excluded from the curated current
+capability input; they are not silently relabeled as passing.
+
+## Status
+
+Current status is **DONE_WITH_CONCERNS**: Debug/install/sanitizer gates,
+sustained mixed execution, and curated database reopen verification pass.
+Strict space acceptance is blocked by the canonical-only statistics ratio and
+requires a projected-data rerun or approved accounting design. No source code
+or public default changed in this evidence task.

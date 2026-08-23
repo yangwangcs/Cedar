@@ -238,6 +238,7 @@ write_idle_overhead_artifact() {
   local source="$output/summary.csv"
   local target="$output/../write-idle-overhead.csv"
   local expected_points expected_samples
+  local facts_metadata="${facts_values//,/|}" writers_metadata="${writers_values//,/|}"
   expected_points=$(csv_values "$facts_values" facts-per-txn | wc -l | tr -d ' ')
   expected_points=$((expected_points * $(csv_values "$writers_values" writers | wc -l | tr -d ' ')))
   expected_samples=$((expected_points * 5))
@@ -265,7 +266,7 @@ write_idle_overhead_artifact() {
   fi
   {
     cat "$target.tmp"
-    printf 'facts_per_txn,%s\nwriters,%s\nseed,1\ncache_state,cold\nprojection_work,paused\n' "$facts_values" "$writers_values"
+    printf 'facts_per_txn,%s\nwriters,%s\nseed,1\ncache_state,cold\nprojection_work,paused\n' "$facts_metadata" "$writers_metadata"
   } > "$target"
   rm -f "$target.tmp"
 }
@@ -277,7 +278,7 @@ compare_idle_query_overhead() {
   elif [[ -f "$output/../write-idle-baseline.csv" ]]; then
     baseline="$output/../write-idle-baseline.csv"
   fi
-  local idle_rate idle_wal baseline_rate baseline_wal baseline_samples expected_points expected_samples baseline_facts baseline_writers baseline_seed baseline_cache baseline_projection reason=""
+  local idle_rate idle_wal baseline_rate baseline_wal baseline_samples expected_points expected_samples baseline_facts baseline_writers baseline_seed baseline_cache baseline_projection expected_facts_metadata expected_writers_metadata reason=""
   idle_rate=$(awk -F, '$1=="write-idle-five-repeats" && $4=="true" {sum+=$6; n++} END {print n ? sum/n : ""}' "$summary")
   idle_wal=$(awk -F, '$1=="write-idle-five-repeats" && $4=="true" {sum+=$8; n++} END {print n ? sum/n : ""}' "$summary")
   if [[ ! -f "$baseline" ]]; then
@@ -301,8 +302,10 @@ compare_idle_query_overhead() {
     baseline_seed=$(awk -F, '$1=="seed" {print $2}' "$baseline")
     baseline_cache=$(awk -F, '$1=="cache_state" {print $2}' "$baseline")
     baseline_projection=$(awk -F, '$1=="projection_work" {print $2}' "$baseline")
-    [[ -n "$reason" || "$baseline_facts" == "$facts_values" ]] || reason="incomparable_facts_per_txn"
-    [[ -n "$reason" || "$baseline_writers" == "$writers_values" ]] || reason="incomparable_writers"
+    expected_facts_metadata="${facts_values//,/|}"
+    expected_writers_metadata="${writers_values//,/|}"
+    [[ -n "$reason" || "$baseline_facts" == "$expected_facts_metadata" ]] || reason="incomparable_facts_per_txn"
+    [[ -n "$reason" || "$baseline_writers" == "$expected_writers_metadata" ]] || reason="incomparable_writers"
     [[ -n "$reason" || "$baseline_seed" == 1 ]] || reason="incomparable_seed"
     [[ -n "$reason" || "$baseline_cache" == cold ]] || reason="incomparable_cache_state"
     [[ -n "$reason" || "$baseline_projection" == paused ]] || reason="incomparable_projection_work"

@@ -24,7 +24,7 @@ no threshold or implementation was weakened.
   facts/transaction, seed `1` in every mixed row (seed range `1..1`). The
   first Release calibration remains calibration-only; its turning-point
   artifact is `build/query-release/evidence/calibration-final/turning-point.json`
-  (1,024 facts/transaction; calibration peak reported as 17,660 facts/s).
+  (1,024 facts/transaction; calibration peak reported as 89,890.5 facts/s).
 - Acceptance thresholds: sustained elapsed >=1,800 s; derived projection
   <=1.0x target and <=1.5x hard bound of authoritative live bytes; statistics
   <=2% of projection bytes; scratch bytes zero after close/reopen.

@@ -27,3 +27,7 @@ $ git status --short --branch
 
 The three report modifications were pre-existing and preserved. No source,
 threshold, default, or generated artifact was changed or deleted.
+
+Follow-up provenance correction: `calibration-final/turning-point.json` reports
+the 1,024-fact calibration peak as `89,890.5 facts/s`; the acceptance document
+now records that exact value.

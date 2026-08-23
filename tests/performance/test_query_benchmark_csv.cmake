@@ -69,6 +69,28 @@ foreach(OP ${OPERATIONS})
   endif()
 endforeach()
 
+# Each non-canonical state is a real persisted/reopenable fixture. This
+# exercises projection publication, QueryDelta, and the canonical fallback
+# contract instead of only checking parser acceptance.
+foreach(PROJECTION_STATE IN ITEMS base short-delta long-delta partial-coverage)
+  set(PROJECTION_DB "/tmp/cedar-query-bench-${TOKEN}-${PROJECTION_STATE}")
+  execute_process(
+    COMMAND "${CEDAR_BENCHMARK}" "--path=${PROJECTION_DB}"
+      "--operation=state-at" "--projection-state=${PROJECTION_STATE}"
+      "--duration-seconds=1" "--facts-per-txn=16" "--writers=1"
+      "--readers=1" "--reopen-verify=true"
+    RESULT_VARIABLE PROJECTION_RC OUTPUT_VARIABLE PROJECTION_OUT
+    ERROR_VARIABLE PROJECTION_ERR)
+  if(NOT PROJECTION_RC EQUAL 0 OR
+     NOT PROJECTION_OUT MATCHES "\"${PROJECTION_STATE}\"" OR
+     NOT PROJECTION_ERR MATCHES "\"hard_gate_pass\":true" OR
+     NOT PROJECTION_ERR MATCHES "\"reopen_verified\":true")
+    message(FATAL_ERROR
+      "projection fixture ${PROJECTION_STATE} failed: rc=${PROJECTION_RC}\n"
+      "${PROJECTION_ERR}\n${PROJECTION_OUT}")
+  endif()
+endforeach()
+
 set(ACTIVE_DB "/tmp/cedar-query-bench-${TOKEN}-active")
 execute_process(COMMAND "${CEDAR_BENCHMARK}" "--path=${ACTIVE_DB}" "--operation=expand-out" "--projection-work=active" "--duration-seconds=1" OUTPUT_VARIABLE ACTIVE_OUT ERROR_VARIABLE ACTIVE_ERR RESULT_VARIABLE ACTIVE_RC)
 if(NOT ACTIVE_RC EQUAL 0)

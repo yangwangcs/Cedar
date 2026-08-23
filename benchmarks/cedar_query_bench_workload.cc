@@ -167,7 +167,7 @@ Status CommitFacts(Database* db, uint64_t first, uint64_t count,
   if (!txn.ok()) return txn.status();
   for (uint64_t i = 0; i < count; ++i) {
     const Status s = txn.ValueOrDie()->Assert(
-        EntityFact::Vertex({PartId{1}, VertexId{first + i}}), ValidTime{1});
+        EntityFact::Vertex({PartId{0}, VertexId{first + i}}), ValidTime{1});
     if (!s.ok()) return s;
   }
   auto result = txn.ValueOrDie()->Commit();
@@ -240,7 +240,9 @@ Status SeedBenchmarkScore(Database* db, const BenchmarkGraph& graph,
 
 Status BuildBenchmarkProjection(const std::string& database_path,
                                 const BenchmarkGraph& graph,
-                                CommitSeq base_seq) {
+                                CommitSeq base_seq,
+                                uint64_t seed_facts,
+                                ProjectionState state) {
   internal::ProjectionStoreOptions options;
   options.path = database_path + "/projections";
   options.database_identity = database_path;
@@ -255,12 +257,35 @@ Status BuildBenchmarkProjection(const std::string& database_path,
   chain.header.generation_id = kGeneration;
   chain.header.base_seq = base_seq;
   chain.header.part_id = graph.source.part_id;
-  chain.header.entity_min = graph.source.vertex_id.value;
-  chain.header.entity_max_exclusive = graph.source.vertex_id.value + 1;
+  const bool partial = state == ProjectionState::kPartialCoverage;
+  chain.header.entity_min = partial ? graph.source.vertex_id.value : 0;
+  chain.header.entity_max_exclusive =
+      partial ? graph.source.vertex_id.value + 1 : UINT64_MAX;
   chain.header.valid_from_min = ValidTime{0};
-  chain.header.valid_to_max = ValidTime{100};
-  chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, ValidTime{100}},
-                             Value::Int64(1), graph.source.vertex_id.value});
+  chain.header.valid_to_max = std::nullopt;
+  if (partial) {
+    chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, ValidTime{100}},
+                               Value::Int64(1), graph.source.vertex_id.value});
+  } else {
+    for (const VertexRef vertex : {graph.source, graph.middle, graph.target}) {
+      chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, ValidTime{100}},
+                                 Value::Int64(1), vertex.vertex_id.value});
+    }
+    chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, ValidTime{20}},
+                               Value::Int64(1), graph.corrected.vertex_id.value});
+    for (uint64_t id = 1; id <= seed_facts; ++id) {
+      chain.intervals.push_back({ValidTimeInterval{ValidTime{1}, std::nullopt},
+                                 Value::Int64(1), id});
+    }
+  }
+  std::sort(chain.intervals.begin(), chain.intervals.end(),
+            [](const internal::ProjectionInterval& left,
+               const internal::ProjectionInterval& right) {
+              if (left.entity_id != right.entity_id) {
+                return left.entity_id < right.entity_id;
+              }
+              return left.effective.from.value < right.effective.from.value;
+            });
   auto encoded = internal::EncodeProjectionPage(chain,
                                                  internal::CompressionCodec::kNone);
   if (!encoded.ok()) return encoded.status();
@@ -278,7 +303,7 @@ Status BuildBenchmarkProjection(const std::string& database_path,
   region.schema_epoch = chain.header.schema_epoch;
   region.entity_min = chain.header.entity_min;
   region.entity_max_exclusive = chain.header.entity_max_exclusive;
-  region.valid_time = ValidTimeInterval{ValidTime{0}, ValidTime{100}};
+  region.valid_time = ValidTimeInterval{ValidTime{0}, std::nullopt};
   region.segments.push_back(descriptor);
   internal::ProjectionBuild build;
   build.manifest.database_identity = database_path;
@@ -287,6 +312,22 @@ Status BuildBenchmarkProjection(const std::string& database_path,
   build.manifest.regions.push_back(std::move(region));
   build.segments.push_back({descriptor, encoded.ConsumeValueOrDie()});
   return opened.ValueOrDie()->Build(build);
+}
+
+Status ApplyProjectionDelta(Database* database, uint64_t first,
+                            uint64_t count, uint64_t commit_deadline_us,
+                            uint64_t* transactions, uint64_t* facts) {
+  for (uint64_t i = 0; i < count; ++i) {
+    uint64_t committed = 0;
+    if (Status status = CommitFacts(database, first + i, 1, &committed,
+                                    commit_deadline_us);
+        !status.ok()) {
+      return status;
+    }
+    ++*transactions;
+    *facts += committed;
+  }
+  return Status::OK();
 }
 
 Status ExecutePublicOperation(Database* database, Snapshot snapshot,
@@ -425,8 +466,8 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
   // as a consumer-side limit while leaving enough budget for one batch; a
   // small cap must not turn a valid public query into ResourceExhausted.
   const uint64_t execution_budget = std::max<uint64_t>(limit, 1'000'000);
-  constexpr uint64_t kBenchmarkQueryPoolMemoryBytes = 128ULL << 20;
-  constexpr uint64_t kMinimumInteractiveQueryMemoryBytes = 4ULL << 20;
+  constexpr uint64_t kBenchmarkQueryPoolMemoryBytes = 256ULL << 20;
+  constexpr uint64_t kMinimumInteractiveQueryMemoryBytes = 8ULL << 20;
   // The benchmark's reader matrix shares a fixed Cedar query pool. Divide
   // that pool across the configured readers so 8/32 concurrent readers are
   // admitted without inflating the storage profile's global allocation.
@@ -765,7 +806,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   // The benchmark intentionally exercises the 1/8/32-reader matrix. Expand
   // only the worker admission limit; query memory remains a fixed Cedar-owned
   // pool and each interactive query receives its proportional budget above.
-  db_options.query_runtime.query_memory_bytes = 128ULL << 20;
+  db_options.query_runtime.query_memory_bytes = 256ULL << 20;
   db_options.query_runtime.query_workers = std::max<uint32_t>(4, options.readers);
   db_options.query_runtime.projection_cache_bytes = 32ULL << 20;
   db_options.query_runtime.query_delta_bytes = 32ULL << 20;
@@ -864,14 +905,6 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.hard_gate_pass = false;
     return result;
   }
-  if (options.projection != ProjectionState::kCanonicalOnly) {
-    result.projection_state_supported = false;
-    result.terminal_status =
-        "projection benchmark setup unavailable: canonical-only paused is the only measured state";
-    result.gate_classification = "unsupported";
-    result.hard_gate_pass = false;
-    return result;
-  }
   const auto run_start = Clock::now();
   result.projection_active = options.projection_work == ProjectionWork::kActive;
   std::optional<QueryMaintenanceHandle> maintenance;
@@ -932,8 +965,14 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     for (uint64_t id = first; id < first + committed; ++id)
       dataset_checksum.fetch_xor(id * kChecksumSalt);
   }
+  // Keep timed appends disjoint from the persisted projection base. The
+  // benchmark graph and append facts share one Cedar partition so a complete
+  // projection fixture can be read without a cross-partition fallback.
+  next_id.store(seed_facts + 1);
   seed_transaction_count = transactions.load();
-  if (result.projection_active) {
+  const bool projection_requested =
+      options.projection != ProjectionState::kCanonicalOnly;
+  if (projection_requested || result.projection_active) {
     CommitSeq base_seq;
     {
       auto seeded_snapshot = database->BeginSnapshot();
@@ -942,7 +981,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     }
     if (Status closed = database->Close(); !closed.ok()) return closed;
     database.reset();
-    if (Status built = BuildBenchmarkProjection(options.path, graph, base_seq);
+    if (Status built = BuildBenchmarkProjection(options.path, graph, base_seq,
+                                                seed_facts, options.projection);
         !built.ok()) {
       result.terminal_status = built.ToString();
       result.gate_classification = "incomplete";
@@ -966,6 +1006,36 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     }
     result.maintenance_status = "refresh-complete";
     result.maintenance_observed = true;
+
+    // Keep the projection base immutable, then create a real contiguous
+    // QueryDelta for the delta fixtures. The mutations are included in the
+    // setup watermark below, so measured write throughput excludes fixture
+    // construction while query correctness still observes the tail.
+    if (options.projection == ProjectionState::kShortDelta ||
+        options.projection == ProjectionState::kLongDelta) {
+      const uint64_t delta_facts =
+          options.projection == ProjectionState::kShortDelta ? 1 : 128;
+      uint64_t delta_transactions = 0;
+      uint64_t delta_committed_facts = 0;
+      if (Status status = ApplyProjectionDelta(
+              database.get(), seed_facts + 1000, delta_facts,
+              options.commit_deadline_us, &delta_transactions,
+              &delta_committed_facts);
+          !status.ok()) {
+        result.terminal_status = status.ToString();
+        result.gate_classification = "incomplete";
+        return result;
+      }
+      transactions.fetch_add(delta_transactions);
+      facts.fetch_add(delta_committed_facts);
+    }
+    {
+      auto setup_snapshot = database->BeginSnapshot();
+      if (!setup_snapshot.ok()) return setup_snapshot.status();
+      seeded_checksum = ScanFactChecksum(setup_snapshot.ValueOrDie());
+      if (!seeded_checksum.ok()) return seeded_checksum.status();
+      seed_transaction_count = transactions.load();
+    }
   }
   const CommitPipelineMetrics pipeline_before_write =
       database->GetCommitPipelineMetrics();

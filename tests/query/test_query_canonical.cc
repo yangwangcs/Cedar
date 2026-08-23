@@ -831,6 +831,57 @@ TEST_F(QueryCanonicalTest, BindsMultipleCanonicalVertexProperties) {
   EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(right, 0), 202);
 }
 
+TEST_F(QueryCanonicalTest,
+       ChargesAllCanonicalStringPropertyValuesToOutputBudget) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{14}, 0, "left_text", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 4096}).ok());
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{15}, 0, "right_text", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 4096}).ok());
+  const VertexRef vertex_ref{PartId{0}, VertexId{1}};
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(vertex_ref), ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(vertex_ref, PropertyId{14}),
+                        ValidTime{0}, Value::String(std::string(1024, 'l')))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(vertex_ref, PropertyId{15}),
+                        ValidTime{0}, Value::String(std::string(1024, 'r')))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v_text_budget");
+  OptionalSlot<std::string> left = OptionalSlot<std::string>::Named("left_text");
+  OptionalSlot<std::string> right = OptionalSlot<std::string>::Named("right_text");
+  auto source = Query::Vertices(
+      vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto bound = source.ValueOrDie().BindVertexProperty(vertex, PropertyId{14}, left);
+  ASSERT_TRUE(bound.ok());
+  bound = bound.ValueOrDie().BindVertexProperty(vertex, PropertyId{15}, right);
+  ASSERT_TRUE(bound.ok());
+  auto query = bound.ValueOrDie().Select(
+      {Project(vertex), Project(left), Project(right)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  QueryOptions options;
+  options.budget.output_bytes = 1500;
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_FALSE(batch.ok());
+  EXPECT_TRUE(batch.status().IsResourceExhausted()) << batch.status().ToString();
+}
+
 TEST_F(QueryCanonicalTest, BindsMultipleCanonicalEdgeProperties) {
   ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
       PropertyId{12}, 0, "weight", PropertyEntityKind::kEdge,

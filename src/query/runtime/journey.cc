@@ -285,11 +285,13 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
       continue;
     }
     if (request.duration_property) {
-      Status fifo = ValidatePropertyFifo(snapshot, oriented.edge,
-                                         oriented.effective,
-                                         *request.duration_property,
-                                         options.delta);
-      if (!fifo.ok()) return fifo;
+      const auto effective = Intersect(oriented.effective, request.interval);
+      if (effective.has_value()) {
+        Status fifo = ValidatePropertyFifo(snapshot, oriented.edge, *effective,
+                                           *request.duration_property,
+                                           options.delta);
+        if (!fifo.ok()) return fifo;
+      }
     }
     ValidTime departure = arrival;
     if (departure.value < oriented.effective.from.value)
@@ -405,11 +407,13 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     if (Status fifo = ValidateCallbackFifo(request, oriented); !fifo.ok())
       return fifo;
     if (request.duration_property) {
-      Status fifo = ValidatePropertyFifo(snapshot, oriented.edge,
-                                         oriented.effective,
-                                         *request.duration_property,
-                                         options.delta);
-      if (!fifo.ok()) return fifo;
+      const auto effective = Intersect(oriented.effective, request.interval);
+      if (effective.has_value()) {
+        Status fifo = ValidatePropertyFifo(snapshot, oriented.edge, *effective,
+                                           *request.duration_property,
+                                           options.delta);
+        if (!fifo.ok()) return fifo;
+      }
     }
     const uint64_t lower = oriented.effective.from.value;
     if (deadline.value < lower) continue;

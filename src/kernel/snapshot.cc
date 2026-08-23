@@ -388,6 +388,17 @@ Status Snapshot::EventColumnarScan(
       FactScanBounds{spec.entity_id_min, spec.entity_id_max}, options, visitor);
 }
 
+Status Snapshot::EventColumnarScanFamily(
+    FactFamily family, PropertyId property_id,
+    const std::vector<FactColumnId>& projection,
+    const FactColumnarBatchVisitor& visitor) const {
+  if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
+  FactColumnarScanOptions options;
+  options.projection = projection;
+  return state_->database->store.ScanColumnarFamily(
+      state_->snapshot, family, property_id, options, visitor);
+}
+
 Status Snapshot::StateScan(const FactScanSpec& spec,
                            const FactEventBatchVisitor& visitor) const {
   if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");

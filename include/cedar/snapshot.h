@@ -76,6 +76,10 @@ class Snapshot {
   Status EventColumnarScan(const FactScanSpec& spec,
                            const std::vector<FactColumnId>& projection,
                            const FactColumnarBatchVisitor& visitor) const;
+  Status EventColumnarScanFamily(
+      FactFamily family, PropertyId property_id,
+      const std::vector<FactColumnId>& projection,
+      const FactColumnarBatchVisitor& visitor) const;
   Status StateColumnarScan(const FactScanSpec& spec,
                            const std::vector<FactColumnId>& projection,
                            const FactColumnarBatchVisitor& visitor) const;

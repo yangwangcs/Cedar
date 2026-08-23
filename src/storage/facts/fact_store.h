@@ -389,6 +389,10 @@ class FactStore {
                       const FactScanBounds& bounds,
                       const FactColumnarScanOptions& options,
                       const FactColumnarBatchVisitor& visitor) const;
+  Status ScanColumnarFamily(const StoreSnapshot& snapshot, FactFamily family,
+                            PropertyId property,
+                            const FactColumnarScanOptions& options,
+                            const FactColumnarBatchVisitor& visitor) const;
   // Projection-only accessors. Both are bound to the supplied StoreSnapshot
   // and never expose RocksDB types to callers.
   StatusOr<SequenceRecord> ReadSequence(const StoreSnapshot& snapshot,

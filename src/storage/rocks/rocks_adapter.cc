@@ -1834,6 +1834,46 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
   return flush();
 }
 
+Status FactStore::ScanColumnarFamily(
+    const StoreSnapshot& snapshot, FactFamily family, PropertyId property,
+    const FactColumnarScanOptions& options,
+    const FactColumnarBatchVisitor& visitor) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("columnar scan", "snapshot belongs to another store");
+    }
+  }
+  if (!visitor) return Status::InvalidArgument("columnar scan", "missing visitor");
+  std::set<uint32_t> partitions;
+  rocksdb::ReadOptions read_options;
+  read_options.snapshot = snapshot.state_->snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(read_options, store->facts_cf));
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    auto key = DecodeFactKey(iterator->key().ToString());
+    if (!key.ok()) return key.status();
+    if (key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value ||
+        key.ValueOrDie().ref.family() != family ||
+        key.ValueOrDie().ref.property_id() != property) {
+      continue;
+    }
+    partitions.insert(key.ValueOrDie().ref.part_id().value);
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "enumerate columnar fact partitions");
+  }
+  for (uint32_t part : partitions) {
+    const Status scanned = ScanColumnar(
+        snapshot, FactPrefix::Family(PartId{part}, family, property),
+        FactScanBounds{}, options, visitor);
+    if (!scanned.ok()) return scanned;
+  }
+  return Status::OK();
+}
+
 StatusOr<SequenceRecord> FactStore::ReadSequence(
     const StoreSnapshot& snapshot, CommitSeq commit_seq) const {
   std::shared_ptr<FactStoreImpl> store;

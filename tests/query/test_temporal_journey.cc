@@ -608,6 +608,54 @@ TEST(TemporalJourneyTest, PublicRegisteredDurationNonFifoRejectedAtExecution) {
       << batch.status().ToString();
 }
 
+TEST(TemporalJourneyTest,
+     PublicRegisteredDurationClipsUnboundedEdgeToFiniteQueryInterval) {
+  JourneyFixture graph;
+  ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{
+      PropertyId{9}, 0, "duration_unbounded", PropertyEntityKind::kEdge,
+      PhysicalType::kInt64, 4096}).ok());
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EntityFact::Vertex(graph.a), ValidTime{0});
+    if (!status.ok()) return status;
+    return txn.Assert(EntityFact::Vertex(graph.b), ValidTime{0});
+  });
+  const EdgeRef edge{PartId{0}, EdgeId{23}};
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Assert(EdgeIdentity{edge, graph.a, graph.b, 1},
+                             ValidTime{0});
+    if (!status.ok()) return status;
+    return txn.Set(PropertyFact::Edge(edge, PropertyId{9}), ValidTime{0},
+                   Value::Int64(3));
+  });
+
+  Slot<VertexRef> source = Slot<VertexRef>::Named("source_unbounded");
+  Slot<EdgeRef> edge_slot = Slot<EdgeRef>::Named("edge_unbounded");
+  Slot<VertexRef> target = Slot<VertexRef>::Named("target_unbounded");
+  Slot<JourneyValue> journey = Slot<JourneyValue>::Named("journey_unbounded");
+  auto source_query = Query::Vertices(
+      source, History{ValidTimeInterval{ValidTime{0}, ValidTime{20}}});
+  ASSERT_TRUE(source_query.ok());
+  auto built = source_query.ValueOrDie().EarliestArrival(
+      ExpandSpec{source, edge_slot, target, ExpandDirection::kOut}, 1,
+      PropertyId{9}, journey);
+  ASSERT_TRUE(built.ok()) << built.status().ToString();
+  auto selected = built.ValueOrDie().Select({Project(source), Project(edge_slot),
+                                             Project(target), Project(journey)});
+  ASSERT_TRUE(selected.ok()) << selected.status().ToString();
+  auto prepared = graph.database->PrepareQuery(selected.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->Get<JourneyValue>(journey, 0).final_arrival,
+            (ValidTime{3}));
+}
+
 TEST(TemporalJourneyTest, CallbackNonFifoIsRejectedBeforeEarliestSearch) {
   JourneyFixture graph;
   graph.Vertex(graph.a); graph.Vertex(graph.b);

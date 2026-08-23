@@ -65,6 +65,34 @@ struct RuntimeRow {
   std::optional<JourneyValue> journey;
 };
 
+StatusOr<uint64_t> PropertyPayloadBytes(const RuntimeRow& row) {
+  uint64_t bytes = 0;
+  auto add = [&bytes](const std::optional<Value>& value) -> Status {
+    if (!value.has_value() ||
+        (value->type() != PhysicalType::kString &&
+         value->type() != PhysicalType::kBinary)) {
+      return Status::OK();
+    }
+    const uint64_t size = std::get<std::string>(value->data()).size();
+    if (size > std::numeric_limits<uint64_t>::max() - bytes) {
+      return Status::ResourceExhausted("query", "property payload accounting overflow");
+    }
+    bytes += size;
+    return Status::OK();
+  };
+  // Canonical bindings are keyed by output slot. The legacy field aliases the
+  // first binding, so count it only when no canonical map is present.
+  if (!row.property_values.empty()) {
+    for (const auto& [slot, value] : row.property_values) {
+      (void)slot;
+      if (Status status = add(value); !status.ok()) return status;
+    }
+  } else if (Status status = add(row.property_value); !status.ok()) {
+    return status;
+  }
+  return bytes;
+}
+
 using EvaluatedLiteral = detail::ExpressionLiteral;
 
 struct EvaluatedValue {
@@ -505,15 +533,12 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
   auto reserve_row = [reservation](const RuntimeRow& row) -> Status {
     if (reservation == nullptr) return Status::OK();
     size_t bytes = sizeof(RuntimeRow);
-    if (row.property_value.has_value() &&
-        (row.property_value->type() == PhysicalType::kString ||
-         row.property_value->type() == PhysicalType::kBinary)) {
-      const auto& value = std::get<std::string>(row.property_value->data());
-      if (value.size() > std::numeric_limits<size_t>::max() - bytes) {
-        return Status::ResourceExhausted("query", "memory_bytes estimate overflow");
-      }
-      bytes += value.size();
+    auto payload = PropertyPayloadBytes(row);
+    if (!payload.ok()) return payload.status();
+    if (payload.ValueOrDie() > std::numeric_limits<size_t>::max() - bytes) {
+      return Status::ResourceExhausted("query", "memory_bytes estimate overflow");
     }
+    bytes += static_cast<size_t>(payload.ValueOrDie());
     return reservation->ReserveMemory(bytes);
   };
   StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan, reservation);
@@ -910,9 +935,7 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
            property_value->type() == PhysicalType::kBinary)) {
         const auto& value = std::get<std::string>(property_value->data());
         if (Status status = reservation->ReserveMemory(value.size());
-            !status.ok()) {
-          return status;
-        }
+            !status.ok()) return status;
       }
       const Status appended = AppendProperty(column, property_value);
       if (!appended.ok()) return appended;
@@ -1651,11 +1674,17 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
     uint64_t estimated_read = 0;
     uint64_t estimated_cpu = row_count;
     for (const auto& row : rows.ValueOrDie()) {
-      if (row.property_value.has_value() &&
-          (row.property_value->type() == PhysicalType::kString ||
-           row.property_value->type() == PhysicalType::kBinary)) {
-        estimated_read += std::get<std::string>(row.property_value->data()).size();
+      auto payload = PropertyPayloadBytes(row);
+      if (!payload.ok() ||
+          payload.ValueOrDie() > std::numeric_limits<uint64_t>::max() - estimated_read) {
+        state_->terminal_error = payload.ok()
+                                     ? Status::ResourceExhausted(
+                                           "query", "read byte accounting overflow")
+                                     : payload.status();
+        state_->snapshot.reset();
+        return *state_->terminal_error;
       }
+      estimated_read += payload.ValueOrDie();
     }
     if (Status status = state_->reservation.ReserveReadBytes(estimated_read);
         !status.ok()) {
@@ -1683,12 +1712,31 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
-    const size_t estimated_materialization =
+    uint64_t output_payload = 0;
+    for (const RuntimeRow& row : rows.ValueOrDie()) {
+      auto payload = PropertyPayloadBytes(row);
+      if (!payload.ok() ||
+          payload.ValueOrDie() > std::numeric_limits<uint64_t>::max() - output_payload) {
+        state_->terminal_error = payload.ok()
+                                     ? Status::ResourceExhausted(
+                                           "query", "output byte accounting overflow")
+                                     : payload.status();
+        state_->snapshot.reset();
+        return *state_->terminal_error;
+      }
+      output_payload += payload.ValueOrDie();
+    }
+    const size_t fixed_materialization =
         row_count > (std::numeric_limits<size_t>::max() - sizeof(QueryBatch)) /
                          std::max<size_t>(1, state_->plan.output_columns.size() * sizeof(QueryColumn))
             ? std::numeric_limits<size_t>::max()
             : sizeof(QueryBatch) + row_count *
                   std::max<size_t>(1, state_->plan.output_columns.size() * sizeof(QueryColumn));
+    const size_t estimated_materialization =
+        fixed_materialization == std::numeric_limits<size_t>::max() ||
+                output_payload > std::numeric_limits<size_t>::max() - fixed_materialization
+            ? std::numeric_limits<size_t>::max()
+            : fixed_materialization + static_cast<size_t>(output_payload);
     if (estimated_materialization == std::numeric_limits<size_t>::max()) {
       state_->terminal_error = Status::ResourceExhausted("query", "memory_bytes estimate overflow");
       state_->snapshot.reset();

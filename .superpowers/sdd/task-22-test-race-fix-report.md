@@ -16,6 +16,7 @@ RAII cleanup owner.
 - Debug build: `cmake --build build/query-debug --target test_query_bench_options test_query_bench_workload -j2` passed.
 - 30 consecutive options runs: 8/8 passed each run (240/240 cases).
 - 30 consecutive workload runs: 4/4 passed each run (120/120 cases).
+- Deadline mutation probes: replacing either setup deadline with zero made the focused test fail with `ResourceExhausted: commit: append queue is full`; both callsites were restored.
 - Release build: `cmake --build build/query-release --target cedar_query_bench -j2` passed.
 - Release smoke with bounded controls (`duration=1`, `writers=8`,
   `facts_per_txn=16`, `commit_deadline_us=5000000`, `group_queue_requests=2048`,

@@ -320,14 +320,24 @@ Status ApplyProjectionDelta(Database* database, uint64_t first,
                             uint64_t count, uint64_t commit_deadline_us,
                             uint64_t* transactions, uint64_t* facts) {
   for (uint64_t i = 0; i < count; ++i) {
-    uint64_t committed = 0;
-    if (Status status = CommitFacts(database, first, 1, &committed,
-                                    commit_deadline_us);
-        !status.ok()) {
-      return status;
+    auto transaction = database->BeginTransaction(
+        TransactionOptions{.commit_deadline_us = commit_deadline_us});
+    if (!transaction.ok()) return transaction.status();
+    const VertexRef vertex{PartId{0}, VertexId{first}};
+    const Status mutation =
+        (i % 2 == 0)
+            ? transaction.ValueOrDie()->Retract(EntityFact::Vertex(vertex),
+                                                ValidTime{1})
+            : transaction.ValueOrDie()->Assert(EntityFact::Vertex(vertex),
+                                               ValidTime{1});
+    if (!mutation.ok()) return mutation;
+    auto committed = transaction.ValueOrDie()->Commit();
+    if (!committed.ok()) return committed.status();
+    if (committed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+      return committed.ValueOrDie().status;
     }
     ++*transactions;
-    *facts += committed;
+    ++*facts;
   }
   return Status::OK();
 }
@@ -467,8 +477,12 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
   // The runtime materializes whole batches. Keep the benchmark's result cap
   // as a consumer-side limit while leaving enough budget for one batch; a
   // small cap must not turn a valid public query into ResourceExhausted.
+  // Reserve for one bounded materialized batch. The consumer stops at
+  // result_limit, but the canonical source may deliver a large batch before
+  // that stop; the calibration lane runs with one reader and a Cedar-owned
+  // 512 MiB pool.
   const uint64_t execution_budget = std::max<uint64_t>(limit, 1'000'000);
-  constexpr uint64_t kBenchmarkQueryPoolMemoryBytes = 256ULL << 20;
+  constexpr uint64_t kBenchmarkQueryPoolMemoryBytes = 512ULL << 20;
   constexpr uint64_t kMinimumInteractiveQueryMemoryBytes = 8ULL << 20;
   // The benchmark's reader matrix shares a fixed Cedar query pool. Divide
   // that pool across the configured readers so 8/32 concurrent readers are
@@ -802,13 +816,13 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   // Reserve enough of the fixed production budget for the benchmark's
   // 32-reader query matrix without allowing the default block cache to crowd
   // out Cedar's explicit query pool.
-  db_options.production.block_cache_bytes = 256ULL << 20;
+  db_options.production.block_cache_bytes = 128ULL << 20;
   db_options.group_commit_max_queue_requests = options.group_queue_requests;
   db_options.group_commit_max_queue_bytes = options.group_queue_bytes;
   // The benchmark intentionally exercises the 1/8/32-reader matrix. Expand
   // only the worker admission limit; query memory remains a fixed Cedar-owned
   // pool and each interactive query receives its proportional budget above.
-  db_options.query_runtime.query_memory_bytes = 256ULL << 20;
+  db_options.query_runtime.query_memory_bytes = 512ULL << 20;
   db_options.query_runtime.query_workers = std::max<uint32_t>(4, options.readers);
   db_options.query_runtime.projection_cache_bytes = 32ULL << 20;
   db_options.query_runtime.query_delta_bytes = 32ULL << 20;

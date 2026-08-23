@@ -12,10 +12,11 @@ The full 30-minute mixed run and five-repeat write matrices remain open gates.
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `f6900c2` (`perf: bound query calibration admission`)
-- Evidence commits: `02bbbe0`, `605da2b`, `ae093ec`, and `f6900c2`; these add
-  persisted projection fixtures, real retract/assert QueryDelta tails, corrected
-  temporal coverage, and Cedar-owned reader admission capacity. Historical
+- Source snapshot: `a42962d` (`fix: align query delta budget and fixture correctness`)
+- Evidence commits: `02bbbe0`, `605da2b`, `ae093ec`, `f6900c2`, and `a42962d`;
+  these add persisted projection fixtures, real retract/assert QueryDelta tails,
+  canonical differential checks, corrected temporal coverage, and Cedar-owned
+  reader admission capacity. Historical
   mixed/reopen artifacts remain named explicitly where they were produced from
   earlier snapshots.
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1

@@ -190,7 +190,11 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
     if (!collection_observed) release_collection = true;
   }
   cv.notify_all();
-  ASSERT_TRUE(collection_observed);
+  if (!collection_observed) {
+    blocker_thread.join();
+    ADD_FAILURE() << "append collection hook was not observed";
+    return;
+  }
 
   std::atomic<bool> setup_done = false;
   Status setup_status = Status::InvalidArgument("test", "not attempted");

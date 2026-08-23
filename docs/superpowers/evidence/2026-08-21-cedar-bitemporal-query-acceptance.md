@@ -13,10 +13,11 @@ residual and is not represented as passing evidence.
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `a4e84df` (`fix: batch graph property bindings and classify journey benchmark`)
-- Evidence commit: this final document is the acceptance record; the evidence
-  commit is the commit that contains this finalized document (the source
-  snapshot above is the audited implementation point).
+- Source snapshot: `e8fad1a` (`fix: bound graph benchmark and temporal property expansion`)
+- Evidence commit: `e8fad1a`; the targeted graph-property, reader-admission,
+  campaign, Release smoke, and sanitizer evidence below was produced from this
+  source snapshot. The longer historical mixed/reopen artifacts remain named
+  explicitly where they were produced from earlier snapshots.
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
 - Release benchmark: `build/query-release/cedar_query_bench`
 - Public defaults were not changed. Campaign admission was explicitly

@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 
 #include "cedar/fact/fact_codec.h"
@@ -233,6 +237,49 @@ TEST(QueryDeltaTest, EnqueueUsesWorkerBeforeResetOrRepair) {
   ASSERT_TRUE(delta.ResetBase(CommitSeq{1}).ok());
   EXPECT_EQ(delta.indexed_through(), CommitSeq{1});
   EXPECT_TRUE(delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{2}}).ok());
+}
+
+TEST(QueryDeltaTest, EnqueueDoesNotWaitForWorkerIndexLock) {
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool worker_entered = false;
+  bool release_worker = false;
+  bool first_callback = true;
+  QueryDeltaOptions options;
+  options.base_seq = CommitSeq{0};
+  options.queue_capacity = 8;
+  options.worker_before_index_observer_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    if (!first_callback) return;
+    first_callback = false;
+    worker_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_worker; });
+  };
+  QueryDelta delta(std::move(options));
+  ASSERT_TRUE(delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{1}}).ok());
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return worker_entered; }));
+  }
+
+  std::atomic<bool> enqueue_done{false};
+  std::thread publisher([&] {
+    ASSERT_TRUE(delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{2}}).ok());
+    enqueue_done.store(true, std::memory_order_release);
+  });
+  for (int attempt = 0; attempt < 100 &&
+       !enqueue_done.load(std::memory_order_acquire); ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(enqueue_done.load(std::memory_order_acquire));
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_worker = true;
+  }
+  gate_cv.notify_all();
+  publisher.join();
 }
 
 }  // namespace

@@ -102,7 +102,8 @@ std::vector<EdgeIdentity> QueryDeltaView::EdgeIdentitiesThrough(
 
 QueryDelta::QueryDelta(QueryDeltaOptions options)
     : options_(std::move(options)), indexed_through_(options_.base_seq),
-      visible_seq_(options_.base_seq), enqueued_through_(options_.base_seq) {
+      visible_seq_value_(options_.base_seq.value),
+      first_missing_value_(0), enqueued_through_(options_.base_seq) {
   if (options_.queue_capacity == 0) options_.queue_capacity = 1;
   if (options_.hard_memory_bytes < options_.soft_memory_bytes) {
     options_.hard_memory_bytes = options_.soft_memory_bytes;
@@ -112,7 +113,7 @@ QueryDelta::QueryDelta(QueryDeltaOptions options)
 
 QueryDelta::~QueryDelta() {
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(queue_mutex_);
     stopping_ = true;
   }
   published_cv_.notify_all();
@@ -128,8 +129,20 @@ size_t QueryDelta::FactRefHash::operator()(const FactRef& ref) const noexcept {
 
 void QueryDelta::SetMissingLocked(CommitSeq missing) {
   if (missing.value == 0) return;
-  if (first_missing_.value == 0 || missing.value < first_missing_.value) {
-    first_missing_ = missing;
+  uint64_t observed = first_missing_value_.load(std::memory_order_relaxed);
+  while ((observed == 0 || missing.value < observed) &&
+         !first_missing_value_.compare_exchange_weak(
+             observed, missing.value, std::memory_order_release,
+             std::memory_order_relaxed)) {
+  }
+}
+
+void AdvanceVisible(std::atomic<uint64_t>* visible, uint64_t sequence) {
+  uint64_t observed = visible->load(std::memory_order_relaxed);
+  while (observed < sequence &&
+         !visible->compare_exchange_weak(observed, sequence,
+                                         std::memory_order_release,
+                                         std::memory_order_relaxed)) {
   }
 }
 
@@ -183,9 +196,10 @@ Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit) {
     }
   }
   indexed_through_ = commit.commit_seq;
-  if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;
-  if (first_missing_.value != 0 && indexed_through_.value >= first_missing_.value) {
-    first_missing_ = CommitSeq{};
+  AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
+  if (first_missing_value_.load(std::memory_order_acquire) != 0 &&
+      indexed_through_.value >= first_missing_value_.load(std::memory_order_acquire)) {
+    first_missing_value_.store(0, std::memory_order_release);
   }
   return Status::OK();
 }
@@ -197,7 +211,7 @@ Status QueryDelta::ObservePublished(const QueryDeltaCommit& commit) {
   if (commit.commit_seq.value <= options_.base_seq.value) {
     return Status::InvalidArgument("query delta", "commit is not after projection base");
   }
-  if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;
+  AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
   const uint64_t expected = indexed_through_.value + 1;
   if (commit.commit_seq.value != expected) {
     SetMissingLocked(CommitSeq{expected});
@@ -215,19 +229,19 @@ Status QueryDelta::ObservePublished(const QueryDeltaCommit& commit) {
 Status QueryDelta::EnqueuePublished(const QueryDeltaCommit& commit) {
   const Status valid = commit.Validate();
   if (!valid.ok()) return valid;
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lock(queue_mutex_);
   if (commit.commit_seq.value <= options_.base_seq.value) {
     return Status::InvalidArgument("query delta", "commit is not after projection base");
   }
   const uint64_t expected = enqueued_through_.value + 1;
   if (commit.commit_seq.value != expected) {
     SetMissingLocked(CommitSeq{expected});
-    if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;
+    AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
     return Status::Conflict("query delta", "published commit is not contiguous");
   }
   if (published_queue_.size() >= options_.queue_capacity) {
     SetMissingLocked(commit.commit_seq);
-    if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;
+    AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
     return Status::ResourceExhausted("query delta", "descriptor queue is full");
   }
   if (options_.crash_fault_injector) {
@@ -236,23 +250,28 @@ Status QueryDelta::EnqueuePublished(const QueryDeltaCommit& commit) {
   }
   published_queue_.push_back(commit);
   enqueued_through_ = commit.commit_seq;
-  if (visible_seq_.value < commit.commit_seq.value) visible_seq_ = commit.commit_seq;
+  AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
   published_cv_.notify_one();
   return Status::OK();
 }
 
 void QueryDelta::WorkerMain() {
   for (;;) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    published_cv_.wait(lock, [this] {
+    std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+    published_cv_.wait(queue_lock, [this] {
       return stopping_ || !published_queue_.empty();
     });
     if (published_queue_.empty() && stopping_) return;
     QueryDeltaCommit commit = std::move(published_queue_.front());
     published_queue_.pop_front();
+    queue_lock.unlock();
+    std::lock_guard<std::mutex> lock(mutex_);
     if (commit.commit_seq.value != indexed_through_.value + 1) {
       SetMissingLocked(CommitSeq{indexed_through_.value + 1});
       continue;
+    }
+    if (options_.worker_before_index_observer_for_testing) {
+      options_.worker_before_index_observer_for_testing();
     }
     IndexLocked(commit);
   }
@@ -262,6 +281,7 @@ Status QueryDelta::RepairThrough(const FactStore& store,
                                  const StoreSnapshot& snapshot,
                                  CommitSeq target,
                                  QueryDeltaRepairLimits limits) {
+  std::lock_guard<std::mutex> queue_lock(queue_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   if (target.value <= indexed_through_.value) return Status::OK();
   if (target.value > snapshot.commit_seq().value) {
@@ -297,8 +317,9 @@ Status QueryDelta::RepairThrough(const FactStore& store,
   queue_size_ = 0;
   published_queue_.clear();
   enqueued_through_ = indexed_through_;
-  if (first_missing_.value != 0 && first_missing_.value <= indexed_through_.value) {
-    first_missing_ = CommitSeq{};
+  if (first_missing_value_.load(std::memory_order_acquire) != 0 &&
+      first_missing_value_.load(std::memory_order_acquire) <= indexed_through_.value) {
+    first_missing_value_.store(0, std::memory_order_release);
   }
   return Status::OK();
 }
@@ -313,6 +334,7 @@ Status QueryDelta::ConsumeThrough(CommitSeq through) {
 }
 
 Status QueryDelta::RetireThrough(CommitSeq through) {
+  std::lock_guard<std::mutex> queue_lock(queue_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   if (through.value < options_.base_seq.value ||
       through.value > indexed_through_.value) {
@@ -339,18 +361,20 @@ Status QueryDelta::RetireThrough(CommitSeq through) {
   options_.base_seq = through;
   queue_size_ = 0;
   if (published_queue_.empty()) enqueued_through_ = indexed_through_;
-  if (first_missing_.value != 0 && first_missing_.value <= through.value) {
-    first_missing_ = CommitSeq{};
+  if (first_missing_value_.load(std::memory_order_acquire) != 0 &&
+      first_missing_value_.load(std::memory_order_acquire) <= through.value) {
+    first_missing_value_.store(0, std::memory_order_release);
   }
   return Status::OK();
 }
 
 Status QueryDelta::ResetBase(CommitSeq base) {
+  std::lock_guard<std::mutex> queue_lock(queue_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   options_.base_seq = base;
   indexed_through_ = base;
-  visible_seq_ = base;
-  first_missing_ = CommitSeq{};
+  visible_seq_value_.store(base.value, std::memory_order_release);
+  first_missing_value_.store(0, std::memory_order_release);
   memory_bytes_ = 0;
   queue_size_ = 0;
   hard_limit_reached_ = false;
@@ -370,11 +394,13 @@ StatusOr<QueryDeltaView> QueryDelta::AcquireThrough(CommitSeq snapshot) const {
     return Status::InvalidArgument("query delta", "snapshot precedes projection base");
   }
   if (snapshot.value > indexed_through_.value ||
-      (first_missing_.value != 0 && first_missing_.value <= snapshot.value) ||
+      (first_missing_value_.load(std::memory_order_acquire) != 0 &&
+       first_missing_value_.load(std::memory_order_acquire) <= snapshot.value) ||
       hard_limit_reached_) {
     return Status::ResourceExhausted("query delta", "delta is not contiguous through snapshot");
   }
-  QueryDeltaView view{options_.base_seq, snapshot, {}, {}, {}, first_missing_};
+  QueryDeltaView view{options_.base_seq, snapshot, {}, {}, {},
+                      CommitSeq{first_missing_value_.load(std::memory_order_acquire)}};
   for (const QueryDeltaCommit& commit : commits_) {
     if (commit.commit_seq.value > options_.base_seq.value &&
         commit.commit_seq.value <= snapshot.value) {
@@ -391,10 +417,18 @@ StatusOr<QueryDeltaView> QueryDelta::AcquireThrough(CommitSeq snapshot) const {
 
 CommitSeq QueryDelta::base_seq() const { std::lock_guard<std::mutex> l(mutex_); return options_.base_seq; }
 CommitSeq QueryDelta::indexed_through() const { std::lock_guard<std::mutex> l(mutex_); return indexed_through_; }
-CommitSeq QueryDelta::visible_seq() const { std::lock_guard<std::mutex> l(mutex_); return visible_seq_; }
-CommitSeq QueryDelta::first_missing() const { std::lock_guard<std::mutex> l(mutex_); return first_missing_; }
+CommitSeq QueryDelta::visible_seq() const {
+  return CommitSeq{visible_seq_value_.load(std::memory_order_acquire)};
+}
+CommitSeq QueryDelta::first_missing() const {
+  return CommitSeq{first_missing_value_.load(std::memory_order_acquire)};
+}
 uint64_t QueryDelta::memory_bytes() const { std::lock_guard<std::mutex> l(mutex_); return memory_bytes_; }
-bool QueryDelta::mergeable() const { std::lock_guard<std::mutex> l(mutex_); return !hard_limit_reached_ && first_missing_.value == 0; }
+bool QueryDelta::mergeable() const {
+  std::lock_guard<std::mutex> l(mutex_);
+  return !hard_limit_reached_ &&
+         first_missing_value_.load(std::memory_order_acquire) == 0;
+}
 bool QueryDelta::hard_limit_reached() const { std::lock_guard<std::mutex> l(mutex_); return hard_limit_reached_; }
 bool QueryDelta::soft_lag_reached() const { std::lock_guard<std::mutex> l(mutex_); return soft_lag_reached_; }
 bool QueryDelta::soft_memory_reached() const { std::lock_guard<std::mutex> l(mutex_); return soft_memory_reached_; }

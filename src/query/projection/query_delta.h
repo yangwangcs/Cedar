@@ -8,8 +8,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <atomic>
 #include <unordered_map>
 #include <utility>
 #include <thread>
@@ -56,6 +58,7 @@ struct QueryDeltaOptions {
   uint64_t target_lag_seconds = 30;
   std::function<Status(const char*)> crash_fault_injector;
   uint64_t soft_lag_commits = 0;
+  std::function<void()> worker_before_index_observer_for_testing;
 };
 
 struct QueryDeltaRepairLimits {
@@ -157,10 +160,11 @@ class QueryDelta {
   void WorkerMain();
 
   mutable std::mutex mutex_;
+  mutable std::mutex queue_mutex_;
   QueryDeltaOptions options_;
   CommitSeq indexed_through_;
-  CommitSeq visible_seq_;
-  CommitSeq first_missing_;
+  std::atomic<uint64_t> visible_seq_value_{0};
+  std::atomic<uint64_t> first_missing_value_{0};
   uint64_t memory_bytes_ = 0;
   size_t queue_size_ = 0;
   std::deque<QueryDeltaCommit> published_queue_;

@@ -260,7 +260,7 @@ write_idle_overhead_artifact() {
     rm -f "$target.tmp"
     : > "$target"
     overall=1
-    printf '{"gate":"idle_query_overhead","pass":false,"reason":"invalid_repeat_cardinality","expected_samples":%d}\n' "$expected_samples" >> "$summary_json"
+    printf '{"gate":"idle_query_overhead","pass":false,"reason":"invalid_repeat_cardinality","expected_samples":%d,"wal_sync_p99_us":null}\n' "$expected_samples" >> "$summary_json"
     return 1
   fi
   {
@@ -374,7 +374,7 @@ compare_active_overhead() {
     return 0
   fi
   overall=1
-  printf '{"gate":"active_projection_overhead","pass":false,"reason":"%s","baseline":"%s","idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s}\n' \
+  printf '{"gate":"active_projection_overhead","pass":false,"reason":"%s","baseline":"%s","idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s,"wal_sync_p99_us":null}\n' \
     "${baseline_reason:-${active_reason:-threshold_or_active_metric_failure}}" "${baseline:-missing}" "${idle_rate:-null}" "${active_rate:-null}" "${idle_p99:-null}" "${active_p99:-null}" >> "$summary_json"
   return 1
 }
@@ -699,7 +699,7 @@ if [[ "$requested_phase" == all ]]; then
     :
   else
     overall=1
-    printf '{"gate":"active_projection_overhead","pass":false,"idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s}\n' "$idle_rate" "$active_rate" "$idle_p99" "$active_p99" >> "$summary_json"
+    printf '{"gate":"active_projection_overhead","pass":false,"idle_facts_per_second":%s,"active_facts_per_second":%s,"idle_p99_us":%s,"active_p99_us":%s,"wal_sync_p99_us":null}\n' "$idle_rate" "$active_rate" "$idle_p99" "$active_p99" >> "$summary_json"
   fi
 fi
 

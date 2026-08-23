@@ -217,7 +217,7 @@ endif()
 
 file(MAKE_DIRECTORY "${OUTPUT}/idle-baseline-invalid")
 file(WRITE "${OUTPUT}/idle-baseline-invalid/write-idle-baseline.csv"
-  "samples,1\navg_facts_per_second,999999999\navg_end_to_end_p99_us,1\navg_wal_sync_p99_us,1\n")
+  "samples,1\navg_facts_per_second,999999999\navg_end_to_end_p99_us,1\navg_wal_sync_p99_us,1\nfacts_per_txn,1\nwriters,1\nseed,1\ncache_state,cold\nprojection_work,paused\n")
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
     --phase write-idle-five-repeats --duration-seconds 1
@@ -225,8 +225,22 @@ execute_process(
     --output "${OUTPUT}/idle-threshold-failure"
   RESULT_VARIABLE IDLE_THRESHOLD_RC)
 file(READ "${OUTPUT}/idle-threshold-failure/summary.jsonl" IDLE_THRESHOLD_SUMMARY)
-if(IDLE_THRESHOLD_RC EQUAL 0 OR NOT IDLE_THRESHOLD_SUMMARY MATCHES "idle_query_overhead.*threshold_failure")
-  message(FATAL_ERROR "idle query overhead threshold failure was not enforced: ${IDLE_THRESHOLD_RC}\n${IDLE_THRESHOLD_SUMMARY}")
+if(IDLE_THRESHOLD_RC EQUAL 0 OR NOT IDLE_THRESHOLD_SUMMARY MATCHES "idle_query_overhead.*invalid_baseline_sample_count")
+  message(FATAL_ERROR "undersampled idle baseline was not rejected: ${IDLE_THRESHOLD_RC}\n${IDLE_THRESHOLD_SUMMARY}")
+endif()
+
+file(MAKE_DIRECTORY "${OUTPUT}/idle-baseline-threshold")
+file(WRITE "${OUTPUT}/idle-baseline-threshold/write-idle-baseline.csv"
+  "samples,5\navg_facts_per_second,999999999\navg_end_to_end_p99_us,1\navg_wal_sync_p99_us,1\nfacts_per_txn,1\nwriters,1\nseed,1\ncache_state,cold\nprojection_work,paused\n")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase write-idle-five-repeats --duration-seconds 1
+    --facts-per-txn 1 --writers 1 --input "${OUTPUT}/idle-baseline-threshold"
+    --output "${OUTPUT}/idle-threshold-failure"
+  RESULT_VARIABLE IDLE_THRESHOLD_VALUE_RC)
+file(READ "${OUTPUT}/idle-threshold-failure/summary.jsonl" IDLE_THRESHOLD_VALUE_SUMMARY)
+if(IDLE_THRESHOLD_VALUE_RC EQUAL 0 OR NOT IDLE_THRESHOLD_VALUE_SUMMARY MATCHES "idle_query_overhead.*threshold_failure")
+  message(FATAL_ERROR "idle query overhead threshold failure was not enforced: ${IDLE_THRESHOLD_VALUE_RC}\n${IDLE_THRESHOLD_VALUE_SUMMARY}")
 endif()
 
 execute_process(

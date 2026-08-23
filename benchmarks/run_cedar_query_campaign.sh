@@ -164,6 +164,10 @@ run_case() {
       schema_reason="missing_wal_sync_p99_us"
       gate=false
       wal_sync_p99="-"
+    elif ! awk -v value="$wal_sync_p99" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }'; then
+      schema_reason="invalid_wal_sync_p99_us"
+      gate=false
+      wal_sync_p99="-"
     fi
   else
     schema_reason="missing_run_csv"

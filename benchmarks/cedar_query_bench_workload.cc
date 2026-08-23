@@ -346,14 +346,23 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
     case QueryBenchmarkOperation::kFastestDuration: {
       auto base = Query::Vertices(vertex, state_scope);
       if (!base.ok()) return base.status();
+      // The setup transaction marks the small graph fixture with score. Keep
+      // the journey benchmark anchored to those graph vertices; otherwise a
+      // write phase that appends thousands of unrelated vertices asks the
+      // public journey operator to search from every one of them.
+      OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score");
+      auto with_score = base.ValueOrDie().BindVertexProperty(
+          vertex, BenchmarkGraph::kScore, score);
+      if (!with_score.ok()) return with_score.status();
+      auto graph_vertices = with_score.ValueOrDie().Where(IsPresent(score));
+      if (!graph_vertices.ok()) return graph_vertices.status();
       built = op == QueryBenchmarkOperation::kEarliestArrival
-                  ? base.ValueOrDie().EarliestArrival(expand, max_hops,
-                                                       BenchmarkGraph::kDuration,
-                                                       journey)
+                  ? graph_vertices.ValueOrDie().EarliestArrival(
+                        expand, max_hops, BenchmarkGraph::kDuration, journey)
                   : op == QueryBenchmarkOperation::kLatestDeparture
-                        ? base.ValueOrDie().LatestDeparture(
+                        ? graph_vertices.ValueOrDie().LatestDeparture(
                               expand, max_hops, BenchmarkGraph::kDuration, journey)
-                        : base.ValueOrDie().FastestDuration(
+                        : graph_vertices.ValueOrDie().FastestDuration(
                               expand, max_hops, BenchmarkGraph::kDuration, journey);
       break;
     }
@@ -436,7 +445,10 @@ Status ExecuteOperation(Database* database, Snapshot snapshot,
                                 QueryBenchmarkOperationName(op));
   }
   if (op != QueryBenchmarkOperation::kTemporalAggregate &&
-      op != QueryBenchmarkOperation::kIntervalJoin) {
+      op != QueryBenchmarkOperation::kIntervalJoin &&
+      op != QueryBenchmarkOperation::kEarliestArrival &&
+      op != QueryBenchmarkOperation::kLatestDeparture &&
+      op != QueryBenchmarkOperation::kFastestDuration) {
     return ExecutePublicOperation(database, std::move(snapshot), op, max_hops,
                                   limit, rows, first_result_us);
   }
@@ -737,7 +749,10 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   result.raw_sample_path = options.path;
   result.query_api_surface =
       (options.operation == QueryBenchmarkOperation::kTemporalAggregate ||
-       options.operation == QueryBenchmarkOperation::kIntervalJoin)
+       options.operation == QueryBenchmarkOperation::kIntervalJoin ||
+       options.operation == QueryBenchmarkOperation::kEarliestArrival ||
+       options.operation == QueryBenchmarkOperation::kLatestDeparture ||
+       options.operation == QueryBenchmarkOperation::kFastestDuration)
           ? "internal-operator"
           : "public";
 #ifdef NDEBUG

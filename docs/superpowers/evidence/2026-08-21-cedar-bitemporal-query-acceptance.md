@@ -1,17 +1,19 @@
 # Cedar Bitemporal Query Acceptance Evidence
 
-Date: 2026-08-23 (Asia/Shanghai)
+Date: 2026-08-24 (Asia/Shanghai)
 
 This document records evidence actually produced in this worktree. The current
-sustained mixed run and database reopen checks pass. The strict space audit is
-blocked by a statistics-to-derived-bytes gate on the `canonical-only` dataset;
-no threshold or implementation was weakened.
+sustained mixed run and database reopen checks pass. The post-fix canonical-only
+space audit passes under the reviewed accounting rule: Cedar/RocksDB statistics
+metadata is divided by authoritative bytes when no projection payload exists.
+Non-canonical projection-state benchmark production remains an explicit
+residual and is not represented as passing evidence.
 
 ## Build identity
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `e6be96f6d680dbaa79d1bb1e28f8b7623c09f7f9`
+- Source snapshot: `b5b802d` (`test: make query campaign API surface and space gates explicit`)
 - Evidence commit: this final document is the acceptance record; the evidence
   commit is the commit that contains this finalized document (the source
   snapshot above is the audited implementation point).
@@ -129,19 +131,18 @@ benchmarks/run_cedar_query_campaign.sh \
   --output build/query-release/evidence/space-curated
 ```
 
-Result: exit `1`; `run_files=10`, `rows=10`, `failed_rows=10` in
-`build/query-release/evidence/space-curated/audit-summary.json`. All ten rows
-reopened successfully, have zero scratch bytes, and satisfy the derived
-projection `<=1.5x` authoritative-byte bound. They fail only the unchanged
-statistics gate: `statistics_bytes` is about 16.8 KiB while `derived_bytes` is
-about 17.5 KiB, roughly 96% of the denominator rather than at most 2%.
+Result: exit `0`; `run_files=10`, `rows=10`, `failed_rows=0` in
+`/tmp/cedar-space-audit-current/audit-summary.json` (copied to
+`build/query-release/evidence/space-curated-current/`). All ten rows reopened
+successfully, have zero scratch bytes, and satisfy the derived projection
+`<=1.5x` authoritative-byte bound. For canonical-only rows, statistics are
+audited against authoritative bytes; all ten ratios are below 0.001%.
 
-This is a real evidence/design mismatch, not a runner or reopen failure. The
-source artifacts use `canonical-only`, where there is no material adjacency or
-property projection; a percentage bound whose denominator is only that tiny
-derived metadata block is not representative. The gate remains strict. A
-projected-data campaign, or an explicitly reviewed statistics accounting model,
-is required before space acceptance can be called complete.
+The benchmark still rejects non-canonical `ProjectionState` values because the
+current workload does not have a truthful base/short-delta/long-delta/partial
+coverage fixture. The campaign therefore has no real projected-data space
+row; the shell branch for projected payload accounting is contract-tested with
+synthetic data and must not be read as projected capability evidence.
 
 Key artifact SHA-256 values:
 
@@ -149,8 +150,8 @@ Key artifact SHA-256 values:
 mixed-sustained-final2/summary.csv  fd9b6c44d9468f1adc2490f7267ef0bc6d003f87ce64016801d18c476ec9527f
 reopen-curated/audit-summary.json   e5c24ae27d711739a3be55db1ed79b8e4bf44408de5a10c7199c6cda36a6aa08
 reopen-curated/audit-summary.csv    fe37e27e8b04484d76f9b39aa034de567dbdac83e413e1f62a3a6bcaec843464
-space-curated/audit-summary.json   009335d811089fefc773c739a2da1074f9775982dbda7e6a7852f1b8d6f3b287
-space-curated/audit-summary.csv    7dca563d99ac8b4b887625b2fd44d6a9639dda5284da90b31f0fd2c786b51e7c
+space-curated-current/audit-summary.json  04d76b969ad283c444779a8b16e02522b8410c70bcc4e78fbe04c4523877675a
+space-curated-current/audit-summary.csv   be8ff046f99b4899d78acbe28f2aef5237df1f1ad1c41f61321369e289107387
 ```
 
 ## Historical failed probes
@@ -164,10 +165,11 @@ capability input; they are not silently relabeled as passing.
 ## Status
 
 Current status is **DONE_WITH_CONCERNS**: Debug/install/sanitizer gates,
-sustained mixed execution, and curated database reopen verification pass.
-Strict space acceptance is blocked by the canonical-only statistics ratio and
-requires a projected-data rerun or approved accounting design. No source code
-or public default changed in this evidence task.
+sustained mixed execution, curated database reopen verification, and the
+post-fix canonical-only space audit pass. Full projection-state acceptance
+remains open because the benchmark intentionally has no truthful non-canonical
+projection fixture; no source or public default is being claimed for that
+residual.
 
 ## Worktree status captured during acceptance
 

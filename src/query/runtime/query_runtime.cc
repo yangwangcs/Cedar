@@ -477,30 +477,50 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
     if (!binding.definition.has_value()) {
       return Status::SchemaMismatch("query", "property binding was not prepared");
     }
+    // Bind the complete entity batch in one temporal source pass. Calling
+    // BindIntervals once per row turns a property predicate into an N+1 scan
+    // over the full property family and can dominate query execution.
+    std::vector<internal::StateRow> entities;
+    entities.reserve(rows.size());
+    for (const RuntimeRow& row : rows) {
+      const ValidTimeInterval entity_interval = row.effective.value_or(
+          ValidTimeInterval{row.point.value_or(ValidTime{0}), std::nullopt});
+      entities.emplace_back(row.ref, entity_interval, std::nullopt);
+    }
+    auto bound = internal::PropertyBinder::BindIntervals(
+        snapshot, entities, *binding.definition);
+    if (!bound.ok()) return bound.status();
+    using RefKey = std::tuple<uint32_t, uint8_t, uint16_t, uint64_t>;
+    auto key_for = [](const FactRef& ref) {
+      return RefKey{ref.part_id().value, static_cast<uint8_t>(ref.family()),
+                    ref.property_id().value, ref.entity_id()};
+    };
+    std::map<RefKey, std::vector<const internal::BoundPropertyRow*>> by_ref;
+    for (const auto& property : bound.ValueOrDie()) {
+      by_ref[key_for(property.ref)].push_back(&property);
+    }
     std::vector<RuntimeRow> result;
     for (const RuntimeRow& row : rows) {
       const ValidTimeInterval entity_interval = row.effective.value_or(
           ValidTimeInterval{row.point.value_or(ValidTime{0}), std::nullopt});
-      internal::StateRow entity{row.ref, entity_interval, std::nullopt};
-      StatusOr<std::vector<internal::BoundPropertyRow>> bound =
-          row.point.has_value()
-              ? internal::PropertyBinder::BindAt(
-                    snapshot, std::vector<internal::StateRow>{entity},
-                    *row.point, *binding.definition)
-              : internal::PropertyBinder::BindIntervals(
-                    snapshot, std::vector<internal::StateRow>{entity},
-                    *binding.definition);
-      if (!bound.ok()) return bound.status();
-      for (const internal::BoundPropertyRow& property : bound.ValueOrDie()) {
+      const auto found = by_ref.find(key_for(row.ref));
+      if (found == by_ref.end()) continue;
+      for (const internal::BoundPropertyRow* property : found->second) {
+        if (row.point.has_value() &&
+            !(property->effective.from.value <= row.point->value &&
+              (!property->effective.to.has_value() ||
+               row.point->value < property->effective.to->value))) {
+          continue;
+        }
         const auto effective = internal::Intersect(entity_interval,
-                                                   property.effective);
+                                                    property->effective);
         if (!effective.has_value()) continue;
         RuntimeRow bound_row = row;
         bound_row.effective = *effective;
-        bound_row.property_values[binding.output.slot.value] = property.value;
+        bound_row.property_values[binding.output.slot.value] = property->value;
         // Keep the old single-value field for one-binding internal callers;
         // canonical consumers resolve values by output slot from the map.
-        if (binding_index == 0) bound_row.property_value = property.value;
+        if (binding_index == 0) bound_row.property_value = property->value;
         result.push_back(std::move(bound_row));
       }
     }
@@ -516,6 +536,15 @@ StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
     if (!binding.definition.has_value()) {
       return Status::SchemaMismatch("query", "property binding was not prepared");
     }
+    struct GraphEntity {
+      const RuntimeRow* row;
+      FactRef ref;
+      ValidTimeInterval interval;
+    };
+    std::vector<GraphEntity> entities;
+    entities.reserve(rows.size());
+    std::vector<internal::StateRow> state_rows;
+    state_rows.reserve(rows.size());
     std::vector<RuntimeRow> bound_rows;
     for (const RuntimeRow& row : rows) {
       std::optional<FactRef> entity_ref;
@@ -538,16 +567,30 @@ StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
       }
       const ValidTimeInterval entity_interval = row.effective.value_or(
           ValidTimeInterval{row.point.value_or(ValidTime{0}), std::nullopt});
-      internal::StateRow entity{*entity_ref, entity_interval, std::nullopt};
-      auto properties = internal::PropertyBinder::BindIntervals(
-          snapshot, std::vector<internal::StateRow>{entity}, *binding.definition);
-      if (!properties.ok()) return properties.status();
-      for (const internal::BoundPropertyRow& property : properties.ValueOrDie()) {
-        auto effective = internal::Intersect(entity_interval, property.effective);
+      entities.push_back({&row, *entity_ref, entity_interval});
+      state_rows.emplace_back(*entity_ref, entity_interval, std::nullopt);
+    }
+    auto properties = internal::PropertyBinder::BindIntervals(
+        snapshot, state_rows, *binding.definition);
+    if (!properties.ok()) return properties.status();
+    using RefKey = std::tuple<uint32_t, uint8_t, uint16_t, uint64_t>;
+    auto key_for = [](const FactRef& ref) {
+      return RefKey{ref.part_id().value, static_cast<uint8_t>(ref.family()),
+                    ref.property_id().value, ref.entity_id()};
+    };
+    std::map<RefKey, std::vector<const internal::BoundPropertyRow*>> by_ref;
+    for (const auto& property : properties.ValueOrDie()) {
+      by_ref[key_for(property.ref)].push_back(&property);
+    }
+    for (const GraphEntity& entity : entities) {
+      const auto found = by_ref.find(key_for(entity.ref));
+      if (found == by_ref.end()) continue;
+      for (const internal::BoundPropertyRow* property : found->second) {
+        auto effective = internal::Intersect(entity.interval, property->effective);
         if (!effective.has_value()) continue;
-        RuntimeRow bound = row;
+        RuntimeRow bound = *entity.row;
         bound.effective = *effective;
-        bound.property_values[binding.output.slot.value] = property.value;
+        bound.property_values[binding.output.slot.value] = property->value;
         bound_rows.push_back(std::move(bound));
       }
     }
@@ -660,6 +703,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation,
     QueryExecutionMode mode,
+    const Bindings& bindings,
     const std::function<Status()>& check_abort = {},
     uint64_t max_journey_labels = 0,
     uint64_t max_journey_interval_fragments = 0) {
@@ -670,6 +714,27 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   if (!interval.ok()) return interval.status();
   auto seeds = ReadSourceRows(snapshot, plan, reservation);
   if (!seeds.ok()) return seeds.status();
+  // Graph operators consume the source rows directly, so apply bindings and
+  // predicates here before frontier expansion. Otherwise a WHERE clause on a
+  // source property is ignored and the journey/path operator searches from
+  // every canonical entity (an accidental multiplicative scan).
+  if (!plan.property_bindings.empty()) {
+    seeds = BindPropertyRows(snapshot, std::move(seeds).ConsumeValueOrDie(),
+                             plan.property_bindings);
+    if (!seeds.ok()) return seeds.status();
+  }
+  if (plan.predicate) {
+    std::vector<RuntimeRow> filtered;
+    for (RuntimeRow& row : seeds.ValueOrDie()) {
+      auto selected = EvaluateExpression(*plan.predicate, row, plan, bindings);
+      if (!selected.ok()) return selected.status();
+      if (selected.ValueOrDie().present &&
+          std::get<bool>(*selected.ValueOrDie().value)) {
+        filtered.push_back(std::move(row));
+      }
+    }
+    seeds = std::move(filtered);
+  }
   const internal::QueryDeltaView* delta = plan.bound_delta_view ? plan.bound_delta_view.get() : nullptr;
   internal::GraphFrontierOptions options{reservation, delta, plan.graph_k_hops};
   options.check_abort = check_abort;
@@ -1682,6 +1747,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                     ? MaterializeGraphRows(*state_->snapshot, state_->plan,
                                            &state_->reservation,
                                            state_->options.mode,
+                                           state_->bindings,
                                            [state = state_.get()]() -> Status {
                                              if (state->cancelled.load(std::memory_order_acquire))
                                                return Status::QueryCancelled("query", "query cancelled");
@@ -2019,6 +2085,18 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
       }
     }
     const LogicalPlanNode* scoped = graph->inputs().front().get();
+    // Graph plans can have a filter/property-binding chain below the graph
+    // operator. Preserve that predicate for source-seed pruning; the graph
+    // runtime otherwise starts from every entity regardless of WHERE.
+    const LogicalPlanNode* metadata_node = graph->inputs().front().get();
+    while (metadata_node != nullptr && !metadata_node->inputs().empty()) {
+      if (metadata_node->kind() == LogicalOpKind::kFilter &&
+          metadata_node->predicate()) {
+        plan.predicate = metadata_node->predicate();
+        break;
+      }
+      metadata_node = metadata_node->inputs().front().get();
+    }
     while (scoped != nullptr && !scoped->scope().has_value() &&
            !scoped->inputs().empty()) {
       scoped = scoped->inputs().front().get();

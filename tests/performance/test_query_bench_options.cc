@@ -4,6 +4,21 @@ namespace cedar::benchmark {
 TEST(QueryBenchOptions, ParsesDocumentedMatrix){auto p=ParseQueryBenchmarkOptions({"--path=/tmp/q","--operation=state-at","--projection-state=canonical-only","--degree=100","--selectivity-percent=1","--readers=8","--cache-state=warm","--duration-seconds=1"});ASSERT_TRUE(p.ok())<<p.status().ToString();EXPECT_EQ(p.ValueOrDie().degree,100U);}
 TEST(QueryBenchOptions, RejectsUnknownAndZero){EXPECT_FALSE(ParseQueryBenchmarkOptions({"--path=/tmp/q","--operation=legacy"}).ok());EXPECT_FALSE(ParseQueryBenchmarkOptions({"--path=/tmp/q","--duration-seconds=0"}).ok());}
 TEST(QueryBenchOptions, ParsesWriteSweepControls){auto p=ParseQueryBenchmarkOptions({"--path=/tmp/q","--projection-work=active","--writers=8","--facts-per-txn=2048"});ASSERT_TRUE(p.ok());EXPECT_EQ(p.ValueOrDie().writers,8U);EXPECT_EQ(p.ValueOrDie().facts_per_txn,2048U);}
+TEST(QueryBenchOptions, ParsesAppendAdmissionControls) {
+  auto p = ParseQueryBenchmarkOptions({"--path=/tmp/q",
+                                       "--commit-deadline-us=500000",
+                                       "--group-queue-requests=2048",
+                                       "--group-queue-bytes=33554432"});
+  ASSERT_TRUE(p.ok()) << p.status().ToString();
+  EXPECT_EQ(p.ValueOrDie().commit_deadline_us, 500000U);
+  EXPECT_EQ(p.ValueOrDie().group_queue_requests, 2048U);
+  EXPECT_EQ(p.ValueOrDie().group_queue_bytes, 33554432U);
+}
+TEST(QueryBenchOptions, RejectsInvalidAppendAdmissionControls) {
+  EXPECT_FALSE(ParseQueryBenchmarkOptions({"--path=/tmp/q", "--commit-deadline-us=-1"}).ok());
+  EXPECT_FALSE(ParseQueryBenchmarkOptions({"--path=/tmp/q", "--group-queue-requests=0"}).ok());
+  EXPECT_FALSE(ParseQueryBenchmarkOptions({"--path=/tmp/q", "--group-queue-bytes=0"}).ok());
+}
 TEST(QueryBenchOptions, ParsesExistingVerification){
   auto p = ParseQueryBenchmarkOptions({"--path=/tmp/q", "--verify-existing=true",
                                        "--expected-facts=12", "--expected-checksum=34"});

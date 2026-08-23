@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <string_view>
 
 namespace cedar::benchmark {
@@ -95,6 +96,18 @@ StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(
       if (value == "paused") options.projection_work = ProjectionWork::kPaused; else if (value == "active") options.projection_work = ProjectionWork::kActive; else return Invalid("projection-work must be paused or active");
     } else if (name == "--writers") {
       uint64_t v=0; if (!ParseU(value,&v) || (v!=1&&v!=2&&v!=8&&v!=32&&v!=64)) return Invalid("writers must be 1,2,8,32,64"); options.writers=static_cast<uint32_t>(v);
+    } else if (name == "--commit-deadline-us") {
+      if (!ParseU(value, &options.commit_deadline_us)) return Invalid("commit-deadline-us must be unsigned");
+    } else if (name == "--group-queue-requests") {
+      uint64_t v = 0;
+      if (!ParseU(value, &v) || v == 0 || v > std::numeric_limits<uint32_t>::max()) {
+        return Invalid("group-queue-requests must fit in uint32_t and be positive");
+      }
+      options.group_queue_requests = static_cast<uint32_t>(v);
+    } else if (name == "--group-queue-bytes") {
+      if (!ParseU(value, &options.group_queue_bytes) || options.group_queue_bytes == 0) {
+        return Invalid("group-queue-bytes must be positive");
+      }
     } else if (name == "--max-hops") { uint64_t v = 0; if (!ParseU(value, &v) || v == 0) return Invalid("max-hops must be positive"); options.max_hops = static_cast<uint32_t>(v);
     } else if (name == "--result-limit") { if (!ParseU(value, &options.result_limit) || options.result_limit == 0) return Invalid("result-limit must be positive");
     } else if (name == "--capture-profile") { if (value == "true") options.capture_profile = true; else if (value == "false") options.capture_profile = false; else return Invalid("capture-profile must be true or false");

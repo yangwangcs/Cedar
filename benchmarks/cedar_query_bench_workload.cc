@@ -161,8 +161,9 @@ std::string JsonEscape(const std::string& value) {
 }
 
 Status CommitFacts(Database* db, uint64_t first, uint64_t count,
-                   uint64_t* committed) {
-  auto txn = db->BeginTransaction();
+                   uint64_t* committed, uint64_t commit_deadline_us) {
+  auto txn = db->BeginTransaction(
+      TransactionOptions{.commit_deadline_us = commit_deadline_us});
   if (!txn.ok()) return txn.status();
   for (uint64_t i = 0; i < count; ++i) {
     const Status s = txn.ValueOrDie()->Assert(
@@ -565,6 +566,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   db_options.storage_profile = StorageProfile::kProductionAppend;
   db_options.production.memory_budget_bytes = 1ULL << 30;
   db_options.production.kernel_mode = true;
+  db_options.group_commit_max_queue_requests = options.group_queue_requests;
+  db_options.group_commit_max_queue_bytes = options.group_queue_bytes;
   db_options.query_runtime.query_memory_bytes = 32ULL << 20;
   db_options.query_runtime.projection_cache_bytes = 32ULL << 20;
   db_options.query_runtime.query_delta_bytes = 32ULL << 20;
@@ -719,7 +722,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     const uint64_t first = next_id.fetch_add(options.facts_per_txn);
     uint64_t committed = 0;
     const Status s = CommitFacts(database.get(), first, options.facts_per_txn,
-                                 &committed);
+                                 &committed, options.commit_deadline_us);
     if (!s.ok()) return s;
     transactions.fetch_add(1);
     facts.fetch_add(committed);
@@ -772,7 +775,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       const auto start = Clock::now();
       uint64_t committed = 0;
       const Status s = CommitFacts(database.get(), first, options.facts_per_txn,
-                                   &committed);
+                                   &committed, options.commit_deadline_us);
       if (!s.ok()) {
         failed.store(true);
         std::lock_guard<std::mutex> lock(failure_mutex);
@@ -1003,7 +1006,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,total_space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,commit_deadline_us,group_queue_requests,group_queue_bytes,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,total_space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -1015,7 +1018,8 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << CsvEscape(ProjectionStateName(o.projection))
     << ',' << o.degree << ',' << o.selectivity_percent << ',' << o.readers << ','
     << CsvEscape(o.cache == QueryCacheState::kCold ? "cold" : "warm") << ',' << o.writers << ','
-    << o.facts_per_txn << ',' << o.seed << ','
+    << o.facts_per_txn << ',' << o.commit_deadline_us << ','
+    << o.group_queue_requests << ',' << o.group_queue_bytes << ',' << o.seed << ','
     << (o.verify_existing ? "true" : "false") << ',' << o.expected_facts << ','
     << o.expected_checksum << ',' << r.dataset_checksum << ','
     << r.transactions << ',' << r.facts << ',' << r.measured_transactions << ','
@@ -1056,7 +1060,10 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
   x << "{\"operation\":\"" << JsonEscape(QueryBenchmarkOperationName(o.operation))
     << "\",\"projection_state\":\"" << JsonEscape(ProjectionStateName(o.projection))
     << "\",\"writers\":" << o.writers << ",\"facts_per_txn\":"
-    << o.facts_per_txn << ",\"verify_existing\":"
+    << o.facts_per_txn << ",\"commit_deadline_us\":" << o.commit_deadline_us
+    << ",\"group_queue_requests\":" << o.group_queue_requests
+    << ",\"group_queue_bytes\":" << o.group_queue_bytes
+    << ",\"verify_existing\":"
     << (o.verify_existing ? "true" : "false") << ",\"expected_facts\":"
     << o.expected_facts << ",\"expected_checksum\":" << o.expected_checksum
     << ",\"transactions\":" << r.transactions

@@ -88,4 +88,24 @@ TEST(QueryBenchWorkload, SpaceAmplificationUsesDerivedProjectionBytes) {
   EXPECT_EQ(field("space_amplification"), "0");
   EXPECT_EQ(field("total_space_amplification"), "10");
 }
+
+TEST(QueryBenchWorkload, AppendAdmissionMetadataIncludesConfiguredControls) {
+  QueryBenchmarkOptions options;
+  options.commit_deadline_us = 500000;
+  options.group_queue_requests = 2048;
+  options.group_queue_bytes = 33554432;
+  QueryBenchmarkResult result;
+  const std::string header = QueryBenchmarkCsvHeader();
+  const std::string row = QueryBenchmarkCsvRow(options, result);
+  EXPECT_NE(header.find("commit_deadline_us"), std::string::npos);
+  EXPECT_NE(header.find("group_queue_requests"), std::string::npos);
+  EXPECT_NE(header.find("group_queue_bytes"), std::string::npos);
+  EXPECT_NE(row.find("500000"), std::string::npos);
+  EXPECT_NE(row.find("2048"), std::string::npos);
+  EXPECT_NE(row.find("33554432"), std::string::npos);
+  const std::string json = QueryBenchmarkJson(options, result);
+  EXPECT_NE(json.find("\"commit_deadline_us\":500000"), std::string::npos);
+  EXPECT_NE(json.find("\"group_queue_requests\":2048"), std::string::npos);
+  EXPECT_NE(json.find("\"group_queue_bytes\":33554432"), std::string::npos);
+}
 }  // namespace cedar::benchmark

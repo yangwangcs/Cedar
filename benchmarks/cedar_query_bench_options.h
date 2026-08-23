@@ -41,6 +41,11 @@ struct QueryBenchmarkOptions {
   uint64_t expected_checksum = 0;
   uint32_t writers = 1;
   ProjectionWork projection_work = ProjectionWork::kPaused;
+  // Benchmark-only append admission controls. Public Database/Transaction
+  // defaults remain unchanged; zero preserves immediate admission behavior.
+  uint64_t commit_deadline_us = 0;
+  uint32_t group_queue_requests = 1024;
+  uint64_t group_queue_bytes = 16ULL * 1024ULL * 1024ULL;
 };
 
 StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(

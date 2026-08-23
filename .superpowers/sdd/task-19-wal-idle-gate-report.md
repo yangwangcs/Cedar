@@ -18,6 +18,9 @@ including the follow-up edge-case fixes from review.
   rejected missing WAL columns in raw run CSVs.
 - Kept audit summary CSV/JSON rows on the same metric schema, using explicit
   zero/null values for audit-only fields.
+- Encoded comma-separated matrix metadata with `|` in the key/value baseline
+  artifact so facts/writer comparability checks cannot be truncated by CSV
+  parsing.
 - Preserved active projection thresholds of at least 90% facts/s and at most
   115% end-to-end p99; no WAL metric was added to that active gate.
 - Extended `QueryCampaignOptionsContract` with CSV/artifact schema assertions
@@ -27,7 +30,8 @@ including the follow-up edge-case fixes from review.
 
 - `bash -n benchmarks/run_cedar_query_campaign.sh`
 - `git diff --check`
-- Focused `QueryCampaignOptionsContract` run after commit (pass).
+- Focused contract passed on the preceding follow-up commit; a final rerun is
+  still required after the metadata-only commit `1f73df2`.
 
 ## Scope/concerns
 

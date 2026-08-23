@@ -401,6 +401,13 @@ audit_run_csv() {
       # be reset to PASS by a later row-level validation.
       invalid = header_invalid
       reason = header_reason
+      # Do not dereference required columns when schema validation already
+      # failed.  Missing headers would otherwise expand to an illegal awk
+      # field expression `$()` and abort the artifact audit.
+      if (header_invalid) {
+        emit("FAIL", reason, "", "", "", "", "", "", "", "", "")
+        next
+      }
       if (NF != header_fields) {
         fail("row field count does not match header")
       }

@@ -150,6 +150,43 @@ if(NOT MIXED_VALID_MANIFEST MATCHES "--facts-per-txn=64")
   message(FATAL_ERROR "mixed campaign did not consume the selected turning point: ${MIXED_VALID_MANIFEST}")
 endif()
 
+# The mixed duration covers both timed phases (write and query) of each of the
+# ten sequential operations. Use a stub benchmark so this contract does not
+# execute the full 1,800-second observation window.
+set(MIXED_DURATION_BUILD "${OUTPUT}/mixed-duration-build")
+file(MAKE_DIRECTORY "${MIXED_DURATION_BUILD}")
+file(WRITE "${MIXED_DURATION_BUILD}/cedar_query_bench" "#!/usr/bin/env bash\nexit 0\n")
+file(CHMOD "${MIXED_DURATION_BUILD}/cedar_query_bench"
+  PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}"
+    --build-dir "${MIXED_DURATION_BUILD}"
+    --phase mixed-30-minute
+    --duration-seconds 1800
+    --facts-per-txn 1
+    --writers 1
+    --readers 1
+    --degrees 1
+    --selectivities 1
+    --output "${OUTPUT}/mixed-duration"
+  RESULT_VARIABLE MIXED_DURATION_RC OUTPUT_VARIABLE MIXED_DURATION_OUT
+  ERROR_VARIABLE MIXED_DURATION_ERR)
+if(MIXED_DURATION_RC EQUAL 0)
+  message(FATAL_ERROR "stub mixed duration campaign unexpectedly passed: ${MIXED_DURATION_OUT}")
+endif()
+file(READ "${OUTPUT}/mixed-duration/commands.manifest" MIXED_DURATION_MANIFEST)
+string(REGEX MATCHALL "--duration-seconds=90" MIXED_DURATION_MATCHES
+  "${MIXED_DURATION_MANIFEST}")
+list(LENGTH MIXED_DURATION_MATCHES MIXED_DURATION_COUNT)
+if(NOT MIXED_DURATION_COUNT EQUAL 10)
+  message(FATAL_ERROR "1800-second mixed campaign did not assign 90 seconds to all ten cases: ${MIXED_DURATION_MANIFEST}")
+endif()
+if(NOT MIXED_DURATION_MANIFEST MATCHES "--commit-deadline-us=5000000" OR
+   NOT MIXED_DURATION_MANIFEST MATCHES "--group-queue-requests=2048" OR
+   NOT MIXED_DURATION_MANIFEST MATCHES "--group-queue-bytes=33554432")
+  message(FATAL_ERROR "mixed duration contract lost bounded admission controls: ${MIXED_DURATION_MANIFEST}")
+endif()
+
 foreach(MALFORMED_TURNING_POINT IN ITEMS
     "{\"facts_per_txn\":-64}"
     "{\"facts_per_txn\":64} trailing"

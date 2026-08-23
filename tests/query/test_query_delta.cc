@@ -378,5 +378,11 @@ TEST(QueryDeltaTest, LifecycleTransitionBlocksAdmissionUntilResetCompletes) {
   EXPECT_TRUE(delta.AcquireThrough(CommitSeq{2}).ok());
 }
 
+TEST(QueryDeltaTest, LifecycleErrorReleasesAdmissionGate) {
+  QueryDelta delta({.base_seq = CommitSeq{0}, .queue_capacity = 8});
+  EXPECT_TRUE(delta.RetireThrough(CommitSeq{1}).IsInvalidArgument());
+  EXPECT_TRUE(delta.EnqueuePublished(QueryDeltaCommit{CommitSeq{1}}).ok());
+}
+
 }  // namespace
 }  // namespace cedar::internal

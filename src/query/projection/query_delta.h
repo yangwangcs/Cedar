@@ -153,6 +153,7 @@ class QueryDelta {
       const std::vector<FactEvent>& delta, CommitSeq snapshot);
 
  private:
+  class LifecycleTransitionGuard;
   struct FactRefHash {
     size_t operator()(const FactRef& ref) const noexcept;
   };

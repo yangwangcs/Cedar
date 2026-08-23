@@ -402,6 +402,14 @@ Status Snapshot::EventColumnarScanFamily(
   if (unique_projection.size() != projection.size()) {
     return Status::InvalidArgument("columnar scan", "duplicate projection column");
   }
+  const Status prefix_status =
+      FactPrefix::Family(PartId{}, family, property_id).Validate();
+  if (!prefix_status.ok()) return prefix_status;
+  for (FactColumnId column_id : projection) {
+    FactColumn column;
+    const Status column_status = MakeFactColumn(column_id, &column);
+    if (!column_status.ok()) return column_status;
+  }
   FactColumnarScanOptions options;
   options.projection = projection;
   return state_->database->store.ScanColumnarFamily(

@@ -816,6 +816,31 @@ TEST_F(ColumnarFactScanTest,
 }
 
 TEST_F(ColumnarFactScanTest,
+       EventColumnarScanFamilyRejectsInvalidRequestOnEmptySnapshot) {
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto visitor = [](const FactColumnarBatch&) { return Status::OK(); };
+
+  const Status invalid_family = snapshot.ValueOrDie().EventColumnarScanFamily(
+      static_cast<FactFamily>(255), PropertyId{}, {FactColumnId::kEntityId},
+      visitor);
+  EXPECT_TRUE(invalid_family.IsInvalidArgument())
+      << invalid_family.ToString();
+
+  const Status invalid_property = snapshot.ValueOrDie().EventColumnarScanFamily(
+      FactFamily::kVertexState, PropertyId{1}, {FactColumnId::kEntityId},
+      visitor);
+  EXPECT_TRUE(invalid_property.IsInvalidArgument())
+      << invalid_property.ToString();
+
+  const Status invalid_projection = snapshot.ValueOrDie().EventColumnarScanFamily(
+      FactFamily::kVertexState, PropertyId{},
+      {static_cast<FactColumnId>(255)}, visitor);
+  EXPECT_TRUE(invalid_projection.IsInvalidArgument())
+      << invalid_projection.ToString();
+}
+
+TEST_F(ColumnarFactScanTest,
        StateColumnarScanResolvesPersistedOverrideBeforeApplyingEventFilters) {
   CommitVertex(VertexId{8}, ValidTime{10});
   Commit(FactOperation::kPut, ValidTime{10});

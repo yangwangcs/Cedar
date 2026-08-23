@@ -319,7 +319,7 @@ Status ApplyProjectionDelta(Database* database, uint64_t first,
                             uint64_t* transactions, uint64_t* facts) {
   for (uint64_t i = 0; i < count; ++i) {
     uint64_t committed = 0;
-    if (Status status = CommitFacts(database, first + i, 1, &committed,
+    if (Status status = CommitFacts(database, first, 1, &committed,
                                     commit_deadline_us);
         !status.ok()) {
       return status;

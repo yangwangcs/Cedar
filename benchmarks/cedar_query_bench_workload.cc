@@ -554,6 +554,16 @@ void ComputeSpaceMetrics(QueryBenchmarkResult* result) {
 }
 }  // namespace
 
+Status SeedQueryBenchmarkSetupForTesting(Database* database,
+                                         uint64_t commit_deadline_us) {
+  const BenchmarkGraph graph;
+  if (Status status = SeedGraph(database, graph, commit_deadline_us);
+      !status.ok()) {
+    return status;
+  }
+  return SeedBenchmarkScore(database, graph, commit_deadline_us);
+}
+
 StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     const QueryBenchmarkOptions& options) {
   if (!options.verify_existing) {
@@ -689,21 +699,14 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     result.gate_classification = "incomplete";
     return result;
   }
+  if (Status status = SeedQueryBenchmarkSetupForTesting(
+          database.get(), options.commit_deadline_us);
+      !status.ok()) {
+    result.terminal_status = status.ToString();
+    result.gate_classification = "incomplete";
+    return result;
+  }
   const BenchmarkGraph graph;
-  if (Status status = SeedGraph(database.get(), graph,
-                                options.commit_deadline_us);
-      !status.ok()) {
-    result.terminal_status = status.ToString();
-    result.gate_classification = "incomplete";
-    return result;
-  }
-  if (Status status = SeedBenchmarkScore(database.get(), graph,
-                                         options.commit_deadline_us);
-      !status.ok()) {
-    result.terminal_status = status.ToString();
-    result.gate_classification = "incomplete";
-    return result;
-  }
 
   std::atomic<uint64_t> next_id{1}, transactions{0}, facts{0};
   std::atomic<uint64_t> dataset_checksum{0};

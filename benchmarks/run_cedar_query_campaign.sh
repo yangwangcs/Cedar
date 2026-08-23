@@ -5,6 +5,9 @@ build_dir=
 output=
 requested_phase=all
 duration=10
+commit_deadline_us=5000000
+group_queue_requests=2048
+group_queue_bytes=33554432
 facts_values=1,16,64,256
 writers_values=1,8
 readers_values=8
@@ -62,6 +65,21 @@ validate_values() {
   done
 }
 
+validate_positive_uint() {
+  local value="$1" label="$2" max="$3"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "--$label must be positive" >&2
+    return 2
+  }
+  # Compare decimal strings without relying on Bash arithmetic, which can
+  # overflow for uint64 values accepted by the benchmark parser.
+  if ((${#value} > ${#max})) ||
+     ((${#value} == ${#max})) && [[ "$value" > "$max" ]]; then
+    echo "--$label exceeds its supported range" >&2
+    return 2
+  fi
+}
+
 first_csv_value() {
   local first
   first=$(csv_values "$1" "$2" | sed -n '1p')
@@ -75,6 +93,12 @@ while (($#)); do
     --output) require_value "$@"; output="$2"; shift 2 ;;
     --phase) require_value "$@"; requested_phase="$2"; shift 2 ;;
     --duration-seconds) require_value "$@"; duration="$2"; shift 2 ;;
+    --commit-deadline-us) require_value "$@"; commit_deadline_us="$2"; shift 2 ;;
+    --group-queue-requests) require_value "$@"; group_queue_requests="$2"; shift 2 ;;
+    --group-queue-bytes) require_value "$@"; group_queue_bytes="$2"; shift 2 ;;
+    --commit-deadline-us=*) commit_deadline_us="${1#*=}"; shift ;;
+    --group-queue-requests=*) group_queue_requests="${1#*=}"; shift ;;
+    --group-queue-bytes=*) group_queue_bytes="${1#*=}"; shift ;;
     --facts-per-txn) require_value "$@"; facts_values="$2"; shift 2 ;;
     --writers) require_value "$@"; writers_values="$2"; shift 2 ;;
     --readers) require_value "$@"; readers_values="$2"; shift 2 ;;
@@ -94,6 +118,9 @@ done
   echo "--duration-seconds must be positive" >&2
   exit 2
 }
+validate_positive_uint "$commit_deadline_us" commit-deadline-us 18446744073709551615 || exit $?
+validate_positive_uint "$group_queue_requests" group-queue-requests 4294967295 || exit $?
+validate_positive_uint "$group_queue_bytes" group-queue-bytes 18446744073709551615 || exit $?
 
 build_dir=$(cd "$build_dir" && pwd)
 mkdir -p "$output"
@@ -127,7 +154,7 @@ manifest="$output/commands.manifest"
 summary="$output/summary.csv"
 summary_json="$output/summary.jsonl"
 printf 'phase,case,command\n' > "$manifest"
-printf 'phase,case,exit_code,hard_gate_pass,terminal_status,facts_per_second,end_to_end_p99_us,wal_sync_p99_us\n' > "$summary"
+printf 'phase,case,exit_code,hard_gate_pass,terminal_status,facts_per_second,end_to_end_p99_us,wal_sync_p99_us,commit_deadline_us,group_queue_requests,group_queue_bytes\n' > "$summary"
 : > "$summary_json"
 overall=0
 
@@ -145,7 +172,7 @@ run_case() {
   cases_run=$((cases_run + 1))
   mkdir -p "$case_dir"
   local db="$case_dir/database" csv="$case_dir/run.csv" json="$case_dir/run.json"
-  local -a cmd=("$build_dir/cedar_query_bench" "--path=$db" "--operation=$operation" "--projection-state=$projection" "--degree=$degree" "--selectivity-percent=$selectivity" "--readers=$readers" "--cache-state=$cache" "--projection-work=$projection_work" "--writers=$writers" "--facts-per-txn=$facts_per_txn" "--seed=1" "--duration-seconds=$case_duration" "--reopen-verify=true")
+  local -a cmd=("$build_dir/cedar_query_bench" "--path=$db" "--operation=$operation" "--projection-state=$projection" "--degree=$degree" "--selectivity-percent=$selectivity" "--readers=$readers" "--cache-state=$cache" "--projection-work=$projection_work" "--writers=$writers" "--facts-per-txn=$facts_per_txn" "--commit-deadline-us=$commit_deadline_us" "--group-queue-requests=$group_queue_requests" "--group-queue-bytes=$group_queue_bytes" "--seed=1" "--duration-seconds=$case_duration" "--reopen-verify=true")
   printf '%s,%s,' "$phase" "$case_name" >> "$manifest"
   printf '%q ' "${cmd[@]}" >> "$manifest"
   printf '\n' >> "$manifest"
@@ -157,6 +184,8 @@ run_case() {
   if [[ -s "$csv" ]]; then
     gate=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="hard_gate_pass") gate=i; next } NR==2 && gate { print $gate }' "$csv")
     terminal=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="terminal_status") status=i; next } NR==2 && status { print $status }' "$csv")
+    terminal="${terminal#\"}"
+    terminal="${terminal%\"}"
     facts_rate=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="facts_per_second") rate=i; next } NR==2 && rate { print $rate }' "$csv")
     end_p99=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="end_to_end_p99_us") p=i; next } NR==2 && p { print $p }' "$csv")
     wal_sync_p99=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="wal_sync_p99_us") p=i; next } NR==2 && p { print $p }' "$csv")
@@ -175,8 +204,8 @@ run_case() {
     wal_sync_p99="-"
   fi
   [[ -z "$schema_reason" ]] || terminal="$schema_reason"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" "$wal_sync_p99" >> "$summary"
-  printf '{"phase":"%s","case":"%s","exit_code":%s,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":%s,"end_to_end_p99_us":%s,"wal_sync_p99_us":%s}\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" "${wal_sync_p99/-/null}" >> "$summary_json"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" "$wal_sync_p99" "$commit_deadline_us" "$group_queue_requests" "$group_queue_bytes" >> "$summary"
+  printf '{"phase":"%s","case":"%s","exit_code":%s,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":%s,"end_to_end_p99_us":%s,"wal_sync_p99_us":%s,"commit_deadline_us":%s,"group_queue_requests":%s,"group_queue_bytes":%s}\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" "${wal_sync_p99/-/null}" "$commit_deadline_us" "$group_queue_requests" "$group_queue_bytes" >> "$summary_json"
   if [[ "$rc" -ne 0 || "$gate" != true ]]; then overall=1; fi
 }
 
@@ -596,6 +625,9 @@ verify_artifact_database() {
   local -a verify_cmd=("$build_dir/cedar_query_bench" "--path=$raw_path"
     --operation=state-at --duration-seconds=1 --verify-existing=true
     "--expected-facts=$expected_facts" "--expected-checksum=$expected_checksum"
+    "--commit-deadline-us=$commit_deadline_us"
+    "--group-queue-requests=$group_queue_requests"
+    "--group-queue-bytes=$group_queue_bytes"
     --reopen-verify=true)
   printf '%s,%s,' "$phase" "$verify_case" >> "$manifest"
   printf '%q ' "${verify_cmd[@]}" >> "$manifest"
@@ -684,10 +716,10 @@ run_artifact_audit() {
   fi
   printf '{"phase":"%s","input":"%s","run_files":%d,"rows":%d,"pass":%s,"failed_rows":%d}\n' \
     "$phase" "$input" "$input_run_count" "$total_rows" "$audit_pass" "$failed_rows" > "$audit_json"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "input-artifacts" "$audit_exit" \
-    "$audit_gate" "$audit_terminal" 0 0 0 >> "$summary"
-  printf '{"phase":"%s","case":"input-artifacts","input":"%s","status":"%s","exit_code":%d,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":0,"end_to_end_p99_us":0,"wal_sync_p99_us":null,"run_files":%d,"rows":%d,"failed_rows":%d}\n' \
-    "$phase" "$input" "$audit_pass" "$audit_exit" "$audit_gate" "$audit_terminal" "$input_run_count" "$total_rows" "$failed_rows" >> "$summary_json"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "input-artifacts" "$audit_exit" \
+    "$audit_gate" "$audit_terminal" 0 0 0 "$commit_deadline_us" "$group_queue_requests" "$group_queue_bytes" >> "$summary"
+  printf '{"phase":"%s","case":"input-artifacts","input":"%s","status":"%s","exit_code":%d,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":0,"end_to_end_p99_us":0,"wal_sync_p99_us":null,"commit_deadline_us":%s,"group_queue_requests":%s,"group_queue_bytes":%s,"run_files":%d,"rows":%d,"failed_rows":%d}\n' \
+    "$phase" "$input" "$audit_pass" "$audit_exit" "$audit_gate" "$audit_terminal" "$commit_deadline_us" "$group_queue_requests" "$group_queue_bytes" "$input_run_count" "$total_rows" "$failed_rows" >> "$summary_json"
 }
 
 for phase in "${phases[@]}"; do

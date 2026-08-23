@@ -1,12 +1,19 @@
 #include <filesystem>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "benchmarks/cedar_query_bench_workload.h"
+#include "cedar/database.h"
 
 namespace cedar::benchmark {
 namespace {
@@ -14,10 +21,22 @@ std::string TestPath(const char* suffix) {
   return (std::filesystem::temp_directory_path() /
           (std::string("cedar-query-existing-") + suffix)).string();
 }
+
+class ScopedPathCleanup {
+ public:
+  explicit ScopedPathCleanup(std::string path) : path_(std::move(path)) {}
+  ~ScopedPathCleanup() { std::filesystem::remove_all(path_); }
+  ScopedPathCleanup(const ScopedPathCleanup&) = delete;
+  ScopedPathCleanup& operator=(const ScopedPathCleanup&) = delete;
+
+ private:
+  std::string path_;
+};
 }
 
 TEST(QueryBenchWorkload, VerifiesExistingDatabaseAcrossReopen) {
   const std::string path = TestPath("database");
+  ScopedPathCleanup cleanup(path);
   std::filesystem::remove_all(path);
   QueryBenchmarkOptions create;
   create.path = path;
@@ -61,7 +80,6 @@ TEST(QueryBenchWorkload, VerifiesExistingDatabaseAcrossReopen) {
   EXPECT_FALSE(mismatch.ValueOrDie().hard_gate_pass);
   EXPECT_FALSE(mismatch.ValueOrDie().reopen_verified);
   EXPECT_EQ(mismatch.ValueOrDie().terminal_status, "reopen verification failed");
-  std::filesystem::remove_all(path);
 }
 
 TEST(QueryBenchWorkload, SpaceAmplificationUsesDerivedProjectionBytes) {
@@ -111,20 +129,90 @@ TEST(QueryBenchWorkload, AppendAdmissionMetadataIncludesConfiguredControls) {
 
 TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
   const std::string path = TestPath("bounded-setup-admission");
-  std::filesystem::remove_all(path);
-  QueryBenchmarkOptions options;
-  options.path = path;
-  options.duration_seconds = 0;
-  options.readers = 1;
-  options.writers = 1;
-  options.facts_per_txn = 1;
-  options.commit_deadline_us = 500000;
-  options.group_queue_requests = 1024;
-  options.group_queue_bytes = 16ULL * 1024ULL * 1024ULL;
-  auto result = RunQueryBenchmark(options);
-  ASSERT_TRUE(result.ok()) << result.status().ToString();
-  EXPECT_EQ(result.ValueOrDie().terminal_status, "OK");
-  EXPECT_GT(result.ValueOrDie().facts, 0U);
-  std::filesystem::remove_all(path);
+  ScopedPathCleanup cleanup(path);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool collection_entered = false;
+  bool release_collection = false;
+  bool setup_admission_entered = false;
+
+  DatabaseOptions database_options;
+  database_options.path = path;
+  database_options.storage_profile = StorageProfile::kProductionAppend;
+  database_options.production.memory_budget_bytes = 1ULL << 30;
+  database_options.production.kernel_mode = true;
+  database_options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
+  database_options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
+  database_options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;
+  database_options.group_commit_max_batch_size = 1;
+  database_options.group_commit_window_us = 0;
+  database_options.group_commit_max_queue_requests = 1;
+  database_options.group_commit_max_queue_bytes = 16ULL * 1024ULL * 1024ULL;
+  database_options.append_commit_collection_observer_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!collection_entered) {
+      collection_entered = true;
+      cv.notify_all();
+      cv.wait(lock, [&] { return release_collection; });
+    }
+  };
+  database_options.foreground_admission_observer_for_testing = [&] {
+    std::lock_guard<std::mutex> lock(mutex);
+    setup_admission_entered = true;
+    cv.notify_all();
+  };
+  auto opened = Database::Open(database_options);
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  ASSERT_TRUE(database->RegisterProperty(PropertyDefinition{
+      PropertyId{7}, 0, "duration", PropertyEntityKind::kEdge,
+      PhysicalType::kInt64, 4096}).ok());
+  ASSERT_TRUE(database->RegisterProperty(PropertyDefinition{
+      PropertyId{8}, 0, "score", PropertyEntityKind::kVertex,
+      PhysicalType::kInt64, 4096}).ok());
+
+  auto blocker = database->BeginTransaction();
+  ASSERT_TRUE(blocker.ok()) << blocker.status().ToString();
+  ASSERT_TRUE(blocker.ValueOrDie()->Assert(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{900001}}),
+      ValidTime{1}).ok());
+  Status blocker_status = Status::InvalidArgument("test", "not attempted");
+  std::thread blocker_thread([&] {
+    const auto committed = blocker.ValueOrDie()->Commit();
+    blocker_status = committed.ok() ? committed.ValueOrDie().status
+                                    : committed.status();
+  });
+  bool collection_observed = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    collection_observed = cv.wait_for(
+        lock, std::chrono::seconds(2), [&] { return collection_entered; });
+    if (!collection_observed) release_collection = true;
+  }
+  cv.notify_all();
+  ASSERT_TRUE(collection_observed);
+
+  std::atomic<bool> setup_done = false;
+  Status setup_status = Status::InvalidArgument("test", "not attempted");
+  std::thread setup([&] {
+    setup_status = SeedQueryBenchmarkSetupForTesting(database.get(), 500000);
+    setup_done.store(true);
+    cv.notify_all();
+  });
+  bool setup_admission_observed = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    setup_admission_observed = cv.wait_for(
+        lock, std::chrono::seconds(2), [&] { return setup_admission_entered; });
+    release_collection = true;
+  }
+  cv.notify_all();
+  setup.join();
+  EXPECT_TRUE(setup_admission_observed);
+  ASSERT_TRUE(setup_done.load());
+  EXPECT_TRUE(setup_status.ok()) << setup_status.ToString();
+  blocker_thread.join();
+  EXPECT_TRUE(blocker_status.ok()) << blocker_status.ToString();
+  ASSERT_TRUE(database->Close().ok());
 }
 }  // namespace cedar::benchmark

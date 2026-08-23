@@ -23,17 +23,22 @@ Prepare the absolute artifact directory once before running the commands:
 mkdir -p /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original
 ```
 
+The original probe directory and its CSV/JSON/database files are absent from
+this worktree. The commands and values below are an unretained prior
+observation, not acceptance evidence; rerunning the commands above is
+required to recreate the artifacts.
+
 ### Baseline: deadline 0, current bounds, duration 2 s
 
-Command (exit status `1`; CSV/JSON paths shown for the retained run
-artifacts):
+Command (historical exit status `1`; CSV/JSON paths are the requested output
+locations):
 
 ```text
 /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/cedar_query_bench --path=/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/baseline-database --operation=state-at --projection-state=canonical-only --projection-work=paused --degree=1 --selectivity-percent=1 --readers=1 --cache-state=cold --writers=32 --facts-per-txn=1024 --duration-seconds=2 --commit-deadline-us=0 --group-queue-requests=1024 --group-queue-bytes=16777216 > /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/baseline.csv 2> /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/baseline.json
 ```
 
-The command writes CSV/JSON to the absolute paths shown above; its database
-path is `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/baseline-database`.
+The historical command used the absolute paths shown above; its database path
+was `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/baseline-database`.
 
 Terminal status: `ResourceExhausted: commit: append queue is full` (process
 exit 1). The run recorded 127 measured transactions / 131072 measured facts,
@@ -49,7 +54,7 @@ Command (exit status `0`):
 /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/cedar_query_bench --path=/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000-database --operation=state-at --projection-state=canonical-only --projection-work=paused --degree=1 --selectivity-percent=1 --readers=1 --cache-state=cold --writers=32 --facts-per-txn=1024 --duration-seconds=2 --commit-deadline-us=500000 --group-queue-requests=1024 --group-queue-bytes=16777216 > /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.csv 2> /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.json
 ```
 
-The command writes CSV/JSON to the absolute
+The historical command used the absolute
 `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.csv`
 and
 `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.json`
@@ -80,7 +85,7 @@ Command (exit status `0`):
 /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/cedar_query_bench --path=/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined-database --operation=state-at --projection-state=canonical-only --projection-work=paused --degree=1 --selectivity-percent=1 --readers=1 --cache-state=cold --writers=32 --facts-per-txn=1024 --duration-seconds=1 --commit-deadline-us=5000000 --group-queue-requests=2048 --group-queue-bytes=33554432 > /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.csv 2> /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.json
 ```
 
-The command writes CSV/JSON to the absolute
+The historical command used the absolute
 `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.csv`
 and
 `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.json`

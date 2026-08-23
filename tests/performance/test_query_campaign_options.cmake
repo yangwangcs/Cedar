@@ -41,6 +41,49 @@ if(NOT MANIFEST MATCHES "--path=/.*")
   message(FATAL_ERROR "campaign did not normalize database paths: ${MANIFEST}")
 endif()
 
+# Admission controls are explicit campaign metadata, including when omitted.
+if(NOT MANIFEST MATCHES "--commit-deadline-us=5000000" OR
+   NOT MANIFEST MATCHES "--group-queue-requests=2048" OR
+   NOT MANIFEST MATCHES "--group-queue-bytes=33554432")
+  message(FATAL_ERROR "campaign admission controls were not applied: ${MANIFEST}")
+endif()
+file(GLOB WRITE_RUNS "${OUTPUT}/write/write-idle-five-repeats/*/run.csv")
+list(LENGTH WRITE_RUNS WRITE_RUN_COUNT)
+if(WRITE_RUN_COUNT LESS 1)
+  message(FATAL_ERROR "campaign did not produce raw run CSV metadata")
+endif()
+list(GET WRITE_RUNS 0 WRITE_RUN)
+file(READ "${WRITE_RUN}" WRITE_RAW)
+if(NOT WRITE_RAW MATCHES "commit_deadline_us,group_queue_requests,group_queue_bytes")
+  message(FATAL_ERROR "raw CSV omitted admission control columns: ${WRITE_RAW}")
+endif()
+if(NOT WRITE_RAW MATCHES ",5000000,2048,33554432,")
+  message(FATAL_ERROR "raw CSV omitted admission control values: ${WRITE_RAW}")
+endif()
+file(READ "${OUTPUT}/write/write-idle-five-repeats/repeat-1-f4-w1/run.json" WRITE_JSON)
+if(NOT WRITE_JSON MATCHES "\"commit_deadline_us\":5000000" OR
+   NOT WRITE_JSON MATCHES "\"group_queue_requests\":2048" OR
+   NOT WRITE_JSON MATCHES "\"group_queue_bytes\":33554432")
+  message(FATAL_ERROR "raw JSON omitted admission control values: ${WRITE_JSON}")
+endif()
+
+foreach(MALFORMED_ADMISSION IN ITEMS
+    "--commit-deadline-us=0"
+    "--commit-deadline-us=-1"
+    "--group-queue-requests=0"
+    "--group-queue-requests=-1"
+    "--group-queue-bytes=0"
+    "--group-queue-bytes=-1")
+  execute_process(
+    COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}" --phase read-cold
+      --duration-seconds 1 --readers 1 --degrees 1 --selectivities 1
+      --projection-states canonical "${MALFORMED_ADMISSION}" --output "${OUTPUT}/malformed-admission"
+    RESULT_VARIABLE ADMISSION_RC ERROR_VARIABLE ADMISSION_ERR)
+  if(NOT ADMISSION_RC EQUAL 2 OR NOT ADMISSION_ERR MATCHES "positive")
+    message(FATAL_ERROR "malformed admission control was accepted: ${MALFORMED_ADMISSION} (${ADMISSION_RC}) ${ADMISSION_ERR}")
+  endif()
+endforeach()
+
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}"
     --build-dir "${BUILD_DIR}"

@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <string>
 #include "benchmarks/cedar_query_bench_options.h"
+namespace cedar {
+class Database;
+}
 namespace cedar::benchmark {
 struct QueryBenchmarkResult {
   uint64_t transactions = 0;
@@ -66,6 +69,11 @@ struct QueryBenchmarkResult {
   std::string maintenance_status = "paused";
 };
 StatusOr<QueryBenchmarkResult> RunQueryBenchmark(const QueryBenchmarkOptions& options);
+// Runs the graph and score setup used by RunQueryBenchmark. This benchmark
+// helper keeps the setup transaction call sites directly testable without
+// changing Cedar's public database API or defaults.
+Status SeedQueryBenchmarkSetupForTesting(Database* database,
+                                         uint64_t commit_deadline_us);
 std::string QueryBenchmarkCsvHeader();
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions&, const QueryBenchmarkResult&);
 std::string QueryBenchmarkJson(const QueryBenchmarkOptions&, const QueryBenchmarkResult&);

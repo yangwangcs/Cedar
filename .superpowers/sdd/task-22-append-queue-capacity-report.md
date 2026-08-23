@@ -109,7 +109,7 @@ build/query-debug/tests/test_query_bench_options
 build/query-debug/tests/test_query_bench_workload
 ```
 
-Both passed (8 option tests and 3 workload tests). A release mixed benchmark
+Both passed (8 option tests and 4 workload tests). A release mixed benchmark
 with bounded admission also passed as described above.
 
 ## Concerns

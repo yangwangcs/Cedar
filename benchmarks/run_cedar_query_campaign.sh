@@ -127,7 +127,7 @@ manifest="$output/commands.manifest"
 summary="$output/summary.csv"
 summary_json="$output/summary.jsonl"
 printf 'phase,case,command\n' > "$manifest"
-printf 'phase,case,exit_code,hard_gate_pass,terminal_status,facts_per_second,end_to_end_p99_us\n' > "$summary"
+printf 'phase,case,exit_code,hard_gate_pass,terminal_status,facts_per_second,end_to_end_p99_us,wal_sync_p99_us\n' > "$summary"
 : > "$summary_json"
 overall=0
 
@@ -153,15 +153,16 @@ run_case() {
   "${cmd[@]}" > "$csv" 2> "$json"
   local rc=$?
   set -e
-  local gate=unknown terminal=unknown facts_rate=0 end_p99=0
+  local gate=unknown terminal=unknown facts_rate=0 end_p99=0 wal_sync_p99=0
   if [[ -s "$csv" ]]; then
     gate=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="hard_gate_pass") gate=i; next } NR==2 && gate { print $gate }' "$csv")
     terminal=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="terminal_status") status=i; next } NR==2 && status { print $status }' "$csv")
     facts_rate=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="facts_per_second") rate=i; next } NR==2 && rate { print $rate }' "$csv")
     end_p99=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="end_to_end_p99_us") p=i; next } NR==2 && p { print $p }' "$csv")
+    wal_sync_p99=$(awk -F, 'NR==1 { for (i=1;i<=NF;i++) if ($i=="wal_sync_p99_us") p=i; next } NR==2 && p { print $p }' "$csv")
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" >> "$summary"
-  printf '{"phase":"%s","case":"%s","exit_code":%s,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":%s,"end_to_end_p99_us":%s}\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" >> "$summary_json"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" "$wal_sync_p99" >> "$summary"
+  printf '{"phase":"%s","case":"%s","exit_code":%s,"hard_gate_pass":"%s","terminal_status":"%s","facts_per_second":%s,"end_to_end_p99_us":%s,"wal_sync_p99_us":%s}\n' "$phase" "$case_name" "$rc" "$gate" "$terminal" "$facts_rate" "$end_p99" "$wal_sync_p99" >> "$summary_json"
   if [[ "$rc" -ne 0 || "$gate" != true ]]; then overall=1; fi
 }
 
@@ -226,7 +227,37 @@ write_turning_point_artifact() {
 write_idle_overhead_artifact() {
   local source="$output/summary.csv"
   local target="$output/../write-idle-overhead.csv"
-  awk -F, '$1=="write-idle-five-repeats" && $4=="true" {rate+=$6; p99+=$7; n++} END {if (n>0) printf "samples,%d\navg_facts_per_second,%s\navg_end_to_end_p99_us,%s\n", n, rate/n, p99/n}' "$source" > "$target"
+  awk -F, '$1=="write-idle-five-repeats" && $4=="true" {rate+=$6; p99+=$7; wal+=$8; n++} END {if (n>0) printf "samples,%d\navg_facts_per_second,%s\navg_end_to_end_p99_us,%s\navg_wal_sync_p99_us,%s\n", n, rate/n, p99/n, wal/n}' "$source" > "$target"
+}
+
+compare_idle_query_overhead() {
+  local baseline="${output}/../write-idle-baseline.csv"
+  if [[ ! -f "$baseline" && -n "$input" && -f "$input/write-idle-baseline.csv" ]]; then
+    baseline="$input/write-idle-baseline.csv"
+  fi
+  local idle_rate idle_wal baseline_rate baseline_wal reason=""
+  idle_rate=$(awk -F, '$1=="write-idle-five-repeats" && $4=="true" {sum+=$6; n++} END {print n ? sum/n : ""}' "$summary")
+  idle_wal=$(awk -F, '$1=="write-idle-five-repeats" && $4=="true" {sum+=$8; n++} END {print n ? sum/n : ""}' "$summary")
+  if [[ ! -f "$baseline" ]]; then
+    reason="missing_baseline"
+  else
+    baseline_rate=$(awk -F, '$1=="avg_facts_per_second" {print $2}' "$baseline")
+    baseline_wal=$(awk -F, '$1=="avg_wal_sync_p99_us" {print $2}' "$baseline")
+    for metric in "$baseline_rate" "$baseline_wal" "$idle_rate" "$idle_wal"; do
+      if ! awk -v value="$metric" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && value+0 > 0 && value+0 < 1e308) }'; then
+        reason="invalid_baseline_metric"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$reason" ]] && awk -v base="$baseline_rate" -v idle="$idle_rate" 'BEGIN { exit !(idle >= base * 0.97) }' &&
+     awk -v base="$baseline_wal" -v idle="$idle_wal" 'BEGIN { exit !(idle <= base * 1.05) }'; then
+    return 0
+  fi
+  overall=1
+  printf '{"gate":"idle_query_overhead","pass":false,"reason":"%s","baseline":"%s","baseline_facts_per_second":%s,"idle_facts_per_second":%s,"baseline_wal_sync_p99_us":%s,"idle_wal_sync_p99_us":%s}\n' \
+    "${reason:-threshold_failure}" "${baseline:-missing}" "${baseline_rate:-null}" "${idle_rate:-null}" "${baseline_wal:-null}" "${idle_wal:-null}" >> "$summary_json"
+  return 1
 }
 
 compare_active_overhead() {
@@ -579,8 +610,8 @@ run_artifact_audit() {
   fi
   printf '{"phase":"%s","input":"%s","run_files":%d,"rows":%d,"pass":%s,"failed_rows":%d}\n' \
     "$phase" "$input" "$input_run_count" "$total_rows" "$audit_pass" "$failed_rows" > "$audit_json"
-  printf '%s,%s,%s,%s,%s,%s,%s\n' "$phase" "input-artifacts" "$audit_exit" \
-    "$audit_gate" "$audit_terminal" 0 0 >> "$summary"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "input-artifacts" "$audit_exit" \
+    "$audit_gate" "$audit_terminal" 0 0 0 >> "$summary"
   printf '{"phase":"%s","input":"%s","status":"%s","run_files":%d,"rows":%d,"failed_rows":%d}\n' \
     "$phase" "$input" "$audit_pass" "$input_run_count" "$total_rows" "$failed_rows" >> "$summary_json"
 }
@@ -588,7 +619,7 @@ run_artifact_audit() {
 for phase in "${phases[@]}"; do
   case "$phase" in
     release-calibration) [[ "$facts_auto" == false ]] || { echo "release-calibration cannot consume auto-turning-point without a prior artifact" >&2; exit 2; }; while IFS= read -r facts; do run_case "$phase" "calibration-f${facts}" cold paused state-at "$facts" 1 8 10 1 canonical-only; done < <(csv_values "$facts_values" facts-per-txn); write_turning_point_artifact || { echo "release calibration produced no valid turning-point artifact" >&2; overall=1; } ;;
-    write-idle-five-repeats) while IFS= read -r facts; do for repeat in 1 2 3 4 5; do while IFS= read -r writers; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold paused state-at "$facts" "$writers" 8 10 1 canonical-only; done < <(csv_values "$writers_values" writers); done; done < <(csv_values "$facts_values" facts-per-txn); write_idle_overhead_artifact ;;
+    write-idle-five-repeats) while IFS= read -r facts; do for repeat in 1 2 3 4 5; do while IFS= read -r writers; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold paused state-at "$facts" "$writers" 8 10 1 canonical-only; done < <(csv_values "$writers_values" writers); done; done < <(csv_values "$facts_values" facts-per-txn); write_idle_overhead_artifact; compare_idle_query_overhead || true ;;
     write-active-projection-five-repeats) while IFS= read -r facts; do for repeat in 1 2 3 4 5; do while IFS= read -r writers; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold active state-at "$facts" "$writers" 8 10 1 canonical-only; done < <(csv_values "$writers_values" writers); done; done < <(csv_values "$facts_values" facts-per-txn); compare_active_overhead || true ;;
     read-cold) for operation in state-at history events changes expand-out expand-in expand-both property-filter temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration; do while IFS= read -r readers; do while IFS= read -r degree; do while IFS= read -r selectivity; do while IFS= read -r projection; do run_case "$phase" "cold-${operation}-r${readers}-d${degree}-s${selectivity}-p${projection}" cold paused "$operation" 16 1 "$readers" "$degree" "$selectivity" "$(projection_value "$projection")"; done < <(csv_values "$projection_states" projection-states); done < <(csv_values "$selectivities_values" selectivities); done < <(csv_values "$degrees_values" degrees); done < <(csv_values "$readers_values" readers); done ;;
     read-warm) for operation in state-at history events changes expand-out expand-in expand-both property-filter temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration; do while IFS= read -r readers; do while IFS= read -r degree; do while IFS= read -r selectivity; do while IFS= read -r projection; do run_case "$phase" "warm-${operation}-r${readers}-d${degree}-s${selectivity}-p${projection}" warm paused "$operation" 16 1 "$readers" "$degree" "$selectivity" "$(projection_value "$projection")"; done < <(csv_values "$projection_states" projection-states); done < <(csv_values "$selectivities_values" selectivities); done < <(csv_values "$degrees_values" degrees); done < <(csv_values "$readers_values" readers); done ;;

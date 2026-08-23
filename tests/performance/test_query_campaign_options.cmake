@@ -14,10 +14,23 @@ execute_process(
     --writers 1,2
     --output "${OUTPUT}/write"
   RESULT_VARIABLE RC OUTPUT_VARIABLE OUT ERROR_VARIABLE ERR)
-if(NOT RC EQUAL 0)
+if(NOT RC MATCHES "^[01]$")
   message(FATAL_ERROR "campaign write option contract failed: ${ERR}\n${OUT}")
 endif()
 file(READ "${OUTPUT}/write/commands.manifest" MANIFEST)
+file(READ "${OUTPUT}/write/summary.csv" WRITE_SUMMARY)
+if(NOT WRITE_SUMMARY MATCHES "phase,case,exit_code,hard_gate_pass,terminal_status,facts_per_second,end_to_end_p99_us,wal_sync_p99_us")
+  message(FATAL_ERROR "campaign summary omitted wal_sync_p99_us: ${WRITE_SUMMARY}")
+endif()
+if(NOT EXISTS "${OUTPUT}/write-idle-overhead.csv")
+  message(FATAL_ERROR "write idle campaign did not produce its aggregate artifact")
+endif()
+file(READ "${OUTPUT}/write-idle-overhead.csv" WRITE_IDLE)
+if(NOT WRITE_IDLE MATCHES "avg_facts_per_second" OR
+   NOT WRITE_IDLE MATCHES "avg_end_to_end_p99_us" OR
+   NOT WRITE_IDLE MATCHES "avg_wal_sync_p99_us")
+  message(FATAL_ERROR "write idle artifact omitted a required metric: ${WRITE_IDLE}")
+endif()
 if(NOT MANIFEST MATCHES "--facts-per-txn=4" OR NOT MANIFEST MATCHES "--facts-per-txn=16")
   message(FATAL_ERROR "facts-per-txn was not applied to campaign commands: ${MANIFEST}")
 endif()
@@ -200,6 +213,20 @@ if(NOT ACTIVE_VALID_RC MATCHES "^[01]$")
 endif()
 if(ACTIVE_VALID_SUMMARY MATCHES "missing_baseline" OR ACTIVE_VALID_SUMMARY MATCHES "invalid_avg_")
   message(FATAL_ERROR "valid baseline was rejected as missing or malformed: ${ACTIVE_VALID_SUMMARY}")
+endif()
+
+file(MAKE_DIRECTORY "${OUTPUT}/idle-baseline-invalid")
+file(WRITE "${OUTPUT}/idle-baseline-invalid/write-idle-baseline.csv"
+  "samples,1\navg_facts_per_second,999999999\navg_end_to_end_p99_us,1\navg_wal_sync_p99_us,1\n")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase write-idle-five-repeats --duration-seconds 1
+    --facts-per-txn 1 --writers 1 --input "${OUTPUT}/idle-baseline-invalid"
+    --output "${OUTPUT}/idle-threshold-failure"
+  RESULT_VARIABLE IDLE_THRESHOLD_RC)
+file(READ "${OUTPUT}/idle-threshold-failure/summary.jsonl" IDLE_THRESHOLD_SUMMARY)
+if(IDLE_THRESHOLD_RC EQUAL 0 OR NOT IDLE_THRESHOLD_SUMMARY MATCHES "idle_query_overhead.*threshold_failure")
+  message(FATAL_ERROR "idle query overhead threshold failure was not enforced: ${IDLE_THRESHOLD_RC}\n${IDLE_THRESHOLD_SUMMARY}")
 endif()
 
 execute_process(

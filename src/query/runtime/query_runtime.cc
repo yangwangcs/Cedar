@@ -699,6 +699,18 @@ StatusOr<ValidTimeInterval> ScopeAsInterval(const TemporalScope& scope) {
   }, scope);
 }
 
+bool ExpressionUsesSlot(const internal::ExpressionNode& expression,
+                        SlotId slot) {
+  if (expression.kind() == internal::ExpressionKind::kSlot &&
+      expression.slot() == slot) {
+    return true;
+  }
+  for (const auto& child : expression.children()) {
+    if (child && ExpressionUsesSlot(*child, slot)) return true;
+  }
+  return false;
+}
+
 StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation,
@@ -718,9 +730,18 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   // predicates here before frontier expansion. Otherwise a WHERE clause on a
   // source property is ignored and the journey/path operator searches from
   // every canonical entity (an accidental multiplicative scan).
-  if (!plan.property_bindings.empty()) {
+  std::vector<internal::PreparedPropertyBinding> seed_bindings;
+  if (plan.graph_source_slot && plan.predicate) {
+    for (const auto& binding : plan.property_bindings) {
+      if (binding.source == *plan.graph_source_slot &&
+          ExpressionUsesSlot(*plan.predicate, binding.output.slot)) {
+        seed_bindings.push_back(binding);
+      }
+    }
+  }
+  if (!seed_bindings.empty()) {
     seeds = BindPropertyRows(snapshot, std::move(seeds).ConsumeValueOrDie(),
-                             plan.property_bindings);
+                             seed_bindings);
     if (!seeds.ok()) return seeds.status();
   }
   if (plan.predicate) {
@@ -750,13 +771,19 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   std::vector<RuntimeRow> result;
   for (const RuntimeRow& seed : seeds.ValueOrDie()) {
     VertexRef vertex{seed.ref.part_id(), VertexId{seed.ref.entity_id()}};
-    internal::GraphExpansionRequest request{{vertex}, interval.ValueOrDie(),
+    ValidTimeInterval expansion_interval = interval.ValueOrDie();
+    if (seed.effective.has_value()) {
+      auto clipped = internal::Intersect(expansion_interval, *seed.effective);
+      if (!clipped.has_value()) continue;
+      expansion_interval = *clipped;
+    }
+    internal::GraphExpansionRequest request{{vertex}, expansion_interval,
                                             plan.graph_expand->direction,
                                             plan.graph_expand->edge_type};
     if (plan.graph_journey != 0) {
       internal::JourneyRequest journey_request;
       journey_request.source = vertex;
-      journey_request.interval = interval.ValueOrDie();
+      journey_request.interval = expansion_interval;
       journey_request.duration_property = plan.graph_duration_property;
       journey_request.max_hops = plan.graph_k_hops;
       journey_request.direction = plan.graph_expand->direction;
@@ -766,7 +793,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
       discovery_options.reservation = nullptr;
       auto discovered = internal::KHopExpand(
           snapshot,
-          internal::GraphExpansionRequest{{vertex}, interval.ValueOrDie(),
+          internal::GraphExpansionRequest{{vertex}, expansion_interval,
                                            plan.graph_expand->direction,
                                            plan.graph_expand->edge_type},
           discovery_options);

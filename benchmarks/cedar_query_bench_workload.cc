@@ -291,7 +291,8 @@ Status BuildBenchmarkProjection(const std::string& database_path,
 
 Status ExecutePublicOperation(Database* database, Snapshot snapshot,
                               QueryBenchmarkOperation op, uint32_t max_hops,
-                              uint64_t limit, uint64_t* rows,
+                              uint64_t limit, uint32_t readers,
+                              uint64_t* rows,
                               uint64_t* first_result_us) {
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("vertex");
   Slot<EdgeRef> edge = Slot<EdgeRef>::Named("edge");
@@ -302,6 +303,15 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
   const TemporalScope state_scope = At{ValidTime{1}};
   const TemporalScope interval_scope = Events{ValidTimeInterval{ValidTime{0}, ValidTime{100}}};
   const ExpandSpec expand{vertex, edge, destination, ExpandDirection::kOut, 1};
+  auto graph_vertices = [&]() -> StatusOr<Query> {
+    auto base = Query::Vertices(vertex, state_scope);
+    if (!base.ok()) return base.status();
+    OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score");
+    auto with_score = base.ValueOrDie().BindVertexProperty(
+        vertex, BenchmarkGraph::kScore, score);
+    if (!with_score.ok()) return with_score.status();
+    return with_score.ValueOrDie().Where(IsPresent(score));
+  };
   switch (op) {
     case QueryBenchmarkOperation::kStateAt:
       built = Query::Vertices(vertex, state_scope);
@@ -318,7 +328,7 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
     case QueryBenchmarkOperation::kExpandOut:
     case QueryBenchmarkOperation::kExpandIn:
     case QueryBenchmarkOperation::kExpandBoth: {
-      auto base = Query::Vertices(vertex, state_scope);
+      auto base = graph_vertices();
       if (!base.ok()) return base.status();
       ExpandSpec spec = expand;
       spec.direction = op == QueryBenchmarkOperation::kExpandIn
@@ -330,13 +340,13 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
       break;
     }
     case QueryBenchmarkOperation::kKHop: {
-      auto base = Query::Vertices(vertex, state_scope);
+      auto base = graph_vertices();
       if (!base.ok()) return base.status();
       built = base.ValueOrDie().KHopExpand(expand, max_hops);
       break;
     }
     case QueryBenchmarkOperation::kCoexistingShortestPath: {
-      auto base = Query::Vertices(vertex, state_scope);
+      auto base = graph_vertices();
       if (!base.ok()) return base.status();
       built = base.ValueOrDie().CoexistingShortestPath(expand, max_hops, path);
       break;
@@ -354,15 +364,15 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
       auto with_score = base.ValueOrDie().BindVertexProperty(
           vertex, BenchmarkGraph::kScore, score);
       if (!with_score.ok()) return with_score.status();
-      auto graph_vertices = with_score.ValueOrDie().Where(IsPresent(score));
-      if (!graph_vertices.ok()) return graph_vertices.status();
+      auto journey_vertices = with_score.ValueOrDie().Where(IsPresent(score));
+      if (!journey_vertices.ok()) return journey_vertices.status();
       built = op == QueryBenchmarkOperation::kEarliestArrival
-                  ? graph_vertices.ValueOrDie().EarliestArrival(
+                  ? journey_vertices.ValueOrDie().EarliestArrival(
                         expand, max_hops, BenchmarkGraph::kDuration, journey)
                   : op == QueryBenchmarkOperation::kLatestDeparture
-                        ? graph_vertices.ValueOrDie().LatestDeparture(
+                        ? journey_vertices.ValueOrDie().LatestDeparture(
                               expand, max_hops, BenchmarkGraph::kDuration, journey)
-                        : graph_vertices.ValueOrDie().FastestDuration(
+                        : journey_vertices.ValueOrDie().FastestDuration(
                               expand, max_hops, BenchmarkGraph::kDuration, journey);
       break;
     }
@@ -415,6 +425,14 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
   // as a consumer-side limit while leaving enough budget for one batch; a
   // small cap must not turn a valid public query into ResourceExhausted.
   const uint64_t execution_budget = std::max<uint64_t>(limit, 1'000'000);
+  constexpr uint64_t kBenchmarkQueryPoolMemoryBytes = 128ULL << 20;
+  constexpr uint64_t kMinimumInteractiveQueryMemoryBytes = 4ULL << 20;
+  // The benchmark's reader matrix shares a fixed Cedar query pool. Divide
+  // that pool across the configured readers so 8/32 concurrent readers are
+  // admitted without inflating the storage profile's global allocation.
+  options.budget.memory_bytes = std::max<uint64_t>(
+      kMinimumInteractiveQueryMemoryBytes,
+      kBenchmarkQueryPoolMemoryBytes / std::max<uint32_t>(1, readers));
   options.budget.output_rows = execution_budget;
   options.budget.decoded_rows = execution_budget;
   auto cursor = prepared.ValueOrDie().Execute(std::move(snapshot), Bindings{}, options);
@@ -438,7 +456,8 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
 
 Status ExecuteOperation(Database* database, Snapshot snapshot,
                         QueryBenchmarkOperation op,
-                        uint32_t max_hops, uint64_t limit, uint64_t* rows,
+                        uint32_t max_hops, uint64_t limit, uint32_t readers,
+                        uint64_t* rows,
                         uint64_t* first_result_us = nullptr) {
   if (!QueryBenchmarkOperationSupported(op)) {
     return Status::NotSupported("query benchmark",
@@ -450,7 +469,7 @@ Status ExecuteOperation(Database* database, Snapshot snapshot,
       op != QueryBenchmarkOperation::kLatestDeparture &&
       op != QueryBenchmarkOperation::kFastestDuration) {
     return ExecutePublicOperation(database, std::move(snapshot), op, max_hops,
-                                  limit, rows, first_result_us);
+                                  limit, readers, rows, first_result_us);
   }
   const auto started = Clock::now();
   auto finish = [&](uint64_t count) {
@@ -737,9 +756,17 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   db_options.storage_profile = StorageProfile::kProductionAppend;
   db_options.production.memory_budget_bytes = 1ULL << 30;
   db_options.production.kernel_mode = true;
+  // Reserve enough of the fixed production budget for the benchmark's
+  // 32-reader query matrix without allowing the default block cache to crowd
+  // out Cedar's explicit query pool.
+  db_options.production.block_cache_bytes = 256ULL << 20;
   db_options.group_commit_max_queue_requests = options.group_queue_requests;
   db_options.group_commit_max_queue_bytes = options.group_queue_bytes;
-  db_options.query_runtime.query_memory_bytes = 32ULL << 20;
+  // The benchmark intentionally exercises the 1/8/32-reader matrix. Expand
+  // only the worker admission limit; query memory remains a fixed Cedar-owned
+  // pool and each interactive query receives its proportional budget above.
+  db_options.query_runtime.query_memory_bytes = 128ULL << 20;
+  db_options.query_runtime.query_workers = std::max<uint32_t>(4, options.readers);
   db_options.query_runtime.projection_cache_bytes = 32ULL << 20;
   db_options.query_runtime.query_delta_bytes = 32ULL << 20;
   auto opened = Database::Open(db_options);
@@ -983,7 +1010,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     uint64_t warm_rows = 0;
     const Status warm_status = ExecuteOperation(
         database.get(), std::move(warm_snapshot).ConsumeValueOrDie(), options.operation, options.max_hops,
-        options.result_limit,
+        options.result_limit, options.readers,
         &warm_rows);
     if (!warm_status.ok()) return warm_status;
     result.cache_conditioned = true;
@@ -1013,7 +1040,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       uint64_t local_rows = 0;
       uint64_t first_result_us = 0;
       const Status s = ExecuteOperation(database.get(), std::move(snapshot).ConsumeValueOrDie(), options.operation,
-                                        options.max_hops, options.result_limit,
+                                        options.max_hops, options.result_limit, options.readers,
                                         &local_rows, &first_result_us);
       if (!s.ok()) {
         std::lock_guard<std::mutex> lock(query_mutex);

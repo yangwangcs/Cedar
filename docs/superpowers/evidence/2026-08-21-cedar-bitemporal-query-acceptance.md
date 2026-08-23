@@ -89,13 +89,14 @@ timed operation elapsed values is `2163.412 s` (at least the required 1800 s).
 | latest-departure | 17497.6 |
 | fastest-duration | 14262.8 |
 
-Because the strict space gate below fails, this mixed run is raw workload
-observation/partial evidence only. The ten rows' `hard_gate_pass=true` values
-are case-level runner results, not the complete Release acceptance gate: the
-idle/active write gates and cold/warm read matrices were not rerun, and the
-mixed rows report WAL-sync p99 `10,000 us` and end-to-end p99 range
-`6,975,545..12,707,197 us`. This is not Cedar capability evidence and must not
-be used to claim acceptance or general Cedar performance capability.
+The strict space audit passes separately below, but this mixed run remains raw
+workload observation/partial evidence only. The ten rows' `hard_gate_pass=true`
+values are case-level runner results, not the complete Release acceptance gate:
+the idle/active write gates, cold/warm read matrices, and a fresh Release
+rerun were not completed. The mixed rows also report WAL-sync p99 `10,000 us`
+and end-to-end p99 range `6,975,545..12,707,197 us`. This is not complete Cedar
+capability evidence and must not be used to claim full acceptance or general
+Cedar performance capability.
 
 ## Curated reopen verification
 

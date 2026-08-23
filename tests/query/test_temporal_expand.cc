@@ -445,4 +445,71 @@ TEST(TemporalExpandTest, GraphMaterializesSourceEdgeAndDestinationProperties) {
   std::filesystem::remove_all(path);
 }
 
+TEST(TemporalExpandTest, SourcePropertyPredicateDoesNotDuplicateTemporalExpansion) {
+  char pattern[] = "/tmp/cedar_temporal_expand_property_predicate_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  ASSERT_TRUE(database.ValueOrDie()->RegisterProperty(PropertyDefinition{
+      PropertyId{7}, 0, "score", PropertyEntityKind::kVertex,
+      PhysicalType::kInt64, 4096}).ok());
+  const VertexRef source{PartId{0}, VertexId{1}};
+  const VertexRef target{PartId{0}, VertexId{2}};
+  const EdgeRef edge{PartId{0}, EdgeId{9}};
+  auto transaction = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(source),
+                                               ValidTime{0}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(target),
+                                               ValidTime{0}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EdgeIdentity{edge, source, target, 1}, ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(source, PropertyId{7}),
+                        ValidTime{0}, Value::Int64(11))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(source, PropertyId{7}),
+                        ValidTime{5}, Value::Int64(22))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> source_slot = Slot<VertexRef>::Named("source_predicate");
+  Slot<EdgeRef> edge_slot = Slot<EdgeRef>::Named("edge_predicate");
+  Slot<VertexRef> target_slot = Slot<VertexRef>::Named("target_predicate");
+  OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score_predicate");
+  auto source_query = Query::Vertices(
+      source_slot, History{ValidTimeInterval{ValidTime{0}, ValidTime{10}}});
+  ASSERT_TRUE(source_query.ok());
+  auto expanded = source_query.ValueOrDie().Expand(
+      ExpandSpec{source_slot, edge_slot, target_slot, ExpandDirection::kOut});
+  ASSERT_TRUE(expanded.ok());
+  auto bound = expanded.ValueOrDie().BindVertexProperty(
+      source_slot, PropertyId{7}, score);
+  ASSERT_TRUE(bound.ok());
+  auto filtered = bound.ValueOrDie().Where(
+      GreaterThan(ValueOf(score), Literal<int64_t>(0)));
+  ASSERT_TRUE(filtered.ok());
+  auto projected = filtered.ValueOrDie().Select(
+      {Project(source_slot), Project(score)});
+  ASSERT_TRUE(projected.ok());
+  auto prepared = database.ValueOrDie()->PrepareQuery(projected.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 2U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(score, 0), 11);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(score, 1), 22);
+  database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
 }  // namespace cedar::internal

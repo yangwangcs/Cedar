@@ -82,6 +82,30 @@ TEST(QueryBenchWorkload, VerifiesExistingDatabaseAcrossReopen) {
   EXPECT_EQ(mismatch.ValueOrDie().terminal_status, "reopen verification failed");
 }
 
+TEST(QueryBenchWorkload, ReaderMatrixHasEnoughQueryAdmissionCapacity) {
+  for (const uint32_t readers : {8U, 32U}) {
+    const std::string path = TestPath(
+        readers == 8 ? "reader-admission-capacity-8"
+                     : "reader-admission-capacity-32");
+    ScopedPathCleanup cleanup(path);
+    QueryBenchmarkOptions options;
+    options.path = path;
+    options.degree = 1;
+    options.readers = readers;
+    options.duration_seconds = 1;
+    options.facts_per_txn = 16;
+    options.verify_reopen = true;
+
+    auto result = RunQueryBenchmark(options);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_TRUE(result.ValueOrDie().hard_gate_pass)
+        << "readers=" << readers << ": "
+        << result.ValueOrDie().terminal_status;
+    EXPECT_EQ(result.ValueOrDie().terminal_status, "OK");
+    EXPECT_TRUE(result.ValueOrDie().reopen_verified);
+  }
+}
+
 TEST(QueryBenchWorkload, SpaceAmplificationUsesDerivedProjectionBytes) {
   QueryBenchmarkOptions options;
   QueryBenchmarkResult result;

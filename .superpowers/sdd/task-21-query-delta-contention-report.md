@@ -68,4 +68,3 @@ not a replacement for Task 20's stable matrix. It confirms a large throughput
 improvement over Task 20's active 18,715.4 facts/s, but the active projection
 gate is still not fully restored (residual projection indexing CPU/queue lag
 remains). No benchmark threshold was changed.
-

@@ -41,4 +41,3 @@ ctest --test-dir build/query-debug --output-on-failure \
 
 Result: all selected tests passed (36/36 in the focused query/canonical/
 projection run; 3/3 crash-matrix tests).
-

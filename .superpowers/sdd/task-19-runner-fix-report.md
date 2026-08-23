@@ -36,4 +36,3 @@ Date: 2026-08-22
   QueryCampaignOptionsContract` was started but interrupted because the
   contract launches multiple real benchmark matrices; no passing result is
   claimed from that run.
-

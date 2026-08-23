@@ -32,4 +32,3 @@ ctest --test-dir build/query-debug --output-on-failure \
 
 The 200-seed exhaustive temporal journey oracle is included in this gate and
 passed. `git diff --check` also passed for the implementation and test files.
-

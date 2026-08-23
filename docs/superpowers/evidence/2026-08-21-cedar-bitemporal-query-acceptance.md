@@ -13,7 +13,7 @@ residual and is not represented as passing evidence.
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `b5b802d` (`test: make query campaign API surface and space gates explicit`)
+- Source snapshot: `a4e84df` (`fix: batch graph property bindings and classify journey benchmark`)
 - Evidence commit: this final document is the acceptance record; the evidence
   commit is the commit that contains this finalized document (the source
   snapshot above is the audited implementation point).
@@ -143,6 +143,13 @@ current workload does not have a truthful base/short-delta/long-delta/partial
 coverage fixture. The campaign therefore has no real projected-data space
 row; the shell branch for projected payload accounting is contract-tested with
 synthetic data and must not be read as projected capability evidence.
+
+The CSV campaign records `state-at`, history/events/changes, property-filter,
+expansion, k-hop, and coexisting-path through the public Query/PreparedQuery/
+QueryCursor surface. Temporal aggregate, interval join, and the three journey
+objectives are explicitly labeled `internal-operator` because the benchmark
+fixture cannot yet produce a truthful public journey result; public journey
+contracts remain covered by the query unit suite.
 
 Key artifact SHA-256 values:
 

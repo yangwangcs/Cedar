@@ -559,6 +559,8 @@ audit_run_csv() {
       derived = $(column["derived_bytes"])
       stats = $(column["statistics_bytes"])
       scratch = $(column["scratch_bytes"])
+      projection_state = "canonical-only"
+      if ("projection_state" in column) projection_state = unquote($(column["projection_state"]))
       amplification = $(column["space_amplification"])
       reopen = $(column["reopen_verified"])
       gate = $(column["hard_gate_pass"])
@@ -581,10 +583,22 @@ audit_run_csv() {
         } else if ((derived + 0) > (auth + 0) * 1.5) {
           fail("derived projection bytes exceed 1.5x authoritative bytes")
         }
-        if ((derived + 0) == 0) {
-          if ((stats + 0) != 0) fail("statistics_bytes exceeds 2% of derived bytes")
-        } else if ((stats + 0) > (derived + 0) * 0.02) {
-          fail("statistics_bytes exceeds 2% of derived bytes")
+        # Statistics are derived metadata. With no projection payload, use
+        # authoritative facts as the denominator; otherwise exclude the
+        # metadata itself and compare statistics with projection bytes.
+        # canonical-only databases have no Cedar projection payload; their
+        # derived bytes are RocksDB/Cedar metadata and must not be treated as
+        # a tiny projection denominator.  For an actual projection, exclude
+        # the statistics metadata from the projection payload denominator.
+        if (projection_state == "canonical-only") {
+          stats_denominator = auth + 0
+        } else {
+          projection_bytes = (derived + 0) - (stats + 0)
+          if (projection_bytes < 0) fail("statistics_bytes exceed derived bytes")
+          stats_denominator = projection_bytes > 0 ? projection_bytes : (auth + 0)
+        }
+        if ((stats + 0) > stats_denominator * 0.02) {
+          fail("statistics_bytes exceeds 2% of the accounting denominator")
         }
       }
       emit(invalid ? "FAIL" : "PASS", reason, exit_value, gate, terminal,

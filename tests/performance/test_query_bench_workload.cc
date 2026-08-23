@@ -105,6 +105,7 @@ TEST(QueryBenchWorkload, SpaceAmplificationUsesDerivedProjectionBytes) {
   };
   EXPECT_EQ(field("space_amplification"), "0");
   EXPECT_EQ(field("total_space_amplification"), "10");
+  EXPECT_EQ(field("query_api_surface"), "\"public\"");
 }
 
 TEST(QueryBenchWorkload, AppendAdmissionMetadataIncludesConfiguredControls) {
@@ -125,6 +126,17 @@ TEST(QueryBenchWorkload, AppendAdmissionMetadataIncludesConfiguredControls) {
   EXPECT_NE(json.find("\"commit_deadline_us\":500000"), std::string::npos);
   EXPECT_NE(json.find("\"group_queue_requests\":2048"), std::string::npos);
   EXPECT_NE(json.find("\"group_queue_bytes\":33554432"), std::string::npos);
+  EXPECT_NE(json.find("\"query_api_surface\":\"public\""), std::string::npos);
+}
+
+TEST(QueryBenchWorkload, RecordsInternalOperatorSurfaceExplicitly) {
+  QueryBenchmarkOptions options;
+  options.operation = QueryBenchmarkOperation::kTemporalAggregate;
+  QueryBenchmarkResult result;
+  result.query_api_surface = "internal-operator";
+  const std::string json = QueryBenchmarkJson(options, result);
+  EXPECT_NE(json.find("\"query_api_surface\":\"internal-operator\""),
+            std::string::npos);
 }
 
 TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {

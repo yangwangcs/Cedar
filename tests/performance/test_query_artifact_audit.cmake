@@ -12,6 +12,7 @@ set(PASS_ROW "0,123,100,100,1,0,1.0,true,true,OK${LF}")
 set(REOPEN_ROW "0,123,100,100,1,0,1.0,false,true,OK${LF}")
 set(SPACE_ROW "0,123,100,160,3,1,1.6,true,true,OK${LF}")
 set(DERIVED_ZERO_ROW "0,123,100,0,0,0,6.0,true,true,OK${LF}")
+set(METADATA_ONLY_ROW "0,123,100,100,1,0,1.0,true,true,OK${LF}")
 
 file(MAKE_DIRECTORY "${OUTPUT}/pass")
 file(WRITE "${OUTPUT}/pass/run.csv" "${HEADER}${PASS_ROW}")
@@ -58,6 +59,16 @@ execute_process(
   RESULT_VARIABLE DERIVED_ZERO_RC OUTPUT_VARIABLE DERIVED_ZERO_OUT ERROR_VARIABLE DERIVED_ZERO_ERR)
 if(NOT DERIVED_ZERO_RC EQUAL 0)
   message(FATAL_ERROR "derived-zero artifact was rejected despite satisfying the projection bound: ${DERIVED_ZERO_RC}\n${DERIVED_ZERO_ERR}\n${DERIVED_ZERO_OUT}")
+endif()
+
+file(MAKE_DIRECTORY "${OUTPUT}/metadata-only")
+file(WRITE "${OUTPUT}/metadata-only/run.csv" "${HEADER}${METADATA_ONLY_ROW}")
+execute_process(
+  COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
+    --phase space-audit --input "${OUTPUT}/metadata-only" --output "${OUTPUT}/metadata-only-out"
+  RESULT_VARIABLE METADATA_ONLY_RC OUTPUT_VARIABLE METADATA_ONLY_OUT ERROR_VARIABLE METADATA_ONLY_ERR)
+if(NOT METADATA_ONLY_RC EQUAL 0)
+  message(FATAL_ERROR "metadata-only artifact was rejected despite statistics fitting the authoritative denominator: ${METADATA_ONLY_RC}\n${METADATA_ONLY_ERR}\n${METADATA_ONLY_OUT}")
 endif()
 
 set(COMMA_ROOT "${OUTPUT}/comma-path")

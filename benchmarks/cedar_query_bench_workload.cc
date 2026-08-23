@@ -289,13 +289,156 @@ Status BuildBenchmarkProjection(const std::string& database_path,
   return opened.ValueOrDie()->Build(build);
 }
 
-Status ExecuteOperation(Database* database, Snapshot& snapshot,
+Status ExecutePublicOperation(Database* database, Snapshot snapshot,
+                              QueryBenchmarkOperation op, uint32_t max_hops,
+                              uint64_t limit, uint64_t* rows,
+                              uint64_t* first_result_us) {
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("vertex");
+  Slot<EdgeRef> edge = Slot<EdgeRef>::Named("edge");
+  Slot<VertexRef> destination = Slot<VertexRef>::Named("destination");
+  Slot<PathValue> path = Slot<PathValue>::Named("path");
+  Slot<JourneyValue> journey = Slot<JourneyValue>::Named("journey");
+  StatusOr<Query> built(Status::InvalidArgument("query benchmark", "operation not public"));
+  const TemporalScope state_scope = At{ValidTime{1}};
+  const TemporalScope interval_scope = Events{ValidTimeInterval{ValidTime{0}, ValidTime{100}}};
+  const ExpandSpec expand{vertex, edge, destination, ExpandDirection::kOut, 1};
+  switch (op) {
+    case QueryBenchmarkOperation::kStateAt:
+      built = Query::Vertices(vertex, state_scope);
+      break;
+    case QueryBenchmarkOperation::kHistory:
+      built = Query::Vertices(vertex, History{ValidTimeInterval{ValidTime{0}, ValidTime{100}}});
+      break;
+    case QueryBenchmarkOperation::kEvents:
+      built = Query::Vertices(vertex, interval_scope);
+      break;
+    case QueryBenchmarkOperation::kChanges:
+      built = Query::Vertices(vertex, Changes{ValidTimeInterval{ValidTime{0}, ValidTime{100}}});
+      break;
+    case QueryBenchmarkOperation::kExpandOut:
+    case QueryBenchmarkOperation::kExpandIn:
+    case QueryBenchmarkOperation::kExpandBoth: {
+      auto base = Query::Vertices(vertex, state_scope);
+      if (!base.ok()) return base.status();
+      ExpandSpec spec = expand;
+      spec.direction = op == QueryBenchmarkOperation::kExpandIn
+                           ? ExpandDirection::kIn
+                           : op == QueryBenchmarkOperation::kExpandBoth
+                                 ? ExpandDirection::kBoth
+                                 : ExpandDirection::kOut;
+      built = base.ValueOrDie().Expand(spec);
+      break;
+    }
+    case QueryBenchmarkOperation::kKHop: {
+      auto base = Query::Vertices(vertex, state_scope);
+      if (!base.ok()) return base.status();
+      built = base.ValueOrDie().KHopExpand(expand, max_hops);
+      break;
+    }
+    case QueryBenchmarkOperation::kCoexistingShortestPath: {
+      auto base = Query::Vertices(vertex, state_scope);
+      if (!base.ok()) return base.status();
+      built = base.ValueOrDie().CoexistingShortestPath(expand, max_hops, path);
+      break;
+    }
+    case QueryBenchmarkOperation::kEarliestArrival:
+    case QueryBenchmarkOperation::kLatestDeparture:
+    case QueryBenchmarkOperation::kFastestDuration: {
+      auto base = Query::Vertices(vertex, state_scope);
+      if (!base.ok()) return base.status();
+      built = op == QueryBenchmarkOperation::kEarliestArrival
+                  ? base.ValueOrDie().EarliestArrival(expand, max_hops,
+                                                       BenchmarkGraph::kDuration,
+                                                       journey)
+                  : op == QueryBenchmarkOperation::kLatestDeparture
+                        ? base.ValueOrDie().LatestDeparture(
+                              expand, max_hops, BenchmarkGraph::kDuration, journey)
+                        : base.ValueOrDie().FastestDuration(
+                              expand, max_hops, BenchmarkGraph::kDuration, journey);
+      break;
+    }
+    case QueryBenchmarkOperation::kPropertyFilter: {
+      auto base = Query::Vertices(vertex, state_scope);
+      if (!base.ok()) return base.status();
+      OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score");
+      auto bound = base.ValueOrDie().BindVertexProperty(
+          vertex, BenchmarkGraph::kScore, score);
+      if (!bound.ok()) return bound.status();
+      built = bound.ValueOrDie().Where(
+          IsPresent(score) &&
+          GreaterThan(ValueOf(score), Literal<int64_t>(0)));
+      break;
+    }
+    default:
+      return Status::NotSupported("query benchmark", "operator has no public API");
+  }
+  if (!built.ok()) return built.status();
+  StatusOr<Query> projected = built.ValueOrDie().Select([&] {
+    switch (op) {
+      case QueryBenchmarkOperation::kStateAt:
+      case QueryBenchmarkOperation::kHistory:
+      case QueryBenchmarkOperation::kEvents:
+      case QueryBenchmarkOperation::kChanges:
+        return std::vector<Projection>{Project(vertex)};
+      case QueryBenchmarkOperation::kExpandOut:
+      case QueryBenchmarkOperation::kExpandIn:
+      case QueryBenchmarkOperation::kExpandBoth:
+      case QueryBenchmarkOperation::kKHop:
+        return std::vector<Projection>{Project(destination)};
+      case QueryBenchmarkOperation::kCoexistingShortestPath:
+        return std::vector<Projection>{Project(path)};
+      case QueryBenchmarkOperation::kEarliestArrival:
+      case QueryBenchmarkOperation::kLatestDeparture:
+      case QueryBenchmarkOperation::kFastestDuration:
+        return std::vector<Projection>{Project(journey)};
+      case QueryBenchmarkOperation::kPropertyFilter:
+        return std::vector<Projection>{Project(vertex)};
+      default:
+        return std::vector<Projection>{};
+    }
+  }());
+  if (!projected.ok()) return projected.status();
+  auto prepared = database->PrepareQuery(projected.ValueOrDie());
+  if (!prepared.ok()) return prepared.status();
+  QueryOptions options;
+  options.mode = QueryExecutionMode::kInteractive;
+  // The runtime materializes whole batches. Keep the benchmark's result cap
+  // as a consumer-side limit while leaving enough budget for one batch; a
+  // small cap must not turn a valid public query into ResourceExhausted.
+  const uint64_t execution_budget = std::max<uint64_t>(limit, 1'000'000);
+  options.budget.output_rows = execution_budget;
+  options.budget.decoded_rows = execution_budget;
+  auto cursor = prepared.ValueOrDie().Execute(std::move(snapshot), Bindings{}, options);
+  if (!cursor.ok()) return cursor.status();
+  uint64_t count = 0;
+  const auto started = Clock::now();
+  for (;;) {
+    auto batch = cursor.ValueOrDie().Next();
+    if (!batch.ok()) return batch.status();
+    if (!batch.ValueOrDie().has_value()) break;
+    count += batch.ValueOrDie()->row_count();
+    if (count >= limit) break;
+  }
+  *rows += std::min(count, limit);
+  if (first_result_us != nullptr && count != 0) {
+    *first_result_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+  }
+  return cursor.ValueOrDie().Close();
+}
+
+Status ExecuteOperation(Database* database, Snapshot snapshot,
                         QueryBenchmarkOperation op,
                         uint32_t max_hops, uint64_t limit, uint64_t* rows,
                         uint64_t* first_result_us = nullptr) {
   if (!QueryBenchmarkOperationSupported(op)) {
     return Status::NotSupported("query benchmark",
                                 QueryBenchmarkOperationName(op));
+  }
+  if (op != QueryBenchmarkOperation::kTemporalAggregate &&
+      op != QueryBenchmarkOperation::kIntervalJoin) {
+    return ExecutePublicOperation(database, std::move(snapshot), op, max_hops,
+                                  limit, rows, first_result_us);
   }
   const auto started = Clock::now();
   auto finish = [&](uint64_t count) {
@@ -592,6 +735,11 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   auto database = std::move(opened).ConsumeValueOrDie();
   QueryBenchmarkResult result;
   result.raw_sample_path = options.path;
+  result.query_api_surface =
+      (options.operation == QueryBenchmarkOperation::kTemporalAggregate ||
+       options.operation == QueryBenchmarkOperation::kIntervalJoin)
+          ? "internal-operator"
+          : "public";
 #ifdef NDEBUG
   result.build_type = "release";
 #else
@@ -819,7 +967,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     if (!warm_snapshot.ok()) return warm_snapshot.status();
     uint64_t warm_rows = 0;
     const Status warm_status = ExecuteOperation(
-        database.get(), warm_snapshot.ValueOrDie(), options.operation, options.max_hops,
+        database.get(), std::move(warm_snapshot).ConsumeValueOrDie(), options.operation, options.max_hops,
         options.result_limit,
         &warm_rows);
     if (!warm_status.ok()) return warm_status;
@@ -849,7 +997,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       const auto start = Clock::now();
       uint64_t local_rows = 0;
       uint64_t first_result_us = 0;
-      const Status s = ExecuteOperation(database.get(), snapshot.ValueOrDie(), options.operation,
+      const Status s = ExecuteOperation(database.get(), std::move(snapshot).ConsumeValueOrDie(), options.operation,
                                         options.max_hops, options.result_limit,
                                         &local_rows, &first_result_us);
       if (!s.ok()) {
@@ -1019,7 +1167,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
 }
 
 std::string QueryBenchmarkCsvHeader() {
-  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,commit_deadline_us,group_queue_requests,group_queue_bytes,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,total_space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
+  return "operation,projection_state,degree,selectivity_percent,readers,cache_state,writers,facts_per_txn,commit_deadline_us,group_queue_requests,group_queue_bytes,seed,verify_existing,expected_facts,expected_checksum,dataset_checksum,transactions,facts,measured_transactions,measured_facts,rows,elapsed_seconds,write_elapsed_seconds,query_elapsed_seconds,transactions_per_second,facts_per_second,query_qps,rows_per_second,mib_per_second,write_mib_per_second,query_mib_per_second,query_physical_bytes,query_bytes_complete,group_fill_p50,query_samples,query_p50_us,query_p95_us,query_p99_us,first_result_p50_us,write_p50_us,write_p95_us,write_p99_us,wal_sync_p99_us,end_to_end_p99_us,authoritative_bytes,adjacency_bytes,property_bytes,statistics_bytes,derived_bytes,scratch_bytes,engine_internal_bytes,wal_manifest_bytes,total_bytes,write_amplification,space_amplification,total_space_amplification,projection_lag,projection_work,maintenance_status,maintenance_observed,cache_conditioned,query_api_surface,operation_supported,projection_state_supported,metrics_complete,build_type,sanitizer,host,plan_fingerprint,raw_sample_path,storage_inspection_status,terminal_status,reopen_verified,gate_classification,hard_gate_pass";
 }
 
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
@@ -1055,6 +1203,7 @@ std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions& o,
     << r.projection_lag << ',' << CsvEscape(r.projection_active ? "active" : "paused") << ','
     << CsvEscape(r.maintenance_status) << ',' << (r.maintenance_observed ? "true" : "false") << ','
     << (r.cache_conditioned ? "true" : "false") << ','
+    << CsvEscape(r.query_api_surface) << ','
     << (r.operation_supported ? "true" : "false") << ','
     << (r.projection_state_supported ? "true" : "false") << ','
     << (r.metrics_complete ? "true" : "false") << ','
@@ -1114,6 +1263,7 @@ std::string QueryBenchmarkJson(const QueryBenchmarkOptions& o,
     << "\",\"seed\":" << o.seed << ",\"dataset_checksum\":"
     << r.dataset_checksum << ",\"cache_conditioned\":"
     << (r.cache_conditioned ? "true" : "false")
+    << ",\"query_api_surface\":\"" << JsonEscape(r.query_api_surface) << "\""
     << ",\"operation_supported\":" << (r.operation_supported ? "true" : "false")
     << ",\"projection_state_supported\":"
     << (r.projection_state_supported ? "true" : "false")

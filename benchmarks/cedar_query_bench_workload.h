@@ -68,6 +68,7 @@ struct QueryBenchmarkResult {
   std::string raw_sample_path;
   std::string storage_inspection_status = "OK";
   std::string maintenance_status = "paused";
+  std::string query_api_surface = "public";
 };
 StatusOr<QueryBenchmarkResult> RunQueryBenchmark(const QueryBenchmarkOptions& options);
 // Runs the graph and score setup used by RunQueryBenchmark. This benchmark

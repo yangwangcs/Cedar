@@ -555,12 +555,14 @@ void ComputeSpaceMetrics(QueryBenchmarkResult* result) {
 }  // namespace
 
 Status SeedQueryBenchmarkSetupForTesting(Database* database,
-                                         uint64_t commit_deadline_us) {
+                                         uint64_t commit_deadline_us,
+                                         std::function<void()> after_graph_commit_for_testing) {
   const BenchmarkGraph graph;
   if (Status status = SeedGraph(database, graph, commit_deadline_us);
       !status.ok()) {
     return status;
   }
+  if (after_graph_commit_for_testing) after_graph_commit_for_testing();
   return SeedBenchmarkScore(database, graph, commit_deadline_us);
 }
 

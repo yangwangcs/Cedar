@@ -136,10 +136,13 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
   size_t released_collections = 0;
   size_t setup_admission_calls = 0;
   size_t released_setup_admissions = 0;
+  size_t released_setup_admission_observations = 0;
   size_t enqueued_calls = 0;
   std::thread::id setup_thread_id;
-  std::vector<Status> blocker_statuses(
-      3, Status::InvalidArgument("test", "not attempted"));
+  std::thread first_blocker_thread;
+  std::thread blocker_thread;
+  Status first_blocker_status = Status::InvalidArgument("test", "not attempted");
+  Status blocker_status = Status::InvalidArgument("test", "not attempted");
 
   DatabaseOptions database_options;
   database_options.path = path;
@@ -158,7 +161,7 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
     ++collection_calls;
     const size_t call = collection_calls;
     cv.notify_all();
-    if (call <= 4) {
+    if (call == 1 || call == 3) {
       cv.wait_for(lock, std::chrono::seconds(2), [&] {
         return released_collections >= call;
       });
@@ -170,11 +173,13 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
     ++setup_admission_calls;
     const size_t call = setup_admission_calls;
     cv.notify_all();
-    if (call <= 2) {
+    if (call <= 2)
       cv.wait_for(lock, std::chrono::seconds(2), [&] {
         return released_setup_admissions >= call;
       });
-    }
+    released_setup_admission_observations =
+        std::max(released_setup_admission_observations, call);
+    cv.notify_all();
   };
   database_options.append_commit_enqueued_observer_for_testing = [&] {
     std::lock_guard<std::mutex> lock(mutex);
@@ -191,32 +196,6 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
       PropertyId{8}, 0, "score", PropertyEntityKind::kVertex,
       PhysicalType::kInt64, 4096}).ok());
 
-  auto launch_blocker = [&](size_t index) {
-    return std::thread([&, index] {
-      auto blocker = database->BeginTransaction();
-      if (!blocker.ok()) {
-        std::lock_guard<std::mutex> lock(mutex);
-        blocker_statuses[index] = blocker.status();
-        cv.notify_all();
-        return;
-      }
-      const Status asserted = blocker.ValueOrDie()->Assert(
-          EntityFact::Vertex(
-              VertexRef{PartId{0}, VertexId{900001 + index}}),
-          ValidTime{1});
-      if (!asserted.ok()) {
-        std::lock_guard<std::mutex> lock(mutex);
-        blocker_statuses[index] = asserted;
-        cv.notify_all();
-        return;
-      }
-      const auto committed = blocker.ValueOrDie()->Commit();
-      std::lock_guard<std::mutex> lock(mutex);
-      blocker_statuses[index] = committed.ok() ? committed.ValueOrDie().status
-                                                : committed.status();
-      cv.notify_all();
-    });
-  };
   auto wait_for = [&](auto predicate, const char* message) {
     std::unique_lock<std::mutex> lock(mutex);
     const bool observed = cv.wait_for(lock, std::chrono::seconds(2), predicate);
@@ -226,16 +205,41 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
   auto release_all = [&] {
     {
       std::lock_guard<std::mutex> lock(mutex);
-      released_collections = 4;
+      released_collections = 3;
       released_setup_admissions = 2;
     }
     cv.notify_all();
   };
 
-  std::thread blocker_threads[3];
-  blocker_threads[0] = launch_blocker(0);
-  if (!wait_for([&] { return collection_calls >= 1; },
-                "first append collection hook was not observed")) {
+  auto commit_blocker = [&](uint64_t vertex_id, Status* status) {
+    return std::thread([&, vertex_id, status] {
+      auto transaction = database->BeginTransaction();
+      if (!transaction.ok()) {
+        std::lock_guard<std::mutex> lock(mutex);
+        *status = transaction.status();
+        cv.notify_all();
+        return;
+      }
+      const Status asserted = transaction.ValueOrDie()->Assert(
+          EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}),
+          ValidTime{1});
+      if (!asserted.ok()) {
+        std::lock_guard<std::mutex> lock(mutex);
+        *status = asserted;
+        cv.notify_all();
+        return;
+      }
+      const auto committed = transaction.ValueOrDie()->Commit();
+      std::lock_guard<std::mutex> lock(mutex);
+      *status = committed.ok() ? committed.ValueOrDie().status
+                               : committed.status();
+      cv.notify_all();
+    });
+  };
+
+  first_blocker_thread = commit_blocker(900000, &first_blocker_status);
+  if (!wait_for([&] { return collection_calls >= 1 && enqueued_calls >= 1; },
+                "first staged commit was not observed")) {
     release_all();
   }
 
@@ -246,66 +250,48 @@ TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
       setup_thread_id = std::this_thread::get_id();
       cv.notify_all();
     }
-    setup_status = SeedQueryBenchmarkSetupForTesting(database.get(), 500000);
+    setup_status = SeedQueryBenchmarkSetupForTesting(
+        database.get(), 500000, [&] {
+          blocker_thread = commit_blocker(900001, &blocker_status);
+          const bool staged = wait_for(
+              [&] { return collection_calls >= 3 && enqueued_calls >= 3; },
+              "second staged commit was not observed");
+          if (!staged) release_all();
+        });
     cv.notify_all();
   });
 
   wait_for([&] { return setup_admission_calls >= 1; },
            "SeedGraph admission hook was not observed");
-  blocker_threads[1] = launch_blocker(1);
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    released_collections = 1;
-  }
-  cv.notify_all();
-  wait_for([&] { return collection_calls >= 2 && enqueued_calls >= 2; },
-           "second blocker did not occupy the append queue");
   {
     std::lock_guard<std::mutex> lock(mutex);
     released_setup_admissions = 1;
   }
   cv.notify_all();
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  wait_for([&] { return released_setup_admission_observations >= 1; },
+           "SeedGraph admission observer did not release");
   {
     std::lock_guard<std::mutex> lock(mutex);
-    released_collections = 2;
+    released_collections = 1;
   }
   cv.notify_all();
-  wait_for([&] { return collection_calls >= 3 && enqueued_calls >= 3; },
-           "SeedGraph was not queued behind the second blocker");
-
-  blocker_threads[2] = launch_blocker(2);
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    released_collections = 3;
-  }
-  cv.notify_all();
-  wait_for([&] { return setup_admission_calls >= 2 && collection_calls >= 4 &&
-                        enqueued_calls >= 4; },
-           "SeedBenchmarkScore was not staged behind the third blocker");
+  wait_for([&] { return setup_admission_calls >= 2; },
+           "SeedBenchmarkScore admission hook was not observed");
   {
     std::lock_guard<std::mutex> lock(mutex);
     released_setup_admissions = 2;
+    released_collections = 2;
   }
   cv.notify_all();
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    released_collections = 4;
-  }
-  cv.notify_all();
-
   release_all();
   setup.join();
-  for (auto& thread : blocker_threads) {
-    if (thread.joinable()) thread.join();
-  }
+  if (first_blocker_thread.joinable()) first_blocker_thread.join();
+  if (blocker_thread.joinable()) blocker_thread.join();
   EXPECT_EQ(setup_admission_calls, 2U);
-  EXPECT_GE(enqueued_calls, 5U);
+  EXPECT_GE(enqueued_calls, 4U);
   EXPECT_TRUE(setup_status.ok()) << setup_status.ToString();
-  for (const Status& status : blocker_statuses) {
-    EXPECT_TRUE(status.ok()) << status.ToString();
-  }
+  EXPECT_TRUE(first_blocker_status.ok()) << first_blocker_status.ToString();
+  EXPECT_TRUE(blocker_status.ok()) << blocker_status.ToString();
   ASSERT_TRUE(database->Close().ok());
 }
 }  // namespace cedar::benchmark

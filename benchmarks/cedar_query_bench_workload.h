@@ -1,6 +1,7 @@
 #ifndef CEDAR_BENCHMARKS_CEDAR_QUERY_BENCH_WORKLOAD_H_
 #define CEDAR_BENCHMARKS_CEDAR_QUERY_BENCH_WORKLOAD_H_
 #include <cstdint>
+#include <functional>
 #include <string>
 #include "benchmarks/cedar_query_bench_options.h"
 namespace cedar {
@@ -73,7 +74,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(const QueryBenchmarkOptions& op
 // helper keeps the setup transaction call sites directly testable without
 // changing Cedar's public database API or defaults.
 Status SeedQueryBenchmarkSetupForTesting(Database* database,
-                                         uint64_t commit_deadline_us);
+                                         uint64_t commit_deadline_us,
+                                         std::function<void()> after_graph_commit_for_testing = {});
 std::string QueryBenchmarkCsvHeader();
 std::string QueryBenchmarkCsvRow(const QueryBenchmarkOptions&, const QueryBenchmarkResult&);
 std::string QueryBenchmarkJson(const QueryBenchmarkOptions&, const QueryBenchmarkResult&);

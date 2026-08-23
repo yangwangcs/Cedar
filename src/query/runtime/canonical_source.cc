@@ -11,23 +11,27 @@ namespace cedar::internal {
 
 StatusOr<std::vector<VertexRef>> CanonicalSource::ReadVerticesAt(
     Snapshot& snapshot, ValidTime valid_time) {
-  std::map<uint64_t, std::vector<FactEvent>> chains;
-  FactScanSpec scan;
-  scan.part_id = PartId{0};
-  scan.family = FactFamily::kVertexState;
-  scan.property_id = PropertyId{};
-  scan.valid_time = valid_time;
-  const Status scanned = snapshot.EventScan(
-      scan, [&chains](const FactEventBatch& batch) {
-        for (const FactEvent& event : batch.events) {
-          chains[event.ref.entity_id()].push_back(event);
-        }
+  struct VertexKey {
+    PartId part_id;
+    uint64_t entity_id = 0;
+
+    bool operator<(const VertexKey& other) const {
+      if (part_id.value != other.part_id.value) {
+        return part_id.value < other.part_id.value;
+      }
+      return entity_id < other.entity_id;
+    }
+  };
+  std::map<VertexKey, std::vector<FactEvent>> chains;
+  const Status scanned = snapshot.ScanFamily(
+      FactFamily::kVertexState, [&chains](const FactEvent& event) {
+        chains[{event.ref.part_id(), event.ref.entity_id()}].push_back(event);
         return Status::OK();
       });
   if (!scanned.ok()) return scanned;
 
   std::vector<VertexRef> vertices;
-  for (const auto& [entity_id, events] : chains) {
+  for (const auto& [key, events] : chains) {
     const auto corrected =
         ResolveCorrectedBoundaries(events, snapshot.commit_seq());
     if (!corrected.ok()) return corrected.status();
@@ -39,7 +43,7 @@ StatusOr<std::vector<VertexRef>> CanonicalSource::ReadVerticesAt(
           valid_time.value < boundaries[index + 1].valid_from.value;
       if (contains && boundaries[index].operation == FactOperation::kPut) {
         vertices.push_back(
-            VertexRef{PartId{0}, VertexId{entity_id}});
+            VertexRef{key.part_id, VertexId{key.entity_id}});
       }
       if (contains) break;
     }

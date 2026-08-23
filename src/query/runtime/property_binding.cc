@@ -62,9 +62,11 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
   auto property_states = TemporalSource::ReadHistory(
       snapshot, family, definition.property_id, std::nullopt);
   if (!property_states.ok()) return property_states.status();
-  std::map<uint64_t, std::vector<StateRow>> states_by_entity;
+  using PropertyKey = std::pair<uint32_t, uint64_t>;
+  std::map<PropertyKey, std::vector<StateRow>> states_by_entity;
   for (StateRow& state : property_states.ValueOrDie()) {
-    states_by_entity[state.ref.entity_id()].push_back(std::move(state));
+    states_by_entity[{state.ref.part_id().value, state.ref.entity_id()}].push_back(
+        std::move(state));
   }
 
   std::vector<BoundPropertyRow> result;
@@ -79,7 +81,8 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
     }
 
     ValidTime cursor = entity.effective.from;
-    const auto found = states_by_entity.find(entity.ref.entity_id());
+    const auto found = states_by_entity.find(
+        {entity.ref.part_id().value, entity.ref.entity_id()});
     if (found != states_by_entity.end()) {
       for (const StateRow& property : found->second) {
         const auto clipped = Intersect(entity.effective, property.effective);

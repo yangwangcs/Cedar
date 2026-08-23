@@ -1646,9 +1646,13 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (recovered_visible.value > projection_base.value) {
     auto recovery_snapshot = impl->store.BeginSnapshot();
     if (recovery_snapshot.ok()) {
+      if (impl->query_delta_repair_budget_observer_for_testing) {
+        impl->query_delta_repair_budget_observer_for_testing(
+            configured_delta_bytes);
+      }
       const Status repaired = impl->query_delta->RepairThrough(
           impl->store, recovery_snapshot.ValueOrDie(), recovered_visible,
-          internal::QueryDeltaRepairLimits{262144, 512ULL << 20});
+          internal::QueryDeltaRepairLimits{262144, configured_delta_bytes});
       if (!repaired.ok()) {
         // Never advance the derived base past a failed repair. Keep the
         // observed base and force canonical fallback until Cedar maintenance

@@ -192,6 +192,30 @@ TEST_F(KernelLifecycleTest, KernelDataReopensThroughKernelProfile) {
   ASSERT_TRUE(reopened->Close().ok());
 }
 
+TEST_F(KernelLifecycleTest, RecoveryRepairUsesConfiguredQueryDeltaByteBudget) {
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  auto transaction = Begin();
+  ASSERT_TRUE(transaction);
+  ASSERT_TRUE(transaction
+                  ->Assert(EntityFact::Vertex(
+                               VertexRef{PartId{0}, VertexId{1}}),
+                           ValidTime{1})
+                  .ok());
+  ASSERT_TRUE(transaction->Commit().ok());
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  uint64_t observed_budget = 0;
+  DatabaseOptions options;
+  options.query_runtime.query_delta_bytes = 1;
+  options.query_delta_repair_budget_observer_for_testing =
+      [&observed_budget](uint64_t budget) { observed_budget = budget; };
+  database_ = Open(std::move(options));
+  ASSERT_TRUE(database_);
+  EXPECT_EQ(observed_budget, 1U);
+}
+
 TEST_F(KernelLifecycleTest, LiveSnapshotPinsCloseButReleaseAllowsRetryAndReopen) {
   database_ = Open();
   ASSERT_TRUE(database_);

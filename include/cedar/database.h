@@ -220,6 +220,9 @@ struct DatabaseOptions {
   // Open-order observer used by recovery tests. Names are
   // authoritative_recovery, query_delta_repaired, and derived_loaded.
   std::function<void(const char*)> query_open_stage_observer_for_testing;
+  // Recovery test hook exposing the configured QueryDelta repair byte cap.
+  std::function<void(uint64_t)>
+      query_delta_repair_budget_observer_for_testing;
   // Test-only lifecycle switch for exercising shutdown discard accounting.
   // Production keeps the normal drain-before-stop ordering.
   bool stop_pipeline_before_drain_for_testing = false;

@@ -3,6 +3,7 @@
 
 #include "cedar/snapshot.h"
 
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -393,6 +394,14 @@ Status Snapshot::EventColumnarScanFamily(
     const std::vector<FactColumnId>& projection,
     const FactColumnarBatchVisitor& visitor) const {
   if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
+  if (!visitor) return Status::InvalidArgument("columnar scan", "missing visitor");
+  if (projection.empty()) {
+    return Status::InvalidArgument("columnar scan", "missing projection");
+  }
+  std::set<FactColumnId> unique_projection(projection.begin(), projection.end());
+  if (unique_projection.size() != projection.size()) {
+    return Status::InvalidArgument("columnar scan", "duplicate projection column");
+  }
   FactColumnarScanOptions options;
   options.projection = projection;
   return state_->database->store.ScanColumnarFamily(

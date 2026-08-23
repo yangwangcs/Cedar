@@ -273,6 +273,8 @@ Status BuildBenchmarkProjection(const std::string& database_path,
     }
     chain.intervals.push_back({ValidTimeInterval{ValidTime{0}, ValidTime{20}},
                                Value::Int64(1), graph.corrected.vertex_id.value});
+    chain.intervals.push_back({ValidTimeInterval{ValidTime{30}, ValidTime{100}},
+                               Value::Int64(1), graph.corrected.vertex_id.value});
     for (uint64_t id = 1; id <= seed_facts; ++id) {
       chain.intervals.push_back({ValidTimeInterval{ValidTime{1}, std::nullopt},
                                  Value::Int64(1), id});
@@ -1018,7 +1020,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       uint64_t delta_transactions = 0;
       uint64_t delta_committed_facts = 0;
       if (Status status = ApplyProjectionDelta(
-              database.get(), seed_facts + 1000, delta_facts,
+              database.get(), 1, delta_facts,
               options.commit_deadline_us, &delta_transactions,
               &delta_committed_facts);
           !status.ok()) {

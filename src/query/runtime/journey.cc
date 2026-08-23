@@ -146,12 +146,10 @@ Status ValidateCallbackFifo(const JourneyRequest& request,
   return Status::OK();
 }
 
-StatusOr<std::optional<ValidDuration>> PropertyDuration(
-    Snapshot& snapshot, EdgeRef edge, ValidTime time,
-    const JourneyRequest& request, const QueryDeltaView* delta) {
-  if (request.duration_at) return request.duration_at(edge, time);
-  if (!request.duration_property) return std::optional<ValidDuration>{};
-  const FactRef ref = PropertyFact::Edge(edge, *request.duration_property).ref();
+StatusOr<std::vector<StateInterval>> DurationIntervals(
+    Snapshot& snapshot, EdgeRef edge, PropertyId property,
+    const QueryDeltaView* delta) {
+  const FactRef ref = PropertyFact::Edge(edge, property).ref();
   std::vector<FactEvent> events;
   FactScanSpec spec;
   spec.part_id = ref.part_id();
@@ -170,37 +168,86 @@ StatusOr<std::optional<ValidDuration>> PropertyDuration(
   }
   auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
   if (!corrected.ok()) return corrected.status();
-  auto intervals = MaterializePresentState(corrected.ValueOrDie());
+  return MaterializePresentState(corrected.ValueOrDie());
+}
+
+StatusOr<ValidDuration> DurationValue(const Value& raw) {
+  switch (raw.type()) {
+    case PhysicalType::kInt32: {
+      const int32_t value = std::get<int32_t>(raw.data());
+      if (value < 0) return Status::InvalidArgument("journey", "duration is negative");
+      return ValidDuration{static_cast<uint64_t>(value)};
+    }
+    case PhysicalType::kInt64: {
+      const int64_t value = std::get<int64_t>(raw.data());
+      if (value < 0) return Status::InvalidArgument("journey", "duration is negative");
+      return ValidDuration{static_cast<uint64_t>(value)};
+    }
+    case PhysicalType::kTimestamp64:
+      return ValidDuration{std::get<uint64_t>(raw.data())};
+    default:
+      return Status::SchemaMismatch("journey", "duration must be numeric");
+  }
+}
+
+// Registered durations are piecewise constant over valid-time intervals.  A
+// time-dependent edge is FIFO exactly when the arrival times at each segment
+// boundary never decrease.  Checking the first and last departure of each
+// segment is complete because t + duration is monotone inside a segment.
+Status ValidatePropertyFifo(Snapshot& snapshot, EdgeRef edge,
+                            const ValidTimeInterval& effective,
+                            PropertyId property, const QueryDeltaView* delta) {
+  auto intervals = DurationIntervals(snapshot, edge, property, delta);
+  if (!intervals.ok()) return intervals.status();
+  std::optional<uint64_t> previous_arrival;
+  for (const StateInterval& state : intervals.ValueOrDie()) {
+    auto clipped = Intersect(state.interval, effective);
+    if (!clipped || !state.value) continue;
+    auto duration = DurationValue(*state.value);
+    if (!duration.ok()) return duration.status();
+    const uint64_t first = clipped->from.value;
+    auto first_arrival = AddDuration(ValidTime{first}, duration.ValueOrDie());
+    if (!first_arrival.ok()) return first_arrival.status();
+    if (previous_arrival && first_arrival.ValueOrDie().value < *previous_arrival) {
+      return Status::NotSupported("journey", "registered duration is non-FIFO");
+    }
+    if (!clipped->to) {
+      if (duration.ValueOrDie().value != 0) {
+        auto terminal = AddDuration(
+            ValidTime{std::numeric_limits<uint64_t>::max()},
+            duration.ValueOrDie());
+        if (!terminal.ok()) return terminal.status();
+      }
+      previous_arrival = first_arrival.ValueOrDie().value;
+      continue;
+    }
+    if (clipped->to->value <= first) continue;
+    const uint64_t last = clipped->to->value - 1;
+    auto last_arrival = AddDuration(ValidTime{last}, duration.ValueOrDie());
+    if (!last_arrival.ok()) return last_arrival.status();
+    previous_arrival = last_arrival.ValueOrDie().value;
+  }
+  return Status::OK();
+}
+
+StatusOr<std::optional<ValidDuration>> PropertyDuration(
+    Snapshot& snapshot, EdgeRef edge, ValidTime time,
+    const JourneyRequest& request, const QueryDeltaView* delta) {
+  if (request.duration_at) return request.duration_at(edge, time);
+  if (!request.duration_property) return std::optional<ValidDuration>{};
+  auto intervals = DurationIntervals(snapshot, edge, *request.duration_property, delta);
+  if (!intervals.ok()) return intervals.status();
   std::optional<Value> value;
-  for (const auto& interval : intervals) {
+  for (const auto& interval : intervals.ValueOrDie()) {
     if (time.value < interval.interval.from.value) continue;
     if (interval.interval.to && time.value >= interval.interval.to->value) continue;
     value = interval.value;
     break;
   }
   if (!value) return std::optional<ValidDuration>{};
-  const Value& raw = *value;
-  uint64_t duration = 0;
-  switch (raw.type()) {
-    case PhysicalType::kInt32: {
-      const int32_t v = std::get<int32_t>(raw.data());
-      if (v < 0) return Status::InvalidArgument("journey", "duration is negative");
-      duration = static_cast<uint64_t>(v);
-      break;
-    }
-    case PhysicalType::kInt64: {
-      const int64_t v = std::get<int64_t>(raw.data());
-      if (v < 0) return Status::InvalidArgument("journey", "duration is negative");
-      duration = static_cast<uint64_t>(v);
-      break;
-    }
-    case PhysicalType::kTimestamp64:
-      duration = std::get<uint64_t>(raw.data());
-      break;
-    default:
-      return Status::SchemaMismatch("journey", "duration must be numeric");
-  }
-  return std::optional<ValidDuration>{ValidDuration{duration}};
+  auto duration = DurationValue(*value);
+  if (!duration.ok()) return duration.status();
+  return std::optional<ValidDuration>{duration.ValueOrDie()};
 }
 
 StatusOr<std::vector<JourneyTraversal>> ExpandAt(
@@ -236,6 +283,13 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
       oriented.target = traversal.source;
     } else {
       continue;
+    }
+    if (request.duration_property) {
+      Status fifo = ValidatePropertyFifo(snapshot, oriented.edge,
+                                         oriented.effective,
+                                         *request.duration_property,
+                                         options.delta);
+      if (!fifo.ok()) return fifo;
     }
     ValidTime departure = arrival;
     if (departure.value < oriented.effective.from.value)
@@ -350,6 +404,13 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     }
     if (Status fifo = ValidateCallbackFifo(request, oriented); !fifo.ok())
       return fifo;
+    if (request.duration_property) {
+      Status fifo = ValidatePropertyFifo(snapshot, oriented.edge,
+                                         oriented.effective,
+                                         *request.duration_property,
+                                         options.delta);
+      if (!fifo.ok()) return fifo;
+    }
     const uint64_t lower = oriented.effective.from.value;
     if (deadline.value < lower) continue;
     uint64_t upper = deadline.value;

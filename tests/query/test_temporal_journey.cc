@@ -521,7 +521,7 @@ TEST(TemporalJourneyTest, IntervalFragmentBudgetAccumulatesAcrossExpansions) {
       << journey.status().ToString();
 }
 
-TEST(TemporalJourneyTest, PrepareRejectsUnprovenRegisteredDurationFifo) {
+TEST(TemporalJourneyTest, PublicRegisteredDurationJourneyExecutesAtSnapshot) {
   JourneyFixture graph;
   ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{
       PropertyId{7}, 0, "duration", PropertyEntityKind::kEdge,
@@ -548,9 +548,64 @@ TEST(TemporalJourneyTest, PrepareRejectsUnprovenRegisteredDurationFifo) {
                                              Project(target), Project(journey)});
   ASSERT_TRUE(selected.ok()) << selected.status().ToString();
   auto prepared = graph.database->PrepareQuery(selected.ValueOrDie());
-  ASSERT_FALSE(prepared.ok());
-  EXPECT_TRUE(prepared.status().IsNotSupportedError())
-      << prepared.status().ToString();
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  const JourneyValue value = batch.ValueOrDie()->Get<JourneyValue>(journey, 0);
+  ASSERT_EQ(value.edges.size(), 1U);
+  EXPECT_EQ(value.edges.front(), edge);
+  EXPECT_EQ(value.departures.front(), (ValidTime{0}));
+  EXPECT_EQ(value.arrivals.front(), (ValidTime{5}));
+  EXPECT_EQ(value.duration, (ValidDuration{5}));
+}
+
+TEST(TemporalJourneyTest, PublicRegisteredDurationNonFifoRejectedAtExecution) {
+  JourneyFixture graph;
+  ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{
+      PropertyId{8}, 0, "duration_non_fifo", PropertyEntityKind::kEdge,
+      PhysicalType::kInt64, 4096}).ok());
+  graph.Vertex(graph.a); graph.Vertex(graph.b);
+  const EdgeRef edge{PartId{0}, EdgeId{22}};
+  graph.Edge(edge, graph.a, graph.b, 0, 20);
+  graph.Commit([&](Transaction& txn) {
+    auto status = txn.Set(PropertyFact::Edge(edge, PropertyId{8}),
+                          ValidTime{0}, Value::Int64(10));
+    if (!status.ok()) return status;
+    return txn.Set(PropertyFact::Edge(edge, PropertyId{8}),
+                   ValidTime{10}, Value::Int64(0));
+  });
+  Slot<VertexRef> source = Slot<VertexRef>::Named("source_non_fifo");
+  Slot<EdgeRef> edge_slot = Slot<EdgeRef>::Named("edge_non_fifo");
+  Slot<VertexRef> target = Slot<VertexRef>::Named("target_non_fifo");
+  Slot<JourneyValue> journey = Slot<JourneyValue>::Named("journey_non_fifo");
+  auto source_query = Query::Vertices(
+      source, History{ValidTimeInterval{ValidTime{0}, ValidTime{20}}});
+  ASSERT_TRUE(source_query.ok());
+  auto built = source_query.ValueOrDie().EarliestArrival(
+      ExpandSpec{source, edge_slot, target, ExpandDirection::kOut}, 2,
+      PropertyId{8}, journey);
+  ASSERT_TRUE(built.ok()) << built.status().ToString();
+  auto selected = built.ValueOrDie().Select({Project(source), Project(edge_slot),
+                                             Project(target), Project(journey)});
+  ASSERT_TRUE(selected.ok()) << selected.status().ToString();
+  auto prepared = graph.database->PrepareQuery(selected.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_FALSE(batch.ok());
+  EXPECT_TRUE(batch.status().IsNotSupportedError())
+      << batch.status().ToString();
 }
 
 TEST(TemporalJourneyTest, CallbackNonFifoIsRejectedBeforeEarliestSearch) {

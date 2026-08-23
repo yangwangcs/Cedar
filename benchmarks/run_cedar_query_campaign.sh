@@ -241,12 +241,17 @@ write_turning_point_artifact() {
 write_idle_overhead_artifact() {
   local source="$output/summary.csv"
   local target="$output/../write-idle-overhead.csv"
-  local expected_points expected_samples
+  local expected_points expected_samples expected_keys="" facts writer
   local facts_metadata="${facts_values//,/|}" writers_metadata="${writers_values//,/|}"
+  while IFS= read -r facts; do
+    while IFS= read -r writer; do
+      expected_keys+="${expected_keys:+,}f${facts}-w${writer}"
+    done < <(csv_values "$writers_values" writers)
+  done < <(csv_values "$facts_values" facts-per-txn)
   expected_points=$(csv_values "$facts_values" facts-per-txn | wc -l | tr -d ' ')
   expected_points=$((expected_points * $(csv_values "$writers_values" writers | wc -l | tr -d ' ')))
   expected_samples=$((expected_points * 5))
-  if ! awk -F, -v expected="$expected_samples" '
+  if ! awk -F, -v expected="$expected_samples" -v expected_keys="$expected_keys" '
     $1=="write-idle-five-repeats" {
       total++
       if ($4=="true" && $8 ~ /^[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/ && $8+0>0) {
@@ -257,7 +262,12 @@ write_idle_overhead_artifact() {
       } else { bad=1 }
     }
     END {
-      for (key in counts) if (counts[key] != 5) bad=1
+      count_expected = split(expected_keys, expected_list, ",")
+      for (i = 1; i <= count_expected; i++) {
+        expected_set[expected_list[i]] = 1
+        if (!(expected_list[i] in counts) || counts[expected_list[i]] != 5) bad=1
+      }
+      for (key in counts) if (!(key in expected_set) || counts[key] != 5) bad=1
       if (good != expected || total != expected || bad) exit 1
       printf "samples,%d\navg_facts_per_second,%s\navg_end_to_end_p99_us,%s\navg_wal_sync_p99_us,%s\n", good, rate/good, p99/good, wal/good
     }

@@ -13,9 +13,11 @@ including the follow-up edge-case fixes from review.
   required, facts/s must remain at least 97% of baseline, and WAL-sync p99 must
   remain at most 105% of baseline. Malformed or missing metrics fail the gate.
 - Standalone idle runs now materialize a deterministic baseline from a complete
-  five-repeat aggregate; explicit input baselines remain strictly validated.
+  five-repeat aggregate as same-run calibration only; this is not independent
+  query-overhead capability evidence. Explicit input baselines remain strictly
+  validated.
 - Enforced exactly five successful samples for every facts/writers point and
-  rejected missing WAL columns in raw run CSVs.
+  rejected missing/extra matrix keys and missing WAL columns in raw run CSVs.
 - Kept audit summary CSV/JSON rows on the same metric schema, using explicit
   zero/null values for audit-only fields.
 - Encoded comma-separated matrix metadata with `|` in the key/value baseline

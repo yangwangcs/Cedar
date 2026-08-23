@@ -121,7 +121,7 @@ execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}"
     --build-dir "${BUILD_DIR}"
     --phase mixed-30-minute
-    --duration-seconds 1
+    --duration-seconds 20
     --facts-per-txn auto-turning-point
     --writers 8
     --readers 1
@@ -138,7 +138,7 @@ file(WRITE "${OUTPUT}/turning-point-input/turning-point.json"
   "{ \"facts_per_txn\" : 64, \"source_summary\" : \"peak-candidate\" }\n")
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
-    --phase mixed-30-minute --duration-seconds 1 --facts-per-txn auto-turning-point
+    --phase mixed-30-minute --duration-seconds 20 --facts-per-txn auto-turning-point
     --writers 1 --readers 1 --degrees 1 --selectivities 1
     --input "${OUTPUT}/turning-point-input" --output "${OUTPUT}/mixed-valid"
   RESULT_VARIABLE MIXED_VALID_RC OUTPUT_VARIABLE MIXED_VALID_OUT ERROR_VARIABLE MIXED_VALID_ERR)
@@ -149,6 +149,12 @@ file(READ "${OUTPUT}/mixed-valid/commands.manifest" MIXED_VALID_MANIFEST)
 if(NOT MIXED_VALID_MANIFEST MATCHES "--facts-per-txn=64")
   message(FATAL_ERROR "mixed campaign did not consume the selected turning point: ${MIXED_VALID_MANIFEST}")
 endif()
+string(REGEX MATCHALL "--duration-seconds=1" MIXED_VALID_DURATION_MATCHES
+  "${MIXED_VALID_MANIFEST}")
+list(LENGTH MIXED_VALID_DURATION_MATCHES MIXED_VALID_DURATION_COUNT)
+if(NOT MIXED_VALID_DURATION_COUNT EQUAL 10)
+  message(FATAL_ERROR "20-second mixed campaign did not assign one second to all ten cases: ${MIXED_VALID_MANIFEST}")
+endif()
 
 # The mixed duration covers both timed phases (write and query) of each of the
 # ten sequential operations. Use a stub benchmark so this contract does not
@@ -156,8 +162,18 @@ endif()
 set(MIXED_DURATION_BUILD "${OUTPUT}/mixed-duration-build")
 file(MAKE_DIRECTORY "${MIXED_DURATION_BUILD}")
 file(WRITE "${MIXED_DURATION_BUILD}/cedar_query_bench" "#!/usr/bin/env bash\nexit 0\n")
-file(CHMOD "${MIXED_DURATION_BUILD}/cedar_query_bench"
-  PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+execute_process(
+  COMMAND chmod +x "${MIXED_DURATION_BUILD}/cedar_query_bench"
+  RESULT_VARIABLE MIXED_STUB_CHMOD_RC)
+if(NOT MIXED_STUB_CHMOD_RC EQUAL 0)
+  message(FATAL_ERROR "failed to make mixed duration stub executable: ${MIXED_STUB_CHMOD_RC}")
+endif()
+execute_process(
+  COMMAND "${MIXED_DURATION_BUILD}/cedar_query_bench"
+  RESULT_VARIABLE MIXED_STUB_RC)
+if(NOT MIXED_STUB_RC EQUAL 0)
+  message(FATAL_ERROR "mixed duration stub could not run: ${MIXED_STUB_RC}")
+endif()
 execute_process(
   COMMAND bash "${CEDAR_CAMPAIGN}"
     --build-dir "${MIXED_DURATION_BUILD}"
@@ -198,7 +214,7 @@ foreach(MALFORMED_TURNING_POINT IN ITEMS
   file(WRITE "${TURNING_POINT_DIR}/turning-point.json" "${MALFORMED_TURNING_POINT}\n")
   execute_process(
     COMMAND bash "${CEDAR_CAMPAIGN}" --build-dir "${BUILD_DIR}"
-      --phase mixed-30-minute --duration-seconds 1 --facts-per-txn auto-turning-point
+      --phase mixed-30-minute --duration-seconds 20 --facts-per-txn auto-turning-point
       --input "${TURNING_POINT_DIR}" --output "${TURNING_POINT_DIR}/run"
     RESULT_VARIABLE TURNING_POINT_RC ERROR_VARIABLE TURNING_POINT_ERR)
   if(TURNING_POINT_RC EQUAL 0 OR NOT TURNING_POINT_ERR MATCHES "invalid turning-point")

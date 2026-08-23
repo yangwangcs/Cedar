@@ -149,6 +149,15 @@ case "$requested_phase" in
   *) echo "unsupported phase: $requested_phase" >&2; exit 2 ;;
 esac
 
+if [[ "$requested_phase" == all || "$requested_phase" == mixed-30-minute ]]; then
+  mixed_operation_count=10
+  mixed_min_duration=$((2 * mixed_operation_count))
+  if ((duration < mixed_min_duration)); then
+    echo "--duration-seconds must be at least ${mixed_min_duration} for mixed-30-minute (10 operations x 2 timed phases)" >&2
+    exit 2
+  fi
+fi
+
 mkdir -p "$output"
 manifest="$output/commands.manifest"
 summary="$output/summary.csv"
@@ -729,7 +738,7 @@ for phase in "${phases[@]}"; do
     write-active-projection-five-repeats) while IFS= read -r facts; do for repeat in 1 2 3 4 5; do while IFS= read -r writers; do run_case "$phase" "repeat-$repeat-f${facts}-w${writers}" cold active state-at "$facts" "$writers" 8 10 1 canonical-only; done < <(csv_values "$writers_values" writers); done; done < <(csv_values "$facts_values" facts-per-txn); compare_active_overhead || true ;;
     read-cold) for operation in state-at history events changes expand-out expand-in expand-both property-filter temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration; do while IFS= read -r readers; do while IFS= read -r degree; do while IFS= read -r selectivity; do while IFS= read -r projection; do run_case "$phase" "cold-${operation}-r${readers}-d${degree}-s${selectivity}-p${projection}" cold paused "$operation" 16 1 "$readers" "$degree" "$selectivity" "$(projection_value "$projection")"; done < <(csv_values "$projection_states" projection-states); done < <(csv_values "$selectivities_values" selectivities); done < <(csv_values "$degrees_values" degrees); done < <(csv_values "$readers_values" readers); done ;;
     read-warm) for operation in state-at history events changes expand-out expand-in expand-both property-filter temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration; do while IFS= read -r readers; do while IFS= read -r degree; do while IFS= read -r selectivity; do while IFS= read -r projection; do run_case "$phase" "warm-${operation}-r${readers}-d${degree}-s${selectivity}-p${projection}" warm paused "$operation" 16 1 "$readers" "$degree" "$selectivity" "$(projection_value "$projection")"; done < <(csv_values "$projection_states" projection-states); done < <(csv_values "$selectivities_values" selectivities); done < <(csv_values "$degrees_values" degrees); done < <(csv_values "$readers_values" readers); done ;;
-    mixed-30-minute) [[ "$facts_auto" == false ]] || facts_values="$(resolve_turning_point)"; mixed_ops=(state-at events expand-out temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration); mixed_case_duration=$(( (duration + (2 * ${#mixed_ops[@]}) - 1) / (2 * ${#mixed_ops[@]}) )); for operation in "${mixed_ops[@]}"; do run_case "$phase" "mixed-${operation}" cold active "$operation" "$(first_csv_value "$facts_values" facts-per-txn)" "$(first_csv_value "$writers_values" writers)" "$(first_csv_value "$readers_values" readers)" "$(first_csv_value "$degrees_values" degrees)" "$(first_csv_value "$selectivities_values" selectivities)" canonical-only "$mixed_case_duration"; done ;;
+    mixed-30-minute) [[ "$facts_auto" == false ]] || facts_values="$(resolve_turning_point)"; mixed_ops=(state-at events expand-out temporal-aggregate interval-join k-hop coexisting-shortest-path earliest-arrival latest-departure fastest-duration); mixed_case_duration=$(( duration / (2 * ${#mixed_ops[@]}) )); for operation in "${mixed_ops[@]}"; do run_case "$phase" "mixed-${operation}" cold active "$operation" "$(first_csv_value "$facts_values" facts-per-txn)" "$(first_csv_value "$writers_values" writers)" "$(first_csv_value "$readers_values" readers)" "$(first_csv_value "$degrees_values" degrees)" "$(first_csv_value "$selectivities_values" selectivities)" canonical-only "$mixed_case_duration"; done ;;
     reopen-verification|space-audit) run_artifact_audit "$phase" ;;
   esac
 done

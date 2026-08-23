@@ -33,7 +33,7 @@ artifacts):
 ```
 
 The command writes CSV/JSON to the absolute paths shown above; its database
-path is the absolute `.../task-22-original/baseline-database` path shown above.
+path is `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/baseline-database`.
 
 Terminal status: `ResourceExhausted: commit: append queue is full` (process
 exit 1). The run recorded 127 measured transactions / 131072 measured facts,
@@ -49,8 +49,11 @@ Command (exit status `0`):
 /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/cedar_query_bench --path=/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000-database --operation=state-at --projection-state=canonical-only --projection-work=paused --degree=1 --selectivity-percent=1 --readers=1 --cache-state=cold --writers=32 --facts-per-txn=1024 --duration-seconds=2 --commit-deadline-us=500000 --group-queue-requests=1024 --group-queue-bytes=16777216 > /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.csv 2> /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.json
 ```
 
-The command writes CSV/JSON to the absolute `.../task-22-original/deadline-500000.csv`
-and `.../task-22-original/deadline-500000.json` paths shown above.
+The command writes CSV/JSON to the absolute
+`/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.csv`
+and
+`/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/deadline-500000.json`
+paths shown above.
 
 At duration 2 s this completed with terminal status `OK` and hard gate pass.
 It recorded 304 measured transactions / 312320 measured facts. This isolates
@@ -77,8 +80,11 @@ Command (exit status `0`):
 /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/cedar_query_bench --path=/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined-database --operation=state-at --projection-state=canonical-only --projection-work=paused --degree=1 --selectivity-percent=1 --readers=1 --cache-state=cold --writers=32 --facts-per-txn=1024 --duration-seconds=1 --commit-deadline-us=5000000 --group-queue-requests=2048 --group-queue-bytes=33554432 > /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.csv 2> /Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.json
 ```
 
-The command writes CSV/JSON to the absolute `.../task-22-original/combined.csv`
-and `.../task-22-original/combined.json` paths shown above.
+The command writes CSV/JSON to the absolute
+`/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.csv`
+and
+`/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query/build/query-release/evidence/task-22-original/combined.json`
+paths shown above.
 
 With `5000000us`, 2048 requests, and 32 MiB, a 1-second run completed with
 terminal status `OK`, hard gate pass, and 100 measured transactions / 103424

@@ -59,6 +59,7 @@ struct QueryDeltaOptions {
   std::function<Status(const char*)> crash_fault_injector;
   uint64_t soft_lag_commits = 0;
   std::function<void()> worker_before_index_observer_for_testing;
+  std::function<void()> worker_after_pop_observer_for_testing;
 };
 
 struct QueryDeltaRepairLimits {
@@ -170,6 +171,7 @@ class QueryDelta {
   std::deque<QueryDeltaCommit> published_queue_;
   CommitSeq enqueued_through_;
   std::condition_variable published_cv_;
+  bool worker_indexing_ = false;
   std::thread worker_;
   bool stopping_ = false;
   bool hard_limit_reached_ = false;

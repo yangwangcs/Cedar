@@ -264,16 +264,26 @@ void QueryDelta::WorkerMain() {
     if (published_queue_.empty() && stopping_) return;
     QueryDeltaCommit commit = std::move(published_queue_.front());
     published_queue_.pop_front();
+    worker_indexing_ = true;
     queue_lock.unlock();
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (commit.commit_seq.value != indexed_through_.value + 1) {
-      SetMissingLocked(CommitSeq{indexed_through_.value + 1});
-      continue;
+    if (options_.worker_after_pop_observer_for_testing) {
+      options_.worker_after_pop_observer_for_testing();
     }
-    if (options_.worker_before_index_observer_for_testing) {
-      options_.worker_before_index_observer_for_testing();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (commit.commit_seq.value != indexed_through_.value + 1) {
+        SetMissingLocked(CommitSeq{indexed_through_.value + 1});
+      } else {
+        if (options_.worker_before_index_observer_for_testing) {
+          options_.worker_before_index_observer_for_testing();
+        }
+        IndexLocked(commit);
+      }
     }
-    IndexLocked(commit);
+    queue_lock.lock();
+    worker_indexing_ = false;
+    queue_lock.unlock();
+    published_cv_.notify_all();
   }
 }
 
@@ -281,7 +291,8 @@ Status QueryDelta::RepairThrough(const FactStore& store,
                                  const StoreSnapshot& snapshot,
                                  CommitSeq target,
                                  QueryDeltaRepairLimits limits) {
-  std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+  std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+  published_cv_.wait(queue_lock, [this] { return !worker_indexing_; });
   std::lock_guard<std::mutex> lock(mutex_);
   if (target.value <= indexed_through_.value) return Status::OK();
   if (target.value > snapshot.commit_seq().value) {
@@ -334,7 +345,8 @@ Status QueryDelta::ConsumeThrough(CommitSeq through) {
 }
 
 Status QueryDelta::RetireThrough(CommitSeq through) {
-  std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+  std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+  published_cv_.wait(queue_lock, [this] { return !worker_indexing_; });
   std::lock_guard<std::mutex> lock(mutex_);
   if (through.value < options_.base_seq.value ||
       through.value > indexed_through_.value) {
@@ -369,7 +381,8 @@ Status QueryDelta::RetireThrough(CommitSeq through) {
 }
 
 Status QueryDelta::ResetBase(CommitSeq base) {
-  std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+  std::unique_lock<std::mutex> queue_lock(queue_mutex_);
+  published_cv_.wait(queue_lock, [this] { return !worker_indexing_; });
   std::lock_guard<std::mutex> lock(mutex_);
   options_.base_seq = base;
   indexed_through_ = base;

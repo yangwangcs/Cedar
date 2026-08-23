@@ -981,10 +981,11 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     for (uint64_t id = first; id < first + committed; ++id)
       dataset_checksum.fetch_xor(id * kChecksumSalt);
   }
+  const uint64_t projection_seed_facts = next_id.load() - 1;
   // Keep timed appends disjoint from the persisted projection base. The
   // benchmark graph and append facts share one Cedar partition so a complete
   // projection fixture can be read without a cross-partition fallback.
-  next_id.store(seed_facts + 1);
+  next_id.store(projection_seed_facts + 1);
   seed_transaction_count = transactions.load();
   const bool projection_requested =
       options.projection != ProjectionState::kCanonicalOnly;
@@ -998,7 +999,8 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     if (Status closed = database->Close(); !closed.ok()) return closed;
     database.reset();
     if (Status built = BuildBenchmarkProjection(options.path, graph, base_seq,
-                                                seed_facts, options.projection);
+                                                projection_seed_facts,
+                                                options.projection);
         !built.ok()) {
       result.terminal_status = built.ToString();
       result.gate_classification = "incomplete";
@@ -1044,6 +1046,15 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       }
       transactions.fetch_add(delta_transactions);
       facts.fetch_add(delta_committed_facts);
+      // Reopen after constructing the tail so Database::Open performs the
+      // authoritative sequence-range repair before the differential check.
+      // This makes the fixture deterministic instead of racing the async
+      // QueryDelta index worker.
+      if (Status closed = database->Close(); !closed.ok()) return closed;
+      database.reset();
+      auto delta_reopened = Database::Open(db_options);
+      if (!delta_reopened.ok()) return delta_reopened.status();
+      database = std::move(delta_reopened).ConsumeValueOrDie();
     }
     {
       auto setup_snapshot = database->BeginSnapshot();
@@ -1051,6 +1062,35 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
       seeded_checksum = ScanFactChecksum(setup_snapshot.ValueOrDie());
       if (!seeded_checksum.ok()) return seeded_checksum.status();
       seed_transaction_count = transactions.load();
+    }
+  }
+  if (projection_requested) {
+    // Validate the persisted fixture against canonical truth before timed
+    // samples. This catches a projection/QueryDelta path that merely passes
+    // lifecycle gates while dropping a corrected interval or retract tail.
+    auto fixture_snapshot = database->BeginSnapshot();
+    if (!fixture_snapshot.ok()) return fixture_snapshot.status();
+    auto canonical_rows = internal::TemporalSource::ReadAt(
+        fixture_snapshot.ValueOrDie(), FactFamily::kVertexState, PropertyId{},
+        ValidTime{1});
+    if (!canonical_rows.ok()) return canonical_rows.status();
+    uint64_t projected_rows = 0;
+    Status fixture_query = ExecuteOperation(
+        database.get(), std::move(fixture_snapshot).ConsumeValueOrDie(),
+        QueryBenchmarkOperation::kStateAt, options.max_hops,
+        std::numeric_limits<uint64_t>::max(), 1, &projected_rows);
+    if (!fixture_query.ok()) {
+      result.terminal_status = fixture_query.ToString();
+      result.gate_classification = "incomplete";
+      return result;
+    }
+    if (projected_rows != canonical_rows.ValueOrDie().size()) {
+      result.terminal_status =
+          "projection fixture differs from canonical expected=" +
+          std::to_string(canonical_rows.ValueOrDie().size()) +
+          " observed=" + std::to_string(projected_rows);
+      result.gate_classification = "incomplete";
+      return result;
     }
   }
   const CommitPipelineMetrics pipeline_before_write =

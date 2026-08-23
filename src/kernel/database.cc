@@ -1508,7 +1508,8 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (options.query_runtime.query_workers == 0 ||
       options.query_runtime.reserved_interactive_workers == 0 ||
       options.query_runtime.reserved_interactive_workers > options.query_runtime.query_workers ||
-      options.query_runtime.max_prefetch_bytes == 0) {
+      options.query_runtime.max_prefetch_bytes == 0 ||
+      options.query_runtime.query_delta_bytes == 0) {
     return Status::InvalidArgument("database", "query runtime bounds are invalid");
   }
   if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
@@ -1617,6 +1618,7 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   const auto metadata_base = impl->projection_store->ReadCurrentBaseMetadata();
   const CommitSeq projection_base = metadata_base.ok()
       ? metadata_base.ValueOrDie() : CommitSeq{0};
+  const uint64_t configured_delta_bytes = options.query_runtime.query_delta_bytes;
   impl->query_delta = std::make_unique<internal::QueryDelta>(
       internal::QueryDeltaOptions{
           projection_base,
@@ -1624,11 +1626,11 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
               ? internal::kQueryDebugThresholds.delta_lag_hard_commits * 2
               : 262144,
           options.storage_profile == StorageProfile::kDebugSmallThresholds
-              ? internal::kQueryDebugThresholds.query_delta_soft_bytes
-              : 256ULL << 20,
-          options.storage_profile == StorageProfile::kDebugSmallThresholds
-              ? internal::kQueryDebugThresholds.query_delta_hard_bytes
-              : 512ULL << 20,
+              ? std::min<uint64_t>(
+                    internal::kQueryDebugThresholds.query_delta_soft_bytes,
+                    configured_delta_bytes)
+              : configured_delta_bytes,
+          configured_delta_bytes,
           options.storage_profile == StorageProfile::kDebugSmallThresholds
               ? internal::kQueryDebugThresholds.delta_lag_hard_commits
               : 262144,

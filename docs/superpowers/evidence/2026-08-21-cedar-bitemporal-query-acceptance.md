@@ -12,11 +12,26 @@ no threshold or implementation was weakened.
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
 - Source snapshot: `e6be96f6d680dbaa79d1bb1e28f8b7623c09f7f9`
+- Evidence commit: this final document is the acceptance record; the evidence
+  commit is the commit that contains this finalized document (the source
+  snapshot above is the audited implementation point).
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
 - Release benchmark: `build/query-release/cedar_query_bench`
 - Public defaults were not changed. Campaign admission was explicitly
   `commit_deadline_us=5000000`, `group_queue_requests=2048`,
   `group_queue_bytes=33554432`.
+- Dataset: canonical-only mixed workload, 32 writers/readers, 1,024
+  facts/transaction, seed `1` in every mixed row (seed range `1..1`). The
+  first Release calibration remains calibration-only; its turning-point
+  artifact is `build/query-release/evidence/calibration-final/turning-point.json`
+  (1,024 facts/transaction; calibration peak reported as 17,660 facts/s).
+- Acceptance thresholds: sustained elapsed >=1,800 s; derived projection
+  <=1.0x target and <=1.5x hard bound of authoritative live bytes; statistics
+  <=2% of projection bytes; scratch bytes zero after close/reopen.
+- The required write-idle, write-active-projection, read-cold, and read-warm
+  matrices were not rerun at this evidence point. Their results are
+  unrun/incomplete, not passing evidence. The required Release build command
+  was also not rerun at this evidence point.
 
 ## Debug, install, and sanitizer gates
 
@@ -72,8 +87,13 @@ timed operation elapsed values is `2163.412 s` (at least the required 1800 s).
 | latest-departure | 17497.6 |
 | fastest-duration | 14262.8 |
 
-This is a capability result for these exact workload parameters, not a claim
-that every graph shape or projection state has the same rate.
+Because the strict space gate below fails, this mixed run is raw workload
+observation/partial evidence only. The ten rows' `hard_gate_pass=true` values
+are case-level runner results, not the complete Release acceptance gate: the
+idle/active write gates and cold/warm read matrices were not rerun, and the
+mixed rows report WAL-sync p99 `10,000 us` and end-to-end p99 range
+`6,975,545..12,707,197 us`. This is not Cedar capability evidence and must not
+be used to claim acceptance or general Cedar performance capability.
 
 ## Curated reopen verification
 
@@ -123,6 +143,16 @@ derived metadata block is not representative. The gate remains strict. A
 projected-data campaign, or an explicitly reviewed statistics accounting model,
 is required before space acceptance can be called complete.
 
+Key artifact SHA-256 values:
+
+```text
+mixed-sustained-final2/summary.csv  fd9b6c44d9468f1adc2490f7267ef0bc6d003f87ce64016801d18c476ec9527f
+reopen-curated/audit-summary.json   e5c24ae27d711739a3be55db1ed79b8e4bf44408de5a10c7199c6cda36a6aa08
+reopen-curated/audit-summary.csv    fe37e27e8b04484d76f9b39aa034de567dbdac83e413e1f62a3a6bcaec843464
+space-curated/audit-summary.json   009335d811089fefc773c739a2da1074f9775982dbda7e6a7852f1b8d6f3b287
+space-curated/audit-summary.csv    7dca563d99ac8b4b887625b2fd44d6a9639dda5284da90b31f0fd2c786b51e7c
+```
+
 ## Historical failed probes
 
 The original `build/query-release/evidence/` tree remains intact. Its global
@@ -138,3 +168,15 @@ sustained mixed execution, and curated database reopen verification pass.
 Strict space acceptance is blocked by the canonical-only statistics ratio and
 requires a projected-data rerun or approved accounting design. No source code
 or public default changed in this evidence task.
+
+## Worktree status captured during acceptance
+
+The required `git status --short --branch` capture showed the three preserved
+pre-existing dirty reports:
+
+```text
+## codex/cedar-bitemporal-query-execution
+ M .superpowers/sdd/task-12-report.md
+ M .superpowers/sdd/task-18-groupfill-contract-fix-report.md
+ M .superpowers/sdd/task-18-report.md
+```

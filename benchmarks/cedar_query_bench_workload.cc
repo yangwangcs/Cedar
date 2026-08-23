@@ -61,6 +61,15 @@ uint64_t EventChecksum(const FactEvent& event) {
   return value;
 }
 
+uint64_t VertexRowsChecksum(const std::vector<VertexRef>& rows) {
+  uint64_t checksum = 0;
+  for (const VertexRef& vertex : rows) {
+    checksum ^= (vertex.vertex_id.value * kChecksumSalt) ^
+                (static_cast<uint64_t>(vertex.part_id.value) << 48);
+  }
+  return checksum;
+}
+
 StatusOr<std::pair<uint64_t, uint64_t>> ScanFactChecksum(
     const Snapshot& snapshot) {
   uint64_t count = 0;
@@ -323,13 +332,20 @@ Status ApplyProjectionDelta(Database* database, uint64_t first,
     auto transaction = database->BeginTransaction(
         TransactionOptions{.commit_deadline_us = commit_deadline_us});
     if (!transaction.ok()) return transaction.status();
-    const VertexRef vertex{PartId{0}, VertexId{first}};
+    // Use a real retract/assert pair per entity.  At valid time 1 the
+    // retract removes the base interval, while the valid-time-2 assert makes
+    // the same entity visible again only after the queried point.  This keeps
+    // the long-delta fixture observable instead of repeatedly asserting one
+    // already-present fact at the same time.
+    const VertexRef vertex{PartId{0}, VertexId{first + i / 2}};
+    const ValidTime valid_time{
+        static_cast<uint64_t>((i % 2 == 0) ? 1 : 2)};
     const Status mutation =
         (i % 2 == 0)
             ? transaction.ValueOrDie()->Retract(EntityFact::Vertex(vertex),
-                                                ValidTime{1})
+                                                valid_time)
             : transaction.ValueOrDie()->Assert(EntityFact::Vertex(vertex),
-                                               ValidTime{1});
+                                               valid_time);
     if (!mutation.ok()) return mutation;
     auto committed = transaction.ValueOrDie()->Commit();
     if (!committed.ok()) return committed.status();
@@ -346,7 +362,8 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
                               QueryBenchmarkOperation op, uint32_t max_hops,
                               uint64_t limit, uint32_t readers,
                               uint64_t* rows,
-                              uint64_t* first_result_us) {
+                              uint64_t* first_result_us,
+                              std::vector<VertexRef>* typed_vertex_rows = nullptr) {
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("vertex");
   Slot<EdgeRef> edge = Slot<EdgeRef>::Named("edge");
   Slot<VertexRef> destination = Slot<VertexRef>::Named("destination");
@@ -500,7 +517,13 @@ Status ExecutePublicOperation(Database* database, Snapshot snapshot,
     auto batch = cursor.ValueOrDie().Next();
     if (!batch.ok()) return batch.status();
     if (!batch.ValueOrDie().has_value()) break;
-    count += batch.ValueOrDie()->row_count();
+    const QueryBatch& query_batch = *batch.ValueOrDie();
+    if (typed_vertex_rows != nullptr && op == QueryBenchmarkOperation::kStateAt) {
+      for (size_t row = 0; row < query_batch.row_count(); ++row) {
+        typed_vertex_rows->push_back(query_batch.Get<VertexRef>(vertex, row));
+      }
+    }
+    count += query_batch.row_count();
     if (count >= limit) break;
   }
   *rows += std::min(count, limit);
@@ -515,7 +538,8 @@ Status ExecuteOperation(Database* database, Snapshot snapshot,
                         QueryBenchmarkOperation op,
                         uint32_t max_hops, uint64_t limit, uint32_t readers,
                         uint64_t* rows,
-                        uint64_t* first_result_us = nullptr) {
+                        uint64_t* first_result_us = nullptr,
+                        std::vector<VertexRef>* typed_vertex_rows = nullptr) {
   if (!QueryBenchmarkOperationSupported(op)) {
     return Status::NotSupported("query benchmark",
                                 QueryBenchmarkOperationName(op));
@@ -526,7 +550,8 @@ Status ExecuteOperation(Database* database, Snapshot snapshot,
       op != QueryBenchmarkOperation::kLatestDeparture &&
       op != QueryBenchmarkOperation::kFastestDuration) {
     return ExecutePublicOperation(database, std::move(snapshot), op, max_hops,
-                                  limit, readers, rows, first_result_us);
+                                  limit, readers, rows, first_result_us,
+                                  typed_vertex_rows);
   }
   const auto started = Clock::now();
   auto finish = [&](uint64_t count) {
@@ -987,6 +1012,7 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   // projection fixture can be read without a cross-partition fallback.
   next_id.store(projection_seed_facts + 1);
   seed_transaction_count = transactions.load();
+  uint64_t projection_base_checksum = 0;
   const bool projection_requested =
       options.projection != ProjectionState::kCanonicalOnly;
   if (projection_requested || result.projection_active) {
@@ -1024,6 +1050,31 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     }
     result.maintenance_status = "refresh-complete";
     result.maintenance_observed = true;
+
+    std::vector<VertexRef> projection_base_rows;
+    if (options.projection == ProjectionState::kShortDelta ||
+        options.projection == ProjectionState::kLongDelta) {
+      auto base_snapshot = database->BeginSnapshot();
+      if (!base_snapshot.ok()) return base_snapshot.status();
+      uint64_t base_count = 0;
+      Status base_query = ExecuteOperation(
+          database.get(), std::move(base_snapshot).ConsumeValueOrDie(),
+          QueryBenchmarkOperation::kStateAt, options.max_hops,
+          std::numeric_limits<uint64_t>::max(), 1, &base_count, nullptr,
+          &projection_base_rows);
+      if (!base_query.ok()) {
+        result.terminal_status = base_query.ToString();
+        result.gate_classification = "incomplete";
+        return result;
+      }
+      if (base_count != projection_base_rows.size()) {
+        result.terminal_status =
+            "projection base typed row accounting mismatch";
+        result.gate_classification = "incomplete";
+        return result;
+      }
+      projection_base_checksum = VertexRowsChecksum(projection_base_rows);
+    }
 
     // Keep the projection base immutable, then create a real contiguous
     // QueryDelta for the delta fixtures. The mutations are included in the
@@ -1075,20 +1126,46 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
         ValidTime{1});
     if (!canonical_rows.ok()) return canonical_rows.status();
     uint64_t projected_rows = 0;
+    std::vector<VertexRef> projected_vertex_rows;
     Status fixture_query = ExecuteOperation(
         database.get(), std::move(fixture_snapshot).ConsumeValueOrDie(),
         QueryBenchmarkOperation::kStateAt, options.max_hops,
-        std::numeric_limits<uint64_t>::max(), 1, &projected_rows);
+        std::numeric_limits<uint64_t>::max(), 1, &projected_rows, nullptr,
+        &projected_vertex_rows);
     if (!fixture_query.ok()) {
       result.terminal_status = fixture_query.ToString();
       result.gate_classification = "incomplete";
       return result;
     }
-    if (projected_rows != canonical_rows.ValueOrDie().size()) {
+    std::vector<VertexRef> canonical_vertex_rows;
+    canonical_vertex_rows.reserve(canonical_rows.ValueOrDie().size());
+    for (const auto& row : canonical_rows.ValueOrDie()) {
+      canonical_vertex_rows.push_back(
+          VertexRef{row.ref.part_id(), VertexId{row.ref.entity_id()}});
+    }
+    const auto sort_vertices = [](std::vector<VertexRef>* rows) {
+      std::sort(rows->begin(), rows->end(), [](const VertexRef& left,
+                                               const VertexRef& right) {
+        return std::tie(left.part_id.value, left.vertex_id.value) <
+               std::tie(right.part_id.value, right.vertex_id.value);
+      });
+    };
+    sort_vertices(&canonical_vertex_rows);
+    sort_vertices(&projected_vertex_rows);
+    if (projected_rows != canonical_vertex_rows.size() ||
+        projected_vertex_rows != canonical_vertex_rows) {
       result.terminal_status =
           "projection fixture differs from canonical expected=" +
-          std::to_string(canonical_rows.ValueOrDie().size()) +
+          std::to_string(canonical_vertex_rows.size()) +
           " observed=" + std::to_string(projected_rows);
+      result.gate_classification = "incomplete";
+      return result;
+    }
+    if ((options.projection == ProjectionState::kShortDelta ||
+         options.projection == ProjectionState::kLongDelta) &&
+        VertexRowsChecksum(projected_vertex_rows) == projection_base_checksum) {
+      result.terminal_status =
+          "projection delta did not change typed state-at result";
       result.gate_classification = "incomplete";
       return result;
     }

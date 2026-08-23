@@ -90,3 +90,48 @@ existing aggregate pool, rather than raising the benchmark pool.
   “no global resource upper-limit change” requirement should be explicitly
   accepted or replaced with a dynamic-borrowing/streaming fix.
 - No projection fixture, threshold, or public Cedar default was changed here.
+
+## Projection delta correctness follow-up
+
+The projection fixture now uses a real retract/assert sequence rather than
+repeating an assert for one entity at valid time 1. For each delta pair, the
+same vertex is retracted at valid time 1 and asserted at valid time 2. Thus the
+state-at-1 result loses those base entities, and the state-at-2 history can
+restore them. Short delta applies one retract; long delta applies 64 retracts
+interleaved with 64 valid-time-2 asserts. The mutations are committed through
+Cedar transactions, persisted, and reopened before validation.
+
+The benchmark now captures typed `VertexRef` rows from the persisted base
+projection before the delta, then compares the post-delta projected rows with
+canonical `TemporalSource::ReadAt` rows after sorting. It requires exact row
+equality and an independent typed vertex checksum match to canonical truth; it
+also requires the post-delta checksum to differ from the pre-delta projection
+checksum. This rejects a fixture that only changes metadata or merely repeats
+an idempotent assert.
+
+Projection smoke command (Debug, `duration-seconds=1`, `facts-per-txn=16`,
+`readers=1`, `reopen-verify=true`) passed for all four states:
+
+```text
+base             terminal=OK reopen=true hard_gate=true
+short-delta      terminal=OK reopen=true hard_gate=true
+long-delta       terminal=OK reopen=true hard_gate=true
+partial-coverage terminal=OK reopen=true hard_gate=true
+```
+
+Focused differential coverage also passed:
+
+```text
+ctest --test-dir build/query-debug --output-on-failure \
+  -R 'QueryDifferential|QueryDelta|QueryCanonical'
+55/55 passed, exit 0
+
+build/query-debug/tests/test_query_bench_workload \
+  --gtest_filter='QueryBenchWorkload.*'
+6/6 passed, exit 0
+```
+
+The ASAN workload target rebuilt successfully. Running the full ASAN workload
+filter and the focused reader case were both terminated by the host with exit
+137 before test completion, so no ASAN runtime pass is claimed for this follow-
+up. The Debug runs above are the valid execution evidence.

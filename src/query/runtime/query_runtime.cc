@@ -410,34 +410,46 @@ std::optional<RuntimeRow> ClipRowToInterval(
 
 StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
     Snapshot& snapshot, std::vector<RuntimeRow> rows,
-    const internal::PreparedPropertyBinding& binding) {
-  if (!binding.definition.has_value()) {
-    return Status::SchemaMismatch("query", "property binding was not prepared");
-  }
-  std::vector<RuntimeRow> result;
-  for (RuntimeRow& row : rows) {
-    internal::StateRow entity{row.ref,
-                              row.effective.value_or(ValidTimeInterval{
-                                  row.point.value_or(ValidTime{0}), std::nullopt}),
-                              std::nullopt};
-    StatusOr<std::vector<internal::BoundPropertyRow>> bound =
-        row.point.has_value()
-            ? internal::PropertyBinder::BindAt(
-                  snapshot, std::vector<internal::StateRow>{entity}, *row.point,
-                  *binding.definition)
-            : internal::PropertyBinder::BindIntervals(
-                  snapshot, std::vector<internal::StateRow>{entity},
-                  *binding.definition);
-    if (!bound.ok()) return bound.status();
-    for (internal::BoundPropertyRow& property : bound.ValueOrDie()) {
-      RuntimeRow bound_row{property.ref, property.effective, row.point,
-                           std::move(property.value), row.graph_source,
-                           row.graph_edge, row.graph_destination,
-                           row.graph_edge_type};
-      result.push_back(std::move(bound_row));
+    const std::vector<internal::PreparedPropertyBinding>& bindings) {
+  // Each binding is a temporal join against the same entity row. Applying
+  // them in plan order intersects effective intervals while carrying values
+  // already materialized for earlier output slots.
+  for (size_t binding_index = 0; binding_index < bindings.size();
+       ++binding_index) {
+    const internal::PreparedPropertyBinding& binding = bindings[binding_index];
+    if (!binding.definition.has_value()) {
+      return Status::SchemaMismatch("query", "property binding was not prepared");
     }
+    std::vector<RuntimeRow> result;
+    for (const RuntimeRow& row : rows) {
+      const ValidTimeInterval entity_interval = row.effective.value_or(
+          ValidTimeInterval{row.point.value_or(ValidTime{0}), std::nullopt});
+      internal::StateRow entity{row.ref, entity_interval, std::nullopt};
+      StatusOr<std::vector<internal::BoundPropertyRow>> bound =
+          row.point.has_value()
+              ? internal::PropertyBinder::BindAt(
+                    snapshot, std::vector<internal::StateRow>{entity},
+                    *row.point, *binding.definition)
+              : internal::PropertyBinder::BindIntervals(
+                    snapshot, std::vector<internal::StateRow>{entity},
+                    *binding.definition);
+      if (!bound.ok()) return bound.status();
+      for (const internal::BoundPropertyRow& property : bound.ValueOrDie()) {
+        const auto effective = internal::Intersect(entity_interval,
+                                                   property.effective);
+        if (!effective.has_value()) continue;
+        RuntimeRow bound_row = row;
+        bound_row.effective = *effective;
+        bound_row.property_values[binding.output.slot.value] = property.value;
+        // Keep the old single-value field for one-binding internal callers;
+        // canonical consumers resolve values by output slot from the map.
+        if (binding_index == 0) bound_row.property_value = property.value;
+        result.push_back(std::move(bound_row));
+      }
+    }
+    rows = std::move(result);
   }
-  return result;
+  return rows;
 }
 
 StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
@@ -531,7 +543,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
   if (!rows.ok()) return rows.status();
   if (!plan.property_bindings.empty()) {
     rows = BindPropertyRows(snapshot, std::move(rows).ConsumeValueOrDie(),
-                            plan.property_bindings.front());
+                            plan.property_bindings);
     if (!rows.ok()) return rows.status();
     // PropertyBinder materializes string/binary values from the canonical
     // history. Charge the actual payload before any subsequent filtering or
@@ -1931,13 +1943,12 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
     plan.predicate = node->predicate();
     node = node->inputs().front().get();
   }
-  if (node->kind() == LogicalOpKind::kBindProperty) {
-    if (node->inputs().size() != 1 || plan.property_bindings.size() != 1) {
-      return plan;
-    }
+  // A canonical query may chain any number of property bindings. Metadata is
+  // collected from the full logical tree above; walk the complete binding
+  // chain before validating the underlying temporal scan.
+  while (node->kind() == LogicalOpKind::kBindProperty) {
+    if (node->inputs().size() != 1) return plan;
     node = node->inputs().front().get();
-  } else if (!plan.property_bindings.empty()) {
-    return plan;
   }
   if (node->inputs().size() != 1 || !node->scope().has_value()) return plan;
   const LogicalPlanNode& scan = *node->inputs().front();

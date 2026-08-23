@@ -179,8 +179,10 @@ Status CommitFacts(Database* db, uint64_t first, uint64_t count,
   return Status::OK();
 }
 
-Status SeedGraph(Database* db, const BenchmarkGraph& graph) {
-  auto txn = db->BeginTransaction();
+Status SeedGraph(Database* db, const BenchmarkGraph& graph,
+                 uint64_t commit_deadline_us) {
+  auto txn = db->BeginTransaction(
+      TransactionOptions{.commit_deadline_us = commit_deadline_us});
   if (!txn.ok()) return txn.status();
   for (const VertexRef vertex : {graph.source, graph.middle, graph.target}) {
     if (Status status = txn.ValueOrDie()->Assert(EntityFact::Vertex(vertex), ValidTime{0});
@@ -220,8 +222,10 @@ Status SeedGraph(Database* db, const BenchmarkGraph& graph) {
   return Status::OK();
 }
 
-Status SeedBenchmarkScore(Database* db, const BenchmarkGraph& graph) {
-  auto txn = db->BeginTransaction();
+Status SeedBenchmarkScore(Database* db, const BenchmarkGraph& graph,
+                          uint64_t commit_deadline_us) {
+  auto txn = db->BeginTransaction(
+      TransactionOptions{.commit_deadline_us = commit_deadline_us});
   if (!txn.ok()) return txn.status();
   if (Status status = txn.ValueOrDie()->Set(
           PropertyFact::Vertex(graph.source, BenchmarkGraph::kScore),
@@ -686,12 +690,16 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
     return result;
   }
   const BenchmarkGraph graph;
-  if (Status status = SeedGraph(database.get(), graph); !status.ok()) {
+  if (Status status = SeedGraph(database.get(), graph,
+                                options.commit_deadline_us);
+      !status.ok()) {
     result.terminal_status = status.ToString();
     result.gate_classification = "incomplete";
     return result;
   }
-  if (Status status = SeedBenchmarkScore(database.get(), graph); !status.ok()) {
+  if (Status status = SeedBenchmarkScore(database.get(), graph,
+                                         options.commit_deadline_us);
+      !status.ok()) {
     result.terminal_status = status.ToString();
     result.gate_classification = "incomplete";
     return result;

@@ -108,4 +108,23 @@ TEST(QueryBenchWorkload, AppendAdmissionMetadataIncludesConfiguredControls) {
   EXPECT_NE(json.find("\"group_queue_requests\":2048"), std::string::npos);
   EXPECT_NE(json.find("\"group_queue_bytes\":33554432"), std::string::npos);
 }
+
+TEST(QueryBenchWorkload, BoundedAdmissionCoversAllSetupWrites) {
+  const std::string path = TestPath("bounded-setup-admission");
+  std::filesystem::remove_all(path);
+  QueryBenchmarkOptions options;
+  options.path = path;
+  options.duration_seconds = 0;
+  options.readers = 1;
+  options.writers = 1;
+  options.facts_per_txn = 1;
+  options.commit_deadline_us = 500000;
+  options.group_queue_requests = 1024;
+  options.group_queue_bytes = 16ULL * 1024ULL * 1024ULL;
+  auto result = RunQueryBenchmark(options);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_EQ(result.ValueOrDie().terminal_status, "OK");
+  EXPECT_GT(result.ValueOrDie().facts, 0U);
+  std::filesystem::remove_all(path);
+}
 }  // namespace cedar::benchmark

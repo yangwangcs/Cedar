@@ -726,6 +726,138 @@ TEST_F(QueryCanonicalTest, ClipsPredicatesAndKeepsTwoValuedMissing) {
   EXPECT_EQ(CountRows(not_equal_query.ValueOrDie()).ValueOrDie(), 0U);
 }
 
+TEST_F(QueryCanonicalTest, ExecutesInt64ParameterPredicate) {
+  ASSERT_TRUE(database_->RegisterProperty(
+      PropertyDefinition{PropertyId{17}, 0, "score", PropertyEntityKind::kVertex,
+                         PhysicalType::kInt64, 4096})
+                  .ok());
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(
+                               VertexRef{PartId{0}, VertexId{1}}),
+                           ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(
+                            VertexRef{PartId{0}, VertexId{1}}, PropertyId{17}),
+                        ValidTime{0}, Value::Int64(7))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  OptionalSlot<int64_t> score = OptionalSlot<int64_t>::Named("score");
+  Parameter<int64_t> minimum = Parameter<int64_t>::Named("minimum");
+  auto source = Query::Vertices(vertex, At{ValidTime{0}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto bound = source.ValueOrDie().BindVertexProperty(vertex, PropertyId{17}, score);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  auto filtered = bound.ValueOrDie().Where(Equal(ValueOf(score), ValueOf(minimum)));
+  ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+  auto query = filtered.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  Bindings bindings;
+  ASSERT_TRUE(bindings.Bind(minimum.id(), QueryType::kInt64, Value::Int64(7)).ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), bindings, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+}
+
+TEST_F(QueryCanonicalTest, ExecutesStringAndBoolParameterPredicates) {
+  ASSERT_TRUE(database_->RegisterProperty(
+      PropertyDefinition{PropertyId{18}, 0, "name", PropertyEntityKind::kVertex,
+                         PhysicalType::kString, 4096})
+                  .ok());
+  ASSERT_TRUE(database_->RegisterProperty(
+      PropertyDefinition{PropertyId{19}, 0, "enabled", PropertyEntityKind::kVertex,
+                         PhysicalType::kBool, 4096})
+                  .ok());
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(
+                               VertexRef{PartId{0}, VertexId{1}}),
+                           ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(
+                            VertexRef{PartId{0}, VertexId{1}}, PropertyId{18}),
+                        ValidTime{0}, Value::String("cedar"))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(
+                            VertexRef{PartId{0}, VertexId{1}}, PropertyId{19}),
+                        ValidTime{0}, Value::Bool(true))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  OptionalSlot<std::string> name = OptionalSlot<std::string>::Named("name");
+  OptionalSlot<bool> enabled = OptionalSlot<bool>::Named("enabled");
+  Parameter<std::string> expected_name = Parameter<std::string>::Named("name");
+  Parameter<bool> expected_enabled = Parameter<bool>::Named("enabled");
+  auto source = Query::Vertices(vertex, At{ValidTime{0}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto with_name = source.ValueOrDie().BindVertexProperty(vertex, PropertyId{18}, name);
+  ASSERT_TRUE(with_name.ok()) << with_name.status().ToString();
+  auto with_enabled = with_name.ValueOrDie().BindVertexProperty(
+      vertex, PropertyId{19}, enabled);
+  ASSERT_TRUE(with_enabled.ok()) << with_enabled.status().ToString();
+  auto filtered = with_enabled.ValueOrDie().Where(
+      Equal(ValueOf(name), ValueOf(expected_name)));
+  ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+  auto query = filtered.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  Bindings bindings;
+  ASSERT_TRUE(bindings
+                  .Bind(expected_name.id(), QueryType::kString,
+                        Value::String("cedar"))
+                  .ok());
+  ASSERT_TRUE(bindings
+                  .Bind(expected_enabled.id(), QueryType::kBool, Value::Bool(true))
+                  .ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), bindings, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+
+  auto bool_filtered = with_enabled.ValueOrDie().Where(
+      Equal(ValueOf(enabled), ValueOf(expected_enabled)));
+  ASSERT_TRUE(bool_filtered.ok()) << bool_filtered.status().ToString();
+  auto bool_query = bool_filtered.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(bool_query.ok()) << bool_query.status().ToString();
+  auto bool_prepared = database_->PrepareQuery(bool_query.ValueOrDie());
+  ASSERT_TRUE(bool_prepared.ok()) << bool_prepared.status().ToString();
+  auto bool_snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(bool_snapshot.ok()) << bool_snapshot.status().ToString();
+  Bindings bool_bindings;
+  ASSERT_TRUE(bool_bindings
+                  .Bind(expected_enabled.id(), QueryType::kBool, Value::Bool(true))
+                  .ok());
+  auto bool_cursor = bool_prepared.ValueOrDie().Execute(
+      std::move(bool_snapshot).ConsumeValueOrDie(), bool_bindings, QueryOptions{});
+  ASSERT_TRUE(bool_cursor.ok()) << bool_cursor.status().ToString();
+  auto bool_batch = bool_cursor.ValueOrDie().Next();
+  ASSERT_TRUE(bool_batch.ok()) << bool_batch.status().ToString();
+  ASSERT_TRUE(bool_batch.ValueOrDie().has_value());
+  EXPECT_EQ(bool_batch.ValueOrDie()->row_count(), 1U);
+}
+
 TEST_F(QueryCanonicalTest, BindsTypedEdgeProperties) {
   const auto property = database_->RegisterProperty(PropertyDefinition{
       PropertyId{8}, 0, "weight", PropertyEntityKind::kEdge,

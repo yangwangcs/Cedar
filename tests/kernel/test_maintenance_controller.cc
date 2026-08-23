@@ -155,14 +155,14 @@ TEST(MaintenanceControllerTest, BlockedCompactionDoesNotPreventEmergencyFlush) {
   controller.Stop();
 }
 
-TEST(MaintenanceControllerTest, EmergencyFlushUsesTwoBoundedCredits) {
+TEST(MaintenanceControllerTest, EmergencyFlushUsesOneBoundedCredit) {
   FakeMaintenanceAdapter adapter;
   adapter.BlockFlush();
   MaintenanceController controller(&adapter);
   ASSERT_TRUE(controller.Start().ok());
 
   controller.PublishSnapshot(Snapshot(1, 64ULL << 20, 0));
-  ASSERT_TRUE(adapter.WaitForFlushStart(2));
+  ASSERT_TRUE(adapter.WaitForFlushStart(1));
   EXPECT_EQ(adapter.flush_completed(), 0U);
 
   adapter.ReleaseFlush();
@@ -177,12 +177,12 @@ TEST(MaintenanceControllerTest, EachLaneHasAtMostOneOutstandingGrant) {
   ASSERT_TRUE(controller.Start().ok());
   controller.PublishSnapshot(Snapshot(1, 64ULL << 20, 4));
   ASSERT_TRUE(adapter.WaitForCompactionStart());
-  ASSERT_TRUE(adapter.WaitForFlushStart(2));
+  ASSERT_TRUE(adapter.WaitForFlushStart(1));
   controller.PublishSnapshot(Snapshot(2, 64ULL << 20, 4));
   std::this_thread::sleep_for(std::chrono::milliseconds(25));
   EXPECT_EQ(adapter.compaction_started(), 1U);
-  EXPECT_EQ(adapter.flush_started(), 2U);
-  EXPECT_EQ(adapter.max_concurrent_flushes(), 2U);
+  EXPECT_EQ(adapter.flush_started(), 1U);
+  EXPECT_EQ(adapter.max_concurrent_flushes(), 1U);
 
   adapter.ReleaseFlush();
   adapter.ReleaseCompaction();

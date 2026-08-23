@@ -136,7 +136,7 @@ StatusOr<EvaluatedValue> ValueAsLiteral(const Value& value) {
 
 StatusOr<EvaluatedValue> EvaluateExpression(
     const internal::ExpressionNode& expression, const RuntimeRow& row,
-    const internal::PreparedQueryPlan& plan) {
+    const internal::PreparedQueryPlan& plan, const Bindings& bindings) {
   using internal::ExpressionKind;
   if (expression.kind() == ExpressionKind::kSlot) {
     if (expression.slot() == plan.entity_slot) {
@@ -176,25 +176,54 @@ StatusOr<EvaluatedValue> EvaluateExpression(
     return EvaluatedValue{expression.type(), true, expression.literal()};
   }
   if (expression.kind() == ExpressionKind::kParameter) {
-    return Status::NotSupported("query", "canonical predicates do not bind parameters");
+    auto bound = bindings.Lookup(expression.parameter(), expression.type());
+    if (!bound.ok()) return bound.status();
+    return std::visit(
+        [](const auto& value) -> StatusOr<EvaluatedValue> {
+          using T = std::decay_t<decltype(value)>;
+          if constexpr (std::is_same_v<T, Value>) {
+            return ValueAsLiteral(value);
+          } else if constexpr (std::is_same_v<T, VertexRef>) {
+            return EvaluatedValue{QueryType::kVertexRef, true,
+                                  EvaluatedLiteral{value}};
+          } else if constexpr (std::is_same_v<T, EdgeRef>) {
+            return EvaluatedValue{QueryType::kEdgeRef, true,
+                                  EvaluatedLiteral{value}};
+          } else if constexpr (std::is_same_v<T, ValidTime>) {
+            return EvaluatedValue{QueryType::kValidTime, true,
+                                  EvaluatedLiteral{value}};
+          } else if constexpr (std::is_same_v<T, ValidDuration>) {
+            return EvaluatedValue{QueryType::kValidDuration, true,
+                                  EvaluatedLiteral{value}};
+          } else if constexpr (std::is_same_v<T, CommitSeq>) {
+            return EvaluatedValue{QueryType::kCommitSeq, true,
+                                  EvaluatedLiteral{value}};
+          } else {
+            return EvaluatedValue{QueryType::kValidTimeInterval, true,
+                                  EvaluatedLiteral{value}};
+          }
+        },
+        bound.ValueOrDie());
   }
   if (expression.kind() == ExpressionKind::kIsPresent) {
-    auto child = EvaluateExpression(*expression.children().front(), row, plan);
+    auto child = EvaluateExpression(*expression.children().front(), row, plan,
+                                    bindings);
     if (!child.ok()) return child.status();
     return EvaluatedValue{QueryType::kBool, true,
                           EvaluatedLiteral{child.ValueOrDie().present}};
   }
   if (expression.kind() == ExpressionKind::kNot) {
-    auto child = EvaluateExpression(*expression.children().front(), row, plan);
+    auto child = EvaluateExpression(*expression.children().front(), row, plan,
+                                    bindings);
     if (!child.ok()) return child.status();
     const bool value = child.ValueOrDie().present &&
                        std::get<bool>(*child.ValueOrDie().value);
     return EvaluatedValue{QueryType::kBool, true, EvaluatedLiteral{!value}};
   }
 
-  auto left = EvaluateExpression(*expression.children()[0], row, plan);
+  auto left = EvaluateExpression(*expression.children()[0], row, plan, bindings);
   if (!left.ok()) return left.status();
-  auto right = EvaluateExpression(*expression.children()[1], row, plan);
+  auto right = EvaluateExpression(*expression.children()[1], row, plan, bindings);
   if (!right.ok()) return right.status();
   if (expression.kind() == ExpressionKind::kAnd) {
     const bool value = left.ValueOrDie().present &&
@@ -529,6 +558,7 @@ StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
 
 StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
+    const Bindings& bindings,
     internal::QueryReservation* reservation = nullptr) {
   auto reserve_row = [reservation](const RuntimeRow& row) -> Status {
     if (reservation == nullptr) return Status::OK();
@@ -541,14 +571,26 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     bytes += static_cast<size_t>(payload.ValueOrDie());
     return reservation->ReserveMemory(bytes);
   };
-  StatusOr<std::vector<RuntimeRow>> rows = ReadSourceRows(snapshot, plan, reservation);
-  if (!rows.ok()) return rows.status();
+  StatusOr<std::vector<RuntimeRow>> rows =
+      Status::NotFound("query runtime", "canonical source is not required");
   if (plan.physical_plan) {
     StatusOr<std::vector<RuntimeRow>> derived =
         Status::NotFound("query runtime", "projection reader is unavailable");
     if (plan.projection_reader) derived = ReadProjectionRows(plan);
     if (!derived.ok() && !derived.status().IsNotFound()) return derived.status();
     const bool have_derived = derived.ok();
+    const bool has_canonical_slice = std::any_of(
+        plan.physical_plan->coverage_slices.begin(),
+        plan.physical_plan->coverage_slices.end(), [](const auto& slice) {
+          return slice.source == internal::CoverageSource::kCanonical;
+        });
+    // A fully covered plan must stay on its derived source. Canonical rows are
+    // read only for explicit fallback slices or when the derived source is
+    // unavailable, preserving mixed-slice behavior without an extra scan.
+    if (has_canonical_slice || !have_derived) {
+      rows = ReadSourceRows(snapshot, plan, reservation);
+      if (!rows.ok()) return rows.status();
+    }
     std::vector<RuntimeRow> combined;
     for (const auto& slice : plan.physical_plan->coverage_slices) {
       const auto& input = slice.source != internal::CoverageSource::kCanonical &&
@@ -564,6 +606,9 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
       }
     }
     rows = std::move(combined);
+  } else {
+    rows = ReadSourceRows(snapshot, plan, reservation);
+    if (!rows.ok()) return rows.status();
   }
   if (!rows.ok()) return rows.status();
   if (!plan.property_bindings.empty()) {
@@ -582,7 +627,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
   if (plan.predicate) {
     std::vector<RuntimeRow> filtered;
     for (RuntimeRow& row : rows.ValueOrDie()) {
-      auto selected = EvaluateExpression(*plan.predicate, row, plan);
+      auto selected = EvaluateExpression(*plan.predicate, row, plan, bindings);
       if (!selected.ok()) return selected.status();
       if (selected.ValueOrDie().present &&
           std::get<bool>(*selected.ValueOrDie().value)) {
@@ -1368,10 +1413,11 @@ class QueryCursor::State {
   };
 
   State(internal::PreparedQueryPlan plan, Snapshot snapshot,
-        QueryOptions options, internal::QueryReservation reservation,
+        Bindings bindings, QueryOptions options,
+        internal::QueryReservation reservation,
         std::unique_ptr<internal::QueryScratch> scratch)
       : plan(std::move(plan)), snapshot(std::move(snapshot)),
-        options(std::move(options)),
+        bindings(std::move(bindings)), options(std::move(options)),
         reservation(std::move(reservation)),
         fragments(this->options.budget.interval_fragments),
         started_at(std::chrono::steady_clock::now()), scratch(std::move(scratch)),
@@ -1426,6 +1472,7 @@ class QueryCursor::State {
 
   internal::PreparedQueryPlan plan;
   std::optional<Snapshot> snapshot;
+  Bindings bindings;
   QueryOptions options;
   internal::QueryReservation reservation;
   internal::FragmentBudget fragments;
@@ -1648,6 +1695,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                                            state_->options.budget.graph_labels,
                                            state_->options.budget.interval_fragments)
                     : MaterializeRows(*state_->snapshot, state_->plan,
+                                      state_->bindings,
                                       &state_->reservation);
     // The lease owns the pre-materialization reservation. Reset it now that
     // MaterializeRows has completed so the reservation is released exactly
@@ -2116,7 +2164,7 @@ StatusOr<RuntimeRelationalResult> ExecuteRelationalPlanNode(
 
 StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
                                             Snapshot snapshot,
-                                            const Bindings&,
+                                            const Bindings& bindings,
                                             const QueryOptions& options,
                                             QueryResourcePool* resource_pool,
                                             std::function<Status(const std::shared_ptr<QueryExecutionState>&)>
@@ -2175,7 +2223,7 @@ StatusOr<QueryCursor> QueryRuntime::Execute(const PreparedQueryPlan& plan,
     }
   }
   auto state = std::make_unique<QueryCursor::State>(
-      plan, std::move(snapshot), std::move(resolved_options),
+      plan, std::move(snapshot), bindings, std::move(resolved_options),
       std::move(admitted).ConsumeValueOrDie(), std::move(scratch));
   // Fallback counters describe the source selected for this query, rather
   // than individual batches. Keep the labels fixed and charge each selected

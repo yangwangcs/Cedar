@@ -40,11 +40,11 @@ TEST(RocksDbProfileTest, KernelTestProfileAcceleratesMaintenanceLifecycle) {
       options, true, &resolved.ValueOrDie());
   EXPECT_TRUE(db_options.cedar_kernel_mode);
   EXPECT_TRUE(db_options.cedar_disable_periodic_tasks);
-  EXPECT_EQ(db_options.max_background_flushes, 2);
+  EXPECT_EQ(db_options.max_background_flushes, 1);
   EXPECT_EQ(db_options.max_background_compactions, 2);
   ASSERT_NE(db_options.write_buffer_manager, nullptr);
   // Small enough to force frequent 32 KiB facts flushes, while retaining
-  // enough Cedar-owned backlog for both emergency flush workers to drain.
+  // enough Cedar-owned backlog for the emergency flush worker to drain.
   EXPECT_EQ(db_options.write_buffer_manager->buffer_size(), 1ULL * 1024ULL * 1024ULL);
 
   const auto descriptors = MakeRocksDbColumnFamilyDescriptors(
@@ -102,7 +102,7 @@ TEST(RocksDbProfileTest, ResolvesProductionBudgetSplitAndBaseline) {
   EXPECT_FALSE(db_options.two_write_queues);
   EXPECT_EQ(db_options.max_write_batch_group_size_bytes, 2ULL * 1024ULL * 1024ULL);
   EXPECT_EQ(db_options.max_background_jobs, 6);
-  EXPECT_EQ(db_options.max_background_flushes, 2);
+  EXPECT_EQ(db_options.max_background_flushes, 1);
   EXPECT_EQ(db_options.max_background_compactions, 2);
   EXPECT_EQ(db_options.max_subcompactions, 2U);
   EXPECT_EQ(db_options.bytes_per_sync, 1ULL << 20);

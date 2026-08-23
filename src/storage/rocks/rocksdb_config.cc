@@ -32,8 +32,8 @@ namespace {
 constexpr uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr uint64_t kGiB = 1024ULL * kMiB;
 // KernelTest deliberately makes every persistent-state transition cheap to
-// reach. The WBM still covers eight facts MemTables so the two Cedar-owned
-// flush workers have a real, bounded drain window rather than artificial
+// reach. The WBM still covers eight facts MemTables so the Cedar-owned flush
+// worker has a real, bounded drain window rather than artificial
 // write-stop from an impossible queue depth.
 constexpr uint64_t kKernelTestFactsWriteBufferBytes = 32ULL * 1024ULL;
 constexpr uint64_t kKernelTestMetaWriteBufferBytes = 8ULL * 1024ULL;
@@ -42,7 +42,7 @@ constexpr uint64_t kKernelTestBlockCacheBytes = 256ULL * 1024ULL;
 constexpr uint64_t kKernelTestMemoryBudgetBytes = 1ULL * kMiB;
 constexpr uint64_t kKernelTestWriteBufferManagerBytes = 1ULL * kMiB;
 constexpr uint64_t kDebugWriteBufferManagerBytes = 256ULL * 1024ULL;
-constexpr int kCedarFlushWorkerCapacity = 2;
+constexpr int kCedarFlushWorkerCapacity = 1;
 constexpr int kCedarCompactionWorkerCapacity = 2;
 
 uint64_t HostMemoryBytes() {

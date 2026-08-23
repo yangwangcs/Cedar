@@ -89,6 +89,10 @@ struct ParameterId {
 
 class Bindings {
  public:
+  using BoundValue =
+      std::variant<Value, VertexRef, EdgeRef, ValidTime, ValidDuration,
+                   CommitSeq, ValidTimeInterval>;
+
   Status Bind(ParameterId parameter, QueryType type, Value value);
   Status Bind(ParameterId parameter, QueryType type, VertexRef value);
   Status Bind(ParameterId parameter, QueryType type, EdgeRef value);
@@ -97,11 +101,11 @@ class Bindings {
   Status Bind(ParameterId parameter, QueryType type, CommitSeq value);
   Status Bind(ParameterId parameter, QueryType type, ValidTimeInterval value);
 
- private:
-  using BoundValue =
-      std::variant<Value, VertexRef, EdgeRef, ValidTime, ValidDuration,
-                   CommitSeq, ValidTimeInterval>;
+  // Returns the exact typed value supplied for a parameter. Query execution
+  // uses this accessor to preserve the public Bindings contract at runtime.
+  StatusOr<BoundValue> Lookup(ParameterId parameter, QueryType type) const;
 
+ private:
   struct Binding {
     ParameterId parameter;
     QueryType type;

@@ -9,7 +9,7 @@
 namespace cedar {
 namespace {
 
-constexpr uint32_t kCedarFlushWorkerSlots = 2;
+constexpr uint32_t kCedarFlushWorkerSlots = 1;
 constexpr uint32_t kCedarCompactionWorkerSlots = 1;
 
 }  // namespace

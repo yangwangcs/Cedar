@@ -2,7 +2,8 @@
 
 ## Status
 
-Implemented the campaign metric propagation and focused hard-gate contract.
+Implemented the campaign metric propagation and focused hard-gate contract,
+including the follow-up edge-case fixes from review.
 
 ## Changes
 
@@ -11,6 +12,12 @@ Implemented the campaign metric propagation and focused hard-gate contract.
 - Added a fail-closed idle query overhead comparator: a comparable baseline is
   required, facts/s must remain at least 97% of baseline, and WAL-sync p99 must
   remain at most 105% of baseline. Malformed or missing metrics fail the gate.
+- Standalone idle runs now materialize a deterministic baseline from a complete
+  five-repeat aggregate; explicit input baselines remain strictly validated.
+- Enforced exactly five successful samples for every facts/writers point and
+  rejected missing WAL columns in raw run CSVs.
+- Kept audit summary CSV/JSON rows on the same metric schema, using explicit
+  zero/null values for audit-only fields.
 - Preserved active projection thresholds of at least 90% facts/s and at most
   115% end-to-end p99; no WAL metric was added to that active gate.
 - Extended `QueryCampaignOptionsContract` with CSV/artifact schema assertions

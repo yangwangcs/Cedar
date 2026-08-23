@@ -2,28 +2,28 @@
 
 Date: 2026-08-24 (Asia/Shanghai)
 
-This document records evidence actually produced in this worktree. The current
-sustained mixed run and database reopen checks pass. The post-fix canonical-only
-space audit passes under the reviewed accounting rule: Cedar/RocksDB statistics
-metadata is divided by authoritative bytes when no projection payload exists.
-Non-canonical projection-state benchmark production remains an explicit
-residual and is not represented as passing evidence.
+This document records evidence actually produced in this worktree. The
+historical sustained mixed run and database reopen checks pass. The current
+bounded Release calibration and cold/warm query matrices also pass, including
+real persisted base, short-delta, long-delta, and partial-coverage fixtures.
+The full 30-minute mixed run and five-repeat write matrices remain open gates.
 
 ## Build identity
 
 - Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
 - Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `e8fad1a` (`fix: bound graph benchmark and temporal property expansion`)
-- Evidence commit: `e8fad1a`; the targeted graph-property, reader-admission,
-  campaign, Release smoke, and sanitizer evidence below was produced from this
-  source snapshot. The longer historical mixed/reopen artifacts remain named
-  explicitly where they were produced from earlier snapshots.
+- Source snapshot: `f6900c2` (`perf: bound query calibration admission`)
+- Evidence commits: `02bbbe0`, `605da2b`, `ae093ec`, and `f6900c2`; these add
+  persisted projection fixtures, real retract/assert QueryDelta tails, corrected
+  temporal coverage, and Cedar-owned reader admission capacity. Historical
+  mixed/reopen artifacts remain named explicitly where they were produced from
+  earlier snapshots.
 - Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
 - Release benchmark: `build/query-release/cedar_query_bench`
 - Public defaults were not changed. Campaign admission was explicitly
   `commit_deadline_us=5000000`, `group_queue_requests=2048`,
   `group_queue_bytes=33554432`.
-- Dataset: canonical-only mixed workload, 32 writers/readers, 1,024
+- Dataset: historical canonical-only mixed workload, 32 writers/readers, 1,024
   facts/transaction, seed `1` in every mixed row (seed range `1..1`). The
   first Release calibration remains calibration-only; its turning-point
   artifact is `build/query-release/evidence/calibration-final/turning-point.json`
@@ -31,10 +31,13 @@ residual and is not represented as passing evidence.
 - Acceptance thresholds: sustained elapsed >=1,800 s; derived projection
   <=1.0x target and <=1.5x hard bound of authoritative live bytes; statistics
   <=2% of projection bytes; scratch bytes zero after close/reopen.
-- The required write-idle, write-active-projection, read-cold, and read-warm
-  matrices were not rerun at this evidence point. Their results are
-  unrun/incomplete, not passing evidence. The required Release build command
-  was also not rerun at this evidence point.
+- Current bounded Release evidence: calibration facts/txn `1,16,64,256` (four
+  rows, one reader), and cold/warm read matrices with all 15 operations and all
+  five projection states at degree `1`, selectivity `1`, one reader (75 rows per
+  phase). All rows exited `0`, passed the hard gate, and verified reopen.
+- The required five-repeat write-idle/write-active matrices, 1/8/32-reader
+  read matrices at all degrees/selectivities, and fresh 30-minute mixed run are
+  still unrun after `f6900c2`; they are not passing evidence.
 
 ## Debug, install, and sanitizer gates
 
@@ -140,11 +143,12 @@ successfully, have zero scratch bytes, and satisfy the derived projection
 `<=1.5x` authoritative-byte bound. For canonical-only rows, statistics are
 audited against authoritative bytes; all ten ratios are below 0.001%.
 
-The benchmark still rejects non-canonical `ProjectionState` values because the
-current workload does not have a truthful base/short-delta/long-delta/partial
-coverage fixture. The campaign therefore has no real projected-data space
-row; the shell branch for projected payload accounting is contract-tested with
-synthetic data and must not be read as projected capability evidence.
+The benchmark now creates truthful persisted projection fixtures. `base` covers
+the seeded state chains; `short-delta` and `long-delta` publish the same base
+followed by real retract/assert commit tails; `partial-coverage` is intentionally
+classified by the planner as canonical fallback. Each fixture is closed,
+reopened, queried, and space-inspected. The bounded cold/warm matrix contains
+no failed rows.
 
 The CSV campaign records `state-at`, history/events/changes, property-filter,
 expansion, k-hop, and coexisting-path through the public Query/PreparedQuery/
@@ -173,12 +177,11 @@ capability input; they are not silently relabeled as passing.
 
 ## Status
 
-Current status is **DONE_WITH_CONCERNS**: Debug/install/sanitizer gates,
-sustained mixed execution, curated database reopen verification, and the
-post-fix canonical-only space audit pass. Full projection-state acceptance
-remains open because the benchmark intentionally has no truthful non-canonical
-projection fixture; no source or public default is being claimed for that
-residual.
+Current status is **IN_PROGRESS**: Debug/install/sanitizer gates, historical
+sustained mixed execution, bounded Release calibration, bounded projected read
+matrices, and reopen verification pass. Full Release turning-point/write
+overhead evidence and the fresh 30-minute mixed campaign remain before the
+goal can be marked complete.
 
 ## Worktree status captured during acceptance
 

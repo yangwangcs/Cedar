@@ -26,5 +26,24 @@ TEST(BoltProtocolTest, NegotiatesSupportedHandshakeOnly) {
   EXPECT_EQ(response.ValueOrDie(), std::string("\x00\x00\x04\x05", 4));
 }
 
+TEST(BoltProtocolTest, DecodesBoundedRequestSignatures) {
+  EXPECT_EQ(DecodeBoltMessageKind("\xB1\x01\xA0").ValueOrDie(),
+            BoltMessageKind::kHello);
+  EXPECT_EQ(DecodeBoltMessageKind("\xB3\x10\x80\xA0\xA0").ValueOrDie(),
+            BoltMessageKind::kRun);
+  EXPECT_EQ(DecodeBoltMessageKind("\xB1\x3F\xA0").ValueOrDie(),
+            BoltMessageKind::kPull);
+  EXPECT_TRUE(DecodeBoltMessageKind("\xB1\x55\xA0").status().IsParseError());
+}
+
+TEST(BoltProtocolTest, EncodesBoundedSuccessAndIgnoredMessages) {
+  const auto success = EncodeBoltSuccess(16);
+  ASSERT_TRUE(success.ok());
+  EXPECT_EQ(success.ValueOrDie(), std::string("\x00\x03\xB1\x70\xA0", 5));
+  const auto ignored = EncodeBoltIgnored(16);
+  ASSERT_TRUE(ignored.ok());
+  EXPECT_EQ(ignored.ValueOrDie(), std::string("\x00\x03\xB1\x7E\xA0", 5));
+}
+
 }  // namespace
 }  // namespace cedar::server

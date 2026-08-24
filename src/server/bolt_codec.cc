@@ -46,4 +46,30 @@ StatusOr<std::string> NegotiateBoltHandshake(const std::string& handshake) {
   return std::string(4, '\0');
 }
 
+StatusOr<BoltMessageKind> DecodeBoltMessageKind(const std::string& payload) {
+  if (payload.size() < 2 || static_cast<uint8_t>(payload[0]) < 0xB0 ||
+      static_cast<uint8_t>(payload[0]) > 0xBF) {
+    return Status::ParseError("bolt", "expected tiny struct message");
+  }
+  switch (static_cast<uint8_t>(payload[1])) {
+    case 0x01: return BoltMessageKind::kHello;
+    case 0x10: return BoltMessageKind::kRun;
+    case 0x3F: return BoltMessageKind::kPull;
+    case 0x11: return BoltMessageKind::kBegin;
+    case 0x12: return BoltMessageKind::kCommit;
+    case 0x13: return BoltMessageKind::kRollback;
+    case 0x0F: return BoltMessageKind::kReset;
+    case 0x02: return BoltMessageKind::kGoodbye;
+    default: return Status::ParseError("bolt", "unsupported message signature");
+  }
+}
+
+StatusOr<std::string> EncodeBoltSuccess(uint32_t max_chunk_bytes) {
+  return EncodeBoltChunk(std::string("\xB1\x70\xA0", 3), max_chunk_bytes);
+}
+
+StatusOr<std::string> EncodeBoltIgnored(uint32_t max_chunk_bytes) {
+  return EncodeBoltChunk(std::string("\xB1\x7E\xA0", 3), max_chunk_bytes);
+}
+
 }  // namespace cedar::server

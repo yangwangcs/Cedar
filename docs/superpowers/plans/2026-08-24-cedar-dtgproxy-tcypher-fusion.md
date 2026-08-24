@@ -26,6 +26,17 @@ sockets/signals/filesystem. No Arrow, Thrift, Boost, Rust runtime, or external s
 - No automatic legacy data migration; the new database directory is created by deployment.
 - Every build and test command sets `CEDAR_ROCKSDB_BUILD_PARALLEL_LEVEL=1` and uses `-j1`.
 
+## Execution status (2026-08-24)
+
+- Tasks 0-3, 5-6: implemented and covered by focused tests.
+- Task 4: bounded paths and CHANGES are implemented; system-time and metadata projection
+  return typed `NotSupported`; mixed patterns are explicitly rejected until a product node
+  exists in the Cedar algebra.
+- Task 7: lifecycle, health, lock/pid, text RUN, handshake, and bounded Bolt request
+  envelopes are implemented; full PackStream value decoding and RECORD streaming remain.
+- Task 8: baseline, evidence, and fixed-duration smoke benchmark are implemented; the
+  benchmark is not a production capacity claim.
+
 ### Task 0: Baseline and clean branch
 
 **Files:** `docs/audit/2026-08-24-cedar-tcypher-fusion-baseline.md`

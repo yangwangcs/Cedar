@@ -39,5 +39,16 @@ TEST(CypherCompilerTest, DoesNotTreatSystemTimeAsValidTime) {
   EXPECT_TRUE(query.status().IsNotSupportedError());
 }
 
+TEST(CypherCompilerTest, RejectsMixedPatternsInsteadOfDroppingTheRemainder) {
+  const auto parsed = Parse("MATCH (a), (b) RETURN a, b");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  const auto bound = Bind(parsed.ValueOrDie(), SchemaCatalog{}, BinderOptions{});
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto query = Compile(bound.ValueOrDie());
+  EXPECT_FALSE(query.ok());
+  EXPECT_TRUE(query.status().IsNotSupportedError());
+  EXPECT_NE(query.status().ToString().find("product operator"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace cedar::cypher

@@ -79,5 +79,35 @@ TEST(ServerLifecycleTest, ServesHealthAndCypherPrepareOnOneProcess) {
   std::filesystem::remove_all(pattern);
 }
 
+TEST(ServerLifecycleTest, AnswersBoundedBoltHelloOnTheSameDatabaseProcess) {
+  char pattern[] = "/tmp/cedar_server_bolt_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  ServerConfig config;
+  config.database_path = pattern;
+  config.lock_path = std::string(pattern) + ".lock";
+  config.pid_path = std::string(pattern) + ".pid";
+  config.port = 0;
+  Server server(config);
+  ASSERT_TRUE(server.Start().ok());
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server.port());
+  ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  const std::string hello("\x00\x03\xB1\x01\xA0", 5);
+  ASSERT_EQ(::send(fd, hello.data(), hello.size(), 0),
+            static_cast<ssize_t>(hello.size()));
+  char response[16]{};
+  const ssize_t count = ::recv(fd, response, sizeof(response), 0);
+  ASSERT_EQ(count, 5);
+  EXPECT_EQ(std::string(response, static_cast<size_t>(count)),
+            std::string("\x00\x03\xB1\x70\xA0", 5));
+  ::close(fd);
+  ASSERT_TRUE(server.Stop().ok());
+  std::filesystem::remove_all(pattern);
+}
+
 }  // namespace
 }  // namespace cedar::server

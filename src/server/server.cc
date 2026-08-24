@@ -216,6 +216,18 @@ void Server::HandleClient(int fd) {
     auto prepared = cypher::PrepareCypher(*database_, source, cypher::SchemaCatalog{});
     response = prepared.ok() ? "200 OK " + std::to_string(prepared.ValueOrDie().fingerprint()) + "\n"
                              : "400 " + prepared.status().ToString() + "\n";
+  } else if (database_) {
+    // Handle one bounded Bolt request per connection. PackStream values stay
+    // opaque here; Cedar Cypher remains the only query compiler.
+    const auto payload = DecodeBoltChunk(request, config_.max_frame_bytes);
+    if (!payload.ok()) return;
+    const auto kind = DecodeBoltMessageKind(payload.ValueOrDie());
+    if (!kind.ok()) return;
+    const auto encoded = kind.ValueOrDie() == BoltMessageKind::kGoodbye
+                             ? EncodeBoltIgnored(config_.max_frame_bytes)
+                             : EncodeBoltSuccess(config_.max_frame_bytes);
+    if (!encoded.ok()) return;
+    response = encoded.ValueOrDie();
   } else {
     response = "400 BAD_REQUEST\n";
   }

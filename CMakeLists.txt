@@ -156,6 +156,8 @@ if(BUILD_BENCHMARKS)
         cedar_kernel_bench_workload)
     add_executable(cedar_query_bench benchmarks/cedar_query_bench.cc)
     target_link_libraries(cedar_query_bench PRIVATE cedar_query_bench_options cedar_query_bench_workload)
+    add_executable(cedar_tcypher_fusion_bench benchmarks/cedar_tcypher_fusion_bench.cc)
+    target_link_libraries(cedar_tcypher_fusion_bench PRIVATE cedar_core)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets

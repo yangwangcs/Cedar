@@ -26,6 +26,12 @@ StatusOr<TemporalScope> MakeScope(const BoundStatement& statement) {
 
 StatusOr<Query> Compile(const BoundStatement& statement) {
   if (statement.patterns.empty()) return Status::InvalidArgument("cypher compiler", "missing pattern");
+  // A comma-separated pattern is a relational product. Cedar's public Query
+  // algebra has no product node yet; rejecting it is safer than compiling only
+  // the first pattern and silently dropping predicates/results.
+  if (statement.patterns.size() != 1) {
+    return CompileError("multiple graph patterns require a product operator");
+  }
   const auto scope = MakeScope(statement);
   if (!scope.ok()) return scope.status();
   const PathPattern& pattern = statement.patterns.front();

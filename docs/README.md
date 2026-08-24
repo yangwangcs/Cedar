@@ -30,6 +30,13 @@ The current implementation preserves Cedar's core storage contracts:
 - [Storage file inspection design](superpowers/specs/2026-08-21-cedar-storage-file-inspection-design.md)
 - [Storage file inspection plan](superpowers/plans/2026-08-21-cedar-storage-file-inspection.md)
 
+## Historical Plans
+
+Plans for superseded transaction, RocksDB-kernel, runtime-admission, embedded
+engine, and product-boundary routes are retained for auditability under
+[the historical-plan archive](superpowers/archive/2026-08-24-historical-plans/README.md).
+They are not active implementation instructions for `main`.
+
 ## Query Acceptance Coverage
 
 The current acceptance evidence covers:
@@ -57,7 +64,8 @@ that explain how the current system was built.
 `superpowers/evidence/` contains measured results and acceptance records.
 `superpowers/archive/` contains explicitly superseded designs.
 
-Historical plans are retained for auditability. The four documents in
-**Current Cedar Kernel Query System** are the authoritative starting point for
-the implementation currently merged to `main`.
-
+The four documents in **Current Cedar Kernel Query System**, together with the
+current storage documents above, are the authoritative starting point for the
+implementation currently merged to `main`. Internal execution reports under
+`.superpowers/sdd/` are intentionally local-only and are not part of the
+repository history going forward.

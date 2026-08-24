@@ -324,7 +324,7 @@ The current implementation can be moved incrementally. During the transition, co
 **Files:**
 - Modify: `README.md`
 - Modify: `CONTEXT.md`
-- Modify: `docs/superpowers/plans/2026-08-19-cedar-product-and-rocksdb-boundary.md`
+- Modify: `docs/superpowers/archive/2026-08-24-historical-plans/2026-08-19-cedar-product-and-rocksdb-boundary.md`
 
 - [ ] **Step 1: Remove obsolete local branches only after the new main and fork tag are verified.** Keep `main` in the superproject and the Cedar fork's release tag/maintenance branch in the fork repository. Delete local branches containing superseded CAC, temporal, pre-Kernel, and old benchmark implementations only after their commits are represented in the archive history or the new source tree.
 

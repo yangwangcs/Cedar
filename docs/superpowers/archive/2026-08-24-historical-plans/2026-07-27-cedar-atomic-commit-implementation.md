@@ -25,7 +25,7 @@
 
 ### Task 1: Execute Stage A — Record, Log, and FORMAT Foundation
 
-**Plan:** `docs/superpowers/plans/2026-07-27-cedar-cac-stage-a.md`
+**Plan:** `docs/superpowers/archive/2026-08-24-historical-plans/2026-07-27-cedar-cac-stage-a.md`
 
 **Produces:**
 
@@ -49,7 +49,7 @@ Expected: a tested, standalone segmented AtomicCommitLog exists, while productio
 
 ### Task 2: Execute Stage B — Queue, OCC, Durable Publication, and Installation
 
-**Plan:** `docs/superpowers/plans/2026-07-27-cedar-cac-stage-b.md`
+**Plan:** `docs/superpowers/archive/2026-08-24-historical-plans/2026-07-27-cedar-cac-stage-b.md`
 
 **Consumes:** Stage A record and log interfaces.
 
@@ -77,7 +77,7 @@ Expected: the coordinator uses CAC queue/validation/install components without h
 
 ### Task 3: Execute Stage C/D — Recovery, Checkpoint, Removal, and Performance Closure
 
-**Plan:** `docs/superpowers/plans/2026-07-27-cedar-cac-stage-cd.md`
+**Plan:** `docs/superpowers/archive/2026-08-24-historical-plans/2026-07-27-cedar-cac-stage-cd.md`
 
 **Consumes:** Stage A/B AtomicCommitLog, queue, validator, installer, timeline, and visible-prefix interfaces.
 

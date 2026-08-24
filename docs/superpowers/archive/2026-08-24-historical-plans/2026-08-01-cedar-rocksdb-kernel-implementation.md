@@ -26,7 +26,7 @@
 
 ### Stage A — RocksDB FactStore Foundation
 
-Plan: `docs/superpowers/plans/2026-08-01-cedar-rocksdb-stage-a.md`
+Plan: `docs/superpowers/archive/2026-08-24-historical-plans/2026-08-01-cedar-rocksdb-stage-a.md`
 
 Produces:
 
@@ -50,7 +50,7 @@ Acceptance:
 
 ### Stage B — Explicit Bitemporal Kernel Interface
 
-Plan: `docs/superpowers/plans/2026-08-01-cedar-rocksdb-stage-b.md`
+Plan: `docs/superpowers/archive/2026-08-24-historical-plans/2026-08-01-cedar-rocksdb-stage-b.md`
 
 Consumes Stage A `FactStore` and produces:
 
@@ -74,7 +74,7 @@ Acceptance:
 
 ### Stage C — Vacuum and Columnar Projection
 
-Plan: `docs/superpowers/plans/2026-08-01-cedar-rocksdb-stage-c.md`
+Plan: `docs/superpowers/archive/2026-08-24-historical-plans/2026-08-01-cedar-rocksdb-stage-c.md`
 
 Consumes Stage B and produces:
 
@@ -97,7 +97,7 @@ Acceptance:
 
 ### Stage D — Clean-Break Removal and Closure
 
-Plan: `docs/superpowers/plans/2026-08-01-cedar-rocksdb-stage-d.md`
+Plan: `docs/superpowers/archive/2026-08-24-historical-plans/2026-08-01-cedar-rocksdb-stage-d.md`
 
 Acceptance:
 

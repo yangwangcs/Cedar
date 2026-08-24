@@ -1429,11 +1429,11 @@ git commit -m "feat: qualify Cedar maintenance with complete evidence"
 ### Task 10: Retire superseded runtime designs and legacy benchmark contracts
 
 **Files:**
-- Move: `docs/superpowers/specs/2026-08-17-cedar-owned-rocksdb-runtime-design.md`
-- Move: `docs/superpowers/plans/2026-08-17-cedar-owned-rocksdb-runtime.md`
+- Move: `docs/superpowers/archive/2026-08-19-superseded-runtime/2026-08-17-cedar-owned-rocksdb-runtime-design.md`
+- Move: `docs/superpowers/archive/2026-08-19-superseded-runtime/2026-08-17-cedar-owned-rocksdb-runtime.md`
 - Create: `docs/superpowers/archive/2026-08-19-superseded-runtime/README.md`
 - Modify: `docs/superpowers/specs/2026-08-17-cedar-bounded-async-executor-design.md`
-- Modify: `docs/superpowers/plans/2026-08-17-cedar-bounded-async-executor.md`
+- Modify: `docs/superpowers/archive/2026-08-24-historical-plans/2026-08-17-cedar-bounded-async-executor.md`
 - Modify: `README.md`
 - Modify: `benchmarks/commit_workloads.h`
 - Modify: `benchmarks/cedar_kernel_bench.cc`
@@ -1480,9 +1480,9 @@ directories:
 
 ```bash
 mkdir -p docs/superpowers/archive/2026-08-19-superseded-runtime
-git mv docs/superpowers/specs/2026-08-17-cedar-owned-rocksdb-runtime-design.md \
+git mv docs/superpowers/archive/2026-08-19-superseded-runtime/2026-08-17-cedar-owned-rocksdb-runtime-design.md \
   docs/superpowers/archive/2026-08-19-superseded-runtime/
-git mv docs/superpowers/plans/2026-08-17-cedar-owned-rocksdb-runtime.md \
+git mv docs/superpowers/archive/2026-08-19-superseded-runtime/2026-08-17-cedar-owned-rocksdb-runtime.md \
   docs/superpowers/archive/2026-08-19-superseded-runtime/
 ```
 
@@ -1567,7 +1567,7 @@ tests pass. Historical matches are allowed only below
 ```bash
 git add -f docs/superpowers/archive/2026-08-19-superseded-runtime \
   docs/superpowers/specs/2026-08-17-cedar-bounded-async-executor-design.md \
-  docs/superpowers/plans/2026-08-17-cedar-bounded-async-executor.md
+  docs/superpowers/archive/2026-08-24-historical-plans/2026-08-17-cedar-bounded-async-executor.md
 git add README.md benchmarks/commit_workloads.h benchmarks/cedar_kernel_bench.cc \
   benchmarks/cedar_kernel_bench_options.cc tests/test_kernel_bench_options.cc \
   include/cedar/fact/fact_store.h src/fact/fact_store.cc \

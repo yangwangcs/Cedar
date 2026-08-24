@@ -35,7 +35,8 @@ StatusOr<Query> Compile(const BoundStatement& statement) {
   if (!pattern.edge.empty() || !pattern.relationship.empty() || pattern.max_hops != 1) {
     const Slot<EdgeRef> edge = Slot<EdgeRef>::WithId(SlotId{2}, pattern.edge.empty() ? "edge" : pattern.edge);
     const Slot<VertexRef> destination = Slot<VertexRef>::WithId(SlotId{3}, pattern.destination);
-    ExpandSpec spec{source, edge, destination, ExpandDirection::kOut, std::nullopt};
+    ExpandSpec spec{source, edge, destination, ExpandDirection::kOut,
+                    std::nullopt, pattern.trail};
     if (pattern.max_hops == 1) {
       query = query.ValueOrDie().Expand(spec);
     } else {

@@ -478,6 +478,11 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
         if (options.check_abort) {
           if (Status status = options.check_abort(); !status.ok()) return status;
         }
+        if (options.trail &&
+            std::find(prior.trail_edges.begin(), prior.trail_edges.end(),
+                      traversal.edge) != prior.trail_edges.end()) {
+          continue;
+        }
         std::vector<std::pair<VertexRef, VertexRef>> moves;
         const bool out = traversal.source == prior.vertex;
         const bool in = traversal.target == prior.vertex;
@@ -517,9 +522,19 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
             emitted.effective = piece;
             result.traversals.push_back(emitted);
             result.labels.push_back(GraphLabel{
-                destination, depth, std::optional<VertexRef>{predecessor}, piece});
+                destination, depth, std::optional<VertexRef>{predecessor}, piece,
+                [&prior, &traversal] {
+                  std::vector<EdgeRef> edges = prior.trail_edges;
+                  edges.push_back(traversal.edge);
+                  return edges;
+                }()});
             next.push_back(GraphLabel{
-                destination, depth, std::optional<VertexRef>{predecessor}, piece});
+                destination, depth, std::optional<VertexRef>{predecessor}, piece,
+                [&prior, &traversal] {
+                  std::vector<EdgeRef> edges = prior.trail_edges;
+                  edges.push_back(traversal.edge);
+                  return edges;
+                }()});
           }
         }
       }

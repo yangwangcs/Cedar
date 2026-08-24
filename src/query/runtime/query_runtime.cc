@@ -758,6 +758,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   }
   const internal::QueryDeltaView* delta = plan.bound_delta_view ? plan.bound_delta_view.get() : nullptr;
   internal::GraphFrontierOptions options{reservation, delta, plan.graph_k_hops};
+  options.trail = plan.graph_expand.has_value() && plan.graph_expand->trail;
   options.check_abort = check_abort;
   options.adjacency_index = snapshot.adjacency_index();
   if (plan.projection_generation.has_value()) {

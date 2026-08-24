@@ -56,6 +56,7 @@ struct ExpandSpec {
   Slot<VertexRef> destination;
   ExpandDirection direction = ExpandDirection::kOut;
   std::optional<uint64_t> edge_type;
+  bool trail = false;
 };
 
 class Query {

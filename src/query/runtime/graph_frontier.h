@@ -84,6 +84,7 @@ struct GraphFrontierOptions {
   QueryReservation* reservation = nullptr;
   const QueryDeltaView* delta = nullptr;
   uint32_t max_hops = 1;
+  bool trail = false;
   // Projection-backed adjacency seek. When present, canonical identity
   // scanning is bypassed and the callback is responsible for returning only
   // postings for the requested frontier.
@@ -104,6 +105,7 @@ struct GraphLabel {
   uint32_t depth = 0;
   std::optional<VertexRef> predecessor;
   std::optional<ValidTimeInterval> effective;
+  std::vector<EdgeRef> trail_edges;
 
   bool operator==(const GraphLabel&) const = default;
 };

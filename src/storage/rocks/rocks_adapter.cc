@@ -1955,6 +1955,36 @@ StatusOr<std::vector<SequenceRecord>> FactStore::ReadSequenceRange(
   return records;
 }
 
+StatusOr<std::vector<FactEvent>> FactStore::ReadCanonicalEvents(
+    const StoreSnapshot& snapshot, CommitSeq first, CommitSeq last) const {
+  const auto records = ReadSequenceRange(snapshot, first, last);
+  if (!records.ok()) return records.status();
+
+  std::vector<std::string> fact_keys;
+  for (const SequenceRecord& record : records.ValueOrDie()) {
+    fact_keys.insert(fact_keys.end(), record.fact_keys.begin(),
+                     record.fact_keys.end());
+  }
+  // Sequence records preserve commit membership. Sort by commit first and
+  // canonical key second so the event stream is deterministic even when a
+  // transaction assembled facts from independent mutation vectors.
+  std::sort(fact_keys.begin(), fact_keys.end(),
+            [](const std::string& left, const std::string& right) {
+              const auto left_key = DecodeFactKey(left);
+              const auto right_key = DecodeFactKey(right);
+              if (!left_key.ok() || !right_key.ok()) {
+                return left < right;
+              }
+              if (left_key.ValueOrDie().commit_seq !=
+                  right_key.ValueOrDie().commit_seq) {
+                return left_key.ValueOrDie().commit_seq.value <
+                       right_key.ValueOrDie().commit_seq.value;
+              }
+              return left < right;
+            });
+  return ReadExactFacts(snapshot, fact_keys);
+}
+
 StatusOr<FactEvent> FactStore::ReadExactFact(
     const StoreSnapshot& snapshot, const std::string& encoded_fact_key) const {
   std::shared_ptr<FactStoreImpl> store;

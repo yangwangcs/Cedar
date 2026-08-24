@@ -145,6 +145,27 @@ TEST_F(CommitPublisherTest, AppendsAuthoritativeEdgeIdentityFactBesideRoutingMet
   EXPECT_EQ(sequence_record.ValueOrDie().fact_keys, expected_fact_keys);
 }
 
+TEST_F(CommitPublisherTest, RejectsDuplicateCanonicalFactKeysBeforeWriting) {
+  const StoreCommitBatch batch{
+      TxnId{9}, 19,
+      {{EntityFact::Vertex(VertexRef{PartId{0}, VertexId{3}}).ref(),
+        ValidTime{10}, FactOperation::kPut, 0, std::nullopt},
+       {EntityFact::Vertex(VertexRef{PartId{0}, VertexId{3}}).ref(),
+        ValidTime{10}, FactOperation::kDelete, 0, std::nullopt}},
+      {}, {}, {}, {}};
+  const CommitSeq sequence{6};
+  const std::string key = EncodeFactKey(batch.mutations[0].ref,
+                                        batch.mutations[0].valid_from,
+                                        sequence);
+  rocksdb::WriteBatch write_batch;
+
+  const Status status = AppendCandidateToWriteBatch(
+      CandidateCommit{&batch, sequence, {key, key}}, handles_[1], handles_[2],
+      &write_batch);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(write_batch.Count(), 0U);
+}
+
 TEST(DecidedEpochTest, ExposesOneImmutablePrebuiltBatchSubmission) {
   auto batch = std::make_unique<rocksdb::WriteBatch>();
   batch->Put("prebuilt-key", "prebuilt-value");

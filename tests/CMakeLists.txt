@@ -207,6 +207,11 @@ add_executable(test_fact_codec storage/test_fact_codec.cc)
 target_link_libraries(test_fact_codec ${CEDAR_TEST_LIBS})
 gtest_discover_tests(test_fact_codec)
 
+add_executable(test_fact_event_canonical storage/test_fact_event_canonical.cc)
+target_include_directories(test_fact_event_canonical PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_fact_event_canonical ${CEDAR_TEST_LIBS})
+gtest_discover_tests(test_fact_event_canonical TEST_PREFIX "FactEventCanonical.")
+
 add_executable(test_fact_store storage/test_fact_store.cc)
 target_include_directories(test_fact_store PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_fact_store

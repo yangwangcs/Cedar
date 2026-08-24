@@ -4,6 +4,7 @@
 #include "storage/rocks/commit_publisher.h"
 
 #include <utility>
+#include <unordered_set>
 
 #include <rocksdb/write_batch.h>
 
@@ -27,6 +28,9 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
   std::vector<std::string> sequence_fact_keys = candidate.fact_keys;
   sequence_fact_keys.reserve(candidate.fact_keys.size() +
                              candidate.batch->edge_identities.size());
+  std::unordered_set<std::string> unique_fact_keys;
+  unique_fact_keys.reserve(candidate.fact_keys.size() +
+                           candidate.batch->edge_identities.size());
   for (size_t index = 0; index < candidate.batch->mutations.size(); ++index) {
     const PendingFactMutation& mutation = candidate.batch->mutations[index];
     const std::string expected_key =
@@ -34,6 +38,28 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
     if (expected_key.empty() || expected_key != candidate.fact_keys[index]) {
       return Status::InvalidArgument("commit publisher", "invalid fact key");
     }
+    if (!unique_fact_keys.insert(candidate.fact_keys[index]).second) {
+      return Status::InvalidArgument("commit publisher", "duplicate fact key");
+    }
+    const auto decoded_key = DecodeFactKey(candidate.fact_keys[index]);
+    if (!decoded_key.ok() || decoded_key.ValueOrDie().commit_seq != candidate.commit_seq) {
+      return Status::InvalidArgument("commit publisher", "fact key commit sequence disagrees");
+    }
+  }
+  for (const EdgeIdentity& identity : candidate.batch->edge_identities) {
+    const FactRef identity_ref(identity.home_part_id, FactFamily::kEdgeIdentity,
+                               PropertyId{}, identity.edge_id.value);
+    const std::string identity_key =
+        EncodeFactKey(identity_ref, ValidTime{0}, candidate.commit_seq);
+    if (identity_key.empty()) {
+      return Status::InvalidArgument("commit publisher", "invalid edge identity fact key");
+    }
+    if (!unique_fact_keys.insert(identity_key).second) {
+      return Status::InvalidArgument("commit publisher", "duplicate fact key");
+    }
+  }
+  for (size_t index = 0; index < candidate.batch->mutations.size(); ++index) {
+    const PendingFactMutation& mutation = candidate.batch->mutations[index];
     const FactEvent event{mutation.ref, mutation.valid_from, candidate.commit_seq,
                           mutation.operation, mutation.schema_epoch, mutation.value};
     const auto encoded_value = EncodeFactValue(event);

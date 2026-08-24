@@ -403,6 +403,11 @@ class FactStore {
   StatusOr<std::vector<SequenceRecord>> ReadSequenceRange(
       const StoreSnapshot& snapshot, CommitSeq first,
       CommitSeq last) const;
+  // Returns the immutable canonical FactEvent rows referenced by a contiguous
+  // commit range. Sequence metadata contributes keys only; payloads are read
+  // from the facts CF through the same canonical decoder used by all scans.
+  StatusOr<std::vector<FactEvent>> ReadCanonicalEvents(
+      const StoreSnapshot& snapshot, CommitSeq first, CommitSeq last) const;
   StatusOr<FactEvent> ReadExactFact(const StoreSnapshot& snapshot,
                                     const std::string& encoded_fact_key) const;
   // Reads exact fact keys through one RocksDB MultiGet while preserving the

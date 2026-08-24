@@ -4,6 +4,7 @@
 #include "cedar/fact/meta_codec.h"
 
 #include <limits>
+#include <unordered_set>
 
 #include "cedar/core/crc32c.h"
 #include "cedar/fact/fact_codec.h"
@@ -167,9 +168,19 @@ Status SequenceRecord::Validate() const {
       fact_keys.size() > std::numeric_limits<uint32_t>::max()) {
     return Status::InvalidArgument("sequence record", "invalid sequence metadata");
   }
+  std::unordered_set<std::string> unique_keys;
+  unique_keys.reserve(fact_keys.size());
   for (const std::string& key : fact_keys) {
-    if (!DecodeFactKey(key).ok()) {
+    const auto decoded = DecodeFactKey(key);
+    if (!decoded.ok()) {
       return Status::InvalidArgument("sequence record", "invalid fact key");
+    }
+    if (decoded.ValueOrDie().commit_seq != commit_seq) {
+      return Status::InvalidArgument("sequence record",
+                                     "fact key commit sequence disagrees");
+    }
+    if (!unique_keys.insert(key).second) {
+      return Status::InvalidArgument("sequence record", "duplicate fact key");
     }
   }
   return Status::OK();

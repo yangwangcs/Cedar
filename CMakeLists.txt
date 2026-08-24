@@ -78,6 +78,8 @@ add_library(cedar_core STATIC
     src/query/planner/query_planner.cc
     src/cypher/lexer.cc
     src/cypher/parser.cc
+    src/cypher/fingerprint.cc
+    src/cypher/binder.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

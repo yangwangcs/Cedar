@@ -80,6 +80,7 @@ add_library(cedar_core STATIC
     src/cypher/parser.cc
     src/cypher/fingerprint.cc
     src/cypher/binder.cc
+    src/cypher/compiler.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

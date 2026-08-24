@@ -28,6 +28,23 @@ TEST(CypherCompilerTest, LowersBoundedPathToExistingExpandOperator) {
   EXPECT_EQ(query.ValueOrDie().schema().columns().size(), 3U);
 }
 
+TEST(CypherCompilerTest, LowersFactMetadataFunctionsToTypedColumns) {
+  const auto query = Compile(Bound(
+      "MATCH (v) RETURN v, valid_from(v), commit_seq(v)"));
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  ASSERT_EQ(query.ValueOrDie().schema().columns().size(), 3U);
+  EXPECT_EQ(query.ValueOrDie().schema().columns()[1].type, QueryType::kValidTime);
+  EXPECT_EQ(query.ValueOrDie().schema().columns()[2].type, QueryType::kCommitSeq);
+}
+
+TEST(CypherCompilerTest, LowersGraphEndpointMetadataFunctions) {
+  const auto query = Compile(Bound(
+      "MATCH (a)-[e:KNOWS]->(b) RETURN a, valid_from(e), b"));
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  ASSERT_EQ(query.ValueOrDie().schema().columns().size(), 3U);
+  EXPECT_EQ(query.ValueOrDie().schema().columns()[1].type, QueryType::kValidTime);
+}
+
 TEST(CypherCompilerTest, DoesNotTreatSystemTimeAsValidTime) {
   const auto parsed = Parse(
       "FOR SYSTEM_TIME AS OF 7 MATCH (v) RETURN v");
@@ -35,8 +52,7 @@ TEST(CypherCompilerTest, DoesNotTreatSystemTimeAsValidTime) {
   const auto bound = Bind(parsed.ValueOrDie(), SchemaCatalog{}, BinderOptions{});
   ASSERT_TRUE(bound.ok()) << bound.status().ToString();
   const auto query = Compile(bound.ValueOrDie());
-  EXPECT_FALSE(query.ok());
-  EXPECT_TRUE(query.status().IsNotSupportedError());
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
 }
 
 TEST(CypherCompilerTest, RejectsMixedPatternsInsteadOfDroppingTheRemainder) {

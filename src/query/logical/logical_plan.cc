@@ -357,6 +357,30 @@ StatusOr<Query> Query::Select(std::vector<Projection> projections) const {
                       RowSchema(std::move(columns))));
 }
 
+StatusOr<Query> Query::ProjectMetadata(SlotId source, MetadataKind kind,
+                                       Projection output) const {
+  if (!root_ || source.value == 0 || output.column.slot.value == 0 ||
+      HasSlotId(schema(), output.column.slot)) {
+    return Status::InvalidArgument("metadata projection", "invalid or duplicate slot");
+  }
+  const auto source_column = std::find_if(
+      schema().columns().begin(), schema().columns().end(),
+      [source](const RowColumn& column) { return column.slot == source; });
+  if (source_column == schema().columns().end() ||
+      (source_column->type != QueryType::kVertexRef &&
+       source_column->type != QueryType::kEdgeRef) ||
+      (kind == MetadataKind::kValidFrom && output.column.type != QueryType::kValidTime) ||
+      (kind == MetadataKind::kCommitSeq && output.column.type != QueryType::kCommitSeq)) {
+    return Status::InvalidArgument("metadata projection", "source or output type is invalid");
+  }
+  std::vector<RowColumn> columns = schema().columns();
+  columns.push_back(output.column);
+  internal::LogicalPlanPayload payload;
+  payload.metadata_binding = internal::MetadataBinding{source, kind, output.column};
+  return Query(Append(internal::LogicalOpKind::kMetadataProject, root_,
+                      RowSchema(std::move(columns)), std::move(payload)));
+}
+
 const RowSchema& Query::schema() const {
   static const RowSchema empty;
   return root_ ? root_->schema() : empty;

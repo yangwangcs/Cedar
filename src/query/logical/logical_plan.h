@@ -19,7 +19,7 @@ enum class LogicalOpKind : uint8_t {
   kStateAt, kEventsBetween, kChangesBetween, kHistory,
   kStateOverlaps, kStateThroughout,
   kExpandOut, kExpandIn, kExpandBoth,
-  kBindProperty, kFilter, kProject,
+  kBindProperty, kMetadataProject, kFilter, kProject,
   kInnerJoin, kSemiJoin, kAntiJoin, kUnionAll, kDistinct, kSort, kLimit,
   kAggregateRows, kTemporalAggregate, kKHopExpand, kCoexistingShortestPath,
   kEarliestArrival, kLatestDeparture, kFastestDuration,
@@ -31,10 +31,17 @@ struct PropertyBinding {
   RowColumn output;
 };
 
+struct MetadataBinding {
+  SlotId source;
+  MetadataKind kind;
+  RowColumn output;
+};
+
 struct LogicalPlanPayload {
   std::optional<TemporalScope> scope;
   std::optional<ExpandSpec> expand_spec;
   std::optional<PropertyBinding> property_binding;
+  std::optional<MetadataBinding> metadata_binding;
   std::shared_ptr<const ExpressionNode> predicate;
   uint32_t max_hops = 1;
   std::optional<PropertyId> journey_duration_property;
@@ -58,6 +65,9 @@ class LogicalPlanNode {
   }
   const std::optional<PropertyBinding>& property_binding() const {
     return payload_.property_binding;
+  }
+  const std::optional<MetadataBinding>& metadata_binding() const {
+    return payload_.metadata_binding;
   }
   const std::shared_ptr<const ExpressionNode>& predicate() const {
     return payload_.predicate;

@@ -63,6 +63,7 @@ struct RuntimeRow {
   std::map<uint32_t, std::optional<Value>> property_values;
   std::optional<PathValue> path;
   std::optional<JourneyValue> journey;
+  std::map<uint32_t, FactEvent> metadata_events;
 };
 
 StatusOr<uint64_t> PropertyPayloadBytes(const RuntimeRow& row) {
@@ -272,6 +273,54 @@ StatusOr<EvaluatedValue> EvaluateExpression(
   return EvaluatedValue{QueryType::kBool, true, EvaluatedLiteral{value}};
 }
 
+Status PopulateMetadataEvents(
+    Snapshot& snapshot, FactFamily family, SlotId source_slot,
+    std::vector<RuntimeRow>* rows,
+    const std::function<std::optional<FactRef>(const RuntimeRow&)>& selector,
+    const std::vector<internal::PreparedMetadataBinding>& bindings) {
+  using MetadataKey = std::tuple<uint32_t, uint64_t>;
+  std::set<MetadataKey> wanted;
+  for (const RuntimeRow& row : *rows) {
+    const auto ref = selector(row);
+    if (ref.has_value()) wanted.emplace(ref->part_id().value, ref->entity_id());
+  }
+  if (wanted.empty()) return Status::OK();
+  std::map<MetadataKey, std::vector<FactEvent>> events;
+  const Status scanned = snapshot.ScanFamily(
+      family, [&wanted, &events](const FactEvent& event) {
+        const MetadataKey key{event.ref.part_id().value, event.ref.entity_id()};
+        if (wanted.find(key) != wanted.end()) events[key].push_back(event);
+        return Status::OK();
+      });
+  if (!scanned.ok()) return scanned;
+  for (RuntimeRow& row : *rows) {
+    const auto ref = selector(row);
+    if (!ref.has_value()) continue;
+    const auto found = events.find({ref->part_id().value, ref->entity_id()});
+    if (found == events.end()) continue;
+    const uint64_t time = row.point ? row.point->value
+                                    : row.effective ? row.effective->from.value : 0;
+    std::optional<FactEvent> winner;
+    for (const FactEvent& event : found->second) {
+      if (event.commit_seq.value > snapshot.commit_seq().value ||
+          event.valid_from.value > time || event.operation != FactOperation::kPut) continue;
+      if (!winner.has_value() ||
+          event.valid_from.value > winner->valid_from.value ||
+          (event.valid_from == winner->valid_from &&
+           event.commit_seq.value > winner->commit_seq.value)) {
+        winner = event;
+      }
+    }
+    if (!winner.has_value()) continue;
+    for (const internal::PreparedMetadataBinding& binding : bindings) {
+      if (binding.source == source_slot) {
+        row.metadata_events.emplace(binding.output.slot.value, *winner);
+      }
+    }
+  }
+  return Status::OK();
+}
+
 StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation = nullptr) {
@@ -284,7 +333,7 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
     result.push_back(std::move(row));
     return Status::OK();
   };
-  return std::visit(
+  auto rows = std::visit(
       [&](const auto& scope) -> StatusOr<std::vector<RuntimeRow>> {
         using T = std::decay_t<decltype(scope)>;
         if constexpr (std::is_same_v<T, At>) {
@@ -333,6 +382,7 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
         return result;
       },
       plan.scope);
+  return rows;
 }
 
 StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
@@ -654,6 +704,14 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     if (!rows.ok()) return rows.status();
   }
   if (!rows.ok()) return rows.status();
+  if (!plan.graph_expand && !plan.metadata_bindings.empty()) {
+    const Status metadata = PopulateMetadataEvents(
+        snapshot, plan.entity_family, plan.entity_slot,
+        &rows.ValueOrDie(),
+        [](const RuntimeRow& row) { return std::optional<FactRef>(row.ref); },
+        plan.metadata_bindings);
+    if (!metadata.ok()) return metadata;
+  }
   if (!plan.property_bindings.empty()) {
     rows = BindPropertyRows(snapshot, std::move(rows).ConsumeValueOrDie(),
                             plan.property_bindings);
@@ -909,6 +967,41 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
       }
     }
   }
+  if (!plan.metadata_bindings.empty()) {
+    if (plan.graph_source_slot) {
+      const Status status = PopulateMetadataEvents(
+          snapshot, FactFamily::kVertexState, *plan.graph_source_slot, &result,
+          [](const RuntimeRow& row) {
+            if (!row.graph_source) return std::optional<FactRef>{};
+            return std::optional<FactRef>(FactRef(
+                row.graph_source->part_id, FactFamily::kVertexState,
+                PropertyId{}, row.graph_source->vertex_id.value));
+          }, plan.metadata_bindings);
+      if (!status.ok()) return status;
+    }
+    if (plan.graph_edge_slot) {
+      const Status status = PopulateMetadataEvents(
+          snapshot, FactFamily::kEdgeState, *plan.graph_edge_slot, &result,
+          [](const RuntimeRow& row) {
+            if (!row.graph_edge) return std::optional<FactRef>{};
+            return std::optional<FactRef>(FactRef(
+                row.graph_edge->home_part_id, FactFamily::kEdgeState,
+                PropertyId{}, row.graph_edge->edge_id.value));
+          }, plan.metadata_bindings);
+      if (!status.ok()) return status;
+    }
+    if (plan.graph_destination_slot) {
+      const Status status = PopulateMetadataEvents(
+          snapshot, FactFamily::kVertexState, *plan.graph_destination_slot, &result,
+          [](const RuntimeRow& row) {
+            if (!row.graph_destination) return std::optional<FactRef>{};
+            return std::optional<FactRef>(FactRef(
+                row.graph_destination->part_id, FactFamily::kVertexState,
+                PropertyId{}, row.graph_destination->vertex_id.value));
+          }, plan.metadata_bindings);
+      if (!status.ok()) return status;
+    }
+  }
   if (!plan.property_bindings.empty()) {
     auto bound = BindGraphPropertyRows(snapshot, std::move(result), plan);
     if (!bound.ok()) return bound.status();
@@ -1052,6 +1145,21 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
         } else {
           Append(column, EdgeRef{row.ref.part_id(), EdgeId{row.ref.entity_id()}},
                  true);
+        }
+        continue;
+      }
+      const auto metadata = std::find_if(
+          plan.metadata_bindings.begin(), plan.metadata_bindings.end(),
+          [&output](const internal::PreparedMetadataBinding& binding) {
+            return binding.output.slot == output.slot;
+          });
+      if (metadata != plan.metadata_bindings.end()) {
+        const auto event = row.metadata_events.find(output.slot.value);
+        const bool present = event != row.metadata_events.end();
+        if (metadata->kind == MetadataKind::kValidFrom) {
+          Append(column, present ? event->second.valid_from : ValidTime{}, present);
+        } else {
+          Append(column, present ? event->second.commit_seq : CommitSeq{}, present);
         }
         continue;
       }
@@ -2029,6 +2137,11 @@ void CollectMetadata(const LogicalPlanNode& node, PreparedQueryPlan* plan) {
     plan->property_bindings.push_back(
         {binding.source, binding.property, binding.output, kind, std::nullopt});
   }
+  if (node.metadata_binding().has_value()) {
+    const MetadataBinding& binding = *node.metadata_binding();
+    plan->metadata_bindings.push_back(
+        {binding.source, binding.kind, binding.output});
+  }
   for (const auto& input : node.inputs()) CollectMetadata(*input, plan);
 }
 
@@ -2044,7 +2157,11 @@ bool IsProjectedCanonicalColumn(const RowColumn& column,
       plan.property_bindings.begin(), plan.property_bindings.end(),
       [&column](const PreparedPropertyBinding& binding) {
         return binding.output == column;
-      });
+      }) ||
+      std::any_of(plan.metadata_bindings.begin(), plan.metadata_bindings.end(),
+                  [&column](const PreparedMetadataBinding& binding) {
+                    return binding.output == column;
+                  });
 }
 
 }  // namespace
@@ -2148,7 +2265,8 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   // A canonical query may chain any number of property bindings. Metadata is
   // collected from the full logical tree above; walk the complete binding
   // chain before validating the underlying temporal scan.
-  while (node->kind() == LogicalOpKind::kBindProperty) {
+  while (node->kind() == LogicalOpKind::kBindProperty ||
+         node->kind() == LogicalOpKind::kMetadataProject) {
     if (node->inputs().size() != 1) return plan;
     node = node->inputs().front().get();
   }

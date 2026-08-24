@@ -42,10 +42,9 @@ StatusOr<Value> LookupValue(const Bindings& bindings, ParameterId parameter) {
 
 }  // namespace
 
-StatusOr<CommitResult> ExecuteWrite(Database& database,
-                                    const BoundStatement& statement,
-                                    const Bindings& bindings,
-                                    ValidTime valid_time) {
+Status StageWrite(Database& database, Transaction& tx,
+                  const BoundStatement& statement, const Bindings& bindings,
+                  ValidTime valid_time) {
   if (statement.kind != StatementKind::kWrite) return WriteError("statement is not a write");
   if (statement.system_time.has_value()) return WriteError("historical system-time writes are forbidden");
   if (statement.valid_time.has_value() && statement.valid_time->to.has_value()) {
@@ -55,9 +54,6 @@ StatusOr<CommitResult> ExecuteWrite(Database& database,
       *statement.valid_time->as_of != valid_time.value) {
     return WriteError("write valid time disagrees with statement scope");
   }
-  auto transaction = database.BeginTransaction();
-  if (!transaction.ok()) return transaction.status();
-  std::unique_ptr<Transaction> tx = std::move(transaction).ConsumeValueOrDie();
   std::unordered_map<std::string, WriteEntity> entities;
   for (const PathPattern& pattern : statement.patterns) {
     auto source = entities.find(pattern.source);
@@ -67,7 +63,7 @@ StatusOr<CommitResult> ExecuteWrite(Database& database,
       source = entities.emplace(pattern.source,
                                 WriteEntity{VertexRef{PartId{statement.part_id.value}, id.ValueOrDie()}, std::nullopt})
                    .first;
-      if (const Status status = tx->Assert(EntityFact::Vertex(*source->second.vertex), valid_time);
+      if (const Status status = tx.Assert(EntityFact::Vertex(*source->second.vertex), valid_time);
           !status.ok()) return status;
     }
     if (pattern.edge.empty() && pattern.relationship.empty()) continue;
@@ -78,7 +74,7 @@ StatusOr<CommitResult> ExecuteWrite(Database& database,
       destination = entities.emplace(pattern.destination,
                                      WriteEntity{VertexRef{PartId{statement.part_id.value}, id.ValueOrDie()}, std::nullopt})
                         .first;
-      if (const Status status = tx->Assert(EntityFact::Vertex(*destination->second.vertex), valid_time);
+      if (const Status status = tx.Assert(EntityFact::Vertex(*destination->second.vertex), valid_time);
           !status.ok()) return status;
     }
     const std::string edge_name = pattern.edge.empty() ? "edge" : pattern.edge;
@@ -91,7 +87,7 @@ StatusOr<CommitResult> ExecuteWrite(Database& database,
                                   *destination->second.vertex,
                                   RelationshipType(pattern.relationship)};
       edge = entities.emplace(edge_name, WriteEntity{std::nullopt, edge_ref}).first;
-      if (const Status status = tx->Assert(identity, valid_time); !status.ok()) return status;
+      if (const Status status = tx.Assert(identity, valid_time); !status.ok()) return status;
     }
   }
   for (const BoundAssignment& assignment : statement.assignments) {
@@ -101,10 +97,10 @@ StatusOr<CommitResult> ExecuteWrite(Database& database,
     if (!value.ok()) return value.status();
     Status status;
     if (entity->second.vertex.has_value()) {
-      status = tx->Set(PropertyFact::Vertex(*entity->second.vertex, assignment.property_id),
+      status = tx.Set(PropertyFact::Vertex(*entity->second.vertex, assignment.property_id),
                        valid_time, value.ValueOrDie());
     } else if (entity->second.edge.has_value()) {
-      status = tx->Set(PropertyFact::Edge(*entity->second.edge, assignment.property_id),
+      status = tx.Set(PropertyFact::Edge(*entity->second.edge, assignment.property_id),
                        valid_time, value.ValueOrDie());
     } else {
       return WriteError("SET target has no identity");
@@ -116,13 +112,28 @@ StatusOr<CommitResult> ExecuteWrite(Database& database,
     if (entity == entities.end()) return WriteError("DELETE target is not created in this statement");
     Status status;
     if (entity->second.vertex.has_value()) {
-      status = tx->Retract(EntityFact::Vertex(*entity->second.vertex), valid_time);
+      status = tx.Retract(EntityFact::Vertex(*entity->second.vertex), valid_time);
     } else if (entity->second.edge.has_value()) {
-      status = tx->Retract(EntityFact::Edge(*entity->second.edge), valid_time);
+      status = tx.Retract(EntityFact::Edge(*entity->second.edge), valid_time);
     } else {
       return WriteError("DELETE target has no identity");
     }
     if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
+StatusOr<CommitResult> ExecuteWrite(Database& database,
+                                    const BoundStatement& statement,
+                                    const Bindings& bindings,
+                                    ValidTime valid_time) {
+  auto transaction = database.BeginTransaction();
+  if (!transaction.ok()) return transaction.status();
+  std::unique_ptr<Transaction> tx = std::move(transaction).ConsumeValueOrDie();
+  const Status staged = StageWrite(database, *tx, statement, bindings, valid_time);
+  if (!staged.ok()) {
+    tx->Rollback().IgnoreError();
+    return staged;
   }
   return tx->Commit();
 }

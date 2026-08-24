@@ -1,6 +1,7 @@
 #include "cedar/cypher/compiler.h"
 
 #include <algorithm>
+#include <cctype>
 
 namespace cedar::cypher {
 namespace {
@@ -9,10 +10,12 @@ Status CompileError(const char* message) {
   return Status::NotSupported("cypher compiler", message);
 }
 
+std::string Lower(std::string value) {
+  for (char& byte : value) byte = static_cast<char>(std::tolower(static_cast<unsigned char>(byte)));
+  return value;
+}
+
 StatusOr<TemporalScope> MakeScope(const BoundStatement& statement) {
-  if (statement.system_time.has_value()) {
-    return CompileError("system-time lowering requires a system snapshot operator");
-  }
   if (!statement.valid_time.has_value()) return TemporalScope{At{ValidTime{0}}};
   const TimeScope& scope = *statement.valid_time;
   if (scope.as_of.has_value()) return TemporalScope{At{ValidTime{*scope.as_of}}};
@@ -52,8 +55,42 @@ StatusOr<Query> Compile(const BoundStatement& statement) {
   }
   if (!statement.projections.empty()) {
     std::vector<Projection> projections;
+    uint32_t metadata_index = 0;
     for (const auto& item : statement.projections) {
-      if (!item.function.empty()) return CompileError("metadata projection is not yet represented by the public row schema");
+      if (!item.function.empty()) {
+        const std::string function = Lower(item.function);
+        SlotId metadata_source;
+        if (item.expression == item.function + "(" + pattern.source + ")") {
+          metadata_source = source.id();
+        } else if (!pattern.edge.empty() &&
+                   item.expression == item.function + "(" + pattern.edge + ")") {
+          metadata_source = SlotId{2};
+        } else if (!pattern.destination.empty() &&
+                   item.expression == item.function + "(" + pattern.destination + ")") {
+          metadata_source = SlotId{3};
+        } else {
+          return Status::BindError("cypher compiler", "metadata variable is not bound");
+        }
+        const SlotId output_id{1000U + metadata_index++};
+        if (function == "valid_from") {
+          const auto metadata_slot = Slot<ValidTime>::WithId(output_id, item.expression);
+          auto projected = query.ValueOrDie().ProjectMetadata(
+              metadata_source, MetadataKind::kValidFrom, Project(metadata_slot));
+          if (!projected.ok()) return projected.status();
+          query = std::move(projected);
+          projections.push_back(Project(metadata_slot));
+        } else if (function == "commit_seq") {
+          const auto metadata_slot = Slot<CommitSeq>::WithId(output_id, item.expression);
+          auto projected = query.ValueOrDie().ProjectMetadata(
+              metadata_source, MetadataKind::kCommitSeq, Project(metadata_slot));
+          if (!projected.ok()) return projected.status();
+          query = std::move(projected);
+          projections.push_back(Project(metadata_slot));
+        } else {
+          return CompileError("unsupported metadata function");
+        }
+        continue;
+      }
       if (item.expression == pattern.source) {
         projections.push_back(Project(source));
       } else if (item.expression == pattern.edge && !pattern.edge.empty()) {

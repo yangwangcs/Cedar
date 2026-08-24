@@ -58,5 +58,12 @@ TEST(CypherParserTest, RejectsUnboundedPath) {
   EXPECT_TRUE(parsed.status().IsParseError());
 }
 
+TEST(CypherParserTest, RejectsMixedPathWithoutASequenceOperator) {
+  const auto parsed = Parse("MATCH (a)-[e:KNOWS]->(b)-[f:LIKES*1..2]->(c) RETURN a");
+  EXPECT_FALSE(parsed.ok());
+  EXPECT_TRUE(parsed.status().IsNotSupportedError());
+  EXPECT_NE(parsed.status().ToString().find("sequence operator"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace cedar::cypher

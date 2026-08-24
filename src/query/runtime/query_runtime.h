@@ -33,6 +33,12 @@ struct PreparedPropertyBinding {
   std::optional<PropertyDefinition> definition;
 };
 
+struct PreparedMetadataBinding {
+  SlotId source;
+  MetadataKind kind;
+  RowColumn output;
+};
+
 // Private pull-runtime boundary between logical relational nodes and physical
 // vector operators. It is intentionally unavailable from the public Query API.
 struct RuntimeRelationalInput {
@@ -63,6 +69,7 @@ struct PreparedQueryPlan {
         entity_slot(other.entity_slot),
         scope(other.scope),
         property_bindings(other.property_bindings),
+        metadata_bindings(other.metadata_bindings),
         predicate(other.predicate),
         output_columns(other.output_columns),
         effective_output_slot(other.effective_output_slot),
@@ -89,6 +96,7 @@ struct PreparedQueryPlan {
     entity_slot = other.entity_slot;
     scope = other.scope;
     property_bindings = other.property_bindings;
+    metadata_bindings = other.metadata_bindings;
     predicate = other.predicate;
     output_columns = other.output_columns;
     effective_output_slot = other.effective_output_slot;
@@ -120,6 +128,7 @@ struct PreparedQueryPlan {
   SlotId entity_slot;
   TemporalScope scope = At{ValidTime{0}};
   std::vector<PreparedPropertyBinding> property_bindings;
+  std::vector<PreparedMetadataBinding> metadata_bindings;
   std::shared_ptr<const ExpressionNode> predicate;
   std::vector<RowColumn> output_columns;
   std::optional<SlotId> effective_output_slot;

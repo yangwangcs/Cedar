@@ -44,6 +44,8 @@ struct Projection {
   RowColumn column;
 };
 
+enum class MetadataKind : uint8_t { kValidFrom, kCommitSeq };
+
 template <typename T, bool Optional>
 Projection Project(const Slot<T, Optional>& slot) {
   return Projection{{slot.id(), slot.name(), slot.type(), Optional}};
@@ -92,6 +94,8 @@ class Query {
   }
   StatusOr<Query> Where(Expr<bool> predicate) const;
   StatusOr<Query> Select(std::vector<Projection> projections) const;
+  StatusOr<Query> ProjectMetadata(SlotId source, MetadataKind kind,
+                                  Projection output) const;
   const RowSchema& schema() const;
  private:
   explicit Query(std::shared_ptr<const internal::LogicalPlanNode> root)

@@ -55,6 +55,7 @@ class Server {
   std::atomic<bool> live_{false};
   std::atomic<bool> ready_{false};
   std::atomic<bool> stopping_{false};
+  std::atomic<int> active_client_fd_{-1};
 };
 
 }  // namespace cedar::server

@@ -29,11 +29,13 @@ sockets/signals/filesystem. No Arrow, Thrift, Boost, Rust runtime, or external s
 ## Execution status (2026-08-24)
 
 - Tasks 0-3, 5-6: implemented and covered by focused tests.
-- Task 4: bounded paths and CHANGES are implemented; system-time and metadata projection
-  return typed `NotSupported`; mixed patterns are explicitly rejected until a product node
+- Task 4: bounded paths, CHANGES, system-time `AS OF` ceilings, and typed metadata projections
+  are implemented; mixed patterns remain explicitly rejected until a product/sequence node
   exists in the Cedar algebra.
-- Task 7: lifecycle, health, lock/pid, text RUN, handshake, and bounded Bolt request
-  envelopes are implemented; full PackStream value decoding and RECORD streaming remain.
+- Task 7: lifecycle, health, lock/pid, text RUN, Bolt handshake, stateful HELLO/RUN/PULL,
+  RECORD frames, and transaction lifecycle messages are implemented. Explicit Bolt writes
+  stage in one Cedar transaction and publish only on COMMIT; pending-write reads are rejected
+  until a transaction-local QueryRuntime view is added.
 - Task 8: baseline, evidence, and fixed-duration smoke benchmark are implemented; the
   benchmark is not a production capacity claim.
 

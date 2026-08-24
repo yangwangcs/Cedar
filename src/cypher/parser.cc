@@ -145,6 +145,10 @@ class Parser {
       auto pattern = ParsePattern();
       if (!pattern.ok()) return pattern.status();
       statement->patterns.push_back(std::move(pattern.ValueOrDie()));
+      if (Peek().kind == TokenKind::kSymbol && Peek().text == "-") {
+        return Status::NotSupported("cypher parser",
+                                    "mixed path sequence requires a bounded sequence operator");
+      }
       if (!Symbol(",")) break;
     }
     if (statement->patterns.empty()) return Error("expected graph pattern");

@@ -25,11 +25,12 @@ class PreparedCypher {
   const BoundStatement& bound_statement() const { return bound_; }
 
  private:
-  PreparedCypher(PreparedQuery prepared, BoundStatement bound)
-      : prepared_(std::move(prepared)), bound_(std::move(bound)) {}
+  PreparedCypher(PreparedQuery prepared, BoundStatement bound, Database* database)
+      : prepared_(std::move(prepared)), bound_(std::move(bound)), database_(database) {}
 
   PreparedQuery prepared_;
   BoundStatement bound_;
+  Database* database_ = nullptr;
   friend StatusOr<PreparedCypher> PrepareCypher(
       Database&, const std::string&, const SchemaCatalog&, BinderOptions);
 };

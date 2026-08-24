@@ -34,6 +34,10 @@ add_executable(test_cypher_compile_execute cypher/test_cypher_compile_execute.cc
 target_link_libraries(test_cypher_compile_execute PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_cypher_compile_execute TEST_PREFIX "CypherCompiler.")
 
+add_executable(test_cypher_embedded_api cypher/test_cypher_embedded_api.cc)
+target_link_libraries(test_cypher_embedded_api PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_cypher_embedded_api TEST_PREFIX "CypherEmbedded.")
+
 add_executable(test_query_differential query/test_query_differential.cc)
 target_include_directories(test_query_differential PRIVATE
     ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)

@@ -83,6 +83,8 @@ add_library(cedar_core STATIC
     src/cypher/compiler.cc
     src/cypher/api.cc
     src/cypher/write.cc
+    src/server/server.cc
+    src/server/bolt_codec.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc
@@ -124,6 +126,11 @@ add_library(Cedar::cedar ALIAS cedar_core)
 add_executable(cedar tools/cedar_main.cc)
 target_link_libraries(cedar PRIVATE cedar_core)
 
+add_executable(cedar-server tools/cedar_server_main.cc)
+target_link_libraries(cedar-server PRIVATE cedar_core)
+add_executable(cedar-admin tools/cedar_admin_main.cc)
+target_link_libraries(cedar-admin PRIVATE cedar_core)
+
 add_library(cedar_kernel_bench_options STATIC
     benchmarks/cedar_kernel_bench_options.cc)
 target_include_directories(cedar_kernel_bench_options PUBLIC ${CMAKE_SOURCE_DIR})
@@ -156,6 +163,7 @@ install(TARGETS cedar_core EXPORT CedarTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS cedar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS cedar-server cedar-admin RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES "${CEDAR_ROCKSDB_LIBRARY}"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal"
     RENAME "libcedar_engine.a")

@@ -24,12 +24,26 @@
 #include "rocksdb/table.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/cedar_parquet/cedar_parquet_table_factory.h"
+#include "kernel/query_debug_thresholds.h"
 
 namespace cedar::internal {
 namespace {
 
 constexpr uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr uint64_t kGiB = 1024ULL * kMiB;
+// KernelTest deliberately makes every persistent-state transition cheap to
+// reach. The WBM still covers eight facts MemTables so the Cedar-owned flush
+// worker has a real, bounded drain window rather than artificial
+// write-stop from an impossible queue depth.
+constexpr uint64_t kKernelTestFactsWriteBufferBytes = 32ULL * 1024ULL;
+constexpr uint64_t kKernelTestMetaWriteBufferBytes = 8ULL * 1024ULL;
+constexpr uint64_t kKernelTestDefaultWriteBufferBytes = 8ULL * 1024ULL;
+constexpr uint64_t kKernelTestBlockCacheBytes = 256ULL * 1024ULL;
+constexpr uint64_t kKernelTestMemoryBudgetBytes = 1ULL * kMiB;
+constexpr uint64_t kKernelTestWriteBufferManagerBytes = 1ULL * kMiB;
+constexpr uint64_t kDebugWriteBufferManagerBytes = 256ULL * 1024ULL;
+constexpr int kCedarFlushWorkerCapacity = 1;
+constexpr int kCedarCompactionWorkerCapacity = 2;
 
 uint64_t HostMemoryBytes() {
 #if defined(__linux__)
@@ -115,6 +129,22 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
     return Status::InvalidArgument(
         "production storage profile",
         "WAL recycling must be disabled or use two through four files");
+  }
+  if (options.storage_profile == StorageProfile::kKernelTest ||
+      options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    const bool debug = options.storage_profile == StorageProfile::kDebugSmallThresholds;
+    result.memory_budget_bytes = kKernelTestMemoryBudgetBytes;
+    result.block_cache_bytes = kKernelTestBlockCacheBytes;
+    result.facts_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes
+                                            : kKernelTestFactsWriteBufferBytes;
+    result.meta_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes / 4
+                                           : kKernelTestMetaWriteBufferBytes;
+    result.default_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes / 4
+                                              : kKernelTestDefaultWriteBufferBytes;
+    result.max_background_jobs = 2;
+    result.max_subcompactions = 1;
+    result.max_total_wal_size = 256ULL * 1024ULL;
+    return result;
   }
   uint64_t budget = options.production.memory_budget_bytes;
   const uint64_t host_memory = HostMemoryBytes();
@@ -215,25 +245,42 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
 
   const auto cache = MakeBlockCache(resolved->block_cache_bytes);
   result.write_buffer_size = resolved->default_write_buffer_bytes;
+  const uint64_t write_buffer_manager_bytes =
+      options.storage_profile == StorageProfile::kKernelTest
+          ? kKernelTestWriteBufferManagerBytes
+          : options.storage_profile == StorageProfile::kDebugSmallThresholds
+                ? kDebugWriteBufferManagerBytes
+          : resolved->facts_write_buffer_bytes + resolved->meta_write_buffer_bytes;
   result.write_buffer_manager = std::make_shared<rocksdb::WriteBufferManager>(
-      static_cast<size_t>(resolved->facts_write_buffer_bytes +
-                          resolved->meta_write_buffer_bytes),
+      static_cast<size_t>(write_buffer_manager_bytes),
       cache, false);
   result.atomic_flush = false;
   result.paranoid_checks = true;
   result.track_and_verify_wals_in_manifest = true;
   result.allow_concurrent_memtable_write = true;
+  result.enable_write_thread_adaptive_yield = true;
   result.enable_pipelined_write = false;
+  result.unordered_write = false;
+  result.two_write_queues = false;
+  // Cedar owns Kernel epoch assembly; this only bounds non-Kernel write groups.
+  result.max_write_batch_group_size_bytes = 2ULL * 1024ULL * 1024ULL;
   result.manual_wal_flush = false;
   result.use_fsync = false;
   result.avoid_unnecessary_blocking_io = true;
   result.max_background_jobs = static_cast<int>(resolved->max_background_jobs);
+  // Cedar grants every maintenance job. Declare fixed engine capacity rather
+  // than inheriting RocksDB's max_background_jobs / 4 flush heuristic.
+  result.max_background_flushes = kCedarFlushWorkerCapacity;
+  result.max_background_compactions = kCedarCompactionWorkerCapacity;
   result.max_subcompactions = resolved->max_subcompactions;
   result.bytes_per_sync = kMiB;
   result.wal_bytes_per_sync = 0;
   result.wal_dir = options.production.wal_directory;
   result.recycle_log_file_num = options.production.recycle_log_file_num;
-  result.cedar_kernel_mode = options.production.kernel_mode;
+  result.cedar_kernel_mode =
+      options.storage_profile == StorageProfile::kKernelTest ||
+      options.storage_profile == StorageProfile::kDebugSmallThresholds ||
+      options.production.kernel_mode;
   result.cedar_disable_periodic_tasks =
       !options.production.diagnostic_periodic_tasks;
   if (options.production.diagnostic_periodic_tasks) {
@@ -276,22 +323,41 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
     default_options.write_buffer_size = resolved->default_write_buffer_bytes;
     default_options.enable_blob_files = false;
 
-    facts_options.write_buffer_size = 128 * kMiB;
-    facts_options.max_write_buffer_number = 4;
-    facts_options.min_write_buffer_number_to_merge = 2;
+    const bool kernel_test =
+        store_options.storage_profile == StorageProfile::kKernelTest ||
+        store_options.storage_profile == StorageProfile::kDebugSmallThresholds;
+    facts_options.write_buffer_size = kernel_test
+                                         ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
+                                                ? kQueryDebugThresholds.memtable_bytes
+                                                : kKernelTestFactsWriteBufferBytes)
+                                         : 128 * kMiB;
+    // Two buffers can be draining under Cedar flush credits, while bounded
+    // queued debt and one active buffer remain available for foreground work.
+    facts_options.max_write_buffer_number = kernel_test ? 6 : 4;
+    facts_options.min_write_buffer_number_to_merge = kernel_test ? 1 : 2;
     facts_options.level_compaction_dynamic_level_bytes = true;
-    facts_options.target_file_size_base = 128 * kMiB;
-    facts_options.level0_file_num_compaction_trigger = 8;
-    facts_options.level0_slowdown_writes_trigger = 24;
-    facts_options.level0_stop_writes_trigger = 36;
-    facts_options.soft_pending_compaction_bytes_limit = 8 * kGiB;
-    facts_options.hard_pending_compaction_bytes_limit = 32 * kGiB;
-    meta_options.write_buffer_size = 32 * kMiB;
-    meta_options.max_write_buffer_number = 3;
+    facts_options.target_file_size_base = kernel_test
+                                              ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
+                                                     ? kQueryDebugThresholds.memtable_bytes
+                                                     : 64ULL * 1024ULL)
+                                              : 128 * kMiB;
+    facts_options.level0_file_num_compaction_trigger = kernel_test ? 2 : 8;
+    facts_options.level0_slowdown_writes_trigger = kernel_test ? 12 : 24;
+    facts_options.level0_stop_writes_trigger = kernel_test ? 24 : 36;
+    facts_options.soft_pending_compaction_bytes_limit =
+        kernel_test ? 512ULL * 1024ULL : 8 * kGiB;
+    facts_options.hard_pending_compaction_bytes_limit =
+        kernel_test ? 2ULL * kMiB : 32 * kGiB;
+    meta_options.write_buffer_size = kernel_test
+                                        ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
+                                                ? kQueryDebugThresholds.memtable_bytes / 4
+                                                : kKernelTestMetaWriteBufferBytes)
+                                        : 32 * kMiB;
+    meta_options.max_write_buffer_number = kernel_test ? 6 : 3;
     meta_options.min_write_buffer_number_to_merge = 1;
-    meta_options.level0_file_num_compaction_trigger = 4;
+    meta_options.level0_file_num_compaction_trigger = kernel_test ? 2 : 4;
     meta_options.level0_slowdown_writes_trigger = 12;
-    meta_options.level0_stop_writes_trigger = 20;
+    meta_options.level0_stop_writes_trigger = kernel_test ? 24 : 20;
     meta_options.enable_blob_files = false;
   }
   return {{rocksdb::kDefaultColumnFamilyName, std::move(default_options)},

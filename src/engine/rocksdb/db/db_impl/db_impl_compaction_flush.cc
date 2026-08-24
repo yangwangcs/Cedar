@@ -3038,9 +3038,14 @@ bool DBImpl::PrepareCedarFlushSchedule(uint64_t* cedar_grant_id) {
     return true;
   }
 
-  if (!cedar_flush_grant_.has_value() || !cedar_flush_grant_->installed ||
-      cedar_flush_grant_->consumed || cedar_flush_grant_->completed ||
-      cedar_flush_grant_->grant.kind != CedarMaintenanceKind::kFlush) {
+  auto grant = std::find_if(
+      cedar_flush_grants_.begin(), cedar_flush_grants_.end(),
+      [](const auto& entry) {
+        const CedarGrantState& state = entry.second;
+        return state.installed && !state.consumed && !state.completed &&
+               state.grant.kind == CedarMaintenanceKind::kFlush;
+      });
+  if (grant == cedar_flush_grants_.end()) {
     return false;
   }
 
@@ -3075,12 +3080,16 @@ bool DBImpl::PrepareCedarFlushSchedule(uint64_t* cedar_grant_id) {
   for (auto candidate = flush_queue_.begin(); candidate != flush_queue_.end();
        ++candidate) {
     const uint64_t input_bytes = request_input_bytes(*candidate);
-    if (cedar_flush_grant_->grant.max_input_bytes != 0 &&
-        input_bytes > cedar_flush_grant_->grant.max_input_bytes) {
+    if (grant->second.grant.max_input_bytes != 0 &&
+        input_bytes > grant->second.grant.max_input_bytes) {
       continue;
     }
     const int rank = request_rank(*candidate);
-    if (selected == flush_queue_.end() || rank < selected_rank) {
+    // Cedar grants one native flush at a time.  Service the largest complete
+    // immutable unit first so a continuously-written metadata CF cannot starve
+    // the authoritative facts CF; role is only a deterministic tie-breaker.
+    if (selected == flush_queue_.end() || input_bytes > selected_input_bytes ||
+        (input_bytes == selected_input_bytes && rank < selected_rank)) {
       selected = candidate;
       selected_input_bytes = input_bytes;
       selected_rank = rank;
@@ -3088,25 +3097,25 @@ bool DBImpl::PrepareCedarFlushSchedule(uint64_t* cedar_grant_id) {
   }
   if (selected == flush_queue_.end()) {
     if (write_controller_.IsStopped() && flush_queue_.empty()) {
-      cedar_flush_grant_->status = Status::InvalidArgument(
+      grant->second.status = Status::InvalidArgument(
           "Cedar flush invariant: write stopped without immutable flush candidate");
-      cedar_flush_grant_->result.yield = CedarMaintenanceYield::kError;
+      grant->second.result.yield = CedarMaintenanceYield::kError;
     } else {
-      cedar_flush_grant_->status = Status::InvalidArgument(
+      grant->second.status = Status::InvalidArgument(
           "Cedar flush grant input budget cannot admit queued debt");
     }
-    cedar_flush_grant_->completed = true;
+    grant->second.completed = true;
     cedar_maintenance_cv_.SignalAll();
     return false;
   }
 
   ColumnFamilyData* selected_cfd =
       selected->cfd_to_max_mem_id_to_persist.begin()->first;
-  cedar_flush_grant_->consumed = true;
-  cedar_flush_grant_->result.selected_column_family_id = selected_cfd->GetID();
-  cedar_flush_grant_->result.input_bytes = selected_input_bytes;
-  cedar_flush_grant_->sst_bytes_before = selected_cfd->current()->GetSstFilesSize();
-  *cedar_grant_id = cedar_flush_grant_->id;
+  grant->second.consumed = true;
+  grant->second.result.selected_column_family_id = selected_cfd->GetID();
+  grant->second.result.input_bytes = selected_input_bytes;
+  grant->second.sst_bytes_before = selected_cfd->current()->GetSstFilesSize();
+  *cedar_grant_id = grant->second.id;
   if (selected != flush_queue_.begin()) {
     FlushRequest request = std::move(*selected);
     flush_queue_.erase(selected);
@@ -3119,21 +3128,20 @@ void DBImpl::CompleteCedarFlushGrant(uint64_t cedar_grant_id,
                                      const Status& status,
                                      uint64_t output_bytes) {
   mutex_.AssertHeld();
-  if (cedar_grant_id == 0 || !cedar_flush_grant_.has_value() ||
-      cedar_flush_grant_->id != cedar_grant_id ||
-      cedar_flush_grant_->completed) {
+  auto grant = cedar_flush_grants_.find(cedar_grant_id);
+  if (cedar_grant_id == 0 || grant == cedar_flush_grants_.end() ||
+      grant->second.completed) {
     return;
   }
-  cedar_flush_grant_->status = status;
-  cedar_flush_grant_->result.output_bytes = output_bytes;
-  cedar_flush_grant_->result.input_budget_exceeded =
-      cedar_flush_grant_->grant.max_input_bytes != 0 &&
-      cedar_flush_grant_->result.input_bytes >
-          cedar_flush_grant_->grant.max_input_bytes;
-  cedar_flush_grant_->result.output_budget_exceeded =
-      cedar_flush_grant_->grant.max_output_bytes != 0 &&
-      output_bytes > cedar_flush_grant_->grant.max_output_bytes;
-  cedar_flush_grant_->completed = true;
+  grant->second.status = status;
+  grant->second.result.output_bytes = output_bytes;
+  grant->second.result.input_budget_exceeded =
+      grant->second.grant.max_input_bytes != 0 &&
+      grant->second.result.input_bytes > grant->second.grant.max_input_bytes;
+  grant->second.result.output_budget_exceeded =
+      grant->second.grant.max_output_bytes != 0 &&
+      output_bytes > grant->second.grant.max_output_bytes;
+  grant->second.completed = true;
   cedar_maintenance_cv_.SignalAll();
 }
 
@@ -3144,28 +3152,31 @@ bool DBImpl::PrepareCedarCompactionSchedule(
   assert(prepicked != nullptr);
   *cedar_grant_id = 0;
   *prepicked = nullptr;
-  if (!cedar_compaction_grant_.has_value() ||
-      !cedar_compaction_grant_->installed ||
-      cedar_compaction_grant_->consumed ||
-      cedar_compaction_grant_->completed ||
-      cedar_compaction_grant_->grant.kind != CedarMaintenanceKind::kCompaction) {
+  auto grant = std::find_if(
+      cedar_compaction_grants_.begin(), cedar_compaction_grants_.end(),
+      [](const auto& entry) {
+        const CedarGrantState& state = entry.second;
+        return state.installed && !state.consumed && !state.completed &&
+               state.grant.kind == CedarMaintenanceKind::kCompaction;
+      });
+  if (grant == cedar_compaction_grants_.end()) {
     return false;
   }
-  if (cedar_compaction_grant_->grant.wal_sync_critical != nullptr &&
-      cedar_compaction_grant_->grant.wal_sync_critical->load(
+  if (grant->second.grant.wal_sync_critical != nullptr &&
+      grant->second.grant.wal_sync_critical->load(
           std::memory_order_acquire)) {
-    cedar_compaction_grant_->status = Status::TryAgain("Cedar WAL sync is critical");
-    cedar_compaction_grant_->result.yield = CedarMaintenanceYield::kWalSync;
-    cedar_compaction_grant_->completed = true;
+    grant->second.status = Status::TryAgain("Cedar WAL sync is critical");
+    grant->second.result.yield = CedarMaintenanceYield::kWalSync;
+    grant->second.completed = true;
     cedar_maintenance_cv_.SignalAll();
     return false;
   }
   if (HasExclusiveManualCompaction()) {
-    cedar_compaction_grant_->status =
+    grant->second.status =
         Status::TryAgain("Cedar maintenance conflicts with manual compaction");
-    cedar_compaction_grant_->result.yield =
+    grant->second.result.yield =
         CedarMaintenanceYield::kManualConflict;
-    cedar_compaction_grant_->completed = true;
+    grant->second.completed = true;
     cedar_maintenance_cv_.SignalAll();
     return false;
   }
@@ -3227,21 +3238,21 @@ bool DBImpl::PrepareCedarCompactionSchedule(
                         : input_bytes + bytes;
     }
   }
-  cedar_compaction_grant_->result.selected_column_family_id = cfd->GetID();
-  cedar_compaction_grant_->result.input_bytes = input_bytes;
-  cedar_compaction_grant_->result.remaining_smallest_complete_unit_bytes =
+  grant->second.result.selected_column_family_id = cfd->GetID();
+  grant->second.result.input_bytes = input_bytes;
+  grant->second.result.remaining_smallest_complete_unit_bytes =
       input_bytes;
-  if (cedar_compaction_grant_->grant.max_input_bytes != 0 &&
-      input_bytes > cedar_compaction_grant_->grant.max_input_bytes) {
+  if (grant->second.grant.max_input_bytes != 0 &&
+      input_bytes > grant->second.grant.max_input_bytes) {
     compaction->ReleaseCompactionFiles(Status::OK());
     cfd->current()->storage_info()->ComputeCompactionScore(
         compaction->immutable_options(), compaction->mutable_cf_options(),
         cfd->GetFullHistoryTsLow());
     EnqueuePendingCompaction(cfd);
-    cedar_compaction_grant_->result.input_budget_exceeded = true;
-    cedar_compaction_grant_->result.yield =
+    grant->second.result.input_budget_exceeded = true;
+    grant->second.result.yield =
         CedarMaintenanceYield::kInputBudget;
-    cedar_compaction_grant_->completed = true;
+    grant->second.completed = true;
     cedar_maintenance_cv_.SignalAll();
     return false;
   }
@@ -3251,9 +3262,9 @@ bool DBImpl::PrepareCedarCompactionSchedule(
                                 &sfm_space_reserved, &log_buffer)) {
     compaction->ReleaseCompactionFiles(Status::CompactionTooLarge());
     EnqueuePendingCompaction(cfd);
-    cedar_compaction_grant_->result.yield = CedarMaintenanceYield::kError;
-    cedar_compaction_grant_->status = Status::CompactionTooLarge();
-    cedar_compaction_grant_->completed = true;
+    grant->second.result.yield = CedarMaintenanceYield::kError;
+    grant->second.status = Status::CompactionTooLarge();
+    grant->second.completed = true;
     cedar_maintenance_cv_.SignalAll();
     return false;
   }
@@ -3264,9 +3275,9 @@ bool DBImpl::PrepareCedarCompactionSchedule(
   next->task_token = std::move(task_token);
   next->need_repick = false;
   next->cedar_sfm_space_reserved = sfm_space_reserved;
-  cedar_compaction_grant_->consumed = true;
-  cedar_compaction_grant_->sst_bytes_before = cfd->current()->GetSstFilesSize();
-  *cedar_grant_id = cedar_compaction_grant_->id;
+  grant->second.consumed = true;
+  grant->second.sst_bytes_before = cfd->current()->GetSstFilesSize();
+  *cedar_grant_id = grant->second.id;
   *prepicked = next;
   return true;
 }
@@ -3275,27 +3286,26 @@ void DBImpl::CompleteCedarCompactionGrant(uint64_t cedar_grant_id,
                                           const Status& status,
                                           uint64_t output_bytes) {
   mutex_.AssertHeld();
-  if (cedar_grant_id == 0 || !cedar_compaction_grant_.has_value() ||
-      cedar_compaction_grant_->id != cedar_grant_id ||
-      cedar_compaction_grant_->completed) {
+  auto grant = cedar_compaction_grants_.find(cedar_grant_id);
+  if (cedar_grant_id == 0 || grant == cedar_compaction_grants_.end() ||
+      grant->second.completed) {
     return;
   }
-  cedar_compaction_grant_->status = status;
-  cedar_compaction_grant_->result.output_bytes = output_bytes;
-  cedar_compaction_grant_->result.input_budget_exceeded =
-      cedar_compaction_grant_->grant.max_input_bytes != 0 &&
-      cedar_compaction_grant_->result.input_bytes >
-          cedar_compaction_grant_->grant.max_input_bytes;
-  cedar_compaction_grant_->result.output_budget_exceeded =
-      cedar_compaction_grant_->grant.max_output_bytes != 0 &&
-      output_bytes > cedar_compaction_grant_->grant.max_output_bytes;
-  if (cedar_compaction_grant_->result.output_budget_exceeded) {
-    cedar_compaction_grant_->result.yield =
+  grant->second.status = status;
+  grant->second.result.output_bytes = output_bytes;
+  grant->second.result.input_budget_exceeded =
+      grant->second.grant.max_input_bytes != 0 &&
+      grant->second.result.input_bytes > grant->second.grant.max_input_bytes;
+  grant->second.result.output_budget_exceeded =
+      grant->second.grant.max_output_bytes != 0 &&
+      output_bytes > grant->second.grant.max_output_bytes;
+  if (grant->second.result.output_budget_exceeded) {
+    grant->second.result.yield =
         CedarMaintenanceYield::kOutputBudget;
-    cedar_compaction_grant_->result.atomic_overrun_bytes =
-        output_bytes - cedar_compaction_grant_->grant.max_output_bytes;
+    grant->second.result.atomic_overrun_bytes =
+        output_bytes - grant->second.grant.max_output_bytes;
   }
-  cedar_compaction_grant_->completed = true;
+  grant->second.completed = true;
   cedar_maintenance_cv_.SignalAll();
 }
 
@@ -3349,9 +3359,6 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
     TEST_SYNC_POINT_CALLBACK(
         "DBImpl::MaybeScheduleFlushOrCompaction:AfterSchedule:0",
         &unscheduled_flushes_);
-    if (cedar_kernel_mode) {
-      break;
-    }
   }
 
   // special case -- if high-pri (flush) thread pool is empty, then schedule
@@ -3372,9 +3379,6 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
       env_->Schedule(&DBImpl::BGWorkFlush, fta, Env::Priority::LOW, this,
                      &DBImpl::UnscheduleFlushCallback);
       --unscheduled_flushes_;
-      if (cedar_kernel_mode) {
-        break;
-      }
     }
   }
 
@@ -3417,9 +3421,6 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
     unscheduled_compactions_--;
     env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::LOW, this,
                    &DBImpl::UnscheduleCompactionCallback);
-    if (cedar_kernel_mode) {
-      break;
-    }
   }
 }
 
@@ -3984,16 +3985,16 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri,
     NotifyOnBackgroundJobPressureChanged();
 
     uint64_t output_bytes = 0;
-    if (cedar_grant_id != 0 && cedar_flush_grant_.has_value() &&
-        cedar_flush_grant_->id == cedar_grant_id) {
+    auto grant = cedar_flush_grants_.find(cedar_grant_id);
+    if (cedar_grant_id != 0 && grant != cedar_flush_grants_.end()) {
       ColumnFamilyData* cfd =
           versions_->GetColumnFamilySet()->GetColumnFamily(
-              cedar_flush_grant_->result.selected_column_family_id);
+              grant->second.result.selected_column_family_id);
       if (s.ok() && cfd != nullptr && !cfd->IsDropped()) {
         const uint64_t sst_bytes_after = cfd->current()->GetSstFilesSize();
         output_bytes =
-            sst_bytes_after >= cedar_flush_grant_->sst_bytes_before
-                ? sst_bytes_after - cedar_flush_grant_->sst_bytes_before
+            sst_bytes_after >= grant->second.sst_bytes_before
+                ? sst_bytes_after - grant->second.sst_bytes_before
                 : 0;
       }
     }

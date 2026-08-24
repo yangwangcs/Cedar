@@ -7,6 +7,7 @@
 #include <pthread/qos.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "cedar/database.h"
@@ -676,7 +678,13 @@ TEST(KernelAdmissionControlTest, BoundsMailboxAdmissionWithoutBlockingCallers) {
         sample->free_disk_bytes = UINT64_MAX;
         sample->free_disk_percent = 100;
       },
-      .async_executor = AsyncExecutorOptions{1, 1, 4ULL * 1024ULL * 1024ULL}});
+      .async_executor = AsyncExecutorOptions{1, 1, 4ULL * 1024ULL * 1024ULL},
+      .query_runtime = QueryRuntimeOptions{
+          .query_workers = 4,
+          .reserved_interactive_workers = 1,
+          .query_memory_bytes = 32ULL * 1024ULL * 1024ULL,
+          .projection_cache_bytes = 32ULL * 1024ULL * 1024ULL,
+          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL}});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto first = database->BeginTransaction();
@@ -1093,6 +1101,51 @@ TEST(KernelGroupCommitTest, GroupsIndependentVertexAssertionsIntoOneDurableWrite
   }
   ASSERT_TRUE(database->Close().ok());
   database.reset();
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, KernelCommitReportsGroupFill) {
+  char pattern[] = "/tmp/cedar_kernel_group_fill_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 2,
+      .group_commit_window_us = 20'000});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  auto first = database->BeginTransaction();
+  auto second = database->BeginTransaction();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  ASSERT_TRUE(first.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{3}}),
+                           ValidTime{10})
+                  .ok());
+  ASSERT_TRUE(second.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{4}}),
+                           ValidTime{20})
+                  .ok());
+
+  std::optional<StatusOr<CommitResult>> first_result;
+  std::optional<StatusOr<CommitResult>> second_result;
+  std::thread first_thread(
+      [&] { first_result.emplace(first.ValueOrDie()->Commit()); });
+  std::thread second_thread(
+      [&] { second_result.emplace(second.ValueOrDie()->Commit()); });
+  first_thread.join();
+  second_thread.join();
+
+  ASSERT_TRUE(first_result->ok()) << first_result->status().ToString();
+  ASSERT_TRUE(second_result->ok()) << second_result->status().ToString();
+  EXPECT_EQ(first_result->ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(second_result->ValueOrDie().outcome, CommitOutcome::kCommitted);
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.group_fill.groups, 1U);
+  EXPECT_EQ(metrics.group_fill.total_transactions, 2U);
+  EXPECT_EQ(metrics.group_fill.buckets[GroupFillBucket(2)], 1U);
+  ASSERT_TRUE(database->Close().ok());
   std::filesystem::remove_all(path);
 }
 
@@ -1929,6 +1982,118 @@ TEST(KernelGroupCommitTest, DiscardsEligibleNPlusOneOnShutdown) {
   std::filesystem::remove_all(path);
 }
 
+TEST(KernelGroupCommitTest,
+     ShutdownDiscardsNPlusOneWhileManyCallersAreQueuedAndLeavesDatabaseReopenable) {
+  constexpr uint32_t kTransactions = 32;
+  char pattern[] = "/tmp/cedar_kernel_large_n_plus_one_shutdown_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex prewrite_mutex;
+  std::condition_variable prewrite_cv;
+  bool first_prewrite_entered = false;
+  bool release_first_prewrite = false;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = kTransactions,
+      .group_commit_window_us = 0,
+      .commit_prewrite_fault_injector_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(prewrite_mutex);
+        if (!first_prewrite_entered) {
+          first_prewrite_entered = true;
+          prewrite_cv.notify_all();
+          prewrite_cv.wait(lock, [&] { return release_first_prewrite; });
+        }
+        return Status::OK();
+      },
+      .group_commit_max_queue_requests = 64,
+      .shutdown_stage_observer_for_testing = [&](const char* stage) {
+        if (std::string(stage) != "queue_worker_stop") return;
+        {
+          std::lock_guard<std::mutex> lock(prewrite_mutex);
+          release_first_prewrite = true;
+        }
+        prewrite_cv.notify_all();
+      },
+      .stop_pipeline_before_drain_for_testing = true});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  std::vector<std::optional<StatusOr<CommitHandle>>> submissions(kTransactions);
+  const auto submit = [&](uint32_t index) {
+    auto transaction = database->BeginTransaction();
+    if (!transaction.ok()) {
+      submissions[index].emplace(transaction.status());
+      return;
+    }
+    const Status asserted = transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{60'000 + index}}),
+        ValidTime{index + 1});
+    if (!asserted.ok()) {
+      submissions[index].emplace(asserted);
+      return;
+    }
+    submissions[index].emplace(transaction.ValueOrDie()->CommitAsync());
+  };
+
+  std::thread first([&] { submit(0); });
+  bool first_entered = false;
+  {
+    std::unique_lock<std::mutex> lock(prewrite_mutex);
+    first_entered = prewrite_cv.wait_for(
+        lock, std::chrono::seconds(2), [&] { return first_prewrite_entered; });
+  }
+  if (!first_entered) {
+    {
+      std::lock_guard<std::mutex> lock(prewrite_mutex);
+      release_first_prewrite = true;
+    }
+    prewrite_cv.notify_all();
+    first.join();
+    EXPECT_TRUE(database->Close().ok());
+    std::filesystem::remove_all(path);
+    FAIL() << "first prewrite did not start";
+  }
+  std::vector<std::thread> followers;
+  followers.reserve(kTransactions - 1);
+  for (uint32_t index = 1; index < kTransactions; ++index) {
+    followers.emplace_back([&, index] { submit(index); });
+  }
+
+  const auto eligible_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < eligible_deadline &&
+         database->GetCommitPipelineMetrics().n_plus_one_eligible == 0) {
+    std::this_thread::yield();
+  }
+  EXPECT_GE(database->GetCommitPipelineMetrics().n_plus_one_eligible, 1U);
+
+  const Status closed = database->Close();
+  EXPECT_TRUE(closed.ok()) << closed.ToString();
+  first.join();
+  for (auto& follower : followers) follower.join();
+  for (const auto& submission : submissions) {
+    ASSERT_TRUE(submission.has_value());
+    if (!submission->ok()) {
+      EXPECT_TRUE(submission->status().IsShutdownInProgress())
+          << submission->status().ToString();
+      continue;
+    }
+    const auto completed = submission->ValueOrDie().Wait();
+    ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  }
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  const size_t reason_index = static_cast<size_t>(NPlusOneDiscardReason::kShutdown);
+  ASSERT_LT(reason_index, metrics.n_plus_one_discarded_by_reason.size());
+  EXPECT_GE(metrics.n_plus_one_discarded_by_reason[reason_index], 1U);
+  EXPECT_GE(metrics.n_plus_one_discards, 1U);
+  database.reset();
+
+  auto reopened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  EXPECT_TRUE(reopened.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 TEST(KernelGroupCommitTest, RetriesStalePredecidedEpochThroughTheNormalWriter) {
   char pattern[] = "/tmp/cedar_kernel_stale_predecision_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
@@ -1982,6 +2147,133 @@ TEST(KernelGroupCommitTest, RetriesStalePredecidedEpochThroughTheNormalWriter) {
   std::filesystem::remove_all(path);
 }
 
+TEST(KernelGroupCommitTest, ConcurrentIndependentGroupsUseOneWalSyncEach) {
+  constexpr uint32_t kTransactions = 32;
+  char pattern[] = "/tmp/cedar_kernel_large_group_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  std::atomic<uint32_t> physical_writes = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = pattern,
+      .group_commit_max_batch_size = kTransactions,
+      .group_commit_window_us = 500'000,
+      .commit_prewrite_fault_injector_for_testing = [&] {
+        physical_writes.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+      },
+      .group_commit_max_queue_requests = 128});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  std::barrier start(kTransactions + 1);
+  std::atomic<bool> failed = false;
+  std::vector<std::thread> workers;
+  workers.reserve(kTransactions);
+  for (uint32_t index = 0; index < kTransactions; ++index) {
+    workers.emplace_back([&, index] {
+      auto transaction = database->BeginTransaction();
+      if (!transaction.ok() ||
+          !transaction.ValueOrDie()
+               ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{20'000 + index}}),
+                        ValidTime{index + 1})
+               .ok()) {
+        failed.store(true, std::memory_order_relaxed);
+        start.arrive_and_wait();
+        return;
+      }
+      start.arrive_and_wait();
+      const auto accepted = transaction.ValueOrDie()->CommitAsync();
+      if (!accepted.ok()) {
+        failed.store(true, std::memory_order_relaxed);
+        return;
+      }
+      const auto completed = accepted.ValueOrDie().Wait();
+      if (!completed.ok() ||
+          completed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+        failed.store(true, std::memory_order_relaxed);
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& worker : workers) worker.join();
+
+  EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_GE(metrics.group_fill.groups, 1U);
+  EXPECT_EQ(metrics.group_fill.total_transactions, kTransactions);
+  EXPECT_GE(metrics.group_fill.max_transactions, 2U);
+  EXPECT_EQ(metrics.latency.wal_sync.count, metrics.group_fill.groups);
+  EXPECT_EQ(physical_writes.load(std::memory_order_relaxed),
+            metrics.group_fill.groups);
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(pattern);
+}
+
+TEST(KernelGroupCommitTest, ConflictingRequestsPreserveConflictUnderHighFanIn) {
+  constexpr uint32_t kTransactions = 32;
+  char pattern[] = "/tmp/cedar_kernel_group_conflict_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = kTransactions,
+      .group_commit_window_us = 500'000,
+      .group_commit_max_queue_requests = 128});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  std::barrier start(kTransactions + 1);
+  std::atomic<bool> failed = false;
+  std::vector<std::optional<CommitResult>> conflicting_results(2);
+  std::vector<std::thread> workers;
+  workers.reserve(kTransactions);
+  for (uint32_t index = 0; index < kTransactions; ++index) {
+    workers.emplace_back([&, index] {
+      auto transaction = database->BeginTransaction();
+      const uint64_t vertex_id = index < 2 ? 50'000 : 50'000 + index;
+      if (!transaction.ok() ||
+          !transaction.ValueOrDie()
+               ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}),
+                        ValidTime{1})
+               .ok()) {
+        failed.store(true, std::memory_order_relaxed);
+        start.arrive_and_wait();
+        return;
+      }
+      start.arrive_and_wait();
+      const auto committed = transaction.ValueOrDie()->Commit();
+      if (!committed.ok() || committed.ValueOrDie().outcome == CommitOutcome::kIndeterminate) {
+        failed.store(true, std::memory_order_relaxed);
+        return;
+      }
+      if (index < 2) {
+        conflicting_results[index].emplace(committed.ValueOrDie());
+      } else if (committed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+        failed.store(true, std::memory_order_relaxed);
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& worker : workers) worker.join();
+
+  EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+  ASSERT_TRUE(conflicting_results[0].has_value());
+  ASSERT_TRUE(conflicting_results[1].has_value());
+  const uint32_t conflicting_commits =
+      (conflicting_results[0]->outcome == CommitOutcome::kCommitted ? 1U : 0U) +
+      (conflicting_results[1]->outcome == CommitOutcome::kCommitted ? 1U : 0U);
+  EXPECT_EQ(conflicting_commits, 1U);
+  const CommitResult& aborted = conflicting_results[0]->outcome == CommitOutcome::kAborted
+                                    ? *conflicting_results[0]
+                                    : *conflicting_results[1];
+  EXPECT_EQ(aborted.outcome, CommitOutcome::kAborted);
+  EXPECT_TRUE(aborted.status.IsConflict()) << aborted.status.ToString();
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.group_fill.total_transactions, kTransactions);
+  EXPECT_GE(metrics.group_fill.max_transactions, 2U);
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 TEST(KernelGroupCommitTest, UsesOnlyCedarWriteSeam) {
   char pattern[] = "/tmp/cedar_kernel_profile_write_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
@@ -1999,7 +2291,13 @@ TEST(KernelGroupCommitTest, UsesOnlyCedarWriteSeam) {
       .kernel_write_observer_for_testing = [&](bool kernel) {
         EXPECT_TRUE(kernel);
         kernel_writes.fetch_add(1, std::memory_order_relaxed);
-      }});
+      },
+      .query_runtime = QueryRuntimeOptions{
+          .query_workers = 4,
+          .reserved_interactive_workers = 1,
+          .query_memory_bytes = 32ULL * 1024ULL * 1024ULL,
+          .projection_cache_bytes = 32ULL * 1024ULL * 1024ULL,
+          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL}});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto transaction = database->BeginTransaction();
@@ -2513,6 +2811,137 @@ TEST(KernelGroupCommitFailureTest, PostwriteIndeterminateMarksEveryMemberThenReo
   EXPECT_EQ(first_recovered.ValueOrDie()->outcome, CommitOutcome::kCommitted);
   EXPECT_EQ(second_recovered.ValueOrDie()->outcome, CommitOutcome::kCommitted);
   ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitFailureTest,
+     ConcurrentIndeterminateRecoveryMatchesDurableAcceptance) {
+  constexpr uint32_t kTransactions = 32;
+  char pattern[] = "/tmp/cedar_kernel_large_group_indeterminate_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex enqueue_mutex;
+  std::condition_variable enqueue_cv;
+  std::atomic<uint32_t> enqueued = 0;
+  std::atomic<uint32_t> physical_writes = 0;
+  std::atomic<bool> physical_write_was_unsynced = false;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = kTransactions,
+      .group_commit_window_us = 500'000,
+      .commit_fault_injector_for_testing = [] {
+        return Status::Indeterminate("test", "injected after durable group write");
+      },
+      .commit_write_options_observer_for_testing = [&](bool sync) {
+        physical_writes.fetch_add(1, std::memory_order_relaxed);
+        if (!sync) physical_write_was_unsynced.store(true, std::memory_order_relaxed);
+      },
+      .group_commit_max_queue_requests = 128,
+      .append_commit_enqueued_observer_for_testing = [&] {
+        enqueued.fetch_add(1, std::memory_order_relaxed);
+        enqueue_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(enqueue_mutex);
+        enqueue_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+          return enqueued.load(std::memory_order_relaxed) == kTransactions;
+        });
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  std::barrier start(kTransactions + 1);
+  std::atomic<bool> failed = false;
+  std::atomic<uint32_t> durable_handle_count = 0;
+  std::vector<std::optional<TxnId>> durably_accepted_txn_ids(kTransactions);
+  std::vector<std::thread> workers;
+  workers.reserve(kTransactions);
+  for (uint32_t index = 0; index < kTransactions; ++index) {
+    workers.emplace_back([&, index] {
+      auto transaction = database->BeginTransaction();
+      if (!transaction.ok() ||
+          !transaction.ValueOrDie()
+               ->Assert(EntityFact::Vertex(
+                            VertexRef{PartId{0}, VertexId{40'000 + index}}),
+                        ValidTime{index + 1})
+               .ok()) {
+        failed.store(true, std::memory_order_relaxed);
+        start.arrive_and_wait();
+        return;
+      }
+      start.arrive_and_wait();
+      const auto accepted = transaction.ValueOrDie()->CommitAsync();
+      if (!accepted.ok()) {
+        if (!accepted.status().IsIndeterminate() &&
+            !accepted.status().IsRecoveryRequired()) {
+          failed.store(true, std::memory_order_relaxed);
+        }
+        return;
+      }
+      durably_accepted_txn_ids[index] = accepted.ValueOrDie().txn_id();
+      durable_handle_count.fetch_add(1, std::memory_order_relaxed);
+      const auto completed = accepted.ValueOrDie().Wait();
+      if (!completed.ok() ||
+          completed.ValueOrDie().outcome != CommitOutcome::kIndeterminate) {
+        failed.store(true, std::memory_order_relaxed);
+        return;
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& worker : workers) worker.join();
+
+  EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+  EXPECT_EQ(enqueued.load(std::memory_order_relaxed), kTransactions);
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.group_fill.total_transactions, kTransactions);
+  EXPECT_EQ(metrics.group_fill.max_transactions, kTransactions);
+  ASSERT_EQ(durable_handle_count.load(std::memory_order_relaxed), kTransactions);
+  EXPECT_EQ(metrics.durably_accepted, kTransactions);
+  EXPECT_EQ(physical_writes.load(std::memory_order_relaxed), 1U);
+  EXPECT_FALSE(physical_write_was_unsynced.load(std::memory_order_relaxed));
+  std::unordered_set<uint64_t> durable_txn_values;
+  for (const std::optional<TxnId>& txn_id : durably_accepted_txn_ids) {
+    ASSERT_TRUE(txn_id.has_value());
+    EXPECT_TRUE(txn_id->valid());
+    EXPECT_TRUE(durable_txn_values.insert(txn_id->value).second)
+        << "duplicate durable transaction id=" << txn_id->value;
+  }
+  ASSERT_EQ(durable_txn_values.size(), kTransactions);
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
+
+  auto reopened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database = std::move(reopened).ConsumeValueOrDie();
+  for (const std::optional<TxnId>& accepted : durably_accepted_txn_ids) {
+    ASSERT_TRUE(accepted.has_value());
+    const auto resolved = database->ResolveTransaction(*accepted);
+    ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+    ASSERT_TRUE(resolved.ValueOrDie().has_value())
+        << "txn=" << accepted->value;
+    EXPECT_EQ(resolved.ValueOrDie()->outcome, CommitOutcome::kCommitted);
+  }
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitFailureTest,
+     CollectionObserverDoesNotRunAfterAppendPipelineStops) {
+  char pattern[] = "/tmp/cedar_kernel_collection_stop_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::atomic<uint32_t> collection_observations = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .append_commit_collection_observer_for_testing = [&] {
+        collection_observations.fetch_add(1, std::memory_order_relaxed);
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  ASSERT_TRUE(database->Close().ok());
+  EXPECT_EQ(collection_observations.load(std::memory_order_relaxed), 0U);
   std::filesystem::remove_all(path);
 }
 

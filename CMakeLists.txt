@@ -53,6 +53,29 @@ include(cmake/CedarRocksDB.cmake)
 add_library(cedar_core STATIC
     src/core/crc32c.cc
     src/core/status.cc
+    src/query/types.cc
+    src/query/temporal/interval.cc
+    src/query/temporal/corrected_chain.cc
+    src/query/logical/expression.cc
+    src/query/logical/logical_plan.cc
+    src/query/query_api.cc
+    src/query/runtime/canonical_source.cc
+    src/query/runtime/property_binding.cc
+    src/query/runtime/query_runtime.cc
+    src/query/runtime/graph_frontier.cc
+    src/query/runtime/journey.cc
+    src/query/runtime/temporal_source.cc
+    src/query/runtime/vector_kernels.cc
+    src/query/runtime/relational.cc
+    src/query/resource/query_resource_pool.cc
+    src/query/resource/query_scratch.cc
+    src/query/projection/projection_compression.cc
+    src/query/projection/projection_format.cc
+    src/query/projection/projection_manifest.cc
+    src/query/projection/projection_store.cc
+    src/query/projection/query_delta.cc
+    src/query/observability/query_metrics.cc
+    src/query/planner/query_planner.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc
@@ -65,6 +88,7 @@ add_library(cedar_core STATIC
     src/storage/facts/meta_codec.cc
     src/storage/facts/prepared_commit_codec.cc
     src/storage/rocks/rocksdb_config.cc
+    src/storage/rocks/storage_file_inspection.cc
     src/storage/facts/vacuum.cc
     src/storage/rocks/rocks_adapter.cc
     src/runtime/pressure_controller.cc
@@ -82,12 +106,16 @@ target_include_directories(cedar_core
            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_SOURCE_DIR}/src
             ${CEDAR_ENGINE_SOURCE_DIR})
-target_link_libraries(cedar_core PRIVATE cedar_rocksdb)
+target_include_directories(cedar_core PRIVATE ${CEDAR_ROCKSDB_CODEC_INCLUDE_DIR})
+target_link_libraries(cedar_core PRIVATE cedar_rocksdb "${CEDAR_ROCKSDB_LZ4_LIBRARY}")
 set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
     "$<BUILD_INTERFACE:cedar_rocksdb>")
 target_compile_features(cedar_core PUBLIC cxx_std_20)
 set_target_properties(cedar_core PROPERTIES EXPORT_NAME cedar)
 add_library(Cedar::cedar ALIAS cedar_core)
+
+add_executable(cedar tools/cedar_main.cc)
+target_link_libraries(cedar PRIVATE cedar_core)
 
 add_library(cedar_kernel_bench_options STATIC
     benchmarks/cedar_kernel_bench_options.cc)
@@ -99,24 +127,32 @@ add_library(cedar_kernel_bench_workload STATIC
 target_include_directories(cedar_kernel_bench_workload PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(cedar_kernel_bench_workload PUBLIC cedar_core)
 
+add_library(cedar_query_bench_options STATIC benchmarks/cedar_query_bench_options.cc)
+target_include_directories(cedar_query_bench_options PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(cedar_query_bench_options PUBLIC cedar_core)
+add_library(cedar_query_bench_workload STATIC benchmarks/cedar_query_bench_workload.cc)
+target_include_directories(cedar_query_bench_workload PUBLIC ${CMAKE_SOURCE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(cedar_query_bench_workload PUBLIC cedar_core)
+
 option(BUILD_BENCHMARKS "Build Cedar kernel benchmarks" OFF)
 if(BUILD_BENCHMARKS)
     add_executable(cedar_kernel_bench benchmarks/cedar_kernel_bench.cc)
     target_link_libraries(cedar_kernel_bench PRIVATE cedar_kernel_bench_options
         cedar_kernel_bench_workload)
-    add_executable(cedar_kernel_columnar_bench
-        benchmarks/cedar_kernel_columnar_bench.cc)
-    target_include_directories(cedar_kernel_columnar_bench PRIVATE
-        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
-    target_link_libraries(cedar_kernel_columnar_bench PRIVATE cedar_core)
+    add_executable(cedar_query_bench benchmarks/cedar_query_bench.cc)
+    target_link_libraries(cedar_query_bench PRIVATE cedar_query_bench_options cedar_query_bench_workload)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS cedar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES "${CEDAR_ROCKSDB_LIBRARY}"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal"
+    RENAME "libcedar_engine.a")
 install(FILES
-    "${CEDAR_ROCKSDB_LIBRARY}"
     "${CEDAR_ROCKSDB_LZ4_LIBRARY}"
     "${CEDAR_ROCKSDB_ZSTD_LIBRARY}"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal")

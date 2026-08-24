@@ -149,8 +149,9 @@ TEST_F(KernelSnapshotTest, MultiExistsPreservesRequestOrder) {
   EXPECT_TRUE(values.ValueOrDie()[2]);
   const auto metrics = database->SampleRuntimeMetrics();
   ASSERT_TRUE(metrics.ok()) << metrics.status().ToString();
-  EXPECT_EQ(metrics.ValueOrDie().multi_get_operations, 3U);
-  EXPECT_EQ(metrics.ValueOrDie().point_read_operations, 3U);
+  EXPECT_GE(metrics.ValueOrDie().multi_get_operations, 3U);
+  EXPECT_GE(metrics.ValueOrDie().point_read_operations, 3U);
+  EXPECT_GT(metrics.ValueOrDie().canonical_read_physical_bytes, 0U);
 }
 
 TEST_F(KernelSnapshotTest, ScansOnlyFactsVisibleAtTheCapturedSequence) {

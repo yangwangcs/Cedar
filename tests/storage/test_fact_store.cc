@@ -113,6 +113,36 @@ TEST_F(FactStoreTest, SamplesRocksDbRuntimeMetricsWithoutExposingRocksDbTypes) {
   ASSERT_TRUE(store.Close().ok());
 }
 
+TEST_F(FactStoreTest, CountsCanonicalPhysicalReadBytes) {
+  FactStore store(FactStoreOptions{path_});
+  ASSERT_TRUE(store.Open().ok());
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref();
+  StoreCommitBatch batch{
+      TxnId{1}, 100,
+      {{ref, ValidTime{10}, FactOperation::kPut, 0, std::nullopt}}, {}};
+  ASSERT_TRUE(store.Commit(batch).ok());
+
+  const auto before = store.SampleRuntimeMetrics();
+  ASSERT_TRUE(before.ok()) << before.status().ToString();
+  {
+    auto snapshot = store.BeginSnapshot({});
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    ASSERT_TRUE(store.Read(snapshot.ValueOrDie(), ref, ValidTime{10}).ok());
+    ASSERT_TRUE(store.Scan(snapshot.ValueOrDie(), FactPrefix::Exact(ref),
+                           [](const FactEvent&) { return Status::OK(); })
+                    .ok());
+  }
+  const auto after = store.SampleRuntimeMetrics();
+  ASSERT_TRUE(after.ok()) << after.status().ToString();
+  EXPECT_GE(after.ValueOrDie().canonical_read_physical_bytes,
+            before.ValueOrDie().canonical_read_physical_bytes);
+  EXPECT_GT(after.ValueOrDie().canonical_read_physical_bytes -
+                before.ValueOrDie().canonical_read_physical_bytes,
+            0U);
+  ASSERT_TRUE(store.Close().ok());
+}
+
 TEST_F(FactStoreTest, SnapshotCreationDoesNotBlockPressureSampling) {
   std::mutex snapshot_mutex;
   std::condition_variable snapshot_cv;

@@ -43,3 +43,16 @@ file(READ "${CEDAR_SOURCE_DIR}/.gitmodules" gitmodules)
 if(gitmodules MATCHES "third_party/rocksdb")
   message(FATAL_ERROR "RocksDB submodule declaration remains in .gitmodules")
 endif()
+
+# An engine source edit must make the parent build reconfigure, otherwise its
+# content-addressed cache key can silently keep linking the previous library.
+file(READ "${CEDAR_SOURCE_DIR}/cmake/CedarRocksDB.cmake" rocksdb_build)
+if(NOT rocksdb_build MATCHES "GLOB_RECURSE[ \\t\\r\\n]+CEDAR_ENGINE_SOURCE_FILES[ \\t\\r\\n]+CONFIGURE_DEPENDS")
+  message(FATAL_ERROR "embedded engine glob must detect added and removed sources")
+endif()
+string(FIND "${rocksdb_build}"
+       "set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS"
+       configure_depends_position)
+if(configure_depends_position EQUAL -1)
+  message(FATAL_ERROR "embedded engine source edits must trigger reconfiguration")
+endif()

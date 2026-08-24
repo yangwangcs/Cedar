@@ -18,6 +18,9 @@ constexpr uint64_t kEmergencyL0Files = 24;
 constexpr uint64_t kNormalWbmPercent = 70;
 constexpr uint64_t kEmergencyWbmPercent = 85;
 constexpr uint64_t kGrantDeadlineUs = 5'000'000;
+constexpr uint32_t kNormalFlushCredits = 1;
+constexpr uint32_t kEmergencyFlushCredits = 2;
+constexpr uint32_t kNormalCompactionCredits = 1;
 
 uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
   return left > std::numeric_limits<uint64_t>::max() - right
@@ -36,6 +39,17 @@ bool WbmAtLeast(const RocksDbRuntimeMetrics& metrics, uint64_t percent) {
   return metrics.write_buffer_manager_limit_bytes != 0 &&
          metrics.write_buffer_manager_bytes >=
              PercentCeiling(metrics.write_buffer_manager_limit_bytes, percent);
+}
+
+bool HasNativeFlushCandidate(const RocksDbRuntimeMetrics& metrics) {
+  if (metrics.flush_queue_depth != 0 || metrics.unscheduled_flushes != 0 ||
+      metrics.scheduled_flushes != 0 || metrics.running_flushes != 0) {
+    return true;
+  }
+  return std::any_of(metrics.column_families.begin(), metrics.column_families.end(),
+                     [](const RocksDbRuntimeMetrics::ColumnFamilyMetrics& cf) {
+                       return cf.flush_pending;
+                     });
 }
 
 uint64_t NextBudget(
@@ -93,18 +107,24 @@ CedarMaintenancePlan SelectCedarMaintenance(
       NextBudget(kBaselineBudgetBytes, history.last_flush), FlushUnitBytes(metrics));
   const uint64_t compaction_budget =
       NextBudget(kBaselineBudgetBytes, history.last_compaction);
-  const bool emergency_flush = metrics.write_stopped != 0 ||
-      WbmAtLeast(metrics, kEmergencyWbmPercent) ||
-      metrics.total_immutable_memtable_bytes >= kEmergencyFlushBytes;
-  const bool normal_flush = WbmAtLeast(metrics, kNormalWbmPercent) ||
-      metrics.total_immutable_memtable_bytes >= kNormalFlushBytes ||
-      metrics.retained_wal_bytes >= kSoftWalBytes;
+  const bool native_flush_candidate = HasNativeFlushCandidate(metrics);
+  const bool queued_flush_debt = metrics.flush_queue_depth != 0 ||
+                                 metrics.unscheduled_flushes != 0;
+  const bool emergency_flush = native_flush_candidate &&
+      (metrics.write_stopped != 0 || WbmAtLeast(metrics, kEmergencyWbmPercent) ||
+       metrics.total_immutable_memtable_bytes >= kEmergencyFlushBytes);
+  const bool normal_flush = native_flush_candidate &&
+      (WbmAtLeast(metrics, kNormalWbmPercent) ||
+       metrics.total_immutable_memtable_bytes >= kNormalFlushBytes ||
+       metrics.retained_wal_bytes >= kSoftWalBytes || queued_flush_debt);
 
   if (emergency_flush) {
     plan.flush = FlushDecision(CedarMaintenancePriority::kEmergency,
-                               flush_budget, metrics.write_stopped == 0);
+                               flush_budget, false);
+    plan.flush_credits = kEmergencyFlushCredits;
   } else if (normal_flush) {
     plan.flush = FlushDecision(CedarMaintenancePriority::kNormal, flush_budget);
+    plan.flush_credits = kNormalFlushCredits;
   }
 
   const bool emergency_compaction = metrics.total_l0_files >= kEmergencyL0Files ||
@@ -114,9 +134,11 @@ CedarMaintenancePlan SelectCedarMaintenance(
   if (emergency_compaction) {
     plan.compaction = CompactionDecision(CedarMaintenancePriority::kEmergency,
                                          compaction_budget);
+    plan.compaction_credits = kNormalCompactionCredits;
   } else if (!wal_sync_critical && normal_compaction) {
     plan.compaction = CompactionDecision(CedarMaintenancePriority::kNormal,
                                          compaction_budget);
+    plan.compaction_credits = kNormalCompactionCredits;
   }
   if (plan.flush.has_value()) plan.flush->snapshot_generation = snapshot.generation;
   if (plan.compaction.has_value()) {

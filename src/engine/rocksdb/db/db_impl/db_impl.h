@@ -3132,8 +3132,10 @@ class DBImpl : public DB {
   uint64_t cedar_maintenance_snapshot_signature_ = 0;
   bool cedar_maintenance_snapshot_initialized_ = false;
   uint64_t next_cedar_grant_id_ = 1;
-  std::optional<CedarGrantState> cedar_flush_grant_;
-  std::optional<CedarGrantState> cedar_compaction_grant_;
+  // Each Cedar flush credit owns exactly one native flush. std::map keeps the
+  // state address stable while the calling maintenance thread waits.
+  std::map<uint64_t, CedarGrantState> cedar_flush_grants_;
+  std::map<uint64_t, CedarGrantState> cedar_compaction_grants_;
 
   // count how many background compactions are running or have been scheduled in
   // the BOTTOM pool

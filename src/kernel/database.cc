@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -13,7 +14,10 @@
 #endif
 
 #include "storage/facts/group_commit_planner.h"
+#include "storage/rocks/rocksdb_config.h"
 #include "kernel/database_impl.h"
+#include "query/resource/query_scratch.h"
+#include "query/runtime/graph_frontier.h"
 
 namespace cedar {
 namespace {
@@ -22,6 +26,9 @@ constexpr std::array<uint64_t, CommitLatencyHistogram::kBucketCount>
     kLatencyBucketUpperBounds = {
         10, 50, 100, 250, 500, 1'000, 2'000,
         5'000, 10'000, 25'000, 50'000, 100'000, UINT64_MAX};
+
+constexpr std::array<uint64_t, CommitGroupFillMetrics::kBucketCount>
+    kGroupFillBucketUpperBounds = {1, 2, 4, 8, 16, 32, 64, 128, UINT64_MAX};
 
 constexpr uint64_t kRuntimeSnapshotStaleUs = 250'000;
 
@@ -53,6 +60,14 @@ void RecordLatency(CommitLatencyHistogram* histogram, uint64_t elapsed_us) {
   }
 }
 
+void RecordGroupFill(CommitGroupFillMetrics* metrics, size_t request_count) {
+  ++metrics->groups;
+  metrics->total_transactions += request_count;
+  metrics->max_transactions = std::max<uint64_t>(metrics->max_transactions,
+                                                  request_count);
+  ++metrics->buckets[GroupFillBucket(request_count)];
+}
+
 CommitResult ToCommitResult(TxnId txn_id,
                             const StatusOr<StoreCommitResult>& result) {
   if (result.ok()) {
@@ -79,12 +94,10 @@ void BindCommitHandleToEpoch(
     const std::shared_ptr<internal::EpochCompletion>& completion,
     size_t ordinal, bool waits_for_durability) {
   if (!handle) return;
-  {
-    std::lock_guard<std::mutex> lock(handle->mutex);
-    handle->epoch_completion = completion;
-    handle->epoch_result_ordinal = ordinal;
-    handle->waits_for_epoch_durability = waits_for_durability;
-  }
+  std::lock_guard<std::mutex> lock(handle->mutex);
+  handle->epoch_completion = completion;
+  handle->epoch_result_ordinal = ordinal;
+  handle->waits_for_epoch_durability = waits_for_durability;
   handle->completed.notify_all();
 }
 
@@ -108,6 +121,16 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.cache_pinned_bytes = source.block_cache_pinned_bytes;
   metrics.running_flushes = source.running_flushes;
   metrics.running_compactions = source.running_compactions;
+  metrics.flush_queue_depth = source.flush_queue_depth;
+  metrics.unscheduled_flushes = source.unscheduled_flushes;
+  metrics.scheduled_flushes = source.scheduled_flushes;
+  for (const auto& column_family : source.column_families) {
+    if (column_family.role == RocksDbRuntimeMetrics::ColumnFamilyRole::kFacts) {
+      metrics.facts_flush_pending = column_family.flush_pending;
+      metrics.facts_compaction_pending = column_family.compaction_pending;
+      break;
+    }
+  }
   metrics.live_fact_bytes = source.live_sst_bytes;
   metrics.write_stopped = source.write_stopped;
   metrics.delayed_write_rate_bytes_per_sec =
@@ -126,6 +149,8 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.projected_scan_physical_bytes_read =
       source.projected_scan_physical_bytes_read;
   metrics.canonical_scan_bytes_read = source.canonical_scan_bytes_read;
+  metrics.canonical_read_physical_bytes =
+      source.canonical_read_physical_bytes;
   metrics.logical_facts_bytes = source.logical_facts_bytes;
   metrics.obsolete_fact_bytes = source.obsolete_sst_bytes;
   metrics.temporary_output_bytes = source.temporary_output_bytes;
@@ -208,6 +233,10 @@ Database::Impl::FactStoreMaintenanceAdapter::Run(
   completion.elapsed_us = result.elapsed_us;
   completion.remaining_smallest_complete_unit_bytes =
       result.remaining_smallest_complete_unit_bytes;
+  completion.flush_queue_depth = result.flush_queue_depth;
+  completion.unscheduled_flushes = result.unscheduled_flushes;
+  completion.scheduled_flushes = result.scheduled_flushes;
+  completion.running_flushes = result.running_flushes;
   completion.status = result.status;
   switch (result.yield) {
     case FactStoreMaintenanceYield::kNone:
@@ -284,51 +313,98 @@ uint64_t CommitLatencyHistogram::ApproximatePercentile(uint32_t percentile) cons
   return max_us;
 }
 
-void Database::Impl::ObserveAppendPressure(const PressureSample& sample) {
-  std::lock_guard<std::mutex> lock(runtime_pressure_mutex);
-  PressureSample effective_sample = sample;
-  if (!enforce_disk_pressure) {
-    effective_sample.free_disk_bytes = UINT64_MAX;
-    effective_sample.free_disk_percent = 100;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  uint64_t sample_interval_us = 0;
-  if (!pressure_clock_initialized) {
-    pressure_last_observed_at = now;
-    pressure_clock_initialized = true;
-  } else {
-    const uint64_t elapsed = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            now - pressure_last_observed_at)
-            .count());
-    sample_interval_us = elapsed;
-    switch (append_commit_pressure_controller.state()) {
-      case PressureState::kNormal:
-        runtime_pressure_normal_us.fetch_add(elapsed, std::memory_order_relaxed);
-        break;
-      case PressureState::kSoft:
-        runtime_pressure_soft_us.fetch_add(elapsed, std::memory_order_relaxed);
-        break;
-      case PressureState::kHard:
-        runtime_pressure_hard_us.fetch_add(elapsed, std::memory_order_relaxed);
-        break;
+uint64_t CommitGroupFillMetrics::ApproximatePercentile(
+    uint32_t percentile) const {
+  if (groups == 0) return 0;
+  const uint64_t clamped = std::min<uint32_t>(percentile, 100);
+  const uint64_t rank = std::max<uint64_t>(1, (groups * clamped + 99) / 100);
+  uint64_t cumulative = 0;
+  for (size_t index = 0; index < buckets.size(); ++index) {
+    cumulative += buckets[index];
+    if (cumulative >= rank) {
+      return index + 1 == buckets.size() ? max_transactions
+                                          : kGroupFillBucketUpperBounds[index];
     }
   }
-  effective_sample.sample_interval_us = sample_interval_us;
-  append_commit_pressure_controller.Observe(effective_sample);
-  runtime_pressure_state.store(append_commit_pressure_controller.state(),
+  return max_transactions;
+}
+
+void Database::Impl::ObserveAppendPressure(const PressureSample& sample) {
+  bool admission_changed = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_pressure_mutex);
+    PressureSample effective_sample = sample;
+    if (!enforce_disk_pressure) {
+      effective_sample.free_disk_bytes = UINT64_MAX;
+      effective_sample.free_disk_percent = 100;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    uint64_t sample_interval_us = 0;
+    if (!pressure_clock_initialized) {
+      pressure_last_observed_at = now;
+      pressure_clock_initialized = true;
+    } else {
+      const uint64_t elapsed = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              now - pressure_last_observed_at)
+              .count());
+      sample_interval_us = elapsed;
+      switch (append_commit_pressure_controller.state()) {
+        case PressureState::kNormal:
+          runtime_pressure_normal_us.fetch_add(elapsed, std::memory_order_relaxed);
+          break;
+        case PressureState::kSoft:
+          runtime_pressure_soft_us.fetch_add(elapsed, std::memory_order_relaxed);
+          break;
+        case PressureState::kHard:
+          runtime_pressure_hard_us.fetch_add(elapsed, std::memory_order_relaxed);
+          break;
+      }
+    }
+    effective_sample.sample_interval_us = sample_interval_us;
+    append_commit_pressure_controller.Observe(effective_sample);
+    runtime_pressure_state.store(append_commit_pressure_controller.state(),
+                                 std::memory_order_release);
+    runtime_target_count.store(append_commit_pressure_controller.target_count(),
                                std::memory_order_release);
-  runtime_target_count.store(append_commit_pressure_controller.target_count(),
-                             std::memory_order_release);
-  runtime_target_bytes.store(append_commit_pressure_controller.target_bytes(),
-                             std::memory_order_release);
-  runtime_collection_window_us.store(
-      append_commit_pressure_controller.collection_window_us(),
-      std::memory_order_release);
-  runtime_admission_permitted.store(
-      append_commit_pressure_controller.DecideAdmission(0, 0, 1).admit,
-      std::memory_order_release);
-  pressure_last_observed_at = now;
+    runtime_target_bytes.store(append_commit_pressure_controller.target_bytes(),
+                               std::memory_order_release);
+    runtime_collection_window_us.store(
+        append_commit_pressure_controller.collection_window_us(),
+        std::memory_order_release);
+    const bool admission_permitted =
+        append_commit_pressure_controller.DecideAdmission(0, 0, 1).admit;
+    admission_changed = admission_permitted !=
+        runtime_admission_permitted.exchange(admission_permitted,
+                                             std::memory_order_acq_rel);
+    pressure_last_observed_at = now;
+  }
+  if (admission_changed) append_commit_cv.notify_all();
+}
+
+internal::EpochLimits Database::Impl::LimitsForQueueLocked() const {
+  internal::EpochQueueSnapshot snapshot;
+  snapshot.depth = append_commit_requests.size();
+  snapshot.pressure_state = runtime_pressure_state.load(std::memory_order_acquire);
+  if (!append_commit_requests.empty()) {
+    snapshot.oldest_age_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() -
+            append_commit_requests.front()->enqueued_at)
+            .count());
+  }
+
+  internal::EpochLimits limits = adaptive_epoch_controller.NextLimits(snapshot);
+  limits.max_transactions = std::min(
+      {limits.max_transactions, append_commit_max_batch_size,
+       runtime_target_count.load(std::memory_order_acquire)});
+  limits.max_encoded_bytes = std::min(
+      {limits.max_encoded_bytes, append_commit_max_batch_bytes,
+       runtime_target_bytes.load(std::memory_order_acquire)});
+  limits.max_age_us = std::min(
+      {limits.max_age_us, append_commit_window_us,
+       runtime_collection_window_us.load(std::memory_order_acquire)});
+  return limits;
 }
 
 void Database::Impl::AccountPressureTime() {
@@ -477,6 +553,7 @@ void Database::Impl::NotifyWalDurable(void* context) noexcept {
             .count());
     durability->wal_callback_us.store(elapsed, std::memory_order_relaxed);
   }
+  durability->wal_durable.store(true, std::memory_order_release);
   if (durability->completion != nullptr) durability->completion->MarkWalDurable();
   if (durability->executor != nullptr) {
     for (const auto& ticket : durability->executor_tickets) {
@@ -535,11 +612,9 @@ Status Database::Impl::StartAppendCommitPipeline() {
         epoch_committed_count = active_epoch_committed_count_hint;
         candidates.assign(append_commit_requests.begin(),
                           append_commit_requests.end());
-        maximum = std::min<uint32_t>(append_commit_max_batch_size,
-                                     runtime_target_count.load(std::memory_order_acquire));
-        target_bytes = std::min<uint64_t>(
-            append_commit_max_batch_bytes,
-            runtime_target_bytes.load(std::memory_order_acquire));
+        const internal::EpochLimits limits = LimitsForQueueLocked();
+        maximum = limits.max_transactions;
+        target_bytes = limits.max_encoded_bytes;
       }
 
       if (epoch_committed_count == 0) {
@@ -635,6 +710,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
         append_commit_cv.wait(lock, [this] {
           return append_commit_stopping || !append_commit_requests.empty();
         });
+        if (!append_commit_stopping &&
+            append_commit_collection_observer_for_testing) {
+          lock.unlock();
+          append_commit_collection_observer_for_testing();
+          lock.lock();
+        }
         if (append_commit_stopping && append_commit_requests.empty()) {
           if (next_epoch_slot.has_value() &&
               next_epoch_slot->state == SlotState::kEligible) {
@@ -706,31 +787,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
           ++append_commit_metrics.n_plus_one_promoted_epochs;
           next_epoch_slot.reset();
         } else {
-          const auto limits_for_queue = [this] {
-            internal::EpochQueueSnapshot snapshot;
-            snapshot.depth = append_commit_requests.size();
-            snapshot.pressure_state =
-                runtime_pressure_state.load(std::memory_order_acquire);
-            if (!append_commit_requests.empty()) {
-              snapshot.oldest_age_us = static_cast<uint64_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() -
-                      append_commit_requests.front()->enqueued_at)
-                      .count());
-            }
-            return adaptive_epoch_controller.NextLimits(snapshot);
-          };
-          internal::EpochLimits collection_limits = limits_for_queue();
-          const uint32_t runtime_maximum = std::min<uint32_t>(
+          internal::EpochLimits collection_limits = LimitsForQueueLocked();
+          const uint32_t queue_ceiling = std::min<uint32_t>(
               append_commit_max_batch_size,
               runtime_target_count.load(std::memory_order_acquire));
           const uint32_t wake_at = std::min<uint32_t>(
-              runtime_maximum, std::max<uint32_t>(2, collection_limits.max_transactions));
-          const uint64_t collection_age_us = std::min<uint64_t>(
-              append_commit_window_us,
-              std::min<uint64_t>(
-                  runtime_collection_window_us.load(std::memory_order_acquire),
-                  collection_limits.max_age_us));
+              queue_ceiling,
+              std::max<uint32_t>(2, collection_limits.max_transactions));
+          const uint64_t collection_age_us = collection_limits.max_age_us;
           if (collection_age_us != 0 && append_commit_requests.size() < wake_at) {
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::microseconds(collection_age_us);
@@ -738,17 +802,11 @@ Status Database::Impl::StartAppendCommitPipeline() {
               return append_commit_stopping || append_commit_requests.size() >= wake_at;
             });
           }
-          collection_limits = limits_for_queue();
+          collection_limits = LimitsForQueueLocked();
           internal::CommitConflictIndex conflict_index;
           const size_t maximum = std::min<size_t>(
-              append_commit_requests.size(), std::min<uint32_t>(
-                  std::min<uint32_t>(append_commit_max_batch_size,
-                                     runtime_target_count.load(std::memory_order_acquire)),
-                  collection_limits.max_transactions));
-          const uint64_t target_bytes = std::min<uint64_t>(
-              std::min<uint64_t>(append_commit_max_batch_bytes,
-                                 runtime_target_bytes.load(std::memory_order_acquire)),
-              collection_limits.max_encoded_bytes);
+              append_commit_requests.size(), collection_limits.max_transactions);
+          const uint64_t target_bytes = collection_limits.max_encoded_bytes;
           uint64_t batch_bytes = 0;
           requests.reserve(maximum);
           for (size_t index = 0; index < maximum; ++index) {
@@ -770,6 +828,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
         }
         active_append_commit_requests += requests.size();
         if (!requests.empty()) {
+          RecordGroupFill(&append_commit_metrics.group_fill, requests.size());
           const auto selected_at = std::chrono::steady_clock::now();
           RecordLatency(&append_commit_metrics.latency.collection,
               static_cast<uint64_t>(
@@ -843,7 +902,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
           BindCommitHandleToEpoch(request->handle, epoch_completion, index,
                                   first_durable_transaction);
           if (first_durable_transaction) {
-            durability.executor_tickets.push_back(request->executor_ticket);
+            const auto ticket = request->executor_ticket.lock();
+            if (ticket != nullptr) durability.executor_tickets.push_back(ticket);
           }
         }
       }
@@ -875,6 +935,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
       const auto write_finished_at = std::chrono::steady_clock::now();
       const CedarRuntimeSnapshot runtime_snapshot = ReadRuntimeSnapshot();
       std::vector<CommitResult> epoch_results;
+      std::vector<internal::QueryDeltaCommit> published_delta;
+      published_delta.reserve(requests.size());
       if (epoch_completion != nullptr) epoch_results.reserve(requests.size());
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
@@ -960,7 +1022,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
                       durability.wal_callback_duration_us.load(
                           std::memory_order_relaxed));
         append_commit_metrics.runtime = ToRuntimeMetrics(runtime_snapshot.rocksdb);
-        if (result.ok()) {
+        if (durability.wal_durable.load(std::memory_order_acquire)) {
           append_commit_metrics.durably_accepted += durably_accepted_transactions;
         }
         for (size_t index = 0; index < requests.size(); ++index) {
@@ -969,6 +1031,32 @@ Status Database::Impl::StartAppendCommitPipeline() {
                 std::move(result.ValueOrDie().results[index]));
             if (requests[index]->result->ok()) {
               ++append_commit_metrics.published;
+              if (query_delta != nullptr) {
+                const CommitSeq sequence =
+                    requests[index]->result->ValueOrDie().commit_seq;
+                internal::QueryDeltaCommit descriptor(sequence);
+                descriptor.facts.reserve(requests[index]->batch.mutations.size() +
+                                         requests[index]->batch.edge_identities.size());
+                for (const PendingFactMutation& mutation :
+                     requests[index]->batch.mutations) {
+                  descriptor.facts.push_back(
+                      FactEvent{mutation.ref, mutation.valid_from, sequence,
+                                mutation.operation, mutation.schema_epoch,
+                                mutation.value, std::nullopt});
+                }
+                for (const EdgeIdentity& identity :
+                     requests[index]->batch.edge_identities) {
+                  const FactRef identity_ref =
+                      FactRef(identity.home_part_id, FactFamily::kEdgeIdentity,
+                              PropertyId{}, identity.edge_id.value);
+                  descriptor.facts.push_back(
+                      FactEvent{identity_ref, ValidTime{0}, sequence,
+                                FactOperation::kPut, 0, std::nullopt,
+                                identity});
+                  descriptor.edge_identities.push_back(identity);
+                }
+                published_delta.push_back(std::move(descriptor));
+              }
             } else {
               ++append_commit_metrics.aborted;
               if (requests[index]->result->status().IsIndeterminate() ||
@@ -1010,6 +1098,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
         active_pending_version_overlay.reset();
         ++preflight_request_generation;
         append_commit_cv.notify_all();
+      }
+      // QueryDelta observes only after visible publication and outside the
+      // append bookkeeping lock.  It performs no exact-fact reads here; a
+      // rejected descriptor is repaired later from durable sequence records.
+      if (query_delta != nullptr) {
+        for (const internal::QueryDeltaCommit& descriptor : published_delta) {
+          query_delta->EnqueuePublished(descriptor).IgnoreError();
+        }
       }
       if (epoch_completion != nullptr) {
         epoch_completion->Publish(std::move(epoch_results));
@@ -1056,9 +1152,27 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
       return Status::ResourceExhausted(
           "commit", "runtime pressure snapshot is stale");
     }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::microseconds(deadline_us);
+    std::optional<std::chrono::steady_clock::time_point> admission_wait_started;
     if (!runtime_admission_permitted.load(std::memory_order_acquire)) {
-      ++append_commit_metrics.rejected;
-      return Status::ResourceExhausted("commit", "append admission is under pressure");
+      if (deadline_us == 0) {
+        ++append_commit_metrics.rejected;
+        return Status::ResourceExhausted("commit", "append admission is under pressure");
+      }
+      admission_wait_started = std::chrono::steady_clock::now();
+      while (!runtime_admission_permitted.load(std::memory_order_acquire)) {
+        if (append_commit_cv.wait_until(lock, deadline) ==
+            std::cv_status::timeout) {
+          ++append_commit_metrics.rejected;
+          return Status::ResourceExhausted(
+              "commit", "append admission deadline expired under pressure");
+        }
+        if (append_commit_stopping) {
+          ++append_commit_metrics.rejected;
+          return Status::ShutdownInProgress("commit", "append pipeline is stopping");
+        }
+      }
     }
     const auto has_capacity = [this, &request] {
       return append_commit_requests.size() < append_commit_max_queue_requests &&
@@ -1074,9 +1188,9 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
         ++append_commit_metrics.rejected;
         return Status::ResourceExhausted("commit", "append queue is full");
       }
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::microseconds(deadline_us);
-      const auto started_wait = std::chrono::steady_clock::now();
+      if (!admission_wait_started.has_value()) {
+        admission_wait_started = std::chrono::steady_clock::now();
+      }
       while (!has_capacity()) {
         if (append_commit_cv.wait_until(lock, deadline) ==
             std::cv_status::timeout) {
@@ -1090,9 +1204,11 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
                                             "append pipeline is stopping");
         }
       }
+    }
+    if (admission_wait_started.has_value()) {
       append_commit_metrics.admission_wait_us += static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - started_wait)
+              std::chrono::steady_clock::now() - *admission_wait_started)
               .count());
     }
     append_commit_requests.push_back(request);
@@ -1205,13 +1321,13 @@ void Database::Impl::CancelQueuedAsyncCommit(
         CommitResult{CommitOutcome::kAborted, CommitSeq{}, request->txn_id,
                      Status::ResourceExhausted(
                          "async commit", "submission was cancelled")});
-    if (request->executor_ticket != nullptr) {
-      async_executor.Release(request->executor_ticket->id);
+    if (const auto ticket = request->executor_ticket.lock(); ticket != nullptr) {
+      async_executor.Release(ticket->id);
     }
-  } else if (request->executor_ticket != nullptr) {
+  } else if (const auto ticket = request->executor_ticket.lock(); ticket != nullptr) {
     // The ticket may still be in the bounded submission mailbox. WorkerMain
     // observes this bit and releases it without handing the request off.
-    async_executor.Cancel(request->executor_ticket->id);
+    async_executor.Cancel(ticket->id);
   }
 }
 
@@ -1334,6 +1450,40 @@ void Database::Impl::StopAppendCommitPipeline() {
 Database::Database(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Database::~Database() { Close().IgnoreError(); }
 
+class QueryMaintenanceHandle::State {
+ public:
+  struct Shared {
+    std::mutex mutex;
+    std::condition_variable cv;
+    Status status;
+    bool cancelled = false;
+    bool done = false;
+  };
+  State() : shared(std::make_shared<Shared>()) {}
+  explicit State(std::shared_ptr<Shared> value) : shared(std::move(value)) {}
+  std::shared_ptr<Shared> shared;
+};
+
+QueryMaintenanceHandle::QueryMaintenanceHandle(std::unique_ptr<State> state)
+    : state_(std::move(state)) {}
+QueryMaintenanceHandle::QueryMaintenanceHandle(QueryMaintenanceHandle&&) noexcept = default;
+QueryMaintenanceHandle& QueryMaintenanceHandle::operator=(QueryMaintenanceHandle&&) noexcept = default;
+QueryMaintenanceHandle::~QueryMaintenanceHandle() = default;
+void QueryMaintenanceHandle::Cancel() {
+  if (!state_) return;
+  std::lock_guard<std::mutex> lock(state_->shared->mutex);
+  if (state_->shared->done) return;
+  state_->shared->cancelled = true;
+  state_->shared->cv.notify_all();
+}
+Status QueryMaintenanceHandle::Await() {
+  if (!state_) return Status::InvalidArgument("query maintenance", "moved-from handle");
+  std::unique_lock<std::mutex> lock(state_->shared->mutex);
+  state_->shared->cv.wait(lock, [this] { return state_->shared->done; });
+  if (state_->shared->cancelled && !state_->shared->done) return Status::QueryCancelled("query maintenance", "refresh cancelled");
+  return state_->shared->status;
+}
+
 StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (options.path.empty()) return Status::InvalidArgument("database", "missing path");
   if (options.group_commit_max_batch_size == 0 ||
@@ -1355,9 +1505,77 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       options.async_executor.max_mailbox_bytes < options.group_commit_max_batch_bytes) {
     return Status::InvalidArgument("database", "async executor bounds are invalid");
   }
+  if (options.query_runtime.query_workers == 0 ||
+      options.query_runtime.reserved_interactive_workers == 0 ||
+      options.query_runtime.reserved_interactive_workers > options.query_runtime.query_workers ||
+      options.query_runtime.max_prefetch_bytes == 0 ||
+      options.query_runtime.query_delta_bytes == 0) {
+    return Status::InvalidArgument("database", "query runtime bounds are invalid");
+  }
+  if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    options.query_runtime = ResolveQueryRuntimeOptions(options);
+  }
+  if (options.storage_profile == StorageProfile::kProductionAppend ||
+      options.storage_profile == StorageProfile::kKernelTest ||
+      options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    FactStoreOptions storage_options;
+    storage_options.path = options.path;
+    storage_options.write_buffer_bytes = options.write_buffer_bytes;
+    storage_options.block_cache_bytes = options.block_cache_bytes;
+    storage_options.group_commit_max_batch_size = options.group_commit_max_batch_size;
+    storage_options.group_commit_max_batch_bytes = options.group_commit_max_batch_bytes;
+    storage_options.storage_profile = options.storage_profile;
+    storage_options.production = options.production;
+    auto resolved = internal::ResolveStorageProfile(storage_options);
+    if (!resolved.ok()) return resolved.status();
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    const auto add = [max](uint64_t left, uint64_t right, uint64_t* out) {
+      if (right > max - left) return false;
+      *out = left + right;
+      return true;
+    };
+    uint64_t allocations = 0;
+    const auto& profile = resolved.ValueOrDie();
+    if (!add(profile.facts_write_buffer_bytes, profile.meta_write_buffer_bytes,
+             &allocations) ||
+        !add(allocations, profile.block_cache_bytes, &allocations) ||
+        !add(allocations, options.query_runtime.query_memory_bytes, &allocations) ||
+        !add(allocations, options.query_runtime.projection_cache_bytes, &allocations) ||
+        !add(allocations, options.query_runtime.query_delta_bytes, &allocations) ||
+        allocations > profile.memory_budget_bytes) {
+      return Status::InvalidArgument("database", "query allocations exceed storage memory budget");
+    }
+  }
+  const std::string database_path = options.path;
   auto impl = std::make_shared<Impl>(std::move(options));
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
+  // Build the Cedar-owned adjacency cache from the authoritative fact lane at
+  // open. QueryDelta supplies the newer commit tail at query time.
+  {
+    auto adjacency_snapshot = impl->store.BeginSnapshot();
+    if (adjacency_snapshot.ok()) {
+      std::vector<FactEvent> events;
+      const Status scanned = impl->store.ScanFamily(
+          adjacency_snapshot.ValueOrDie(), FactFamily::kEdgeIdentity,
+          [&events](const FactEvent& event) {
+            events.push_back(event);
+            return Status::OK();
+          });
+      if (scanned.ok()) {
+        impl->adjacency_index = std::make_shared<internal::AdjacencyIndex>();
+        impl->adjacency_index
+            ->Build(events, adjacency_snapshot.ValueOrDie().commit_seq(), 0)
+            .IgnoreError();
+      }
+    }
+  }
+  const Status scratch_cleanup = internal::QueryScratch::CleanupOldInstances(
+      database_path, "active");
+  if (!scratch_cleanup.ok()) {
+    impl->store.Close().IgnoreError();
+    return scratch_cleanup;
+  }
   const auto prepared = impl->store.ListPreparedCommits();
   if (!prepared.ok()) {
     impl->store.Close().IgnoreError();
@@ -1370,12 +1588,158 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
       return finalized.status();
     }
   }
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("authoritative_recovery");
+  }
+  const CommitSeq recovered_visible = impl->store.visible_seq();
+  CommitSeq recovered_oldest{0};
+  if (auto recovery_snapshot = impl->store.BeginSnapshot(); recovery_snapshot.ok()) {
+    recovered_oldest = recovery_snapshot.ValueOrDie().oldest_readable_seq();
+  }
+  internal::ProjectionStoreOptions projection_options;
+  projection_options.path = database_path + "/projections";
+  projection_options.database_identity = database_path;
+  projection_options.visible_seq = recovered_visible;
+  projection_options.oldest_readable_seq = recovered_oldest;
+  projection_options.crash_fault_injector =
+      impl->query_crash_fault_injector_for_testing;
+  if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    projection_options.page_bytes = internal::kQueryDebugThresholds.projection_page_bytes;
+    projection_options.commits_per_generation =
+        internal::kQueryDebugThresholds.manifest_commits_per_generation;
+  }
+  auto projections = internal::QueryProjectionStore::OpenDeferred(
+      std::move(projection_options));
+  if (!projections.ok()) {
+    impl->store.Close().IgnoreError();
+    return projections.status();
+  }
+  impl->projection_store = projections.ConsumeValueOrDie();
+  const auto metadata_base = impl->projection_store->ReadCurrentBaseMetadata();
+  const CommitSeq projection_base = metadata_base.ok()
+      ? metadata_base.ValueOrDie() : CommitSeq{0};
+  const uint64_t configured_delta_bytes = options.query_runtime.query_delta_bytes;
+  impl->query_delta = std::make_unique<internal::QueryDelta>(
+      internal::QueryDeltaOptions{
+          projection_base,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? internal::kQueryDebugThresholds.delta_lag_hard_commits * 2
+              : 262144,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? std::min<uint64_t>(
+                    internal::kQueryDebugThresholds.query_delta_soft_bytes,
+                    configured_delta_bytes)
+              : configured_delta_bytes,
+          configured_delta_bytes,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? internal::kQueryDebugThresholds.delta_lag_hard_commits
+              : 262144,
+          30,
+          impl->query_crash_fault_injector_for_testing,
+          options.storage_profile == StorageProfile::kDebugSmallThresholds
+              ? internal::kQueryDebugThresholds.delta_lag_soft_commits
+              : 0});
+  // Reconstruct the derived tail from durable sequence metadata before any
+  // new publication can be observed.  A derived rebuild failure must not make
+  // authoritative Open fail; in that case start a fresh tail at the current
+  // durable watermark and let canonical reads serve the older range.
+  if (recovered_visible.value > projection_base.value) {
+    auto recovery_snapshot = impl->store.BeginSnapshot();
+    if (recovery_snapshot.ok()) {
+      if (impl->query_delta_repair_budget_observer_for_testing) {
+        impl->query_delta_repair_budget_observer_for_testing(
+            configured_delta_bytes);
+      }
+      const Status repaired = impl->query_delta->RepairThrough(
+          impl->store, recovery_snapshot.ValueOrDie(), recovered_visible,
+          internal::QueryDeltaRepairLimits{262144, configured_delta_bytes});
+      if (!repaired.ok()) {
+        // Never advance the derived base past a failed repair. Keep the
+        // observed base and force canonical fallback until Cedar maintenance
+        // can retry the exact missing range.
+        impl->query_delta->ResetBase(projection_base).IgnoreError();
+      }
+    } else {
+      impl->query_delta->ResetBase(projection_base).IgnoreError();
+    }
+  }
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("query_delta_repaired");
+  }
+  const Status derived_loaded = impl->projection_store->LoadDerived();
+  if (!derived_loaded.ok() && !derived_loaded.IsNotFound() &&
+      !derived_loaded.IsCorruption() && !derived_loaded.IsIOError()) {
+    impl->store.Close().IgnoreError();
+    return derived_loaded;
+  }
+  if (impl->query_open_stage_observer_for_testing) {
+    impl->query_open_stage_observer_for_testing("derived_loaded");
+  }
+  impl->query_statistics = std::make_unique<internal::QueryStatisticsStore>(
+      database_path + "/projections", database_path);
   const Status pipeline_started = impl->StartAppendCommitPipeline();
   if (!pipeline_started.ok()) {
     impl->store.Close().IgnoreError();
     return pipeline_started;
   }
   return std::unique_ptr<Database>(new Database(std::move(impl)));
+}
+
+StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::shared_ptr<internal::QueryStatisticsStore> statistics;
+  std::shared_ptr<internal::ProjectionManifest> manifest;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+    if (impl_->closing) return Status::ShutdownInProgress("database", "database close is in progress");
+    if (!impl_->projection_store || !impl_->query_statistics) {
+      return Status::NotFound("query statistics", "projection catalog is unavailable");
+    }
+    const auto current = impl_->projection_store->current_manifest();
+    if (!current) return Status::NotFound("query statistics", "projection generation is unavailable");
+    manifest = std::make_shared<internal::ProjectionManifest>(*current);
+    // The store owns the object; keep a non-owning shared wrapper only for the
+    // worker lifetime. Database shutdown joins the executor before destruction.
+    statistics = std::shared_ptr<internal::QueryStatisticsStore>(
+        impl_, impl_->query_statistics.get());
+  }
+  const auto schema = impl_->store.SchemaFingerprint();
+  if (!schema.ok()) return schema.status();
+  auto state = std::make_shared<QueryMaintenanceHandle::State::Shared>();
+  auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
+  ticket->estimated_bytes = 1;
+  ticket->release_after_handoff = true;
+  ticket->handoff = [state, statistics, manifest, schema = schema.ValueOrDie()] {
+    Status result;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->cancelled) {
+        state->status = Status::QueryCancelled("query maintenance", "refresh cancelled");
+        state->done = true;
+        state->cv.notify_all();
+        return state->status;
+      }
+    }
+    result = statistics->Refresh(*manifest, schema);
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->status = std::move(result);
+      state->done = true;
+    }
+    state->cv.notify_all();
+    return Status::OK();
+  };
+  ticket->fail = [state](const Status& status) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->status = status;
+    state->done = true;
+    state->cv.notify_all();
+  };
+  ticket->release = [] {};
+  const Status submitted = impl_->async_executor.TrySubmit(ticket);
+  if (!submitted.ok()) return submitted;
+  return QueryMaintenanceHandle(std::make_unique<QueryMaintenanceHandle::State>(std::move(state)));
 }
 
 Status Database::Close() {
@@ -1386,8 +1750,20 @@ Status Database::Close() {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
   impl_->closing = true;
+  impl_->query_shutdown_stage_mode = std::any_of(
+      impl_->active_query_states.begin(), impl_->active_query_states.end(),
+      [](const std::shared_ptr<QueryExecutionState>& candidate) {
+        return static_cast<bool>(candidate);
+      });
+  const bool had_active_queries = impl_->query_shutdown_stage_mode;
   lock.unlock();
   impl_->ObserveShutdownStage("queue_admission_closed");
+  if (had_active_queries) {
+    impl_->CancelActiveQueries();
+    impl_->ObserveShutdownStage("query_cancel_requested");
+    impl_->WaitForActiveQueries();
+    impl_->ObserveShutdownStage("query_tasks_joined");
+  }
   lock.lock();
   if (!impl_->stop_pipeline_before_drain_for_testing) {
     impl_->commits_drained.wait(lock, [this] {
@@ -1408,6 +1784,12 @@ Status Database::Close() {
   impl_->StopAppendCommitPipeline();
   impl_->RefreshRuntimeSnapshot().IgnoreError();
   impl_->ObserveShutdownStage("final_runtime_snapshot");
+  impl_->query_delta.reset();
+  impl_->ObserveShutdownStage("query_delta_stopped");
+  impl_->projection_store.reset();
+  if (had_active_queries) impl_->ObserveShutdownStage("projection_builders_stopped");
+  if (had_active_queries) impl_->ObserveShutdownStage("maintenance_joined");
+  if (had_active_queries) impl_->ObserveShutdownStage("scratch_cleaned");
   impl_->ObserveShutdownStage("rocksdb_close");
   lock.lock();
   const Status closed = impl_->store.Close();
@@ -1418,6 +1800,33 @@ Status Database::Close() {
   impl_->closed = true;
   impl_->closing = false;
   return Status::OK();
+}
+
+QueryMetricsSnapshot Database::SampleQueryMetrics() const {
+  QueryMetricsSnapshot result;
+  if (!impl_) return result;
+  const auto snapshot = impl_->query_metrics.Snapshot();
+  result.operator_rows = snapshot.operator_rows;
+  result.terminal = snapshot.terminal;
+  result.fallback = snapshot.fallback;
+  result.admission = snapshot.admission;
+  result.projection = snapshot.projection;
+  result.projection_health = snapshot.projection_health;
+  result.adjacency_pruning = snapshot.adjacency_pruning;
+  result.label_dominance = snapshot.label_dominance;
+  result.latency_us = snapshot.latency_us;
+  result.admission_wait_us = snapshot.admission_wait_us;
+  result.worker_wait_us = snapshot.worker_wait_us;
+  result.io_wait_us = snapshot.io_wait_us;
+  result.delta_lag = snapshot.delta_lag;
+  result.batches = snapshot.batches;
+  result.physical_bytes = snapshot.physical_bytes;
+  result.decoded_bytes = snapshot.decoded_bytes;
+  result.interval_fragments = snapshot.interval_fragments;
+  result.spill_bytes = snapshot.spill_bytes;
+  result.memory_bytes = snapshot.memory_bytes;
+  result.scratch_bytes = snapshot.scratch_bytes;
+  return result;
 }
 
 Status Database::CreateCheckpoint(const std::string& checkpoint_path) const {
@@ -1474,6 +1883,93 @@ StatusOr<PropertyDefinition> Database::RegisterProperty(
   return impl_->store.RegisterProperty(std::move(definition));
 }
 
+Status Database::Impl::ValidatePreparedQuery(
+    CommitSeq snapshot_seq,
+    const std::vector<PropertyDefinition>& schema_fingerprint) const {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (closed || closing) {
+    return Status::ShutdownInProgress("query", "database is closing or closed");
+  }
+  auto current_snapshot = store.BeginSnapshot();
+  if (!current_snapshot.ok()) return current_snapshot.status();
+  if (snapshot_seq.value <
+      current_snapshot.ValueOrDie().oldest_readable_seq().value) {
+    return Status::SnapshotExpired(
+        "query", "snapshot is below durable retention boundary");
+  }
+  for (const PropertyDefinition& expected : schema_fingerprint) {
+    const auto current = store.LookupProperty(expected.property_id);
+    if (!current.ok()) return current.status();
+    if (!current.ValueOrDie().has_value() ||
+        *current.ValueOrDie() != expected) {
+      return Status::SchemaMismatch(
+          "query", "referenced property schema has changed");
+    }
+  }
+  return Status::OK();
+}
+
+Status Database::Impl::RegisterQueryState(
+    const std::shared_ptr<QueryExecutionState>& state) {
+  if (!state) return Status::InvalidArgument("query", "query execution state is null");
+  std::lock_guard<std::mutex> lock(mutex);
+  if (closed || closing) {
+    return Status::ShutdownInProgress("query", "database is closing or closed");
+  }
+  active_query_states.erase(
+      std::remove_if(active_query_states.begin(), active_query_states.end(),
+                     [](const std::shared_ptr<QueryExecutionState>& candidate) {
+                       return !candidate;
+                     }),
+      active_query_states.end());
+  active_query_states.emplace_back(state);
+  return Status::OK();
+}
+
+void Database::Impl::UnregisterQueryState(
+    const std::shared_ptr<QueryExecutionState>& state) {
+  std::lock_guard<std::mutex> lock(mutex);
+  active_query_states.erase(
+      std::remove_if(active_query_states.begin(), active_query_states.end(),
+                     [&state](const std::shared_ptr<QueryExecutionState>& candidate) {
+                       return !candidate || candidate == state;
+                     }),
+      active_query_states.end());
+}
+
+bool Database::Impl::HasActiveQueries() const {
+  std::lock_guard<std::mutex> lock(mutex);
+  return std::any_of(active_query_states.begin(), active_query_states.end(),
+                     [](const std::shared_ptr<QueryExecutionState>& candidate) {
+                       return static_cast<bool>(candidate);
+                     });
+}
+
+void Database::Impl::CancelActiveQueries() {
+  std::vector<std::shared_ptr<QueryExecutionState>> states;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    states = active_query_states;
+  }
+  for (const auto& state : states) if (state) state->RequestCancel();
+}
+
+void Database::Impl::WaitForActiveQueries() {
+  std::vector<std::shared_ptr<QueryExecutionState>> states;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    states = active_query_states;
+  }
+  // RequestCancel is deliberately non-blocking. Close supplies the ordered
+  // acknowledgement barrier: it waits for every in-flight Next operation,
+  // then releases the query Snapshot and scratch before RocksDB shutdown.
+  for (const auto& state : states) if (state) state->Close();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    active_query_states.clear();
+  }
+}
+
 Status Database::Vacuum(CommitSeq oldest_readable) {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -1481,7 +1977,20 @@ Status Database::Vacuum(CommitSeq oldest_readable) {
   if (impl_->closing) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
-  return impl_->store.Vacuum(oldest_readable);
+  for (const auto& query_state : impl_->active_query_states) {
+    if (!query_state) continue;
+    const QueryTerminalInfo terminal = query_state->terminal_info();
+    if (terminal.state != QueryCursorState::kRunning) continue;
+    const auto pinned = query_state->snapshot_seq();
+    if (pinned.has_value() && pinned->value < oldest_readable.value) {
+      return Status::SnapshotPinned("database", "query snapshot is pinned");
+    }
+  }
+  const Status vacuumed = impl_->store.Vacuum(oldest_readable);
+  if (!vacuumed.ok()) return vacuumed;
+  return impl_->projection_store
+             ? impl_->projection_store->RetireBefore(oldest_readable)
+             : Status::OK();
 }
 
 StatusOr<std::optional<CommitResult>> Database::ResolveTransaction(
@@ -1566,6 +2075,21 @@ StatusOr<RuntimeMetrics> Database::SampleRuntimeMetrics() const {
         maintenance.flush_grants_accepted;
     metrics.maintenance_compaction_grants_accepted =
         maintenance.compaction_grants_accepted;
+    metrics.maintenance_flush_grants_requested =
+        maintenance.flush_grants_requested;
+    metrics.maintenance_completed_grants = maintenance.completed_grants;
+    metrics.maintenance_flush_wal_sync_yields =
+        maintenance.yields[static_cast<size_t>(CedarMaintenanceYield::kWalSync)];
+    metrics.maintenance_flush_deadline_yields =
+        maintenance.yields[static_cast<size_t>(CedarMaintenanceYield::kDeadline)];
+    metrics.maintenance_last_flush_queue_depth =
+        maintenance.last_flush_completion.flush_queue_depth;
+    metrics.maintenance_last_unscheduled_flushes =
+        maintenance.last_flush_completion.unscheduled_flushes;
+    metrics.maintenance_last_scheduled_flushes =
+        maintenance.last_flush_completion.scheduled_flushes;
+    metrics.maintenance_last_running_flushes =
+        maintenance.last_flush_completion.running_flushes;
     metrics.maintenance_errors = maintenance.maintenance_errors;
   }
   return metrics;

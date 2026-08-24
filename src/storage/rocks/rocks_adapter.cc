@@ -4,6 +4,7 @@
 #include "storage/rocks/rocks_adapter.h"
 
 #include <algorithm>
+#include <sstream>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -25,6 +26,7 @@
 #include <rocksdb/cedar_maintenance.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <rocksdb/perf_context.h>
 #include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/statistics.h>
@@ -32,6 +34,7 @@
 #include <rocksdb/write_batch.h>
 
 #include "db/cedar_columnar_scan.h"
+#include "cedar/core/crc32c.h"
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
 #include "cedar/format.h"
@@ -105,6 +108,44 @@ bool StartsWith(const rocksdb::Slice& value, const std::string& prefix) {
   return value.size() >= prefix.size() &&
          std::equal(prefix.begin(), prefix.end(), value.data());
 }
+
+uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
+  return right > UINT64_MAX - left ? UINT64_MAX : left + right;
+}
+
+uint64_t CounterDelta(uint64_t current, uint64_t before) {
+  // PerfContext counters are monotonic for the lifetime of a thread. Treat a
+  // reset defensively as zero rather than allowing unsigned underflow into a
+  // bogus physical-read total.
+  return current >= before ? current - before : 0;
+}
+
+class CanonicalReadPerfTracker {
+ public:
+  explicit CanonicalReadPerfTracker(std::atomic<uint64_t>* destination)
+      : destination_(destination), context_(rocksdb::get_perf_context()) {
+    get_read_bytes_ = context_->get_read_bytes;
+    multiget_read_bytes_ = context_->multiget_read_bytes;
+    iter_read_bytes_ = context_->iter_read_bytes;
+  }
+
+  ~CanonicalReadPerfTracker() {
+    if (destination_ == nullptr) return;
+    uint64_t delta = CounterDelta(context_->get_read_bytes, get_read_bytes_);
+    delta = SaturatingAdd(
+        delta, CounterDelta(context_->multiget_read_bytes, multiget_read_bytes_));
+    delta = SaturatingAdd(
+        delta, CounterDelta(context_->iter_read_bytes, iter_read_bytes_));
+    if (delta != 0) destination_->fetch_add(delta, std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t>* destination_;
+  rocksdb::PerfContext* context_;
+  uint64_t get_read_bytes_ = 0;
+  uint64_t multiget_read_bytes_ = 0;
+  uint64_t iter_read_bytes_ = 0;
+};
 
 bool SamePropertyDefinition(const PropertyDefinition& left,
                             const PropertyDefinition& right) {
@@ -364,6 +405,7 @@ class FactStoreImpl {
   std::atomic<uint64_t> projected_scan_pages_read{0};
   std::atomic<uint64_t> projected_scan_physical_bytes_read{0};
   std::atomic<uint64_t> canonical_scan_bytes_read{0};
+  std::atomic<uint64_t> canonical_read_physical_bytes{0};
   std::atomic<uint64_t> logical_facts_bytes{0};
   IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
   IdAllocatorState edge_allocator{IdKind::kEdge, 1};
@@ -604,6 +646,7 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
   store->point_read_operations.fetch_add(1, std::memory_order_relaxed);
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   const std::string seek = EncodeFactKey(
       ref, valid_time, CommitSeq{std::numeric_limits<uint64_t>::max()});
   if (seek.empty()) {
@@ -1216,7 +1259,7 @@ Status FactStore::Open() {
   const auto resolved_profile = internal::ResolveStorageProfile(options_);
   if (!resolved_profile.ok()) return resolved_profile.status();
   const internal::ResolvedStorageProfile* resolved_ptr =
-      options_.storage_profile == StorageProfile::kProductionAppend
+      UsesCedarKernelProfile(options_.storage_profile)
           ? &resolved_profile.ValueOrDie()
           : nullptr;
   rocksdb::Options options = internal::MakeRocksDbOptions(
@@ -1463,6 +1506,7 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
       ref, valid_time, CommitSeq{std::numeric_limits<uint64_t>::max()});
   if (seek.empty()) return Status::InvalidArgument("fact read", "invalid fact key");
   const std::string prefix = seek.substr(0, kFactIdentityPrefixBytes);
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
@@ -1509,6 +1553,37 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
   return Scan(snapshot, prefix, FactScanBounds{}, visitor);
 }
 
+Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
+                             const FactVisitor& visitor) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store)
+      return Status::InvalidArgument("fact scan", "snapshot belongs to another store");
+  }
+  if (!visitor) return Status::InvalidArgument("fact scan", "missing visitor");
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    auto decoded_key = DecodeFactKey(iterator->key().ToString());
+    if (!decoded_key.ok()) return decoded_key.status();
+    if (decoded_key.ValueOrDie().ref.family() != family ||
+        decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value)
+      continue;
+    auto decoded_value = DecodeFactValue(
+        decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
+        decoded_key.ValueOrDie().commit_seq, iterator->value().ToString());
+    if (!decoded_value.ok()) return decoded_value.status();
+    if (Status status = visitor(decoded_value.ValueOrDie()); !status.ok()) return status;
+  }
+  return iterator->status().ok() ? Status::OK()
+                                 : FromRocksDb(iterator->status(), "iterate family scan");
+}
+
 Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                        const FactScanBounds& bounds,
                        const FactVisitor& visitor) const {
@@ -1540,6 +1615,7 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
       prefix.part_id(), prefix.family(), prefix.property_id(), prefix.entity_id());
   const std::string seek_key = EncodeFactIdentityPrefix(
       prefix.part_id(), prefix.family(), prefix.property_id(), seek_entity);
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   std::unique_ptr<rocksdb::Iterator> iterator(
@@ -1758,6 +1834,46 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
   return flush();
 }
 
+Status FactStore::ScanColumnarFamily(
+    const StoreSnapshot& snapshot, FactFamily family, PropertyId property,
+    const FactColumnarScanOptions& options,
+    const FactColumnarBatchVisitor& visitor) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("columnar scan", "snapshot belongs to another store");
+    }
+  }
+  if (!visitor) return Status::InvalidArgument("columnar scan", "missing visitor");
+  std::set<uint32_t> partitions;
+  rocksdb::ReadOptions read_options;
+  read_options.snapshot = snapshot.state_->snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(read_options, store->facts_cf));
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    auto key = DecodeFactKey(iterator->key().ToString());
+    if (!key.ok()) return key.status();
+    if (key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value ||
+        key.ValueOrDie().ref.family() != family ||
+        key.ValueOrDie().ref.property_id() != property) {
+      continue;
+    }
+    partitions.insert(key.ValueOrDie().ref.part_id().value);
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(), "enumerate columnar fact partitions");
+  }
+  for (uint32_t part : partitions) {
+    const Status scanned = ScanColumnar(
+        snapshot, FactPrefix::Family(PartId{part}, family, property),
+        FactScanBounds{}, options, visitor);
+    if (!scanned.ok()) return scanned;
+  }
+  return Status::OK();
+}
+
 StatusOr<SequenceRecord> FactStore::ReadSequence(
     const StoreSnapshot& snapshot, CommitSeq commit_seq) const {
   std::shared_ptr<FactStoreImpl> store;
@@ -1787,6 +1903,58 @@ StatusOr<SequenceRecord> FactStore::ReadSequence(
   return record;
 }
 
+StatusOr<std::vector<SequenceRecord>> FactStore::ReadSequenceRange(
+    const StoreSnapshot& snapshot, CommitSeq first, CommitSeq last) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("scan sequence range",
+                                     "snapshot belongs to another store");
+    }
+  }
+  if (first.value == 0 || last.value < first.value ||
+      last.value > snapshot.commit_seq().value) {
+    return Status::InvalidArgument("scan sequence range", "invalid snapshot range");
+  }
+  const auto first_key = EncodeSequenceMetaKey(first);
+  if (!first_key.ok()) return first_key.status();
+  std::vector<SequenceRecord> records;
+  records.reserve(static_cast<size_t>(last.value - first.value + 1));
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->meta_cf));
+  iterator->Seek(first_key.ValueOrDie());
+  CommitSeq expected = first;
+  while (iterator->Valid() && expected.value <= last.value) {
+    if (!StartsWith(iterator->key(), kSequenceMetaPrefix)) break;
+    const auto expected_key = EncodeSequenceMetaKey(expected);
+    if (!expected_key.ok()) return expected_key.status();
+    if (iterator->key().ToString() != expected_key.ValueOrDie()) {
+      return Status::Corruption("scan sequence range", "sequence key disagrees with requested range");
+    }
+    const auto decoded = DecodeSequenceRecord(iterator->value().ToString());
+    if (!decoded.ok()) {
+      return decoded.status();
+    }
+    if (decoded.ValueOrDie().commit_seq != expected) {
+      return Status::Corruption("scan sequence range", "non-contiguous sequence metadata");
+    }
+    records.push_back(decoded.ValueOrDie());
+    if (expected.value == last.value) break;
+    ++expected.value;
+    iterator->Next();
+  }
+  const rocksdb::Status iterator_status = iterator->status();
+  if (!iterator_status.ok()) return FromRocksDb(iterator_status, "read sequence range");
+  if (records.size() != static_cast<size_t>(last.value - first.value + 1)) {
+    return Status::Corruption("scan sequence range", "missing sequence metadata");
+  }
+  return records;
+}
+
 StatusOr<FactEvent> FactStore::ReadExactFact(
     const StoreSnapshot& snapshot, const std::string& encoded_fact_key) const {
   std::shared_ptr<FactStoreImpl> store;
@@ -1804,6 +1972,7 @@ StatusOr<FactEvent> FactStore::ReadExactFact(
     return Status::InvalidArgument("scan fact", "outside snapshot range");
   }
   std::string encoded;
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.state_->snapshot;
   const rocksdb::Status got = store->db->Get(options, store->facts_cf,
@@ -1811,6 +1980,58 @@ StatusOr<FactEvent> FactStore::ReadExactFact(
   if (!got.ok()) return FromRocksDb(got, "read scan fact");
   return DecodeFactValue(key.ValueOrDie().ref, key.ValueOrDie().valid_from,
                          key.ValueOrDie().commit_seq, encoded);
+}
+
+StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
+    const StoreSnapshot& snapshot,
+    const std::vector<std::string>& encoded_fact_keys) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
+      return Status::InvalidArgument("scan facts", "snapshot belongs to another store");
+    }
+  }
+  if (encoded_fact_keys.empty()) return std::vector<FactEvent>{};
+  std::vector<DecodedFactKey> decoded_keys;
+  decoded_keys.reserve(encoded_fact_keys.size());
+  std::vector<rocksdb::Slice> keys;
+  keys.reserve(encoded_fact_keys.size());
+  for (const std::string& encoded : encoded_fact_keys) {
+    const auto decoded = DecodeFactKey(encoded);
+    if (!decoded.ok()) return decoded.status();
+    if (decoded.ValueOrDie().commit_seq.value > snapshot.commit_seq().value) {
+      return Status::InvalidArgument("scan facts", "outside snapshot range");
+    }
+    decoded_keys.push_back(decoded.ValueOrDie());
+    keys.emplace_back(encoded);
+  }
+  std::vector<rocksdb::ColumnFamilyHandle*> families(keys.size(), store->facts_cf);
+  std::vector<std::string> values;
+  CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  const std::vector<rocksdb::Status> statuses =
+      store->db->MultiGet(options, families, keys, &values);
+  store->multi_get_operations.fetch_add(encoded_fact_keys.size(),
+                                        std::memory_order_relaxed);
+  std::vector<FactEvent> events;
+  events.reserve(encoded_fact_keys.size());
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    if (!statuses[i].ok()) {
+      if (statuses[i].IsNotFound()) {
+        return Status::Corruption("scan facts", "sequence references missing fact");
+      }
+      return FromRocksDb(statuses[i], "read exact facts");
+    }
+    const auto event = DecodeFactValue(decoded_keys[i].ref,
+                                       decoded_keys[i].valid_from,
+                                       decoded_keys[i].commit_seq, values[i]);
+    if (!event.ok()) return event.status();
+    events.push_back(event.ValueOrDie());
+  }
+  return events;
 }
 
 StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
@@ -3047,6 +3268,30 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
                                  schema_epoch);
 }
 
+StatusOr<std::string> FactStore::SchemaFingerprint() const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("property definition", "store is not open");
+  }
+  const auto schemas = std::atomic_load(&store->property_schemas);
+  std::ostringstream canonical;
+  for (const auto& [property_id, epochs] : *schemas) {
+    if (epochs.empty()) continue;
+    const auto& definition = epochs.back();
+    canonical << property_id << ':' << definition.schema_epoch << ':'
+              << static_cast<unsigned>(definition.entity_kind) << ':'
+              << static_cast<unsigned>(definition.physical_type) << ':'
+              << definition.blob_threshold_bytes << ':' << definition.name << ';';
+  }
+  const std::string bytes = canonical.str();
+  const uint32_t digest = crc32c::Value(bytes.data(), bytes.size());
+  std::ostringstream fingerprint;
+  fingerprint << std::hex << digest << ':' << bytes.size();
+  return fingerprint.str();
+}
+
 StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
     const StoreSnapshot& snapshot, PropertyId property_id,
     uint32_t schema_epoch) const {
@@ -3314,6 +3559,10 @@ StatusOr<FactStoreMaintenanceResult> FactStore::RunNativeMaintenance(
   result.remaining_smallest_complete_unit_bytes =
       native.remaining_smallest_complete_unit_bytes;
   result.atomic_overrun_bytes = native.atomic_overrun_bytes;
+  result.flush_queue_depth = native.flush_queue_depth;
+  result.unscheduled_flushes = native.unscheduled_flushes;
+  result.scheduled_flushes = native.scheduled_flushes;
+  result.running_flushes = native.running_flushes;
   result.selected_column_family_id = native.selected_column_family_id;
   switch (native.yield) {
     case rocksdb::CedarMaintenanceYield::kNone:
@@ -3405,17 +3654,10 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   }
   sample.write_stopped = maintenance.write_stopped ? 1 : 0;
   sample.background_error = maintenance.background_errors;
-  const uint64_t all_memtable_bytes =
-      maintenance.total_immutable_memtable_bytes >
-              UINT64_MAX - maintenance.total_active_memtable_bytes
-          ? UINT64_MAX
-          : maintenance.total_immutable_memtable_bytes +
-                maintenance.total_active_memtable_bytes;
-  const auto resolved = internal::ResolveStorageProfile(options_);
-  if (resolved.ok() && resolved.ValueOrDie().facts_write_buffer_bytes != 0) {
+  if (maintenance.write_buffer_manager_limit_bytes != 0) {
     sample.immutable_memtable_percent = std::min<uint64_t>(
-        100, all_memtable_bytes * 100 /
-                 resolved.ValueOrDie().facts_write_buffer_bytes);
+        100, maintenance.total_immutable_memtable_bytes * 100 /
+                 maintenance.write_buffer_manager_limit_bytes);
   }
   metrics.l0_files = sample.l0_files;
   metrics.maintenance_generation = maintenance.generation;
@@ -3427,6 +3669,9 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
   metrics.block_cache_pinned_bytes = maintenance.block_cache_pinned_bytes;
   metrics.running_flushes = maintenance.running_flushes;
   metrics.running_compactions = maintenance.running_compactions;
+  metrics.flush_queue_depth = maintenance.flush_queue_depth;
+  metrics.unscheduled_flushes = maintenance.unscheduled_flushes;
+  metrics.scheduled_flushes = maintenance.scheduled_flushes;
   metrics.background_errors = maintenance.background_errors;
   metrics.background_errors_total = maintenance.background_errors;
   metrics.live_sst_bytes = maintenance.live_sst_bytes;
@@ -3581,6 +3826,8 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
       store->projected_scan_physical_bytes_read.load(std::memory_order_relaxed);
   metrics.canonical_scan_bytes_read =
       store->canonical_scan_bytes_read.load(std::memory_order_relaxed);
+  metrics.canonical_read_physical_bytes =
+      store->canonical_read_physical_bytes.load(std::memory_order_relaxed);
   metrics.logical_facts_bytes =
       store->logical_facts_bytes.load(std::memory_order_relaxed);
   std::unordered_set<std::string> live_files;

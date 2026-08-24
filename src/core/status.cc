@@ -86,8 +86,11 @@ std::string Status::ToString() const {
       case kQueryCancelled:
         type = "QueryCancelled: ";
         break;
-      case kQueryMemoryLimit:
-        type = "QueryMemoryLimit: ";
+      case kDeadlineExceeded:
+        type = "DeadlineExceeded: ";
+        break;
+      case kNumericOverflow:
+        type = "NumericOverflow: ";
         break;
       case kWriteStalled:
         type = "WriteStalled: ";

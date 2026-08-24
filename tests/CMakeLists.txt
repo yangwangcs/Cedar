@@ -18,10 +18,92 @@ else()
     set(GTEST_MAIN_TARGET gtest_main)
 endif()
 
+add_executable(test_query_types query/test_query_types.cc)
+target_link_libraries(test_query_types PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_types)
+
+add_executable(test_query_differential query/test_query_differential.cc)
+target_include_directories(test_query_differential PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_differential PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_differential TEST_PREFIX "QueryDifferential.")
+
+add_executable(test_logical_plan query/test_logical_plan.cc)
+target_include_directories(test_logical_plan PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_logical_plan PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_logical_plan)
+
+add_executable(test_query_canonical query/test_query_canonical.cc)
+target_include_directories(test_query_canonical PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_canonical PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_canonical)
+
+add_executable(test_query_lifecycle query/test_query_lifecycle.cc)
+target_include_directories(test_query_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_lifecycle PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_lifecycle TEST_PREFIX "QueryLifecycle.")
+
+add_executable(test_query_relational query/test_query_relational.cc)
+target_include_directories(test_query_relational PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_relational PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_relational TEST_PREFIX "QueryRelational.")
+
+add_executable(test_query_resources query/test_query_resources.cc)
+target_include_directories(test_query_resources PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_resources PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_resources TEST_PREFIX "QueryResource.")
+
+add_executable(test_projection_format query/test_projection_format.cc)
+target_include_directories(test_projection_format PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_projection_format PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_projection_format)
+
+add_executable(test_projection_store query/test_projection_store.cc)
+target_include_directories(test_projection_store PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_projection_store PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_projection_store)
+
+add_executable(test_query_delta query/test_query_delta.cc)
+target_include_directories(test_query_delta PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_delta PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_delta)
+
+add_executable(test_query_observability query/test_query_observability.cc)
+target_include_directories(test_query_observability PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_observability PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_observability TEST_PREFIX "QueryObservability.")
+
+add_executable(test_query_planner query/test_query_planner.cc)
+target_include_directories(test_query_planner PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_planner PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_planner)
+
+add_executable(test_temporal_expand query/test_temporal_expand.cc)
+target_include_directories(test_temporal_expand PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_temporal_expand PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_temporal_expand TEST_PREFIX "TemporalExpand.")
+
+add_executable(test_coexisting_path query/test_coexisting_path.cc)
+target_include_directories(test_coexisting_path PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_coexisting_path PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_coexisting_path TEST_PREFIX "CoexistingPath.")
+
+add_executable(test_temporal_journey query/test_temporal_journey.cc)
+target_include_directories(test_temporal_journey PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_temporal_journey PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_temporal_journey TEST_PREFIX "TemporalJourney.")
+
 set(CEDAR_TEST_LIBS
     cedar_core
     ${GTEST_MAIN_TARGET}
 )
+
+add_executable(test_temporal_model query/test_temporal_model.cc)
+target_include_directories(test_temporal_model PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_temporal_model PRIVATE ${CEDAR_TEST_LIBS})
+gtest_discover_tests(test_temporal_model)
 
 function(configure_cedar_parquet_test target)
     target_include_directories(${target} PRIVATE
@@ -255,22 +337,42 @@ target_link_libraries(test_kernel_bench_options
     PRIVATE cedar_kernel_bench_options ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bench_options)
 
+add_executable(test_query_bench_options performance/test_query_bench_options.cc)
+target_include_directories(test_query_bench_options PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_query_bench_options PRIVATE cedar_query_bench_options ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_bench_options TEST_PREFIX "QueryBench.")
+
+add_executable(test_query_bench_workload performance/test_query_bench_workload.cc)
+target_include_directories(test_query_bench_workload PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_query_bench_workload
+    PRIVATE cedar_query_bench_workload cedar_query_bench_options ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_bench_workload TEST_PREFIX "QueryBench.")
+
+if(TARGET cedar_query_bench)
+  add_test(NAME QueryBenchmarkCsvContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_benchmark_csv.cmake)
+  add_test(NAME QueryCampaignOptionsContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_CAMPAIGN=${CMAKE_SOURCE_DIR}/benchmarks/run_cedar_query_campaign.sh
+      -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_campaign_options.cmake)
+  add_test(NAME QueryArtifactAuditContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_CAMPAIGN=${CMAKE_SOURCE_DIR}/benchmarks/run_cedar_query_campaign.sh
+      -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_query_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_query_artifact_audit.cmake)
+endif()
+
 add_executable(test_kernel_bounded_benchmark performance/test_kernel_bounded_benchmark.cc)
 target_include_directories(test_kernel_bounded_benchmark PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_kernel_bounded_benchmark
     PRIVATE cedar_kernel_bench_workload ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bounded_benchmark)
 
-add_test(NAME KernelBenchmarkCsvContract
-    COMMAND ${CMAKE_COMMAND}
-        -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
-
-if(TARGET cedar_kernel_columnar_bench)
-    add_test(NAME KernelColumnarBenchmarkSmoke
+if(TARGET cedar_kernel_bench)
+    add_test(NAME KernelBenchmarkCsvContract
         COMMAND ${CMAKE_COMMAND}
-            -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_columnar_bench>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_columnar_benchmark.cmake)
+            -DCEDAR_BENCHMARK=$<TARGET_FILE:cedar_kernel_bench>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
 endif()
 
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)
@@ -296,6 +398,14 @@ target_link_libraries(test_rocksdb_lifecycle
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_rocksdb_lifecycle)
 
+add_executable(test_cedar_files tools/test_cedar_files.cc)
+target_include_directories(test_cedar_files PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_cedar_files PRIVATE
+    CEDAR_BINARY="$<TARGET_FILE:cedar>")
+target_link_libraries(test_cedar_files PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+add_dependencies(test_cedar_files cedar)
+gtest_discover_tests(test_cedar_files)
+
 add_executable(test_vacuum storage/test_vacuum.cc)
 target_include_directories(test_vacuum PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_vacuum
@@ -307,6 +417,11 @@ target_include_directories(test_recovery_crash_matrix PRIVATE ${CMAKE_SOURCE_DIR
 target_link_libraries(test_recovery_crash_matrix
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_recovery_crash_matrix)
+
+add_executable(test_query_crash_matrix recovery/test_query_crash_matrix.cc)
+target_include_directories(test_query_crash_matrix PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_crash_matrix PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_crash_matrix TEST_PREFIX "QueryCrashMatrix.")
 
 add_executable(test_recovery_format recovery/test_format.cc)
 target_include_directories(test_recovery_format PRIVATE ${CMAKE_SOURCE_DIR}/src)

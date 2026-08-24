@@ -53,6 +53,19 @@ TEST(PressureControllerTest, SustainedColumnarFlushDeficitEntersSoftPressure) {
   EXPECT_GE(controller.projected_debt_bytes(), 8ULL << 30);
 }
 
+TEST(PressureControllerTest,
+     ShortPredictedDebtDoesNotStopAdmissionWithoutActualHardPressure) {
+  PressureController controller;
+  PressureSample deficit;
+  deficit.sample_interval_us = 1'000'000;
+  deficit.admitted_facts_bytes_per_sec = 8ULL << 30;
+  deficit.completed_background_bytes_per_sec = 0;
+  for (int i = 0; i < 6; ++i) controller.Observe(deficit);
+
+  EXPECT_NE(controller.state(), PressureState::kHard);
+  EXPECT_TRUE(controller.DecideAdmission(0, 0, 1).admit);
+}
+
 TEST(PressureControllerTest, ZeroDurationSampleDoesNotCreateThroughputPressure) {
   PressureController controller;
   PressureSample invalid_rate;

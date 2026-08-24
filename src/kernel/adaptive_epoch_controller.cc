@@ -22,6 +22,11 @@ AdaptiveEpochController::AdaptiveEpochController(Options options) : options_(opt
   options_.max_transactions = std::max<uint32_t>(1, options_.max_transactions);
   options_.max_encoded_bytes = std::max<uint64_t>(1, options_.max_encoded_bytes);
   options_.latency_slo_us = std::max<uint64_t>(1, options_.latency_slo_us);
+  options_.min_transactions_under_load = std::min<uint32_t>(
+      options_.max_transactions,
+      std::max<uint32_t>(1, options_.min_transactions_under_load));
+  options_.deep_queue_threshold =
+      std::max<uint32_t>(1, options_.deep_queue_threshold);
 }
 
 uint64_t AdaptiveEpochController::Ewma(uint64_t previous, uint64_t sample) {
@@ -29,13 +34,15 @@ uint64_t AdaptiveEpochController::Ewma(uint64_t previous, uint64_t sample) {
 }
 
 void AdaptiveEpochController::Observe(const EpochObservation& observation) {
-  wal_sync_us_ewma_ = Ewma(wal_sync_us_ewma_, observation.wal_sync_us);
-  queue_p99_us_ewma_ = Ewma(queue_p99_us_ewma_, observation.queue_p99_us);
   if (observation.transactions != 0) {
     bytes_per_transaction_ewma_ = Ewma(
         bytes_per_transaction_ewma_, observation.encoded_bytes / observation.transactions);
   }
-  if (observations_ != std::numeric_limits<uint32_t>::max()) ++observations_;
+}
+
+uint64_t AdaptiveEpochController::BytesForTarget(uint32_t target) const {
+  return std::min(options_.max_encoded_bytes,
+                  SaturatingMultiply(bytes_per_transaction_ewma_, target));
 }
 
 EpochLimits AdaptiveEpochController::NextLimits(
@@ -52,30 +59,40 @@ EpochLimits AdaptiveEpochController::NextLimits(
                        std::min<uint64_t>(options_.maximum_collection_age_us, 50)};
   }
 
-  const bool enough_history = observations_ >= 4;
-  const bool latency_limited = enough_history &&
-      (wal_sync_us_ewma_ > options_.latency_slo_us ||
-       queue_p99_us_ewma_ > options_.latency_slo_us ||
-       snapshot.oldest_age_us > options_.latency_slo_us);
-  if (latency_limited) {
-    return EpochLimits{std::max<uint32_t>(1, options_.max_transactions / 2),
-                       std::max<uint64_t>(1, options_.max_encoded_bytes / 2), 0};
-  }
-
   if (snapshot.depth <= 1) {
+    if (snapshot.oldest_age_us > options_.latency_slo_us) {
+      return EpochLimits{1, options_.max_encoded_bytes, 0};
+    }
     return EpochLimits{1, options_.max_encoded_bytes,
                        options_.maximum_collection_age_us};
   }
 
-  limits.max_transactions = static_cast<uint32_t>(std::min<uint64_t>(
-      options_.max_transactions, std::max<uint64_t>(2, snapshot.depth)));
+  const bool deep_queue = snapshot.depth >= options_.deep_queue_threshold;
+  limits.max_transactions = deep_queue ? options_.max_transactions
+      : static_cast<uint32_t>(std::min<uint64_t>(
+            options_.max_transactions,
+            std::max<uint64_t>(options_.min_transactions_under_load,
+                               snapshot.depth)));
   if (bytes_per_transaction_ewma_ != 0) {
-    const uint64_t target_bytes = SaturatingMultiply(
-        bytes_per_transaction_ewma_, limits.max_transactions);
-    limits.max_encoded_bytes = std::min(options_.max_encoded_bytes,
-                                        std::max<uint64_t>(1, target_bytes));
+    limits.max_encoded_bytes =
+        std::max<uint64_t>(1, BytesForTarget(limits.max_transactions));
   }
-  if (snapshot.depth >= limits.max_transactions) limits.max_age_us = 0;
+  if (snapshot.oldest_age_us > options_.latency_slo_us) {
+    limits.max_transactions = std::max<uint32_t>(
+        options_.min_transactions_under_load, limits.max_transactions / 2);
+    if (bytes_per_transaction_ewma_ != 0) {
+      limits.max_encoded_bytes =
+          std::max<uint64_t>(1, BytesForTarget(limits.max_transactions));
+    } else {
+      limits.max_encoded_bytes =
+          std::max<uint64_t>(1, options_.max_encoded_bytes / 2);
+    }
+    limits.max_age_us = 0;
+    return limits;
+  }
+  if (deep_queue || snapshot.depth >= limits.max_transactions) {
+    limits.max_age_us = 0;
+  }
   return limits;
 }
 

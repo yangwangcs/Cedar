@@ -32,6 +32,8 @@ class AsyncSubmissionExecutor {
     std::function<Status()> handoff;
     std::function<void(const Status&)> fail;
     std::function<void()> release;
+    // One-shot maintenance tasks do not retain the ticket after handoff.
+    bool release_after_handoff = false;
     std::atomic<bool> released{false};
     std::atomic<bool> cancelled{false};
   };

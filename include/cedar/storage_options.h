@@ -12,7 +12,23 @@ namespace cedar {
 inline constexpr uint32_t kMaximumCommitBatchCount = 512;
 inline constexpr uint64_t kMaximumCommitBatchBytes = 2ULL * 1024ULL * 1024ULL;
 
-enum class StorageProfile : uint8_t { kDeveloper, kProductionAppend };
+enum class StorageProfile : uint8_t {
+  kDeveloper,
+  // Test-only Kernel profile with intentionally small maintenance thresholds.
+  // It exercises the same single-WAL and recovery path as production without
+  // exposing production capacity controls to tests.
+  kKernelTest,
+  // Debug-only profile with deliberately small capacities. It selects the
+  // same production classes and recovery paths; only limits are reduced.
+  kDebugSmallThresholds,
+  kProductionAppend,
+};
+
+constexpr bool UsesCedarKernelProfile(StorageProfile profile) {
+  return profile == StorageProfile::kKernelTest ||
+         profile == StorageProfile::kDebugSmallThresholds ||
+         profile == StorageProfile::kProductionAppend;
+}
 
 struct ProductionStorageOptions {
   uint64_t memory_budget_bytes = 0;

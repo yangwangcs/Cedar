@@ -24,9 +24,14 @@ find_package(Threads REQUIRED)
 
 # The engine is source-owned by Cedar, so its cache identity derives from its
 # exact embedded content rather than a nested Git worktree's revision/diff.
-file(GLOB_RECURSE CEDAR_ENGINE_SOURCE_FILES LIST_DIRECTORIES false
+file(GLOB_RECURSE CEDAR_ENGINE_SOURCE_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
      "${CEDAR_ENGINE_SOURCE_DIR}/*")
 list(SORT CEDAR_ENGINE_SOURCE_FILES)
+# Content changes select a new cache identity, while the glob also detects
+# additions/removals.  Register every current file so normal `cmake --build`
+# reconfigures before resolving that identity after a source edit.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             ${CEDAR_ENGINE_SOURCE_FILES})
 set(CEDAR_ENGINE_SOURCE_DIGEST_INPUT "")
 foreach(CEDAR_ENGINE_SOURCE_FILE IN LISTS CEDAR_ENGINE_SOURCE_FILES)
     file(SHA256 "${CEDAR_ENGINE_SOURCE_FILE}" CEDAR_ENGINE_SOURCE_FILE_SHA256)

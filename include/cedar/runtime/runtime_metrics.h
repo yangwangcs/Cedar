@@ -16,6 +16,14 @@ struct RuntimeMetrics {
   uint64_t maintenance_snapshot_age_us = 0;
   uint64_t maintenance_flush_grants_accepted = 0;
   uint64_t maintenance_compaction_grants_accepted = 0;
+  uint64_t maintenance_flush_grants_requested = 0;
+  uint64_t maintenance_completed_grants = 0;
+  uint64_t maintenance_flush_wal_sync_yields = 0;
+  uint64_t maintenance_flush_deadline_yields = 0;
+  uint64_t maintenance_last_flush_queue_depth = 0;
+  uint64_t maintenance_last_unscheduled_flushes = 0;
+  uint64_t maintenance_last_scheduled_flushes = 0;
+  uint64_t maintenance_last_running_flushes = 0;
   uint64_t background_flush_calls = 0;
   uint64_t manual_compaction_calls = 0;
   uint64_t periodic_task_registrations = 0;
@@ -33,6 +41,11 @@ struct RuntimeMetrics {
   uint64_t cache_pinned_bytes = 0;
   uint64_t running_flushes = 0;
   uint64_t running_compactions = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
+  bool facts_flush_pending = false;
+  bool facts_compaction_pending = false;
   uint64_t live_fact_bytes = 0;
   uint64_t write_stopped = 0;
   uint64_t delayed_write_rate_bytes_per_sec = 0;
@@ -49,6 +62,7 @@ struct RuntimeMetrics {
   uint64_t projected_scan_pages_read = 0;
   uint64_t projected_scan_physical_bytes_read = 0;
   uint64_t canonical_scan_bytes_read = 0;
+  uint64_t canonical_read_physical_bytes = 0;
   uint64_t logical_facts_bytes = 0;
   uint64_t obsolete_fact_bytes = 0;
   uint64_t temporary_output_bytes = 0;

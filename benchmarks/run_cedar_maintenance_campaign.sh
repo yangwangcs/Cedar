@@ -11,11 +11,19 @@ if [[ "$output_dir" != /* ]]; then
   echo "output directory must be absolute" >&2
   exit 2
 fi
+if [[ -e "$output_dir" && -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo "output directory must be empty: $output_dir" >&2
+  exit 2
+fi
 mkdir -p "$output_dir"
 
 bench="${CEDAR_BENCH:-./build-release-kernel/cedar_kernel_bench}"
 if [[ ! -x "$bench" ]]; then
   echo "benchmark executable is not executable: $bench" >&2
+  exit 2
+fi
+if [[ "$bench" == /* ]] && pgrep -f -x -- "${bench}.*" >/dev/null; then
+  echo "benchmark is already running from this worktree: $bench" >&2
   exit 2
 fi
 
@@ -60,4 +68,5 @@ run_case() {
 run_case warm 30 kernel-30s true mixed-90-write-10-point-read 1
 run_case preflight 60 kernel-60s false mixed-90-write-10-point-read 1
 run_case preflight 300 kernel-300s false mixed-90-write-10-point-read 1
-run_case sustained 1800 kernel-1800s false property-put 2
+run_case sustained 1800 latency-sustained false property-put 2
+run_case sustained 1800 throughput-sustained false property-put 32

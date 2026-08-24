@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <cstddef>
 #include <chrono>
 #include <atomic>
+#include <limits>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -28,8 +30,33 @@
 #include "kernel/async_submission_executor.h"
 #include "kernel/maintenance_controller.h"
 #include "kernel/maintenance_policy.h"
+#include "query/projection/projection_store.h"
+#include "query/projection/query_delta.h"
+#include "query/resource/query_resource_pool.h"
+#include "query/observability/query_metrics.h"
+#include "kernel/query_debug_thresholds.h"
 
 namespace cedar {
+
+namespace internal {
+class AdjacencyIndex;
+}
+
+inline QueryRuntimeOptions ResolveQueryRuntimeOptions(const DatabaseOptions& options) {
+  QueryRuntimeOptions resolved = options.query_runtime;
+  if (options.storage_profile == StorageProfile::kDebugSmallThresholds) {
+    const auto& t = internal::kQueryDebugThresholds;
+    resolved.query_workers = 1;
+    resolved.reserved_interactive_workers = 1;
+    resolved.query_memory_bytes = t.query_memory_bytes;
+    resolved.projection_cache_bytes = t.projection_segment_bytes;
+    resolved.query_delta_bytes = t.query_delta_hard_bytes;
+    resolved.scratch_disk_bytes = t.scratch_run_bytes;
+    resolved.scratch_free_space_reserve_bytes = 0;
+    resolved.max_prefetch_bytes = std::min<uint64_t>(resolved.max_prefetch_bytes, 4ULL << 10);
+  }
+  return resolved;
+}
 
 inline AsyncSubmissionExecutor::Options ResolveAsyncExecutorOptions(
     const DatabaseOptions& options) {
@@ -38,7 +65,7 @@ inline AsyncSubmissionExecutor::Options ResolveAsyncExecutorOptions(
       options.async_executor.max_mailbox_requests,
       options.async_executor.max_mailbox_bytes};
   const AsyncExecutorOptions defaults;
-  if (options.storage_profile != StorageProfile::kProductionAppend &&
+  if (!UsesCedarKernelProfile(options.storage_profile) &&
       options.async_executor.submission_workers == defaults.submission_workers &&
       options.async_executor.max_mailbox_requests == defaults.max_mailbox_requests &&
       options.async_executor.max_mailbox_bytes == defaults.max_mailbox_bytes) {
@@ -86,7 +113,10 @@ class Database::Impl {
     internal::CommitFootprint preflight_footprint;
     std::chrono::steady_clock::time_point enqueued_at;
     std::shared_ptr<CommitHandle::State> handle;
-    std::shared_ptr<AsyncSubmissionExecutor::Ticket> executor_ticket;
+    // The mailbox and the active WAL epoch own the ticket. Keeping this as a
+    // weak reference prevents the ticket callbacks from retaining the request
+    // after terminal completion.
+    std::weak_ptr<AsyncSubmissionExecutor::Ticket> executor_ticket;
     std::atomic<bool> cancelled{false};
     bool selected = false;
     std::optional<StatusOr<StoreCommitResult>> result;
@@ -107,6 +137,7 @@ class Database::Impl {
     std::vector<std::shared_ptr<AsyncSubmissionExecutor::Ticket>> executor_tickets;
     AsyncSubmissionExecutor* executor = nullptr;
     std::chrono::steady_clock::time_point write_started_at;
+    std::atomic<bool> wal_durable{false};
     std::atomic<uint64_t> wal_callback_us{0};
     std::atomic<uint64_t> wal_callback_duration_us{0};
   };
@@ -135,6 +166,8 @@ class Database::Impl {
             options.group_commit_window_us}),
         append_commit_enqueued_observer_for_testing(
             std::move(options.append_commit_enqueued_observer_for_testing)),
+        append_commit_collection_observer_for_testing(
+            std::move(options.append_commit_collection_observer_for_testing)),
         commit_result_processing_observer_for_testing(
             std::move(options.commit_result_processing_observer_for_testing)),
         runtime_sampler_interval_observer_for_testing(
@@ -151,22 +184,29 @@ class Database::Impl {
             std::move(options.runtime_pressure_override_for_testing)),
         shutdown_stage_observer_for_testing(
             std::move(options.shutdown_stage_observer_for_testing)),
+        query_open_stage_observer_for_testing(
+            std::move(options.query_open_stage_observer_for_testing)),
+        query_delta_repair_budget_observer_for_testing(
+            std::move(options.query_delta_repair_budget_observer_for_testing)),
+        query_crash_fault_injector_for_testing(
+            std::move(options.query_crash_fault_injector_for_testing)),
         stop_pipeline_before_drain_for_testing(
             options.stop_pipeline_before_drain_for_testing),
         foreground_admission_concurrency(
             options.foreground_admission_concurrency != 0
-                ? (options.storage_profile == StorageProfile::kProductionAppend
+                ? (UsesCedarKernelProfile(options.storage_profile)
                        ? std::min(options.foreground_admission_concurrency,
                                   std::max(1U, std::thread::hardware_concurrency()))
                        : options.foreground_admission_concurrency)
-                : (options.storage_profile == StorageProfile::kProductionAppend
+                : (UsesCedarKernelProfile(options.storage_profile)
                        ? std::max(1U, std::thread::hardware_concurrency())
                        : 0)),
         foreground_admission_observer_for_testing(
             std::move(options.foreground_admission_observer_for_testing)),
         enforce_disk_pressure(
-            options.storage_profile == StorageProfile::kProductionAppend),
-        store(FactStoreOptions{std::move(options.path),
+            UsesCedarKernelProfile(options.storage_profile)),
+        // Keep the database path available for query scratch ownership.
+        store(FactStoreOptions{options.path,
                                options.write_buffer_bytes,
                                options.block_cache_bytes,
                                options.blob_threshold_bytes,
@@ -186,7 +226,40 @@ class Database::Impl {
                                std::move(options.runtime_sample_observer_for_testing),
                                std::move(options.snapshot_open_observer_for_testing),
                                std::move(options.kernel_write_observer_for_testing)}),
-        async_executor(ResolveAsyncExecutorOptions(options)) {}
+        async_executor(ResolveAsyncExecutorOptions(options)),
+        query_runtime_options(ResolveQueryRuntimeOptions(options)),
+        query_database_path(options.path) {
+    internal::QueryResourcePoolOptions pool_options;
+    pool_options.memory_bytes = query_runtime_options.query_memory_bytes;
+    pool_options.scratch_bytes = query_runtime_options.scratch_disk_bytes;
+    pool_options.scratch_free_space_reserve_bytes =
+        query_runtime_options.scratch_free_space_reserve_bytes;
+    pool_options.read_bytes_per_second = query_runtime_options.read_bytes_per_second;
+    pool_options.scratch_bytes_per_second = query_runtime_options.scratch_bytes_per_second;
+    pool_options.scratch_root = query_database_path;
+    pool_options.scratch_instance = "active";
+    pool_options.read_bytes = UINT64_MAX;
+    // Prefetch is a per-query reservation. Size the pool cap for all admitted
+    // workers so independent default queries do not reject one another merely
+    // because each consumes the full per-query allowance.
+    pool_options.prefetch_bytes =
+        query_runtime_options.max_prefetch_bytes >
+                std::numeric_limits<uint64_t>::max() /
+                    query_runtime_options.query_workers
+            ? std::numeric_limits<uint64_t>::max()
+            : query_runtime_options.max_prefetch_bytes *
+                  query_runtime_options.query_workers;
+    pool_options.decoded_rows = UINT64_MAX;
+    pool_options.output_rows = UINT64_MAX;
+    pool_options.output_bytes = UINT64_MAX;
+    pool_options.interval_fragments = UINT64_MAX;
+    pool_options.graph_labels = UINT64_MAX;
+    pool_options.visited_vertices = UINT64_MAX;
+    pool_options.cpu_us = UINT64_MAX;
+    pool_options.max_parallelism = query_runtime_options.query_workers;
+    pool_options.wal_sync_critical = &wal_sync_critical;
+    query_resource_pool = std::make_unique<internal::QueryResourcePool>(pool_options);
+  }
 
   ~Impl();
 
@@ -208,18 +281,60 @@ class Database::Impl {
       const std::shared_ptr<AppendCommitRequest>& request);
   void CancelQueuedAsyncCommit(
       const std::shared_ptr<AppendCommitRequest>& request);
+  internal::EpochLimits LimitsForQueueLocked() const;
   Status DrainAppendCommitPipeline();
   void StopAppendCommitPipeline();
   void ObserveShutdownStage(const char* stage) {
-    if (shutdown_stage_observer_for_testing) {
+    if (!shutdown_stage_observer_for_testing) return;
+    if (!query_shutdown_stage_mode) {
+      shutdown_stage_observer_for_testing(stage);
+      return;
+    }
+    if (std::strcmp(stage, "queue_admission_closed") == 0) {
+      shutdown_stage_observer_for_testing("admission_closed");
+    } else if (std::strcmp(stage, "active_commit_resolution") == 0) {
+      shutdown_stage_observer_for_testing("accepted_commits_drained");
+    } else if (std::strcmp(stage, "query_delta_stopped") == 0) {
+      shutdown_stage_observer_for_testing(stage);
+    } else if (std::strcmp(stage, "rocksdb_close") == 0) {
+      shutdown_stage_observer_for_testing("rocksdb_closed");
+    } else if (std::strcmp(stage, "maintenance_join") == 0) {
+      // Report the Cedar lifecycle stage after derived query components have
+      // been stopped, even though the underlying worker is joined earlier by
+      // the existing append-pipeline shutdown helper.
+    } else if (std::strcmp(stage, "query_cancel_requested") == 0 ||
+               std::strcmp(stage, "query_tasks_joined") == 0 ||
+               std::strcmp(stage, "projection_builders_stopped") == 0 ||
+               std::strcmp(stage, "maintenance_joined") == 0 ||
+               std::strcmp(stage, "scratch_cleaned") == 0) {
       shutdown_stage_observer_for_testing(stage);
     }
   }
+  Status ValidatePreparedQuery(
+      CommitSeq snapshot_seq,
+      const std::vector<PropertyDefinition>& schema_fingerprint) const;
+  Status RegisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
+  void UnregisterQueryState(const std::shared_ptr<QueryExecutionState>& state);
+  bool HasActiveQueries() const;
+  void CancelActiveQueries();
+  void WaitForActiveQueries();
 
   mutable std::mutex mutex;
   std::condition_variable commits_drained;
+  std::string query_database_path;
   FactStore store;
+  std::unique_ptr<internal::QueryProjectionStore> projection_store;
+  std::unique_ptr<internal::QueryStatisticsStore> query_statistics;
+  internal::QueryMetrics query_metrics;
+  // Derived, rebuildable commit tail.  It is deliberately independent from
+  // the durable commit path; queue overflow records a gap but never rejects a
+  // commit that RocksDB has already published.
+  std::unique_ptr<internal::QueryDelta> query_delta;
+  std::shared_ptr<internal::AdjacencyIndex> adjacency_index;
   AsyncSubmissionExecutor async_executor;
+  QueryRuntimeOptions query_runtime_options;
+  std::unique_ptr<internal::QueryResourcePool> query_resource_pool;
+  std::vector<std::shared_ptr<QueryExecutionState>> active_query_states;
   uint64_t next_vertex_id = 0;
   uint64_t vertex_lease_limit = 0;
   uint64_t next_edge_id = 0;
@@ -234,6 +349,7 @@ class Database::Impl {
   // separately published through atomics for the preflight worker.
   internal::AdaptiveEpochController adaptive_epoch_controller;
   std::function<void()> append_commit_enqueued_observer_for_testing;
+  std::function<void()> append_commit_collection_observer_for_testing;
   std::function<void()> commit_result_processing_observer_for_testing;
   std::function<void(uint64_t)> runtime_sampler_interval_observer_for_testing;
   std::function<void()> runtime_sampler_thread_started_observer_for_testing;
@@ -243,6 +359,10 @@ class Database::Impl {
   std::function<void()> runtime_snapshot_published_observer_for_testing;
   std::function<void(PressureSample*)> runtime_pressure_override_for_testing;
   std::function<void(const char*)> shutdown_stage_observer_for_testing;
+  std::function<void(const char*)> query_open_stage_observer_for_testing;
+  std::function<void(uint64_t)>
+      query_delta_repair_budget_observer_for_testing;
+  std::function<Status(const char*)> query_crash_fault_injector_for_testing;
   bool stop_pipeline_before_drain_for_testing = false;
   bool enforce_disk_pressure = false;
   std::mutex append_commit_mutex;
@@ -298,6 +418,7 @@ class Database::Impl {
   std::unique_ptr<MaintenanceController> maintenance_controller;
   bool closing = false;
   bool closed = false;
+  bool query_shutdown_stage_mode = false;
 };
 
 }  // namespace cedar

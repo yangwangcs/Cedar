@@ -3,11 +3,13 @@
 
 #include "cedar/snapshot.h"
 
+#include <set>
 #include <tuple>
 #include <utility>
 
 #include "cedar/database.h"
 #include "kernel/database_impl.h"
+#include "query/runtime/graph_frontier.h"
 
 namespace cedar {
 namespace {
@@ -271,12 +273,20 @@ Snapshot::~Snapshot() = default;
 Snapshot::Snapshot(Snapshot&&) noexcept = default;
 Snapshot& Snapshot::operator=(Snapshot&&) noexcept = default;
 
+bool Snapshot::BelongsToDatabase(const void* database_identity) const {
+  return state_ != nullptr && state_->database.get() == database_identity;
+}
+
 CommitSeq Snapshot::commit_seq() const {
   return state_ == nullptr ? CommitSeq{} : state_->snapshot.commit_seq();
 }
 
 CommitSeq Snapshot::oldest_readable_seq() const {
   return state_ == nullptr ? CommitSeq{} : state_->snapshot.oldest_readable_seq();
+}
+
+std::shared_ptr<const internal::AdjacencyIndex> Snapshot::adjacency_index() const {
+  return state_ == nullptr ? nullptr : state_->database->adjacency_index;
 }
 
 StatusOr<bool> Snapshot::Exists(EntityFact entity, ValidTime valid_time) const {
@@ -333,6 +343,12 @@ Status Snapshot::Scan(FactFamily family, PropertyId property_id,
                                       visitor);
 }
 
+Status Snapshot::ScanFamily(FactFamily family,
+                            const SnapshotFactVisitor& visitor) const {
+  if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
+  return state_->database->store.ScanFamily(state_->snapshot, family, visitor);
+}
+
 Status Snapshot::EventScan(const FactScanSpec& spec,
                            const FactEventBatchVisitor& visitor) const {
   if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
@@ -371,6 +387,33 @@ Status Snapshot::EventColumnarScan(
       state_->snapshot,
       FactPrefix::Family(spec.part_id, spec.family, spec.property_id),
       FactScanBounds{spec.entity_id_min, spec.entity_id_max}, options, visitor);
+}
+
+Status Snapshot::EventColumnarScanFamily(
+    FactFamily family, PropertyId property_id,
+    const std::vector<FactColumnId>& projection,
+    const FactColumnarBatchVisitor& visitor) const {
+  if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
+  if (!visitor) return Status::InvalidArgument("columnar scan", "missing visitor");
+  if (projection.empty()) {
+    return Status::InvalidArgument("columnar scan", "missing projection");
+  }
+  std::set<FactColumnId> unique_projection(projection.begin(), projection.end());
+  if (unique_projection.size() != projection.size()) {
+    return Status::InvalidArgument("columnar scan", "duplicate projection column");
+  }
+  const Status prefix_status =
+      FactPrefix::Family(PartId{}, family, property_id).Validate();
+  if (!prefix_status.ok()) return prefix_status;
+  for (FactColumnId column_id : projection) {
+    FactColumn column;
+    const Status column_status = MakeFactColumn(column_id, &column);
+    if (!column_status.ok()) return column_status;
+  }
+  FactColumnarScanOptions options;
+  options.projection = projection;
+  return state_->database->store.ScanColumnarFamily(
+      state_->snapshot, family, property_id, options, visitor);
 }
 
 Status Snapshot::StateScan(const FactScanSpec& spec,

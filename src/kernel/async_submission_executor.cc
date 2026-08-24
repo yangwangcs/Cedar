@@ -146,6 +146,8 @@ void AsyncSubmissionExecutor::WorkerMain() {
     if (!handed_off.ok()) {
       ticket->fail(handed_off);
       Release(ticket->id);
+    } else if (ticket->release_after_handoff) {
+      Release(ticket->id);
     }
   }
 }

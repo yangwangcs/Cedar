@@ -34,6 +34,10 @@ struct KernelBenchmarkOptions {
   uint64_t operations = 10'000;
   uint64_t read_operations = 10'000;
   uint32_t writer_clients = 1;
+  uint32_t group_max_batch = 128;
+  uint64_t group_max_bytes = 2ULL * 1024ULL * 1024ULL;
+  uint64_t group_window_us = 200;
+  uint32_t group_queue_requests = 1024;
   bool verify_reopen = true;
   CampaignKind campaign = CampaignKind::kNone;
   KernelWorkload workload = KernelWorkload::kPropertyPut;

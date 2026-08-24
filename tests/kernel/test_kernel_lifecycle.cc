@@ -138,6 +138,7 @@ TEST_F(KernelLifecycleTest, ClosePublishesDeterministicPipelineShutdownOrder) {
                         "maintenance_join",
                         "sampler_join",
                         "final_runtime_snapshot",
+                        "query_delta_stopped",
                         "rocksdb_close",
                     }));
 }
@@ -148,6 +149,9 @@ TEST_F(KernelLifecycleTest, KernelDataReopensThroughKernelProfile) {
     options.storage_profile = StorageProfile::kProductionAppend;
     options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
     options.production.kernel_mode = true;
+    options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
+    options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
+    options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;
     options.runtime_pressure_override_for_testing = [](PressureSample* sample) {
       sample->free_disk_bytes = UINT64_MAX;
       sample->free_disk_percent = 100;
@@ -186,6 +190,30 @@ TEST_F(KernelLifecycleTest, KernelDataReopensThroughKernelProfile) {
   ASSERT_TRUE(reopened);
   expect_fact_and_transaction(reopened.get(), txn_id);
   ASSERT_TRUE(reopened->Close().ok());
+}
+
+TEST_F(KernelLifecycleTest, RecoveryRepairUsesConfiguredQueryDeltaByteBudget) {
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  auto transaction = Begin();
+  ASSERT_TRUE(transaction);
+  ASSERT_TRUE(transaction
+                  ->Assert(EntityFact::Vertex(
+                               VertexRef{PartId{0}, VertexId{1}}),
+                           ValidTime{1})
+                  .ok());
+  ASSERT_TRUE(transaction->Commit().ok());
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  uint64_t observed_budget = 0;
+  DatabaseOptions options;
+  options.query_runtime.query_delta_bytes = 1;
+  options.query_delta_repair_budget_observer_for_testing =
+      [&observed_budget](uint64_t budget) { observed_budget = budget; };
+  database_ = Open(std::move(options));
+  ASSERT_TRUE(database_);
+  EXPECT_EQ(observed_budget, 1U);
 }
 
 TEST_F(KernelLifecycleTest, LiveSnapshotPinsCloseButReleaseAllowsRetryAndReopen) {

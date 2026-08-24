@@ -20,6 +20,8 @@ uint64_t NowMicros() {
       std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+constexpr size_t kCedarFlushGrantCapacity = 2;
+
 uint64_t CedarSaturatingAdd(uint64_t left, uint64_t right) {
   return left > std::numeric_limits<uint64_t>::max() - right
              ? std::numeric_limits<uint64_t>::max()
@@ -44,34 +46,19 @@ void CedarHashCombine(uint64_t* hash, uint64_t value) {
 
 uint64_t CedarMaintenanceSignature(const CedarMaintenanceSnapshot& snapshot) {
   uint64_t hash = 0xcbf29ce484222325ULL;
-  CedarHashCombine(&hash, snapshot.total_active_memtable_bytes);
-  CedarHashCombine(&hash, snapshot.total_immutable_memtable_bytes);
-  CedarHashCombine(&hash, snapshot.total_immutable_memtable_count);
-  CedarHashCombine(&hash, snapshot.write_buffer_manager_bytes);
-  CedarHashCombine(&hash, snapshot.write_buffer_manager_limit_bytes);
-  CedarHashCombine(&hash, snapshot.retained_wal_bytes);
-  CedarHashCombine(&hash, snapshot.total_l0_files);
-  CedarHashCombine(&hash, snapshot.total_pending_compaction_bytes);
-  CedarHashCombine(&hash, snapshot.running_flushes);
-  CedarHashCombine(&hash, snapshot.running_compactions);
+  // A grant must remain valid while scheduling telemetry changes. The selected
+  // native work is identified only by per-CF maintenance debt and boundaries.
   CedarHashCombine(&hash, snapshot.background_errors);
-  CedarHashCombine(&hash, snapshot.write_delayed);
-  CedarHashCombine(&hash, snapshot.write_stopped);
   CedarHashCombine(&hash, snapshot.manual_conflict);
   CedarHashCombine(&hash, snapshot.recovery_in_progress);
   CedarHashCombine(&hash, snapshot.shutting_down);
-  CedarHashCombine(&hash, snapshot.recovery_flush_exceptions);
   for (const auto& debt : snapshot.column_families) {
     CedarHashCombine(&hash, debt.id);
     CedarHashCombine(&hash, static_cast<uint64_t>(debt.role));
-    CedarHashCombine(&hash, debt.active_memtable_bytes);
     CedarHashCombine(&hash, debt.immutable_memtable_bytes);
     CedarHashCombine(&hash, debt.immutable_memtable_count);
-    CedarHashCombine(&hash, debt.oldest_immutable_age_us);
     CedarHashCombine(&hash, debt.l0_files);
     CedarHashCombine(&hash, debt.pending_compaction_bytes);
-    CedarHashCombine(&hash, debt.flush_pending);
-    CedarHashCombine(&hash, debt.compaction_pending);
   }
   return hash;
 }
@@ -135,52 +122,96 @@ Status DBImpl::RunCedarMaintenance(const CedarMaintenanceGrant& grant,
       cedar_maintenance_generation_.load(std::memory_order_relaxed)) {
     return Status::TryAgain("Cedar maintenance snapshot is stale");
   }
-  std::optional<CedarGrantState>* grant_state =
-      grant.kind == CedarMaintenanceKind::kFlush ? &cedar_flush_grant_
-                                                  : &cedar_compaction_grant_;
-  if (grant_state->has_value()) {
-    return Status::Busy("Cedar maintenance grant already installed");
+  const uint64_t now_us = immutable_db_options_.clock->NowMicros();
+  auto new_state = [&] {
+    CedarGrantState state;
+    state.id = next_cedar_grant_id_++;
+    state.grant = grant;
+    state.result.grant_id = state.id;
+    state.status = Status::OK();
+    state.expires_at_us =
+        grant.deadline_us > std::numeric_limits<uint64_t>::max() - now_us
+            ? std::numeric_limits<uint64_t>::max()
+            : now_us + grant.deadline_us;
+    state.installed = true;
+    return state;
+  };
+
+  if (grant.kind == CedarMaintenanceKind::kFlush) {
+    if (cedar_flush_grants_.size() >= kCedarFlushGrantCapacity) {
+      return Status::Busy("Cedar flush grant capacity is exhausted");
+    }
+    CedarGrantState state = new_state();
+    const uint64_t grant_id = state.id;
+    auto inserted = cedar_flush_grants_.emplace(grant_id, std::move(state));
+    CedarGrantState& grant_state = inserted.first->second;
+    MaybeScheduleFlushOrCompaction();
+
+    while (!grant_state.completed &&
+           !shutting_down_.load(std::memory_order_acquire)) {
+      const uint64_t current_us = immutable_db_options_.clock->NowMicros();
+      if (!grant_state.consumed && current_us >= grant_state.expires_at_us) {
+        grant_state.status = Status::TimedOut("Cedar maintenance grant expired");
+        grant_state.result.yield = CedarMaintenanceYield::kDeadline;
+        grant_state.completed = true;
+        break;
+      }
+      if (grant_state.consumed) {
+        cedar_maintenance_cv_.Wait();
+      } else {
+        cedar_maintenance_cv_.TimedWait(grant_state.expires_at_us);
+      }
+    }
+    if (!grant_state.completed) {
+      grant_state.status = Status::ShutdownInProgress();
+      grant_state.completed = true;
+    }
+    grant_state.result.flush_queue_depth = flush_queue_.size();
+    grant_state.result.unscheduled_flushes =
+        static_cast<uint64_t>(std::max(0, unscheduled_flushes_));
+    grant_state.result.scheduled_flushes =
+        static_cast<uint64_t>(std::max(0, bg_flush_scheduled_));
+    grant_state.result.running_flushes = static_cast<uint64_t>(
+        std::max(0, num_running_flushes_.load(std::memory_order_relaxed)));
+    *result = grant_state.result;
+    const Status status = grant_state.status;
+    cedar_flush_grants_.erase(grant_id);
+    return status;
   }
 
-  const uint64_t now_us = immutable_db_options_.clock->NowMicros();
-  CedarGrantState state;
-  state.id = next_cedar_grant_id_++;
-  state.grant = grant;
-  state.result.grant_id = state.id;
-  state.status = Status::OK();
-  state.expires_at_us =
-      grant.deadline_us > std::numeric_limits<uint64_t>::max() - now_us
-          ? std::numeric_limits<uint64_t>::max()
-          : now_us + grant.deadline_us;
-  state.installed = true;
-  grant_state->emplace(std::move(state));
+  if (cedar_compaction_grants_.size() >= kCedarFlushGrantCapacity) {
+    return Status::Busy("Cedar compaction grant capacity is exhausted");
+  }
+  CedarGrantState state = new_state();
+  const uint64_t grant_id = state.id;
+  auto inserted = cedar_compaction_grants_.emplace(grant_id, std::move(state));
+  CedarGrantState& grant_state = inserted.first->second;
   MaybeScheduleFlushOrCompaction();
 
-  while (!grant_state->value().completed &&
+  while (!grant_state.completed &&
          !shutting_down_.load(std::memory_order_acquire)) {
     const uint64_t current_us = immutable_db_options_.clock->NowMicros();
-    if (!grant_state->value().consumed &&
-        current_us >= grant_state->value().expires_at_us) {
-      grant_state->value().status =
+    if (!grant_state.consumed && current_us >= grant_state.expires_at_us) {
+      grant_state.status =
           Status::TimedOut("Cedar maintenance grant expired");
-      grant_state->value().result.yield = CedarMaintenanceYield::kDeadline;
-      grant_state->value().completed = true;
+      grant_state.result.yield = CedarMaintenanceYield::kDeadline;
+      grant_state.completed = true;
       break;
     }
-    if (grant_state->value().consumed) {
+    if (grant_state.consumed) {
       cedar_maintenance_cv_.Wait();
     } else {
-      cedar_maintenance_cv_.TimedWait(grant_state->value().expires_at_us);
+      cedar_maintenance_cv_.TimedWait(grant_state.expires_at_us);
     }
   }
 
-  if (!grant_state->value().completed) {
-    grant_state->value().status = Status::ShutdownInProgress();
-    grant_state->value().completed = true;
+  if (!grant_state.completed) {
+    grant_state.status = Status::ShutdownInProgress();
+    grant_state.completed = true;
   }
-  *result = grant_state->value().result;
-  const Status status = grant_state->value().status;
-  grant_state->reset();
+  *result = grant_state.result;
+  const Status status = grant_state.status;
+  cedar_compaction_grants_.erase(grant_id);
   return status;
 }
 
@@ -198,6 +229,10 @@ Status DBImpl::GetCedarMaintenanceSnapshot(CedarMaintenanceSnapshot* snapshot) {
       std::max(0, num_running_flushes_.load(std::memory_order_relaxed)));
   next.running_compactions = static_cast<uint64_t>(
       std::max(0, num_running_compactions_.load(std::memory_order_relaxed)));
+  next.flush_queue_depth = flush_queue_.size();
+  next.unscheduled_flushes =
+      static_cast<uint64_t>(std::max(0, unscheduled_flushes_));
+  next.scheduled_flushes = static_cast<uint64_t>(std::max(0, bg_flush_scheduled_));
   next.retained_wal_bytes = wals_total_size_.LoadRelaxed();
   // WBM stalls are a database-wide write stop even when no compaction stop
   // token is held. Cedar must see both sources to admit an emergency flush.

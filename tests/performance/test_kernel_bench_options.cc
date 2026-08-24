@@ -51,22 +51,22 @@ TEST(BenchmarkQualificationTest, WriterFailureFailsClosed) {
             "sustained_writer_failure");
 }
 
-TEST(BenchmarkOptionsTest, RequiresAbsolutePath) {
+TEST(KernelBenchmarkOptionsTest, RequiresAbsolutePath) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions({"--path", "relative"}).ok());
   const auto parsed = ParseKernelBenchmarkOptions({"--path", "/tmp/cedar"});
   ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
 }
 
-TEST(BenchmarkOptionsTest, RejectsRemovedExecutionProfileOption) {
+TEST(KernelBenchmarkOptionsTest, RejectsRemovedExecutionProfileOption) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
-                   {"--path", "/tmp/cedar", "--profile", "lean"})
+                   {"--path", "/tmp/cedar", "--profile", "experimental"})
                    .ok());
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
                    {"--path", "/tmp/cedar", "--profile", "kernel"})
                    .ok());
 }
 
-TEST(BenchmarkOptionsTest, ParsesKernelWorkloadNames) {
+TEST(KernelBenchmarkOptionsTest, ParsesKernelWorkloadNames) {
   const auto parsed = ParseKernelBenchmarkOptions(
       {"--path", "/tmp/cedar", "--workload", "projected-event-scan"});
   ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
@@ -74,13 +74,13 @@ TEST(BenchmarkOptionsTest, ParsesKernelWorkloadNames) {
   EXPECT_STREQ(KernelWorkloadName(parsed.ValueOrDie().workload), "projected-event-scan");
 }
 
-TEST(BenchmarkOptionsTest, RejectsUnknownKernelWorkload) {
+TEST(KernelBenchmarkOptionsTest, RejectsUnknownKernelWorkload) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
                    {"--path", "/tmp/cedar", "--workload", "legacy"})
                    .ok());
 }
 
-TEST(BenchmarkOptionsTest, ValidatesCampaignDurations) {
+TEST(KernelBenchmarkOptionsTest, ValidatesCampaignDurations) {
   EXPECT_TRUE(ParseKernelBenchmarkOptions(
       {"--path", "/tmp/cedar", "--campaign", "smoke", "--operations", "2048"})
                   .ok());
@@ -145,23 +145,53 @@ TEST(BenchmarkQualificationTest, MaintenanceDebtFailsClosed) {
   EXPECT_NE(CampaignExitCode(options, sample), 0);
 }
 
-TEST(BenchmarkOptionsTest, ParsesBoundedWriterClients) {
+TEST(KernelBenchmarkOptionsTest, ParsesMaximumWriterClientFanIn) {
   const auto parsed = ParseKernelBenchmarkOptions(
-      {"--path", "/tmp/cedar", "--writer-clients", "32"});
+      {"--path", "/tmp/cedar", "--writer-clients", "128"});
   ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
-  EXPECT_EQ(parsed.ValueOrDie().writer_clients, 32U);
+  EXPECT_EQ(parsed.ValueOrDie().writer_clients, 128U);
 }
 
-TEST(BenchmarkOptionsTest, RejectsUnboundedWriterClients) {
+TEST(KernelBenchmarkOptionsTest, RejectsOutOfRangeWriterClients) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
                    {"--path", "/tmp/cedar", "--writer-clients", "0"})
                    .ok());
   EXPECT_FALSE(ParseKernelBenchmarkOptions(
-                   {"--path", "/tmp/cedar", "--writer-clients", "33"})
+                   {"--path", "/tmp/cedar", "--writer-clients", "129"})
                    .ok());
 }
 
-TEST(BenchmarkOptionsTest, RejectsSeedAndDestinationAlias) {
+TEST(KernelBenchmarkOptionsTest, ParsesGroupAdmissionControls) {
+  const auto parsed = ParseKernelBenchmarkOptions(
+      {"--path", "/tmp/cedar", "--group-max-batch", "256",
+       "--group-max-bytes", "1048576", "--group-window-us", "250",
+       "--group-queue-requests", "2048"});
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  EXPECT_EQ(parsed.ValueOrDie().group_max_batch, 256U);
+  EXPECT_EQ(parsed.ValueOrDie().group_max_bytes, 1'048'576U);
+  EXPECT_EQ(parsed.ValueOrDie().group_window_us, 250U);
+  EXPECT_EQ(parsed.ValueOrDie().group_queue_requests, 2'048U);
+}
+
+TEST(KernelBenchmarkOptionsTest, RejectsZeroAndOverflowGroupAdmissionControls) {
+  for (const std::vector<std::string>& arguments : {
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-max-batch", "0"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-max-bytes", "0"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-window-us", "0"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-queue-requests", "0"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-max-batch",
+                                    "4294967296"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-queue-requests",
+                                    "4294967296"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-max-bytes",
+                                    "18446744073709551616"},
+           std::vector<std::string>{"--path", "/tmp/cedar", "--group-window-us",
+                                    "18446744073709551616"}}) {
+    EXPECT_FALSE(ParseKernelBenchmarkOptions(arguments).ok());
+  }
+}
+
+TEST(KernelBenchmarkOptionsTest, RejectsSeedAndDestinationAlias) {
   EXPECT_FALSE(ParseKernelBenchmarkOptions({
                    "--seed-db", "/tmp/cedar-seed", "--database-path",
                    "/tmp/cedar-seed", "--prepare-seed", "true"})

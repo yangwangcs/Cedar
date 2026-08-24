@@ -141,6 +141,9 @@ struct RocksDbRuntimeMetrics {
   uint64_t block_cache_pinned_bytes = 0;
   uint64_t running_flushes = 0;
   uint64_t running_compactions = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
   uint64_t background_errors = 0;
   uint64_t live_sst_bytes = 0;
   uint64_t blob_file_bytes = 0;
@@ -170,6 +173,10 @@ struct RocksDbRuntimeMetrics {
   uint64_t projected_scan_pages_read = 0;
   uint64_t projected_scan_physical_bytes_read = 0;
   uint64_t canonical_scan_bytes_read = 0;
+  // Foreground physical bytes decoded by canonical RocksDB Get, MultiGet,
+  // and iterator reads. This is sampled from the storage adapter and does
+  // not expose the backing engine's metric types to Cedar callers.
+  uint64_t canonical_read_physical_bytes = 0;
   uint64_t logical_facts_bytes = 0;
   uint64_t obsolete_sst_bytes = 0;
   uint64_t temporary_output_bytes = 0;
@@ -218,6 +225,10 @@ struct FactStoreMaintenanceResult {
   uint64_t elapsed_us = 0;
   uint64_t remaining_smallest_complete_unit_bytes = 0;
   uint64_t atomic_overrun_bytes = 0;
+  uint64_t flush_queue_depth = 0;
+  uint64_t unscheduled_flushes = 0;
+  uint64_t scheduled_flushes = 0;
+  uint64_t running_flushes = 0;
   uint32_t selected_column_family_id = 0;
   FactStoreMaintenanceYield yield = FactStoreMaintenanceYield::kNone;
   Status status = Status::OK();
@@ -369,16 +380,36 @@ class FactStore {
               const FactVisitor& visitor) const;
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactScanBounds& bounds, const FactVisitor& visitor) const;
+  // Scans one Cedar fact family across every home partition. This is used by
+  // graph adjacency fallback because PartId{0} is a real partition, not a
+  // wildcard.
+  Status ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
+                    const FactVisitor& visitor) const;
   Status ScanColumnar(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                       const FactScanBounds& bounds,
                       const FactColumnarScanOptions& options,
                       const FactColumnarBatchVisitor& visitor) const;
+  Status ScanColumnarFamily(const StoreSnapshot& snapshot, FactFamily family,
+                            PropertyId property,
+                            const FactColumnarScanOptions& options,
+                            const FactColumnarBatchVisitor& visitor) const;
   // Projection-only accessors. Both are bound to the supplied StoreSnapshot
   // and never expose RocksDB types to callers.
   StatusOr<SequenceRecord> ReadSequence(const StoreSnapshot& snapshot,
                                         CommitSeq commit_seq) const;
+  // Reads an ordered, contiguous range of durable sequence records.  The
+  // range is validated against the supplied Snapshot and a missing sequence
+  // is canonical corruption rather than a silently shortened result.
+  StatusOr<std::vector<SequenceRecord>> ReadSequenceRange(
+      const StoreSnapshot& snapshot, CommitSeq first,
+      CommitSeq last) const;
   StatusOr<FactEvent> ReadExactFact(const StoreSnapshot& snapshot,
                                     const std::string& encoded_fact_key) const;
+  // Reads exact fact keys through one RocksDB MultiGet while preserving the
+  // caller's key order.  Missing values are canonical corruption.
+  StatusOr<std::vector<FactEvent>> ReadExactFacts(
+      const StoreSnapshot& snapshot,
+      const std::vector<std::string>& encoded_fact_keys) const;
   StatusOr<StoreCommitResult> Commit(const StoreCommitBatch& batch);
   StatusOr<StoreCommitResult> CommitWithWalCallback(
       const StoreCommitBatch& batch, WalDurableCallback on_wal_durable,
@@ -416,6 +447,10 @@ class FactStore {
   StatusOr<std::optional<PropertyDefinition>> LookupProperty(
       const StoreSnapshot& snapshot, PropertyId property_id,
       uint32_t schema_epoch = 0) const;
+  // Stable fingerprint of the latest registered definition for every property.
+  // The value is derived from the authoritative schema catalog and is used to
+  // bind derived query statistics to the schema that produced them.
+  StatusOr<std::string> SchemaFingerprint() const;
   StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
       const StoreSnapshot& snapshot, EdgeRef edge) const;
   Status Vacuum(CommitSeq oldest_readable);

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "kernel/maintenance_policy.h"
 
@@ -51,16 +52,18 @@ class MaintenanceController {
   MaintenanceAdapter* adapter_ = nullptr;
   mutable std::mutex mutex_;
   std::condition_variable work_available_;
-  std::thread flush_worker_;
-  std::thread compaction_worker_;
+  std::vector<std::thread> flush_workers_;
+  std::vector<std::thread> compaction_workers_;
   std::optional<CedarRuntimeSnapshot> snapshot_;
   CedarMaintenanceHistory history_;
   CedarMaintenanceMetrics metrics_;
   uint64_t published_sequence_ = 0;
   uint64_t flush_dispatched_sequence_ = 0;
+  uint32_t flush_dispatched_credits_ = 0;
   uint64_t compaction_dispatched_sequence_ = 0;
-  bool flush_outstanding_ = false;
-  bool compaction_outstanding_ = false;
+  uint32_t compaction_dispatched_credits_ = 0;
+  uint32_t flush_outstanding_ = 0;
+  uint32_t compaction_outstanding_ = 0;
   bool started_ = false;
   bool stopping_ = false;
   std::atomic<bool> wal_sync_critical_{false};

@@ -22,6 +22,10 @@ struct BoundedWriterResult {
 BoundedWriterResult RunBoundedWriters(Database* database,
                                       uint32_t clients,
                                       uint64_t duration_seconds);
+// Runs a finite, concurrently started burst for small-threshold correctness
+// profiles. Sustained throughput uses RunBoundedWriters in production mode.
+BoundedWriterResult RunFixedWriters(Database* database, uint32_t clients,
+                                    uint32_t commits_per_client);
 DatabaseOptions MakeBenchmarkDatabaseOptions(const KernelBenchmarkOptions& options);
 
 }  // namespace benchmark

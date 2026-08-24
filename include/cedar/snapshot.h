@@ -16,7 +16,13 @@
 
 namespace cedar {
 
+namespace internal {
+class AdjacencyIndex;
+}
+
 class Database;
+class Snapshot;
+class PreparedQuery;
 
 using SnapshotFactVisitor = std::function<Status(const FactEvent&)>;
 
@@ -51,6 +57,7 @@ class Snapshot {
 
   CommitSeq commit_seq() const;
   CommitSeq oldest_readable_seq() const;
+  std::shared_ptr<const internal::AdjacencyIndex> adjacency_index() const;
   StatusOr<bool> Exists(EntityFact entity, ValidTime valid_time) const;
   // Evaluates a batch against one pinned Cedar snapshot and preserves caller
   // order. The current adapter is correctness-first; Parquet page-grouped
@@ -61,6 +68,7 @@ class Snapshot {
                                      ValidTime valid_time) const;
   Status Scan(FactFamily family, PropertyId property_id,
               const SnapshotFactVisitor& visitor) const;
+  Status ScanFamily(FactFamily family, const SnapshotFactVisitor& visitor) const;
   Status EventScan(const FactScanSpec& spec,
                    const FactEventBatchVisitor& visitor) const;
   Status StateScan(const FactScanSpec& spec,
@@ -68,6 +76,10 @@ class Snapshot {
   Status EventColumnarScan(const FactScanSpec& spec,
                            const std::vector<FactColumnId>& projection,
                            const FactColumnarBatchVisitor& visitor) const;
+  Status EventColumnarScanFamily(
+      FactFamily family, PropertyId property_id,
+      const std::vector<FactColumnId>& projection,
+      const FactColumnarBatchVisitor& visitor) const;
   Status StateColumnarScan(const FactScanSpec& spec,
                            const std::vector<FactColumnId>& projection,
                            const FactColumnarBatchVisitor& visitor) const;
@@ -75,10 +87,12 @@ class Snapshot {
  private:
   class State;
   explicit Snapshot(std::unique_ptr<State> state);
+  bool BelongsToDatabase(const void* database_identity) const;
 
   std::unique_ptr<State> state_;
 
   friend class Database;
+  friend class PreparedQuery;
 };
 
 }  // namespace cedar

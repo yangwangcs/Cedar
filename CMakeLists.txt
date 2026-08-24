@@ -76,6 +76,8 @@ add_library(cedar_core STATIC
     src/query/projection/query_delta.cc
     src/query/observability/query_metrics.cc
     src/query/planner/query_planner.cc
+    src/cypher/lexer.cc
+    src/cypher/parser.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

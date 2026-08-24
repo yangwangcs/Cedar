@@ -119,7 +119,7 @@ the cold/warm read matrix because writers and readers contend simultaneously.
   typed canonical differential checks and reopen verification.
 - Space audits passed with zero scratch bytes after reopen.
 
-See the [acceptance evidence](2026-08-21-cedar-bitemporal-query-acceptance.md)
+See the [acceptance evidence](query-acceptance.md)
 for the complete gate interpretation and known limits.
 
 ## Reproduction

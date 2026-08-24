@@ -48,7 +48,7 @@ successfully, and passed its case-level hard gate.
 
 This long-running campaign is stability and recovery evidence. Its throughput
 must not be treated as a universal Cedar SLA; the measured values are reported
-in the [local performance report](2026-08-24-cedar-query-performance-local.md).
+in the [development-host performance report](query-performance.md).
 
 ## Reproduction Commands
 
@@ -125,7 +125,5 @@ The storage invariants remain unchanged:
 
 ## Related Documents
 
-- [Bitemporal graph query design](../specs/2026-08-21-cedar-bitemporal-graph-query-design.md)
-- [Bitemporal query implementation plan](../plans/2026-08-21-cedar-bitemporal-graph-query-implementation.md)
-- [Local performance results](2026-08-24-cedar-query-performance-local.md)
-- [Cedar documentation index](../../README.md)
+- [Development-host performance results](query-performance.md)
+- [Cedar documentation index](README.md)

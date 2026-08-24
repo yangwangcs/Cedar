@@ -8,8 +8,13 @@ out/
 .superpowers/
 .worktrees/
 
-# Local design notes are not part of the public source tree
-docs/
+# Public documentation is tracked; local design and execution material is not.
+docs/*
+!docs/
+!docs/README.md
+!docs/query-acceptance.md
+!docs/query-performance.md
+docs/superpowers/
 
 # IDE
 .vscode/

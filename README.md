@@ -328,8 +328,8 @@ compaction debt, and write, background, and maintenance errors.
 
 Measured results:
 
-- [Bitemporal query acceptance evidence](docs/superpowers/evidence/2026-08-21-cedar-bitemporal-query-acceptance.md)
-- [Local development-machine performance results](docs/superpowers/evidence/2026-08-24-cedar-query-performance-local.md)
+- [Bitemporal query acceptance evidence](docs/query-acceptance.md)
+- [Development-host performance results](docs/query-performance.md)
 - [Cedar documentation index](docs/README.md)
 
 ## Verification
@@ -350,8 +350,8 @@ Cedar includes:
 The current `main` branch contains the Cedar Kernel implementation and the
 bitemporal graph query system. Active design, implementation, and evidence
 documents are indexed in [`docs/README.md`](docs/README.md). Superseded
-implementation routes are retained under
-[`docs/superpowers/archive/`](docs/superpowers/archive/).
+Detailed implementation records are maintained outside the public product
+documentation and are not required to build or use Cedar.
 
 ## License
 

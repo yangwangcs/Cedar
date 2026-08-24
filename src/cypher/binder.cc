@@ -37,15 +37,25 @@ Status SchemaCatalog::Add(PropertyDefinition definition) {
     }
   }
   properties_.push_back(std::move(definition));
+  std::sort(properties_.begin(), properties_.end(),
+            [](const PropertyDefinition& left, const PropertyDefinition& right) {
+              if (left.name != right.name) return left.name < right.name;
+              return static_cast<uint8_t>(left.entity_kind) <
+                     static_cast<uint8_t>(right.entity_kind);
+            });
   return Status::OK();
 }
 
 StatusOr<PropertyDefinition> SchemaCatalog::Find(
     const std::string& name, std::optional<PropertyEntityKind> kind) const {
-  for (const auto& property : properties_) {
-    if (property.name == name && (!kind.has_value() || property.entity_kind == *kind)) {
-      return property;
-    }
+  const auto first = std::lower_bound(
+      properties_.begin(), properties_.end(), name,
+      [](const PropertyDefinition& property, const std::string& value) {
+        return property.name < value;
+      });
+  for (auto current = first; current != properties_.end() && current->name == name;
+       ++current) {
+    if (!kind.has_value() || current->entity_kind == *kind) return *current;
   }
   return Status::BindError("cypher schema", "unknown property");
 }

@@ -1,21 +1,174 @@
 # Cedar
 
-Cedar is an embedded C++20 bitemporal graph database kernel. Its Cedar-owned,
-RocksDB-derived engine is the sole canonical WAL, MemTable, manifest, and LSM
-store. Cedar stores
-immutable bitemporal facts there; columnar and adjacency structures are
-rebuildable analytical projections rather than a second source of truth.
+Cedar is a bitemporal graph database kernel built on an LSM-backed columnar
+storage architecture.
 
-Every write occurs in an explicit transaction. Snapshot reads bind a logical
-commit sequence and an engine snapshot, so a fact is resolved by both the
-requested valid time and the snapshot's system time. New databases use the
-clean-break engine format; legacy Cedar formats are rejected without mutation.
+It combines a single embedded LSM engine for durable writes, WAL recovery,
+MemTables, VersionSet, and MANIFEST management with Cedar's authoritative
+columnar bitemporal facts. Cedar is designed for applications that need graph
+relationships, temporal history, transactional durability, and analytical
+scans without running a separate database service.
 
-## Build
+## Core Model
 
-LZ4 1.10.0 and Zstd 1.5.7 are pinned under `third_party/` and compiled
-statically by default. Building and starting Cedar does not install packages or
-require host codec libraries.
+Cedar is not a traditional row-only LSM database.
+
+- The embedded LSM engine provides ordering, durability, recovery, and file
+  lifecycle management.
+- CedarParquet stores the authoritative bitemporal facts in columnar form.
+- Temporal and adjacency indexes are rebuildable derived projections.
+- The public API exposes Cedar abstractions and does not expose engine types.
+
+```text
+Cedar public API
+      |
+      v
+Bitemporal transaction and snapshot kernel
+      |
+      v
+Cedar storage and query runtime
+      |
+      +--> authoritative CedarParquet facts
+      +--> temporal projections
+      +--> adjacency projections
+      |
+      v
+Embedded Cedar-owned LSM engine
+      |
+      +--> one WAL
+      +--> recovery
+      +--> MemTables
+      +--> VersionSet and MANIFEST
+      +--> native flush and compaction
+```
+
+## Features
+
+- Bitemporal graph facts with valid time and system time
+- Explicit transactions with synchronous durable commit
+- One embedded WAL and one recovery path
+- Snapshot-consistent temporal reads
+- Point-in-time, history, event, and change queries
+- Typed property binding and typed result batches
+- Temporal expansion and k-hop traversal
+- Temporal shortest path and arrival-time queries
+- Temporal interval joins and aggregates
+- Columnar analytical scans
+- Rebuildable temporal and adjacency projections
+- Canonical fallback when a projection is stale or incomplete
+- Durable asynchronous commit with bounded group commit
+- Clean-break, versioned database format
+
+## Bitemporal Fact Model
+
+Cedar stores graph data as immutable, versioned facts. A fact is an
+independently versioned state assertion, not a mutable row or an entire
+vertex/edge object.
+
+```text
+(fact reference, valid_from, operation, value, commit_seq)
+```
+
+### Fact reference
+
+A fact reference identifies the logical object being changed:
+
+- vertex state;
+- vertex property;
+- edge identity;
+- edge state; or
+- edge property.
+
+Examples:
+
+```text
+VertexState(PartID=0, VertexID=42)
+VertexProperty(PartID=0, VertexID=42, PropertyID=7)
+EdgeState(PartID=0, EdgeID=100)
+EdgeProperty(PartID=0, EdgeID=100, PropertyID=9)
+```
+
+An edge identity also records its source vertex, target vertex, and edge type.
+
+### Valid time
+
+`valid_from` is the business-effective time at which a fact starts to apply.
+Cedar stores event boundaries rather than repeatedly rewriting complete
+intervals:
+
+```text
+PUT    Vertex(42) at valid time 2020
+PUT    Vertex(42) at valid time 2022
+DELETE Vertex(42) at valid time 2024
+```
+
+These events describe the effective state:
+
+```text
+[2020, 2022)  present
+[2022, 2024)  present
+[2024, +inf)  absent
+```
+
+The storage layer may coalesce adjacent equivalent states, but the corrected
+boundary stream is retained so later historical corrections can be resolved
+correctly.
+
+### System time
+
+`commit_seq` is the system-time version assigned by the durable transaction
+commit. A query snapshot fixes a system-time cutoff. For each fact boundary,
+Cedar uses the greatest `commit_seq` visible to that snapshot and reconstructs
+the valid-time state from those visible events.
+
+```text
+valid time:   when the fact was effective in the modeled world
+system time:  when Cedar knew and durably committed that fact
+```
+
+For example, if Cedar commits:
+
+| Commit | Fact | Valid time | Operation |
+| --- | --- | ---: | --- |
+| 101 | `Vertex(42)` | 2020 | `PUT` |
+| 120 | `Vertex(42)` | 2022 | `PUT` |
+| 130 | `Vertex(42)` | 2024 | `DELETE` |
+
+a snapshot at `commit_seq = 130` sees `Vertex(42)` as present during
+`[2020, 2024)` and absent during `[2024, +inf)`. A snapshot at
+`commit_seq = 120` does not see the later deletion and sees the vertex as
+present during `[2020, +inf)`.
+
+## Architecture and Ownership
+
+Cedar preserves these ownership boundaries:
+
+- Cedar uses one embedded WAL.
+- The embedded engine owns WAL framing and recovery.
+- The engine owns sequence allocation and MemTable lifecycle.
+- The engine owns VersionSet, MANIFEST, flush, compaction, and obsolete-file
+  reclamation.
+- CedarParquet facts are the authoritative logical columnar representation.
+- Temporal and adjacency indexes are rebuildable projections.
+- Cedar does not create a second WAL or a second recovery protocol.
+- Cedar owns bitemporal graph semantics, query planning, and public API
+  behavior.
+
+The LSM engine provides the durable storage lifecycle. Cedar provides the
+bitemporal graph model and query semantics.
+
+## Quick Start
+
+### Requirements
+
+- C++20 compiler
+- CMake
+- Ninja or Make
+
+Pinned LZ4 and Zstandard sources are included under `third_party/` and are
+built statically by default. Host codec packages are not required.
+
+### Build and test
 
 ```bash
 cmake -S . -B build -DBUILD_TESTS=ON
@@ -23,166 +176,185 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-`Cedar::cedar` is the sole installed consumer target. Cedar packages its
-private engine archives beneath `lib/cedar/internal` only to resolve the
-static library; it installs no engine headers or consumer-facing engine target.
-Columnar and adjacency projections are optional derived targets; they
-are deliberately not installed as part of the embedded kernel.
+The installed consumer target is `Cedar::cedar`. Engine headers and
+engine-specific consumer targets are not installed.
 
-## Format and migration
-
-Format version `1` is stored, checksummed, at `meta/format/current` in the
-engine `meta` Column Family. Cedar verifies the exact version, the `facts` and
-`meta` Column Family layout, watermarks, and contiguous sequence metadata at
-open. It rejects old Cedar directories, missing or corrupt format records, and
-future versions without modifying them.
-
-This release has no dual-write or online migration path. Export an old database
-using a binary that understands its old format, then import its facts through
-the explicit Cedar `Transaction` API into a fresh version-1 directory.
-
-## Verification and benchmark
-
-The standard verification profiles are Debug/Release CTest plus ASAN, UBSAN,
-and TSAN. Cedar builds its embedded engine source once into a profile-keyed
-static-library cache, then every Cedar build links that library. The cache key
-includes the Cedar engine baseline, engine source digest, compiler, target, and
-sanitizer profile; set `CEDAR_ROCKSDB_CACHE_DIR` to relocate it. UBSAN enables
-the embedded engine's upstream UBSAN mode, which suppresses only its documented
-intentional unaligned checksum loads.
-
-```bash
-cmake -S . -B build-bench -DBUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-bench --target cedar_kernel_bench -j2
-./build-bench/cedar_kernel_bench --path /tmp/cedar-kernel-bench \
-  --workload mixed-90-write-10-point-read --operations 10000 \
-  --read-operations 10000 --campaign warm --duration-seconds 30 \
-  --writer-clients 32 --verify-reopen false
-```
-
-`cedar_kernel_bench` is the only supported benchmark. It exercises Cedar's
-single-WAL Kernel write, read, mixed, and authoritative columnar paths and
-emits Cedar-owned runtime and space metrics. `--campaign sustained` rejects
-durations below 1,800 seconds and only a run that actually reaches that
-duration can receive a sustained qualification status.
-
-For group-commit throughput, the matrix and sustained campaigns are separate:
-
-```bash
-bench="$PWD/build-bench/cedar_kernel_bench"
-benchmarks/run_cedar_group_commit_matrix.sh "$bench" /private/tmp/cedar-group-matrix
-CEDAR_BENCH="$bench" benchmarks/run_cedar_maintenance_campaign.sh \
-  /private/tmp/cedar-maintenance
-```
-
-The matrix measures group fill at 2, 4, 8, 16, 32, 64, and 128 blocking
-writer callers and labels every 30-second result `warm_not_sustained`. The
-maintenance campaign keeps a 2-client `latency-sustained` control and adds a
-32-client `throughput-sustained` case, both with reopen verification. Compare
-results only when commit, binary, host, workload, duration, writer clients,
-group limits, and reopen setting match. The CSV reports committed operations,
-actual WAL sync count, transactions per sync, encoded bytes per transaction,
-group-fill percentiles, retained WAL, compaction debt, and all
-writer/background/maintenance errors.
-
-Cedar production commits require the single embedded-engine WAL and
-`sync = true`. `disableWAL`, `sync = false`, `enable_pipelined_write`,
-`unordered_write`, and `two_write_queues` are not Cedar Kernel production
-settings. Cedar assembles an epoch before calling the exclusive Kernel write;
-the engine continues to own WAL append/sync, MANIFEST, MemTable, VersionSet,
-and recovery.
-
-### Durable asynchronous commit
-
-`Transaction::Commit()` remains the synchronous API. `CommitAsync()` returns a
-`CommitHandle` only after the complete transaction has been durably written as
-a CRC-protected prepare record with `sync = true`; it does not merely mean that
-the request reached an in-memory queue. `Wait()` returns the eventual
-`Committed` or `Aborted` result. On reopen Cedar resumes any durable prepares
-before accepting new async work.
+## Basic Usage
 
 ```cpp
-auto accepted = transaction->CommitAsync();
-if (!accepted.ok()) return accepted.status();
-const cedar::CommitResult result = accepted.ValueOrDie().Wait().ConsumeValueOrDie();
-```
-
-The prepare and final-publish paths each use bounded group commit. This API
-reduces how long callers wait for a durable acceptance boundary, but it does
-not remove synchronous persistence: each ultimately committed async batch has
-one durable prepare write and one durable final publish.
-
-## API shape
-
-```cpp
-#include <memory>
 #include "cedar/database.h"
 
 auto opened = cedar::Database::Open({.path = "/data/cedar"});
 if (!opened.ok()) return opened.status();
-std::unique_ptr<cedar::Database> database =
-    std::move(opened).ConsumeValueOrDie();
 
-const cedar::VertexId vertex =
-    database->AllocateVertexId().ConsumeValueOrDie();
+auto database = std::move(opened).ConsumeValueOrDie();
+const cedar::VertexRef vertex{{0}, {1}};
+
 auto begun = database->BeginTransaction();
 if (!begun.ok()) return begun.status();
-std::unique_ptr<cedar::Transaction> transaction =
-    std::move(begun).ConsumeValueOrDie();
-transaction->Assert(cedar::EntityFact::Vertex(vertex), cedar::ValidTime{1000});
-const cedar::CommitResult committed =
-    transaction->Commit().ConsumeValueOrDie();
-if (committed.outcome != cedar::CommitOutcome::kCommitted) {
-  return committed.status;
-}
 
-auto begun_snapshot = database->BeginSnapshot();
-if (!begun_snapshot.ok()) return begun_snapshot.status();
-cedar::Snapshot snapshot = std::move(begun_snapshot).ConsumeValueOrDie();
-const bool exists = snapshot.Exists(
-    cedar::EntityFact::Vertex(vertex), cedar::ValidTime{1000}).ConsumeValueOrDie();
+auto transaction = std::move(begun).ConsumeValueOrDie();
+transaction->Assert(
+    cedar::EntityFact::Vertex(vertex), cedar::ValidTime{1000});
+
+auto committed = transaction->Commit();
+if (!committed.ok()) return committed.status();
+if (committed.ValueOrDie().outcome != cedar::CommitOutcome::kCommitted) {
+  return committed.ValueOrDie().status;
+}
 ```
 
-`AllocateVertexId` and `AllocateEdgeId` use separate durable leases; gaps after
-a restart are intentional and IDs are never reused. `Close()` rejects new
-operations, waits for active commits, and returns `SnapshotPinned` until caller
-owned Snapshots have been released.
+A transaction becomes visible only after Cedar's durable commit boundary has
+completed.
 
-### Typed bitemporal queries
+## Snapshot Reads
 
-The installed package exposes the query builder through Cedar headers only.
-Prepare a logical query once, then execute it against a consumed Cedar
-`Snapshot`; the snapshot fixes system time while `At`, `History`, `Events`,
-and the other temporal scopes select valid time. Typed slots preserve the
-property's declared physical type through planning and result decoding.
+A snapshot binds a logical commit sequence and an engine snapshot. Temporal
+resolution therefore considers both the requested valid time and the
+snapshot's system time.
 
 ```cpp
-#include <cedar/database.h>
-#include <cedar/query.h>
-#include <cedar/transaction.h>
+auto begun_snapshot = database->BeginSnapshot();
+if (!begun_snapshot.ok()) return begun_snapshot.status();
 
-cedar::Slot<cedar::VertexRef> vertex =
+auto snapshot = std::move(begun_snapshot).ConsumeValueOrDie();
+auto exists = snapshot.Exists(
+    cedar::EntityFact::Vertex(vertex), cedar::ValidTime{1000});
+if (!exists.ok()) return exists.status();
+```
+
+Snapshots remain valid until released or destroyed. Cedar refuses database
+close while caller-owned snapshots are still pinned.
+
+## Temporal Queries
+
+Queries are prepared once and executed against a Cedar snapshot.
+
+```cpp
+#include "cedar/query.h"
+
+auto vertex_slot =
     cedar::Slot<cedar::VertexRef>::Named("vertex");
-cedar::OptionalSlot<int64_t> score =
-    cedar::OptionalSlot<int64_t>::Named("score");
-auto source = cedar::Query::Vertices(vertex, cedar::At{cedar::ValidTime{15}});
-auto bound = source.ValueOrDie().BindVertexProperty(
-    vertex, cedar::PropertyId{7}, score);
-auto query = bound.ValueOrDie().Select(
-    {cedar::Project(vertex), cedar::Project(score)});
+auto query = cedar::Query::Vertices(
+    vertex_slot, cedar::At{cedar::ValidTime{1000}});
+
 auto prepared = database->PrepareQuery(query.ValueOrDie());
-auto snapshot = database->BeginSnapshot();
+if (!prepared.ok()) return prepared.status();
+
+auto query_snapshot = database->BeginSnapshot();
+if (!query_snapshot.ok()) return query_snapshot.status();
+
 auto cursor = prepared.ValueOrDie().Execute(
-    std::move(snapshot).ConsumeValueOrDie(), cedar::Bindings{},
-    cedar::QueryOptions{});
-auto batch = cursor.ValueOrDie().Next().ConsumeValueOrDie();
-if (batch && batch->row_count() != 0) {
-  const cedar::VertexRef row_vertex = batch->Get<cedar::VertexRef>(vertex, 0);
-  const int64_t row_score = batch->Get<int64_t>(score, 0);
+    std::move(query_snapshot).ConsumeValueOrDie(),
+    cedar::Bindings{}, cedar::QueryOptions{});
+if (!cursor.ok()) return cursor.status();
+
+auto batch = cursor.ValueOrDie().Next();
+```
+
+The query layer supports:
+
+- `At` point-in-time reads;
+- `History`, `Events`, and `Changes`;
+- typed property filtering and binding;
+- temporal expansion;
+- k-hop traversal;
+- coexisting shortest paths;
+- earliest-arrival and latest-departure queries;
+- fastest-duration queries;
+- interval joins; and
+- temporal aggregates.
+
+Typed slots preserve declared physical types through planning and result
+decoding.
+
+## Durable Asynchronous Commit
+
+`Transaction::Commit()` is the synchronous API. `CommitAsync()` returns only
+after the complete transaction reaches Cedar's durable acceptance boundary.
+
+```cpp
+auto accepted = transaction->CommitAsync();
+if (!accepted.ok()) return accepted.status();
+
+auto result = accepted.ValueOrDie().Wait().ConsumeValueOrDie();
+if (result.outcome != cedar::CommitOutcome::kCommitted) {
+  return result.status;
 }
 ```
 
-`ctest -R CedarInstallConsumer` builds this example from the installed prefix,
-then closes and reopens the database before running the same typed query. The
-consumer links only `Cedar::cedar`; implementation archives are package-owned
-details and no implementation headers are installed.
+Asynchronous commit uses bounded group commit. It reduces caller wait time by
+sharing durable WAL operations, but it does not remove synchronous persistence.
+
+## Database Format
+
+Cedar uses a versioned clean-break database format. On open, Cedar validates
+the format record, expected column families, visible watermarks, and sequence
+metadata.
+
+Legacy Cedar directories are rejected without modification. There is no online
+migration path. Existing data must be exported by a binary that understands
+its old format and imported into a fresh Cedar directory through the public
+transaction API.
+
+## Performance and Benchmarks
+
+The supported benchmark is `cedar_kernel_bench`.
+
+```bash
+cmake -S . -B build-bench \
+  -DBUILD_BENCHMARKS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-bench --target cedar_kernel_bench -j2
+
+./build-bench/cedar_kernel_bench \
+  --path /tmp/cedar-kernel-bench \
+  --workload mixed-90-write-10-point-read \
+  --operations 10000 \
+  --read-operations 10000 \
+  --campaign warm \
+  --duration-seconds 30 \
+  --writer-clients 32 \
+  --verify-reopen false
+```
+
+Benchmark results are workload- and host-specific. Compare results only when
+the Cedar commit, binary, host, filesystem, workload, transaction size,
+duration, writer count, group-commit limits, and reopen setting match.
+
+The benchmark reports committed operations, WAL sync count, transactions per
+sync, encoded bytes per transaction, group-fill latency, retained WAL,
+compaction debt, and write, background, and maintenance errors.
+
+Measured results:
+
+- [Bitemporal query acceptance evidence](docs/superpowers/evidence/2026-08-21-cedar-bitemporal-query-acceptance.md)
+- [Local development-machine performance results](docs/superpowers/evidence/2026-08-24-cedar-query-performance-local.md)
+- [Cedar documentation index](docs/README.md)
+
+## Verification
+
+Cedar includes:
+
+- Debug and Release CTest suites;
+- AddressSanitizer, UBSAN, and ThreadSanitizer profiles;
+- WAL and reopen recovery tests;
+- crash-recovery tests;
+- temporal query correctness tests;
+- projection fallback tests;
+- columnar storage and space audits; and
+- write, read, mixed, and analytical benchmarks.
+
+## Project Status
+
+The current `main` branch contains the Cedar Kernel implementation and the
+bitemporal graph query system. Active design, implementation, and evidence
+documents are indexed in [`docs/README.md`](docs/README.md). Superseded
+implementation routes are retained under
+[`docs/superpowers/archive/`](docs/superpowers/archive/).
+
+## License
+
+Cedar is distributed under the Apache License 2.0.
+
+See [LICENSE](LICENSE).

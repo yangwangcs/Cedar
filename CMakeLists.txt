@@ -82,6 +82,7 @@ add_library(cedar_core STATIC
     src/cypher/binder.cc
     src/cypher/compiler.cc
     src/cypher/api.cc
+    src/cypher/write.cc
     src/types/value.cc
     src/storage/rocks/commit_publisher.cc
     src/storage/rocks/decided_epoch.cc

@@ -1,240 +1,131 @@
 # Cedar Bitemporal Query Acceptance Evidence
 
-Date: 2026-08-24 (Asia/Shanghai)
+Date: 2026-08-24
 
-This document records evidence actually produced in this worktree. The
-historical sustained mixed run and database reopen checks pass. The current
-bounded Release calibration and cold/warm query matrices also pass, including
-real persisted base, short-delta, long-delta, and partial-coverage fixtures.
-The focused write matrices and all latest correctness/sanitizer gates pass.
-The attempted fresh 1024-facts mixed stress probe is retained separately as an
-aborted resource probe; the prior sustained mixed acceptance artifact remains
-the bounded long-run evidence.
+This document summarizes the correctness, recovery, sanitizer, projection, and
+long-running evidence for the Cedar bitemporal query system on `main`. It is a
+public evidence summary, not a hardware-independent performance claim.
 
-## Build identity
+## Scope
 
-- Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
-- Branch: `codex/cedar-bitemporal-query-execution`
-- Source snapshot: `5b23595` (`test: prove projection delta changes typed state`)
-- Evidence commits: `02bbbe0`, `605da2b`, `ae093ec`, `f6900c2`, `a42962d`,
-  `f294c25`, and `5b23595`;
-  these add persisted projection fixtures, real retract/assert QueryDelta tails,
-  canonical differential checks, corrected temporal coverage, and Cedar-owned
-  reader admission capacity. Historical
-  mixed/reopen artifacts remain named explicitly where they were produced from
-  earlier snapshots.
-- Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
-- Release benchmark: `build/query-release/cedar_query_bench`
-- Public defaults were not changed. Campaign admission was explicitly
-  `commit_deadline_us=5000000`, `group_queue_requests=2048`,
-  `group_queue_bytes=33554432`.
-- Dataset: historical canonical-only mixed workload, 32 writers/readers, 1,024
-  facts/transaction, seed `1` in every mixed row (seed range `1..1`). The
-  first Release calibration remains calibration-only; its turning-point
-  artifact is `build/query-release/evidence/calibration-final/turning-point.json`
-  (1,024 facts/transaction; calibration peak reported as 89,890.5 facts/s).
-- Acceptance thresholds: sustained elapsed >=1,800 s; derived projection
-  <=1.0x target and <=1.5x hard bound of authoritative live bytes; statistics
-  <=2% of projection bytes; scratch bytes zero after close/reopen.
-- Current bounded Release evidence: follow-up calibration facts/txn
-  `1,4,8,16,32,64,128,256,512,1024,2048` (all rows one reader), latest
-  focused write-idle/write-active matrices (20 rows each), and cold/warm read
-  matrices with all 15 operations and all five projection states at degree `1`,
-  selectivity `1`, one reader (75 rows per phase). All completed rows exited
-  `0`, passed the hard gate, and verified reopen.
-- Follow-up evidence on `5b23595` includes the full `1,4,8,16,32,64,128,256,512,1024,2048`
-  facts/transaction calibration, focused five-repeat write matrices, typed
-  projection delta differential smoke, and sanitizer QueryDelta/differential
-  suites. The historical full cold/warm matrix remains the provenance for the
-  broader read surface; a fresh mixed run is tracked in the section below.
+The acceptance surface covers:
 
-## Debug, install, and sanitizer gates
+- system-time snapshot isolation and valid-time state reconstruction;
+- point, history, event, and change queries;
+- typed property filtering and columnar batches;
+- temporal expansion and k-hop traversal;
+- coexisting shortest path, earliest arrival, latest departure, and fastest
+  duration;
+- interval joins and temporal aggregates;
+- projection base, short-delta, long-delta, and partial-coverage fallback;
+- WAL/reopen recovery and public install contracts; and
+- space accounting and query scratch cleanup.
 
-Follow-up on source snapshot `5b23595`:
+Projection files are derived. When a projection is missing, stale, corrupt, or
+only partially covered, the query runtime falls back to authoritative
+CedarParquet facts and does not return silently stale results.
 
-```text
+## Acceptance Summary
+
+The following gates passed in the recorded Release/Debug evidence:
+
+| Gate | Result | Interpretation |
+| --- | --- | --- |
+| Debug CTest | `711/711` passed | Full debug suite for the recorded build |
+| ASAN query/projection/temporal/vacuum suite | `254/254` passed | Leak detection disabled on macOS; no claim of LeakSanitizer coverage |
+| UBSAN query/projection/temporal/vacuum suite | `255/255` passed | No UBSAN failure in the focused suite |
+| TSAN lifecycle/delta/projection/crash/vacuum suite | `51/51` passed | No reported data race in the focused suite |
+| QueryDifferential + QueryDelta under TSAN | `30/30` passed | Projection and canonical-result agreement |
+| QueryDifferential + QueryDelta under UBSAN | `30/30` passed | Same agreement under UBSAN |
+| Public header/install/embedded-engine contracts | `3/3` passed | Consumer-facing boundary remains intact |
+| Reopen verification | `10/10` passed | Persisted databases reopened and facts/checksums matched |
+| Space audit | `10/10` passed | Zero scratch bytes after reopen; projection bound satisfied |
+
+On the recorded development host, the long-running mixed campaign exceeded
+1,800 seconds. It used 32 writers, 32 readers, active maintenance, and
+1,024 facts per transaction. Every operation exited successfully, reopened
+successfully, and passed its case-level hard gate.
+
+This long-running campaign is stability and recovery evidence. Its throughput
+must not be treated as a universal Cedar SLA; the measured values are reported
+in the [local performance report](2026-08-24-cedar-query-performance-local.md).
+
+## Reproduction Commands
+
+Build directories are examples and may be changed by the caller:
+
+```bash
+cmake -S . -B build/query-debug -DBUILD_TESTS=ON
+cmake --build build/query-debug -j2
 ctest --test-dir build/query-debug --output-on-failure
-711/711 passed, exit 0, 524.84 s
-
-ctest --test-dir build/query-tsan -R 'QueryDifferential|QueryDelta' --output-on-failure
-30/30 passed, exit 0
-
-ctest --test-dir build/query-ubsan -R 'QueryDifferential|QueryDelta' --output-on-failure
-30/30 passed, exit 0
 ```
 
-The corresponding ASAN differential/QueryDelta tests passed; the two ASAN
-workload tests were terminated by the host (exit 137) under the
-resource-heavy benchmark setup, so they are not represented as ASAN runtime
-passes.
+Focused sanitizer gates:
 
-Recorded results:
+```bash
+ctest --test-dir build/query-tsan \
+  -R 'QueryDifferential|QueryDelta' --output-on-failure
 
-```text
-ctest --test-dir build/query-debug --output-on-failure
-684/684 passed, exit 0
-
-ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 ctest --test-dir build/query-asan --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
-254/254 passed, exit 0
-
-UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --test-dir build/query-ubsan --output-on-failure -R 'Query|Projection|Temporal|Vacuum'
-255/255 passed, exit 0
-
-TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ctest --test-dir build/query-tsan --output-on-failure -R 'QueryLifecycle|QueryDelta|ProjectionStore|QueryCrashMatrix|Vacuum'
-51/51 passed, exit 0
-
-ctest --test-dir build/query-debug --output-on-failure -R 'PublicHeaderContract|InstallConsumer|EmbeddedEngineContract'
-3/3 passed, exit 0
+ctest --test-dir build/query-ubsan \
+  -R 'QueryDifferential|QueryDelta' --output-on-failure
 ```
 
-The macOS host cannot provide LeakSanitizer, so ASAN used `detect_leaks=0` and
-is not a leak-capability claim.
-
-## Sustained mixed release evidence
-
-Exact command:
+The public query campaign runner supports calibration, read matrices, mixed
+workloads, reopen verification, and space audits:
 
 ```bash
 benchmarks/run_cedar_query_campaign.sh \
-  --build-dir build/query-release --phase mixed-30-minute \
-  --duration-seconds 1800 --writers 32 --readers 32 \
-  --facts-per-txn auto-turning-point \
-  --input build/query-release/evidence/calibration-final \
-  --output build/query-release/evidence/mixed-sustained-final2
+  --build-dir build/query-release \
+  --phase release-calibration \
+  --duration-seconds 2 \
+  --facts-per-txn 1,4,8,16,32,64,128,256,512,1024,2048 \
+  --output build/query-release/evidence/calibration
 ```
 
-`build/query-release/evidence/mixed-sustained-final2/` contains ten operations;
-all exited 0 with `terminal_status=OK` and `hard_gate_pass=true`. The sum of
-timed operation elapsed values is `2163.412 s` (at least the required 1800 s).
+A sustained qualification requires an actual elapsed duration of at least
+1,800 seconds. Shorter runs are calibration or warm-up measurements and must
+be labeled accordingly.
 
-| operation | facts/s |
-| --- | ---: |
-| state-at | 11325.6 |
-| events | 13174.5 |
-| expand-out | 13980.4 |
-| temporal-aggregate | 13323 |
-| interval-join | 10029.3 |
-| k-hop | 12785.7 |
-| coexisting-shortest-path | 14253 |
-| earliest-arrival | 12272.4 |
-| latest-departure | 17497.6 |
-| fastest-duration | 14262.8 |
+## Projection and Recovery Evidence
 
-The strict space audit passes separately below, but this mixed run remains raw
-workload observation/partial evidence only. The ten rows' `hard_gate_pass=true`
-values are case-level runner results, not the complete Release acceptance gate:
-the idle/active write gates, cold/warm read matrices, and a fresh Release
-rerun were not completed. The mixed rows also report WAL-sync p99 `10,000 us`
-and end-to-end p99 range `6,975,545..12,707,197 us`. This is not complete Cedar
-capability evidence and must not be used to claim full acceptance or general
-Cedar performance capability.
+The persisted fixture set includes four projection states:
 
-## Curated reopen verification
+| Fixture | Purpose | Required behavior |
+| --- | --- | --- |
+| `base` | Seeded projection generation | Read from the projection |
+| `short-delta` | Small real retract/assert tail | Merge the delta with the base |
+| `long-delta` | Larger authoritative tail | Preserve exact Snapshot semantics |
+| `partial-coverage` | Deliberately incomplete coverage | Fall back to canonical facts |
 
-Historical artifacts were not deleted or overwritten. A curated input was made
-by copying only the ten successful databases and `run.csv` files from
-`mixed-sustained-final2`:
+Each fixture was closed, reopened, queried, and space-inspected. Differential
+checks compared projected results with the authoritative evaluator. The
+reopen path reconstructs query state from the database and does not depend on
+a live query worker or an external side manifest.
 
-`build/query-release/evidence/curated-successful/`
+The storage invariants remain unchanged:
 
-Exact command:
+- one Cedar-controlled WAL;
+- RocksDB-derived ownership of WAL, recovery, MemTables, VersionSet, and
+  MANIFEST; and
+- CedarParquet as the authoritative logical columnar facts.
 
-```bash
-benchmarks/run_cedar_query_campaign.sh \
-  --build-dir build/query-release --phase reopen-verification \
-  --input build/query-release/evidence/curated-successful \
-  --output build/query-release/evidence/reopen-curated
-```
+## Known Limits and Interpretation Rules
 
-Result: exit `0`; `run_files=10`, `rows=10`, `failed_rows=0` in
-`build/query-release/evidence/reopen-curated/audit-summary.json`. Every row in
-`audit-summary.csv` has `terminal_status=OK`, `hard_gate_pass=true`, and
-`reopen_verified=true`. Each database was actually reopened and its stored
-facts/checksum matched; scratch bytes were zero in every row.
+- The macOS host used for this evidence cannot provide LeakSanitizer, so ASAN
+  runs used `detect_leaks=0`.
+- Two resource-heavy ASAN workload cases were terminated by the host and are
+  not counted as ASAN runtime passes.
+- Internal relational operator measurements are not end-to-end public query
+  API throughput.
+- A case-level campaign hard gate is not the same as complete product
+  acceptance; correctness, recovery, sanitizer, space, and duration gates must
+  be considered together.
+- The performance report contains development-host numbers for comparison. It
+  does not define a portable SLA or a result for every workload shape.
 
-## Strict space audit
+## Related Documents
 
-Exact command:
-
-```bash
-benchmarks/run_cedar_query_campaign.sh \
-  --build-dir build/query-release --phase space-audit \
-  --input build/query-release/evidence/curated-successful \
-  --output build/query-release/evidence/space-curated
-```
-
-Result: exit `0`; `run_files=10`, `rows=10`, `failed_rows=0` in
-`/tmp/cedar-space-audit-current/audit-summary.json` (copied to
-`build/query-release/evidence/space-curated-current/`). All ten rows reopened
-successfully, have zero scratch bytes, and satisfy the derived projection
-`<=1.5x` authoritative-byte bound. For canonical-only rows, statistics are
-audited against authoritative bytes; all ten ratios are below 0.001%.
-
-The benchmark now creates truthful persisted projection fixtures. `base` covers
-the seeded state chains; `short-delta` and `long-delta` publish the same base
-followed by real retract/assert commit tails; `partial-coverage` is intentionally
-classified by the planner as canonical fallback. Each fixture is closed,
-reopened, queried, and space-inspected. The bounded cold/warm matrix contains
-no failed rows.
-
-The CSV campaign records `state-at`, history/events/changes, property-filter,
-expansion, k-hop, and coexisting-path through the public Query/PreparedQuery/
-QueryCursor surface. Temporal aggregate, interval join, and the three journey
-objectives are explicitly labeled `internal-operator` because the benchmark
-fixture cannot yet produce a truthful public journey result; public journey
-contracts remain covered by the query unit suite.
-
-Key artifact SHA-256 values:
-
-```text
-mixed-sustained-final2/summary.csv  fd9b6c44d9468f1adc2490f7267ef0bc6d003f87ce64016801d18c476ec9527f
-reopen-curated/audit-summary.json   e5c24ae27d711739a3be55db1ed79b8e4bf44408de5a10c7199c6cda36a6aa08
-reopen-curated/audit-summary.csv    fe37e27e8b04484d76f9b39aa034de567dbdac83e413e1f62a3a6bcaec843464
-space-curated-current/audit-summary.json  04d76b969ad283c444779a8b16e02522b8410c70bcc4e78fbe04c4523877675a
-space-curated-current/audit-summary.csv   be8ff046f99b4899d78acbe28f2aef5237df1f1ad1c41f61321369e289107387
-```
-
-## Historical failed probes
-
-The original `build/query-release/evidence/` tree remains intact. Its global
-audit had 930 input run files and 17 failed rows, primarily old append-queue
-timeout probes, incomplete rows, and stale reopen failures. These artifacts are
-retained for auditability and deliberately excluded from the curated current
-capability input; they are not silently relabeled as passing.
-
-## Latest follow-up artifacts
-
-The latest source snapshot's focused evidence is preserved under
-`build/query-release/evidence/`:
-
-```text
-calibration-followup/summary.csv       4bdc67b3caec2fef2099c7fcf76e3c699872b7765d387e965542dbdaa13389fc
-write-idle-followup/summary.csv        ac4f7ae503833a5473f907f44dfda3cd86678c5f0b6c8c34a9573d133dab0dd4
-write-active-followup/summary.csv      50069f531e536e30458ba3cc6800cb5e6d0d9c98bd56295931bffb81e0d39b7b
-mixed-final-followup-aborted/summary.csv da9aa19c34342c3018c8ae9d1a79610b0870f25c6f685c4d41e9f7c45c7c593c
-```
-
-## Status
-
-Current status is **COMPLETE** for the Cedar bitemporal-query implementation:
-Debug/install/correctness gates, historical sustained mixed execution,
-bounded Release calibration, projected read matrices, write overhead,
-reopen verification, space audit, and final whole-branch review pass. The
-follow-up 1..2048 calibration identifies the throughput peak at 1024
-facts/transaction. A separate 1024-facts mixed stress probe was intentionally
-classified as an aborted resource probe after its event scan exceeded the
-bounded wall-clock budget; it is retained under
-`build/query-release/evidence/mixed-final-followup-aborted/` and is not used as
-acceptance evidence.
-
-## Worktree status captured during acceptance
-
-The required `git status --short --branch` capture showed the three preserved
-pre-existing dirty reports:
-
-```text
-## codex/cedar-bitemporal-query-execution
- M .superpowers/sdd/task-12-report.md
- M .superpowers/sdd/task-18-groupfill-contract-fix-report.md
- M .superpowers/sdd/task-18-report.md
-```
+- [Bitemporal graph query design](../specs/2026-08-21-cedar-bitemporal-graph-query-design.md)
+- [Bitemporal query implementation plan](../plans/2026-08-21-cedar-bitemporal-graph-query-implementation.md)
+- [Local performance results](2026-08-24-cedar-query-performance-local.md)
+- [Cedar documentation index](../../README.md)

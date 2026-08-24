@@ -1,7 +1,7 @@
 # Cedar Documentation
 
-This directory contains Cedar's design records, implementation plans, and
-measured acceptance evidence. The links below identify the current Cedar
+This directory contains Cedar's public design records, implementation plans,
+and measured acceptance evidence. The links below identify the current Cedar
 Kernel query system and its source-of-truth documents.
 
 ## Current Cedar Kernel Query System
@@ -51,21 +51,19 @@ The current acceptance evidence covers:
 - projection base, short delta, long delta, and partial coverage;
 - WAL/reopen recovery, sanitizer-focused suites, and space audits.
 
-Raw Release artifacts remain under `build/query-release/evidence/` locally.
 The committed evidence documents record the commands, gate results, and
-provenance without committing generated database directories into the source
-tree.
+interpretation rules. Generated database directories and host-specific raw
+artifacts are intentionally not part of the public source tree.
 
 ## Document Status
 
 `superpowers/specs/` contains architecture and behavioral specifications.
-`superpowers/plans/` contains implementation plans, including historical plans
-that explain how the current system was built.
+`superpowers/plans/` contains active implementation plans.
 `superpowers/evidence/` contains measured results and acceptance records.
 `superpowers/archive/` contains explicitly superseded designs.
 
 The four documents in **Current Cedar Kernel Query System**, together with the
 current storage documents above, are the authoritative starting point for the
-implementation currently merged to `main`. Internal execution reports under
-`.superpowers/sdd/` are intentionally local-only and are not part of the
-repository history going forward.
+implementation currently merged to `main`. Historical implementation routes
+remain available in the archive for design archaeology, but are not active
+instructions for new work.

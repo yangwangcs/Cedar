@@ -1,29 +1,30 @@
-# Cedar Query System: Local Performance Results
+# Cedar Query Performance: Development-Host Results
 
-Date: 2026-08-24 (Asia/Shanghai)
+Date: 2026-08-24
 
-This report records measurements produced on the Cedar development machine. It
-is not a hardware-independent benchmark claim. Results are tied to the source,
-build, workload, and admission parameters below.
+This report records measurements from the Cedar development host. The numbers
+are reproducible workload observations, not hardware-independent claims or a
+portable service-level objective.
 
-## Test Identity
+## Test Configuration
 
-- Worktree: `/Users/wangyang/Desktop/Cedar/.worktrees/cedar-bitemporal-query`
-- Branch: `codex/cedar-bitemporal-query-execution`
-- Source: `ce554a6` (Cedar bitemporal-query implementation)
-- Host: Darwin arm64, Apple clang 21.0.0, CMake 4.2.1
-- Build: `build/query-release`
-- Storage model: one Cedar-controlled RocksDB WAL, authoritative CedarParquet
-  facts, Cedar projection/QueryDelta layers
-- WAL admission: `commit_deadline_us=5000000`,
-  `group_queue_requests=2048`, `group_queue_bytes=33554432`
+- Release build of the Cedar bitemporal query system;
+- one Cedar-controlled WAL;
+- authoritative CedarParquet facts;
+- Cedar temporal projections and QueryDelta overlays;
+- WAL admission of 5,000,000 microseconds, 2,048 queue requests, and
+  33,554,432 queued bytes; and
+- macOS arm64 development host with Apple Clang.
+
+The write calibration used one writer and one reader, paused projection work,
+and a two-second timed window for each transaction size. Focused write cases
+used five repeats. The sustained mixed case used 32 writers, 32 readers,
+active maintenance, and 1,024 facts per transaction.
 
 ## Write Performance
 
-Release calibration used one writer, one reader, paused projection work, and a
-two-second timed window per batch size. `facts/s` is the primary metric because
-one transaction can contain many facts; `txn/s` is derived as `facts/s /
-facts_per_txn`.
+`facts/s` is the primary metric because one transaction can contain many
+facts. `txn/s` is derived as `facts/s / facts_per_txn`.
 
 | Facts per transaction | Facts/s | Approx. transactions/s |
 |---:|---:|---:|
@@ -39,14 +40,14 @@ facts_per_txn`.
 | 1024 | **111,396** | **109** |
 | 2048 | 108,704 | 53 |
 
-The local batch-size turning point is approximately `1024 facts/transaction`.
-Throughput rises as a WAL sync amortizes more facts, then starts to flatten and
-decline when transaction assembly and processing cost dominate.
+The local turning point is approximately 1,024 facts per transaction. Through
+that point, a durable WAL sync is amortized over more facts. Beyond it,
+transaction assembly and processing cost begin to offset the batching gain.
 
-Focused five-repeat write measurements:
+### Focused write cases
 
 | Workload | Average facts/s | Average end-to-end p99 |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Idle, 16 facts, 1 writer | 5,018 | 5 ms |
 | Idle, 16 facts, 8 writers | 19,704 | 13 ms |
 | Idle, 64 facts, 1 writer | 15,761 | 7 ms |
@@ -56,21 +57,19 @@ Focused five-repeat write measurements:
 | Active projection, 64 facts, 1 writer | 14,856 | 6 ms |
 | Active projection, 64 facts, 8 writers | 65,301 | 19 ms |
 
-WAL-sync p99 was normally `5 ms` in these focused Release cases. The
-8-writer/64-fact active result is higher than its idle counterpart and should
-be treated as run-to-run variance until a larger paired sample is collected;
-it is not used as a universal active-maintenance overhead claim.
+WAL-sync p99 was normally 5 ms in the focused Release cases. The active
+8-writer/64-fact result is treated as run-to-run variance until a larger paired
+sample is collected; it is not a universal maintenance-overhead claim.
 
 ## Read Performance
 
-The reduced cold and warm matrices each contain 270 passing cases. They cover
-15 query operators, five projection states, reader counts 1 and 8, multiple
-degrees/selectivities, reopen verification, and space accounting. The values
-below are averages across the matrix for each operator, so they are useful for
-relative comparison rather than a single fixed-query SLA.
+The cold and warm matrices cover 15 query operators, five projection states,
+reader counts of 1 and 8, multiple degrees and selectivities, reopen
+verification, and space accounting. The values below are matrix averages and
+are useful for relative comparison rather than a fixed-query SLA.
 
 | Operator | Cold qps | Warm qps | Cold p99 | Warm p99 |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | `state-at` | 36.6 | 37.4 | 229 ms | 232 ms |
 | `history` | 81.7 | 85.7 | 126 ms | 116 ms |
 | `events` | 77.3 | 82.0 | 126 ms | 117 ms |
@@ -84,27 +83,18 @@ relative comparison rather than a single fixed-query SLA.
 | `latest-departure` | 86.9 | 91.8 | 94 ms | 78 ms |
 | `fastest-duration` | 22.1 | 23.7 | 261 ms | 227 ms |
 
-Typical result rates are approximately 36k-37k rows/s for `state-at`,
-77k-86k rows/s for `events`/`history`, 390-403 rows/s for `expand-out`, and
-650-670 rows/s for `expand-both`.
-
-The following two rows are internal relational operator measurements, not
-end-to-end public query API throughput:
-
-| Internal operator | Cold qps | Warm qps | p99 |
-|---|---:|---:|---:|
-| `interval-join` | 477k | 476k | 6 us |
-| `temporal-aggregate` | 457k | 452k | 7-8 us |
+`interval-join` and `temporal-aggregate` were also measured as internal
+relational operators at approximately 477k and 457k queries/s respectively.
+Those values are not end-to-end public query API throughput and are therefore
+reported separately.
 
 ## Sustained Mixed Workload
 
-The accepted sustained campaign used 32 writers, 32 readers, 1024 facts per
-transaction, active maintenance, and ten query operations. Timed operation
-elapsed time exceeded 1,800 seconds; every case exited successfully, reopened
-successfully, and passed the hard gate.
+The sustained campaign exceeded 1,800 seconds. Every case exited successfully,
+reopened successfully, and passed its case-level hard gate.
 
 | Operation | Facts/s |
-|---|---:|
+| --- | ---: |
 | `state-at` | 11,326 |
 | `events` | 13,175 |
 | `expand-out` | 13,980 |
@@ -116,40 +106,39 @@ successfully, and passed the hard gate.
 | `latest-departure` | 17,498 |
 | `fastest-duration` | 14,263 |
 
-This sustained workload validates long-running stability, WAL/reopen behavior,
+This campaign validates long-running stability, WAL/reopen behavior,
 maintenance, and space accounting. Its latency is not directly comparable to
-the cold/warm read matrix because 32 writers and 32 readers contend
-simultaneously.
+the cold/warm read matrix because writers and readers contend simultaneously.
 
 ## Correctness and Resource Gates
 
 - Debug CTest: `711/711` passed.
 - QueryDifferential + QueryDelta under TSAN: `30/30` passed.
 - QueryDifferential + QueryDelta under UBSAN: `30/30` passed.
-- Projection `base`, `short-delta`, `long-delta`, and `partial-coverage` all
-  passed typed canonical differential checks and reopen verification.
+- `base`, `short-delta`, `long-delta`, and `partial-coverage` fixtures passed
+  typed canonical differential checks and reopen verification.
 - Space audits passed with zero scratch bytes after reopen.
-- `query_delta_bytes` controls both query memory admission and recovery repair
-  memory; no separate hidden 512 MiB recovery allowance remains.
 
-## Reproduction Commands
+See the [acceptance evidence](2026-08-21-cedar-bitemporal-query-acceptance.md)
+for the complete gate interpretation and known limits.
+
+## Reproduction
 
 ```bash
 ctest --test-dir build/query-debug --output-on-failure
-ctest --test-dir build/query-tsan -R 'QueryDifferential|QueryDelta' --output-on-failure
-ctest --test-dir build/query-ubsan -R 'QueryDifferential|QueryDelta' --output-on-failure
+ctest --test-dir build/query-tsan \
+  -R 'QueryDifferential|QueryDelta' --output-on-failure
+ctest --test-dir build/query-ubsan \
+  -R 'QueryDifferential|QueryDelta' --output-on-failure
 
 benchmarks/run_cedar_query_campaign.sh \
   --build-dir build/query-release \
   --phase release-calibration \
   --duration-seconds 2 \
   --facts-per-txn 1,4,8,16,32,64,128,256,512,1024,2048 \
-  --output /tmp/cedar-release-calibration
+  --output build/query-release/evidence/calibration
 ```
 
-Raw evidence is retained under
-`build/query-release/evidence/calibration-followup/`,
-`write-idle-followup/`, `write-active-followup/`,
-`read-cold-reduced/`, `read-warm-reduced/`, and
-`mixed-sustained-final2/`.
-
+Compare future results only when the Cedar revision, compiler, host,
+filesystem, workload, transaction size, duration, writer count, group-commit
+limits, and reopen setting are documented together.

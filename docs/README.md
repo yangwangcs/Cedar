@@ -7,9 +7,12 @@ Cedar Kernel bitemporal graph database.
 
 1. Read the [Cedar overview](../README.md) for the product model, LSM-backed
    columnar architecture, bitemporal fact definition, and public C++ API.
-2. Read the [query acceptance summary](query-acceptance.md) for correctness,
+2. Read the [Cedar User Guide](user-guide.md) for build instructions, the
+   embedded C++ API, T-Cypher syntax and examples, Bolt usage, schema manifests,
+   transactions, and operational limits.
+3. Read the [query acceptance summary](query-acceptance.md) for correctness,
    recovery, sanitizer, projection, and space gates.
-3. Read the [development-host performance report](query-performance.md) for
+4. Read the [development-host performance report](query-performance.md) for
    measured write, read, and sustained mixed-workload results.
 
 ## Public Storage Model

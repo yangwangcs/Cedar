@@ -172,8 +172,8 @@ built statically by default. Host codec packages are not required.
 
 ```bash
 cmake -S . -B build -DBUILD_TESTS=ON
-cmake --build build -j2
-ctest --test-dir build --output-on-failure
+cmake --build build -j1
+ctest --test-dir build -j1 --output-on-failure
 ```
 
 The installed consumer target is `Cedar::cedar`. Engine headers and
@@ -215,6 +215,10 @@ if (committed.ValueOrDie().outcome != cedar::CommitOutcome::kCommitted) {
 
 A transaction becomes visible only after Cedar's durable commit boundary has
 completed.
+
+For the complete embedded API, T-Cypher grammar and examples, parameter
+binding, Bolt server, schema manifests, transaction flow, and operational
+limits, see the [Cedar User Guide](docs/user-guide.md).
 
 ## Snapshot Reads
 
@@ -314,7 +318,7 @@ The supported benchmark is `cedar_kernel_bench`.
 cmake -S . -B build-bench \
   -DBUILD_BENCHMARKS=ON \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build-bench --target cedar_kernel_bench -j2
+cmake --build build-bench --target cedar_kernel_bench -j1
 
 ./build-bench/cedar_kernel_bench \
   --path /tmp/cedar-kernel-bench \
@@ -339,6 +343,7 @@ Measured results:
 
 - [Bitemporal query acceptance evidence](docs/query-acceptance.md)
 - [Development-host performance results](docs/query-performance.md)
+- [Cedar User Guide](docs/user-guide.md)
 - [Cedar documentation index](docs/README.md)
 
 ## Verification

@@ -61,8 +61,8 @@ Build directories are examples and may be changed by the caller:
 
 ```bash
 cmake -S . -B build/query-debug -DBUILD_TESTS=ON
-cmake --build build/query-debug -j2
-ctest --test-dir build/query-debug --output-on-failure
+cmake --build build/query-debug -j1
+ctest --test-dir build/query-debug -j1 --output-on-failure
 ```
 
 Focused sanitizer gates:

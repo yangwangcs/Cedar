@@ -159,11 +159,11 @@ for the complete gate interpretation and known limits.
 ## Reproduction
 
 ```bash
-ctest --test-dir build/query-debug --output-on-failure
+ctest --test-dir build/query-debug -j1 --output-on-failure
 ctest --test-dir build/query-tsan \
-  -R 'QueryDifferential|QueryDelta' --output-on-failure
+  -j1 -R 'QueryDifferential|QueryDelta' --output-on-failure
 ctest --test-dir build/query-ubsan \
-  -R 'QueryDifferential|QueryDelta' --output-on-failure
+  -j1 -R 'QueryDifferential|QueryDelta' --output-on-failure
 
 benchmarks/run_cedar_query_campaign.sh \
   --build-dir build/query-release \

@@ -11,12 +11,14 @@
 #include <functional>
 #include <memory>
 #include <map>
+#include <unordered_map>
 
 #include "cedar/query/query.h"
 #include "cedar/query/result.h"
 #include "cedar/query/types.h"
 #include "cedar/snapshot.h"
 #include "query/projection/query_delta.h"
+#include "query/read/read_catalog.h"
 #include "query/resource/query_resource_pool.h"
 
 namespace cedar::internal {
@@ -65,18 +67,34 @@ class AdjacencyIndex {
       const std::function<Status()>& check_abort = {}) const;
   bool covers(CommitSeq snapshot_seq) const { return built_through_.value >= snapshot_seq.value; }
   CommitSeq built_through() const { return built_through_; }
+  std::shared_ptr<const ReadCatalog> read_catalog() const { return read_catalog_; }
 
  private:
   struct Key {
     VertexRef vertex;
     ExpandDirection direction = ExpandDirection::kOut;
     std::optional<uint64_t> edge_type;
+    bool operator==(const Key&) const = default;
     bool operator<(const Key& other) const;
   };
-  std::map<Key, std::vector<Entry>> postings_;
+  struct KeyHash {
+    size_t operator()(const Key& key) const noexcept {
+      size_t hash = static_cast<size_t>(key.vertex.part_id.value) * 1315423911u;
+      hash ^= std::hash<uint64_t>{}(key.vertex.vertex_id.value) +
+              (hash << 6) + (hash >> 2);
+      hash ^= static_cast<size_t>(key.direction) + (hash << 6) + (hash >> 2);
+      if (key.edge_type.has_value()) {
+        hash ^= std::hash<uint64_t>{}(*key.edge_type) +
+                (hash << 6) + (hash >> 2);
+      }
+      return hash;
+    }
+  };
+  std::unordered_map<Key, std::vector<Entry>, KeyHash> postings_;
   CommitSeq built_through_;
   uint64_t generation_ = 0;
   bool generation_complete_ = true;
+  std::shared_ptr<const ReadCatalog> read_catalog_;
   void Add(const Entry& entry);
 };
 
@@ -93,6 +111,7 @@ struct GraphFrontierOptions {
       std::optional<uint64_t>)> adjacency_seek;
   std::shared_ptr<const AdjacencyIndex> adjacency_index;
   std::optional<uint64_t> projection_generation;
+  PartScope part_scope = PartScope::All();
   std::function<Status()> check_abort;
   // Zero means no fallback bound. A non-zero value makes a cache miss fail
   // explicitly once the authoritative fallback would exceed this count.

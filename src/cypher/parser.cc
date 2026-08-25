@@ -47,6 +47,7 @@ class Parser {
     statement.changes = changes_prefix || Match("CHANGES");
     if (Match("MATCH")) {
       statement.kind = StatementKind::kRead;
+      statement.head = StatementHead::kMatch;
       auto status = ParsePatterns(&statement);
       if (!status.ok()) return status;
       if (Match("TRAIL")) {
@@ -56,6 +57,7 @@ class Parser {
       if (!projections.ok()) return projections.status();
     } else if (Match("CREATE")) {
       statement.kind = StatementKind::kWrite;
+      statement.head = StatementHead::kCreate;
       auto status = ParsePatterns(&statement);
       if (!status.ok()) return status;
     } else {
@@ -132,7 +134,7 @@ class Parser {
       if (!Match("AND")) return Error("expected AND");
       auto to = Integer("expected temporal end");
       if (!to.ok()) return to.status();
-      if (to.ValueOrDie() <= from.ValueOrDie()) return Error("temporal range must be increasing");
+      if (to.ValueOrDie() < from.ValueOrDie()) return Error("temporal range must not be reversed");
       scope.from = from.ValueOrDie();
       scope.to = to.ValueOrDie();
     }
@@ -145,14 +147,59 @@ class Parser {
       auto pattern = ParsePattern();
       if (!pattern.ok()) return pattern.status();
       statement->patterns.push_back(std::move(pattern.ValueOrDie()));
-      if (Peek().kind == TokenKind::kSymbol && Peek().text == "-") {
-        return Status::NotSupported("cypher parser",
-                                    "mixed path sequence requires a bounded sequence operator");
+      while (Peek().kind == TokenKind::kSymbol && Peek().text == "-") {
+        auto continuation = ParseContinuation(statement->patterns.back());
+        if (!continuation.ok()) return continuation.status();
+        statement->patterns.push_back(std::move(continuation.ValueOrDie()));
       }
       if (!Symbol(",")) break;
     }
     if (statement->patterns.empty()) return Error("expected graph pattern");
     return Status::OK();
+  }
+
+  StatusOr<PathPattern> ParseContinuation(const PathPattern& previous) {
+    PathPattern pattern;
+    pattern.source = previous.destination;
+    const uint32_t start = Peek().span.offset;
+    if (!Symbol("-") || !Symbol("[")) return Error("expected sequence edge");
+    if (!AtEnd() && Peek().kind == TokenKind::kIdentifier) {
+      pattern.edge = Advance().text;
+    }
+    if (Symbol(":")) {
+      auto relationship = Identifier("expected relationship type");
+      if (!relationship.ok()) return relationship.status();
+      pattern.relationship = relationship.ValueOrDie();
+    }
+    if (Symbol("*")) {
+      auto min = Integer("expected minimum hop");
+      if (!min.ok()) return min.status();
+      pattern.min_hops = static_cast<uint32_t>(min.ValueOrDie());
+      if (Symbol("..")) {
+        auto max = Integer("expected maximum hop");
+        if (!max.ok()) return max.status();
+        pattern.max_hops = static_cast<uint32_t>(max.ValueOrDie());
+      } else {
+        pattern.max_hops = pattern.min_hops;
+      }
+    }
+    if (pattern.max_hops < pattern.min_hops || pattern.max_hops > 64) {
+      return Error("path hop bound exceeds limit");
+    }
+    if (!Symbol("]") || !Symbol("-") || !Symbol(">") || !Symbol("(")) {
+      return Error("expected path destination");
+    }
+    auto destination = Identifier("expected destination variable");
+    if (!destination.ok()) return destination.status();
+    pattern.destination = destination.ValueOrDie();
+    if (Symbol(":")) {
+      auto label = Identifier("expected destination label");
+      if (!label.ok()) return label.status();
+      pattern.destination_label = label.ValueOrDie();
+    }
+    if (!Symbol(")")) return Error("expected )");
+    pattern.span = {start, static_cast<uint32_t>(Peek().span.offset - start)};
+    return pattern;
   }
 
   StatusOr<PathPattern> ParsePattern() {

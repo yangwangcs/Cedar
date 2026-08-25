@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -330,6 +331,31 @@ TEST(RelationalTest, ExternalSpillJoinsMatchCanonicalResults) {
     ++verified_runs;
   }
   EXPECT_GT(verified_runs, 2U);
+  EXPECT_TRUE(scratch.Cleanup().ok());
+}
+
+TEST(RelationalTest, ExternalSpillReadsEachNonEmptyPartitionOnce) {
+  std::vector<RelationalRow> left_rows{Row(7, 700), Row(99, 990)};
+  std::vector<RelationalRow> right_rows;
+  for (int64_t key = 0; key < 512; ++key) right_rows.push_back(Row(key, key));
+  const auto root = std::filesystem::temp_directory_path() /
+                    "cedar-task11-relational-observer";
+  std::filesystem::remove_all(root);
+  std::atomic<uint64_t> reads{0};
+  std::atomic<uint64_t> rebuilds{0};
+  SetSpillPartitionObserverForTesting([&](bool rebuilt) {
+    (rebuilt ? rebuilds : reads).fetch_add(1, std::memory_order_relaxed);
+  });
+  QueryReservation reservation(4096);
+  QueryScratch scratch(root, "instance", "observer", 1 << 20, &reservation);
+  JoinInput input{{left_rows}, {right_rows}, 0, 0, JoinKind::kInner};
+  auto result = HashJoin(input, &reservation,
+                         std::numeric_limits<size_t>::max(), &scratch);
+  SetSpillPartitionObserverForTesting({});
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_GT(reads.load(std::memory_order_relaxed), 0U);
+  EXPECT_EQ(reads.load(std::memory_order_relaxed),
+            rebuilds.load(std::memory_order_relaxed));
   EXPECT_TRUE(scratch.Cleanup().ok());
 }
 

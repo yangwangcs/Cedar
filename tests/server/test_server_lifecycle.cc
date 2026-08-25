@@ -51,6 +51,10 @@ TEST(ServerLifecycleTest, OwnsOneDatabaseAndStopsIdempotently) {
   EXPECT_TRUE(server.Live());
   EXPECT_TRUE(server.Ready());
   EXPECT_NE(server.port(), 0U);
+  const std::string metrics = server.Metrics();
+  EXPECT_NE(metrics.find("cedar_server_live"), std::string::npos);
+  EXPECT_NE(metrics.find("cedar_query_physical_bytes"), std::string::npos);
+  EXPECT_NE(metrics.find("cedar_commit_submitted"), std::string::npos);
   EXPECT_TRUE(server.Stop().ok());
   EXPECT_TRUE(server.Stop().ok());
   EXPECT_FALSE(server.Live());
@@ -70,6 +74,16 @@ TEST(ServerConfigTest, ParsesAndRejectsUnknownOptions) {
   char bad1[] = "--unknown";
   char* bad_argv[] = {bad0, bad1};
   EXPECT_FALSE(ServerConfig::FromArgs(2, bad_argv).ok());
+
+  char auth0[] = "cedar-server";
+  char auth1[] = "--db";
+  char auth2[] = "/tmp/cedar-server-auth-config";
+  char auth3[] = "--auth-token";
+  char auth4[] = "secret";
+  char* auth_argv[] = {auth0, auth1, auth2, auth3, auth4};
+  const auto authenticated = ServerConfig::FromArgs(5, auth_argv);
+  ASSERT_TRUE(authenticated.ok()) << authenticated.status().ToString();
+  EXPECT_EQ(authenticated.ValueOrDie().auth_token, "secret");
 }
 
 TEST(ServerLifecycleTest, ServesHealthAndCypherPrepareOnOneProcess) {
@@ -133,6 +147,45 @@ TEST(ServerLifecycleTest, AnswersBoundedBoltHelloOnTheSameDatabaseProcess) {
   std::filesystem::remove_all(pattern);
 }
 
+TEST(ServerLifecycleTest, RequiresConfiguredBoltAuthBeforeRequests) {
+  char pattern[] = "/tmp/cedar_server_bolt_auth_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  ServerConfig config;
+  config.database_path = pattern;
+  config.lock_path = std::string(pattern) + ".lock";
+  config.pid_path = std::string(pattern) + ".pid";
+  config.port = 0;
+  config.auth_token = "secret";
+  Server server(config);
+  ASSERT_TRUE(server.Start().ok());
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server.port());
+  ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  const std::string handshake(
+      "\x60\x60\xB0\x17\x00\x00\x04\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 20);
+  ASSERT_EQ(::send(fd, handshake.data(), handshake.size(), 0),
+            static_cast<ssize_t>(handshake.size()));
+  char negotiated[4]{};
+  ASSERT_EQ(::recv(fd, negotiated, sizeof(negotiated), MSG_WAITALL), 4);
+  SendBoltMessage(fd, std::string("\xB1\x10\xA0", 3));
+  const std::string unauthenticated = ReceiveBoltMessage(fd);
+  ASSERT_GE(unauthenticated.size(), 2U);
+  EXPECT_EQ(static_cast<uint8_t>(unauthenticated[1]), 0x7F);
+  const std::string hello = {static_cast<char>(0xB1), static_cast<char>(0x01),
+                             static_cast<char>(0xA1), static_cast<char>(0x8B),
+                             'c', 'r', 'e', 'd', 'e', 'n', 't', 'i', 'a', 'l', 's',
+                             static_cast<char>(0x86), 's', 'e', 'c', 'r', 'e', 't'};
+  SendBoltMessage(fd, hello);
+  EXPECT_EQ(ReceiveBoltMessage(fd), std::string("\xB1\x70\xA0", 3));
+  ::close(fd);
+  ASSERT_TRUE(server.Stop().ok());
+  std::filesystem::remove_all(pattern);
+}
+
 TEST(ServerLifecycleTest, RunsAndPullsThroughStatefulBoltSession) {
   char pattern[] = "/tmp/cedar_server_bolt_session_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
@@ -178,6 +231,20 @@ TEST(ServerLifecycleTest, RunsAndPullsThroughStatefulBoltSession) {
   ASSERT_GE(run_response.size(), 2U);
   EXPECT_EQ(static_cast<uint8_t>(run_response[1]), 0x70);
   SendBoltMessage(fd, std::string("\xB1\x3F\xA0", 3));
+  EXPECT_EQ(ReceiveBoltMessage(fd), std::string("\xB1\x70\xA0", 3));
+
+  SendBoltMessage(fd, std::string("\xB0\x11", 2));
+  EXPECT_EQ(ReceiveBoltMessage(fd), std::string("\xB1\x70\xA0", 3));
+  ASSERT_GE(send_run("CREATE (a)").size(), 2U);
+  const std::string dirty_read = send_run("MATCH (v) RETURN v");
+  ASSERT_GE(dirty_read.size(), 2U);
+  EXPECT_EQ(static_cast<uint8_t>(dirty_read[1]), 0x70);
+  SendBoltMessage(fd, std::string("\xB1\x3F\xA0", 3));
+  const std::string dirty_record = ReceiveBoltMessage(fd);
+  ASSERT_FALSE(dirty_record.empty());
+  EXPECT_EQ(static_cast<uint8_t>(dirty_record[1]), 0x71);
+  EXPECT_EQ(ReceiveBoltMessage(fd), std::string("\xB1\x70\xA0", 3));
+  SendBoltMessage(fd, std::string("\xB0\x13", 2));
   EXPECT_EQ(ReceiveBoltMessage(fd), std::string("\xB1\x70\xA0", 3));
 
   SendBoltMessage(fd, std::string("\xB0\x11", 2));

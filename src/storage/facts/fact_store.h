@@ -167,6 +167,7 @@ struct RocksDbRuntimeMetrics {
   // RocksDB property calls.
   uint64_t point_read_operations = 0;
   uint64_t multi_get_operations = 0;
+  uint64_t multi_get_batches = 0;
   uint64_t projected_scan_rows = 0;
   uint64_t projected_scan_bytes_read = 0;
   uint64_t projected_scan_pages_skipped = 0;
@@ -354,6 +355,7 @@ struct FactColumnarScanOptions {
   std::optional<CommitSeq> event_commit_seq_max;
   std::vector<FactColumnId> projection;
   uint32_t batch_row_limit = 1024;
+  std::optional<uint64_t> max_rows;
 };
 
 class FactStore {

@@ -142,6 +142,7 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   metrics.compression_output_bytes = source.compression_output_bytes;
   metrics.point_read_operations = source.point_read_operations;
   metrics.multi_get_operations = source.multi_get_operations;
+  metrics.multi_get_batches = source.multi_get_batches;
   metrics.projected_scan_rows = source.projected_scan_rows;
   metrics.projected_scan_bytes_read = source.projected_scan_bytes_read;
   metrics.projected_scan_pages_skipped = source.projected_scan_pages_skipped;
@@ -1448,7 +1449,11 @@ void Database::Impl::StopAppendCommitPipeline() {
 }
 
 Database::Database(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
-Database::~Database() { Close().IgnoreError(); }
+Database::Database(std::shared_ptr<Impl> impl, bool close_on_destroy)
+    : impl_(std::move(impl)), close_on_destroy_(close_on_destroy) {}
+Database::~Database() {
+  if (close_on_destroy_) Close().IgnoreError();
+}
 
 class QueryMaintenanceHandle::State {
  public:

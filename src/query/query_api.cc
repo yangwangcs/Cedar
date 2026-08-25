@@ -9,104 +9,16 @@
 
 #include "cedar/query/query.h"
 #include "cedar/query/result.h"
+#include "cedar/transaction.h"
 #include "kernel/database_impl.h"
+#include "query/execution_context.h"
+#include "query/plan_outcome.h"
 #include "query/runtime/query_runtime.h"
 #include "query/planner/query_planner.h"
 #include "query/logical/logical_plan.h"
 
 namespace cedar {
 namespace {
-
-template <typename ImplT>
-StatusOr<internal::PhysicalPlan> BindPhysicalForSnapshot(
-    const std::shared_ptr<ImplT>& database,
-    const std::shared_ptr<const internal::LogicalPlanNode>& root,
-    CommitSeq snapshot_seq, const QueryOptions& options,
-    std::shared_ptr<const internal::QueryDeltaView>* bound_delta,
-    std::optional<internal::ProjectionGeneration>* pinned_generation) {
-  internal::ProjectionCatalogView catalog;
-  if (database->projection_store) {
-    const auto manifest = database->projection_store->current_manifest();
-    if (manifest) catalog = internal::ProjectionCatalogView(*manifest);
-  }
-  internal::QueryDeltaView empty_delta{catalog.base_seq, snapshot_seq, {}, {}, {}, {}};
-  internal::QueryDeltaView delta = empty_delta;
-  bool delta_usable = false;
-  if (database->query_delta) {
-    auto acquired = database->query_delta->AcquireThrough(snapshot_seq);
-    if (acquired.ok()) {
-      delta = std::move(acquired).ConsumeValueOrDie();
-      delta_usable = delta.base_seq == catalog.base_seq &&
-                     delta.through.value >= snapshot_seq.value &&
-                     delta.first_missing.value == 0;
-      if (delta_usable && bound_delta) {
-        *bound_delta = std::make_shared<const internal::QueryDeltaView>(delta);
-      }
-    } else {
-      delta.first_missing = snapshot_seq;
-    }
-  }
-  internal::QueryStatisticsView statistics;
-  if (database->query_statistics && catalog.generation_id != 0) {
-    const auto schema = database->store.SchemaFingerprint();
-    const auto loaded = schema.ok()
-        ? database->query_statistics->Load(catalog.generation_id, catalog.base_seq,
-                                           schema.ValueOrDie())
-        : StatusOr<internal::QueryStatisticsSnapshot>(schema.status());
-    if (loaded.ok() && loaded.ValueOrDie().complete &&
-        !loaded.ValueOrDie().schema_fingerprint.empty()) {
-      statistics.known = true;
-      for (const auto& column : loaded.ValueOrDie().columns) {
-        statistics.candidate_rows += column.rows;
-        statistics.pages += column.pages;
-        statistics.physical_bytes += column.bytes;
-        statistics.interval_fragments += column.interval_count;
-        statistics.fanout += column.edge_count;
-      }
-    }
-  }
-  internal::PlanningContext context{snapshot_seq, catalog, delta, statistics,
-                                    options};
-  context.database_identity = catalog.database_identity;
-  context.schema_epoch = 0;
-  context.allow_delta_merge = delta_usable;
-  auto physical = internal::QueryPlanner::Bind(*root, context);
-  if (!physical.ok() || !pinned_generation || !database->projection_store) {
-    return physical;
-  }
-  for (const auto& slice : physical.ValueOrDie().coverage_slices) {
-    if (slice.source == internal::CoverageSource::kCanonical ||
-        !slice.projection_generation) {
-      continue;
-    }
-    internal::CoverageRequest request;
-    request.kind = slice.kind;
-    request.part_id = slice.part_id;
-    request.property_id = slice.property_id;
-    request.schema_epoch = slice.schema_epoch;
-    request.entity_min = slice.entity_min;
-    request.entity_max_exclusive = slice.entity_max_exclusive;
-    request.valid_time = slice.interval;
-    request.snapshot_seq = snapshot_seq;
-    request.generation_id = slice.projection_generation;
-    request.expected_base_seq = slice.projection_base;
-    request.database_identity = slice.database_identity;
-    auto acquired = database->projection_store->Acquire(request);
-    if (!acquired.has_value()) {
-      return Status::Conflict("query", "projection generation rolled over during planning");
-    }
-    if (pinned_generation->has_value() &&
-        ((*pinned_generation)->generation_id() != acquired->generation_id() ||
-         !(*pinned_generation)->manifest() || !acquired->manifest() ||
-         (*pinned_generation)->manifest()->base_seq != acquired->manifest()->base_seq)) {
-      return Status::Conflict("query", "physical plan spans multiple projection generations");
-    }
-    if (!pinned_generation->has_value()) {
-      *pinned_generation = std::move(acquired);
-    }
-  }
-  return physical;
-}
 
 std::optional<PhysicalType> PhysicalTypeOf(QueryType type) {
   switch (type) {
@@ -230,62 +142,48 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
     return Status::InvalidArgument(
         "query", "snapshot belongs to a different database");
   }
-  if (snapshot.commit_seq().value != 0) {
-    std::shared_ptr<const internal::QueryDeltaView> bound_delta;
-    std::optional<internal::ProjectionGeneration> pinned_generation;
-    auto physical = BindPhysicalForSnapshot(database, state_->logical_root,
-                                            snapshot.commit_seq(), options,
-                                            &bound_delta, &pinned_generation);
+  const bool bounded_system_range =
+      state_->plan.execution_scope.system_time_range.has_value();
+  if (snapshot.commit_seq().value != 0 && !bounded_system_range) {
+    auto binding = internal::QueryExecutionContextFactory::Bind(
+        database, state_->logical_root, snapshot.commit_seq(), options,
+        state_->plan.execution_scope.part_scope);
     // The canonical runtime retains the established handling for unbounded
     // History and synthetic zero-sequence test snapshots. A planner refusal
     // for those shapes must not change their existing execution contract.
-    if (!physical.ok() && !physical.status().IsNotSupportedError() &&
-        !physical.status().IsInvalidArgument()) {
-      return physical.status();
+    if (!binding.ok() && internal::ClassifyPlanStatus(binding.status()) !=
+                           internal::PlanOutcomeKind::kUnsupported &&
+        internal::ClassifyPlanStatus(binding.status()) !=
+            internal::PlanOutcomeKind::kInvalidRequest) {
+      return binding.status();
     }
-    if (physical.ok()) {
+    if (binding.ok()) {
       internal::PreparedQueryPlan execution_plan = state_->plan;
-      execution_plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(
-          physical.ValueOrDie());
-      execution_plan.bound_delta_view = bound_delta;
-      execution_plan.projection_generation = std::move(pinned_generation);
-      const FactFamily family = execution_plan.entity_family;
-      const std::weak_ptr<Database::Impl> weak_database = database;
-      execution_plan.projection_reader =
-          [weak_database, family, snapshot_seq = snapshot.commit_seq(),
-           pinned_generation = execution_plan.projection_generation](
-              const internal::CoverageSlice& slice)
-          -> StatusOr<std::vector<internal::ProjectionChain>> {
-        const auto db = weak_database.lock();
-        if (!db || !db->projection_store) {
-          return Status::NotFound("query", "projection store is unavailable");
+      const auto& bound = binding.ValueOrDie();
+      if (bound.read_binding) {
+        const auto& capsule = *bound.read_binding;
+        execution_plan.physical_plan = capsule.plan_template().physical;
+        if (capsule.plan_template().physical) {
+          execution_plan.safe_read_limit =
+              capsule.plan_template().physical->safe_read_limit;
         }
-        if (!pinned_generation || !pinned_generation->exists()) {
-          return Status::NotFound("query", "pinned projection generation is unavailable");
-        }
-        internal::CoverageRequest request;
-        request.kind = slice.kind;
-        request.part_id = slice.part_id;
-        request.property_id = slice.property_id;
-        request.schema_epoch = slice.schema_epoch;
-        request.entity_min = slice.entity_min;
-        request.entity_max_exclusive = slice.entity_max_exclusive;
-        request.valid_time = slice.interval;
-        request.snapshot_seq = snapshot_seq;
-        request.generation_id = slice.projection_generation;
-        request.expected_base_seq = slice.projection_base;
-        request.database_identity = slice.database_identity;
-        return db->projection_store->ReadChains(request, *pinned_generation);
-      };
-      execution_plan.delta_reader =
-          [weak_database, snapshot_seq = snapshot.commit_seq()]()
-          -> StatusOr<internal::QueryDeltaView> {
-        const auto db = weak_database.lock();
-        if (!db || !db->query_delta) {
-          return Status::NotFound("query", "query delta is unavailable");
-        }
-        return db->query_delta->AcquireThrough(snapshot_seq);
-      };
+        execution_plan.bound_delta_view = capsule.delta_view();
+        execution_plan.bound_delta_lease = capsule.delta_lease();
+        execution_plan.projection_generation = capsule.projection_generation();
+        execution_plan.projection_stats = capsule.projection_stats();
+        execution_plan.projection_reader = capsule.projection_reader();
+        execution_plan.delta_reader = capsule.delta_reader();
+      } else {
+        execution_plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(
+            bound.physical);
+        execution_plan.safe_read_limit = bound.physical.safe_read_limit;
+        execution_plan.bound_delta_view = bound.delta_view;
+        execution_plan.bound_delta_lease = bound.delta_lease;
+        execution_plan.projection_generation = bound.projection_generation;
+        execution_plan.projection_stats = bound.projection_stats;
+        execution_plan.projection_reader = bound.projection_reader;
+        execution_plan.delta_reader = bound.delta_reader;
+      }
       return internal::QueryRuntime::Execute(
           execution_plan, std::move(snapshot), bindings, options,
           database->query_resource_pool.get(),
@@ -316,6 +214,17 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
       &database->query_metrics);
 }
 
+StatusOr<QueryCursor> PreparedQuery::Execute(
+    Transaction& transaction, const Bindings& bindings,
+    const QueryOptions& options) const {
+  if (!state_) return Status::InvalidArgument("prepared query", "moved-from query");
+  const bool historical = state_->plan.execution_scope.system_time_as_of.has_value() ||
+                          state_->plan.execution_scope.system_time_range.has_value();
+  auto snapshot = transaction.BeginReadSnapshot(!historical);
+  if (!snapshot.ok()) return snapshot.status();
+  return Execute(std::move(snapshot).ConsumeValueOrDie(), bindings, options);
+}
+
 StatusOr<std::string> PreparedQuery::ExplainLogical() const {
   if (!state_ || !state_->logical_root) {
     return Status::InvalidArgument("prepared query", "moved-from query");
@@ -330,11 +239,50 @@ StatusOr<std::string> PreparedQuery::ExplainPhysical(
   }
   const auto database = state_->database.lock();
   if (!database) return Status::ShutdownInProgress("query", "database no longer exists");
-  auto plan = BindPhysicalForSnapshot(database, state_->logical_root,
-                                      snapshot.commit_seq(), options, nullptr,
-                                      nullptr);
-  if (!plan.ok()) return plan.status();
-  return internal::QueryPlanner::ExplainPhysical(plan.ValueOrDie());
+  auto binding = internal::QueryExecutionContextFactory::Bind(
+      database, state_->logical_root, snapshot.commit_seq(), options,
+      state_->plan.execution_scope.part_scope);
+  if (!binding.ok()) return binding.status();
+  return internal::QueryPlanner::ExplainPhysical(binding.ValueOrDie().physical);
+}
+
+StatusOr<QueryPhysicalSummary> PreparedQuery::ExplainPhysicalSummary(
+    const Snapshot& snapshot, const QueryOptions& options) const {
+  if (!state_ || !state_->logical_root) {
+    return Status::InvalidArgument("prepared query", "moved-from query");
+  }
+  if (snapshot.commit_seq().value == 0) return QueryPhysicalSummary{};
+  const auto database = state_->database.lock();
+  if (!database) {
+    return Status::ShutdownInProgress("query", "database no longer exists");
+  }
+  auto binding = internal::QueryExecutionContextFactory::Bind(
+      database, state_->logical_root, snapshot.commit_seq(), options,
+      state_->plan.execution_scope.part_scope);
+  if (!binding.ok()) return binding.status();
+  bool projection = false;
+  bool delta = false;
+  bool canonical = false;
+  QueryPhysicalSummary summary;
+  for (const auto& slice : binding.ValueOrDie().physical.coverage_slices) {
+    projection |= slice.source == internal::CoverageSource::kProjection;
+    delta |= slice.source == internal::CoverageSource::kDeltaMerge;
+    canonical |= slice.source == internal::CoverageSource::kCanonical;
+    if (!summary.projection_generation && slice.projection_generation) {
+      summary.projection_generation = slice.projection_generation;
+      summary.projection_base = slice.projection_base;
+    }
+  }
+  const int sources = static_cast<int>(projection) + static_cast<int>(delta) +
+                      static_cast<int>(canonical);
+  if (sources > 1) {
+    summary.source = QueryAccessSource::kMixed;
+  } else if (projection) {
+    summary.source = QueryAccessSource::kProjection;
+  } else if (delta) {
+    summary.source = QueryAccessSource::kDeltaMerge;
+  }
+  return summary;
 }
 
 }  // namespace cedar

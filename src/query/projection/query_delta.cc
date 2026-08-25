@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <tuple>
 #include <unordered_set>
 
 namespace cedar::internal {
@@ -89,13 +90,18 @@ uint64_t QueryDeltaCommit::EstimatedBytes() const {
 
 std::vector<FactEvent> QueryDeltaView::EventsFor(const FactRef& ref) const {
   std::vector<FactEvent> result;
-  for (const FactEvent& event : facts) {
-    if (event.ref == ref) result.push_back(event);
-  }
-  std::sort(result.begin(), result.end(), [](const FactEvent& a, const FactEvent& b) {
-    if (a.valid_from != b.valid_from) return a.valid_from.value < b.valid_from.value;
-    return a.commit_seq.value < b.commit_seq.value;
-  });
+  const auto begin = std::lower_bound(facts.begin(), facts.end(), ref,
+      [](const FactEvent& event, const FactRef& key) {
+        if (event.ref.part_id().value != key.part_id().value)
+          return event.ref.part_id().value < key.part_id().value;
+        if (event.ref.family() != key.family())
+          return static_cast<uint8_t>(event.ref.family()) < static_cast<uint8_t>(key.family());
+        if (event.ref.property_id().value != key.property_id().value)
+          return event.ref.property_id().value < key.property_id().value;
+        return event.ref.entity_id() < key.entity_id();
+      });
+  for (auto current = begin; current != facts.end() && current->ref == ref; ++current)
+    result.push_back(*current);
   return result;
 }
 
@@ -108,6 +114,53 @@ std::vector<EdgeIdentity> QueryDeltaView::EdgeIdentitiesThrough(
     }
   } else {
     result = edge_identities;
+  }
+  return result;
+}
+
+std::vector<FactEvent> QueryDeltaLease::EventsFor(const FactRef& ref) const {
+  std::vector<FactEvent> result;
+  auto range = EventsForRange(ref);
+  if (!range.ok()) return result;
+  result.reserve(range.ValueOrDie().size());
+  for (const FactEvent& event : range.ValueOrDie()) result.push_back(event);
+  return result;
+}
+
+StatusOr<QueryDeltaFactRange> QueryDeltaLease::EventsForRange(
+    const FactRef& ref) const {
+  const auto less = [](const QueryDeltaFactRef& event, const FactRef& key) {
+    return event.ref.part_id().value < key.part_id().value ||
+           (event.ref.part_id().value == key.part_id().value &&
+            (static_cast<uint8_t>(event.ref.family()) <
+                 static_cast<uint8_t>(key.family()) ||
+             (event.ref.family() == key.family() &&
+              (event.ref.property_id().value < key.property_id().value ||
+               (event.ref.property_id().value == key.property_id().value &&
+                event.ref.entity_id() < key.entity_id())))));
+  };
+  const auto begin = std::lower_bound(
+      events_->begin(), events_->end(), ref,
+      [&less](const QueryDeltaFactRef& event, const FactRef& key) {
+        return less(event, key);
+      });
+  size_t begin_index = static_cast<size_t>(begin - events_->begin());
+  size_t end_index = begin_index;
+  while (end_index < events_->size() && (*events_)[end_index].ref == ref) ++end_index;
+  return QueryDeltaFactRange(events_, begin_index, end_index);
+}
+
+std::vector<EdgeIdentity> QueryDeltaLease::EdgeIdentitiesThrough(
+    CommitSeq snapshot) const {
+  std::vector<EdgeIdentity> result;
+  const uint64_t cut = std::min(snapshot.value, through_.value);
+  for (const auto& commit : commits_) {
+    if (!commit || commit->commit_seq.value <= base_seq_.value ||
+        commit->commit_seq.value > cut) {
+      continue;
+    }
+    result.insert(result.end(), commit->edge_identities.begin(),
+                  commit->edge_identities.end());
   }
   return result;
 }
@@ -171,8 +224,21 @@ Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit) {
        memory_bytes_ >= options_.soft_memory_bytes - bytes)) {
     soft_memory_reached_ = true;
   }
-  if (bytes > options_.hard_memory_bytes || memory_bytes_ > options_.hard_memory_bytes - bytes ||
-      commits_.size() >= options_.max_lag_commits) {
+  uint64_t retired_bytes = 0;
+  {
+    std::lock_guard<std::mutex> epoch_lock(epoch_state_->mutex);
+    retired_bytes = epoch_state_->retired_bytes;
+  }
+  bool exceeds_hard_memory = bytes > options_.hard_memory_bytes;
+  if (!exceeds_hard_memory) {
+    uint64_t remaining = options_.hard_memory_bytes - bytes;
+    exceeds_hard_memory = memory_bytes_ > remaining;
+    if (!exceeds_hard_memory) {
+      remaining -= memory_bytes_;
+      exceeds_hard_memory = retired_bytes > remaining;
+    }
+  }
+  if (exceeds_hard_memory || commits_.size() >= options_.max_lag_commits) {
     hard_limit_reached_ = true;
     SetMissingLocked(commit.commit_seq);
     return Status::ResourceExhausted("query delta", "hard memory or lag bound reached");
@@ -190,6 +256,11 @@ Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit) {
     normalized.mutations.clear();
   }
   commits_.push_back(normalized);
+  auto immutable_commit =
+      std::make_shared<const QueryDeltaCommit>(commits_.back());
+  lease_commits_.push_back(immutable_commit);
+  chunks_.push_back(std::make_shared<const DeltaChunk>(
+      DeltaChunk{commit.commit_seq, commit.commit_seq, immutable_commit, bytes}));
   memory_bytes_ += bytes;
   for (const FactEvent& event : normalized.facts) {
     chains_[event.ref].push_back(event);
@@ -385,6 +456,24 @@ Status QueryDelta::RetireThrough(CommitSeq through) {
     if (commit.commit_seq.value > through.value) retained.push_back(commit);
   }
   commits_ = std::move(retained);
+  while (!lease_commits_.empty() &&
+         lease_commits_.front()->commit_seq.value <= through.value) {
+    lease_commits_.pop_front();
+  }
+  while (!chunks_.empty() && chunks_.front()->last.value <= through.value) {
+    {
+      std::lock_guard<std::mutex> epoch_lock(epoch_state_->mutex);
+      epoch_state_->retired.push_back(chunks_.front());
+      epoch_state_->retired_bytes += chunks_.front()->memory_bytes;
+    }
+    chunks_.pop_front();
+  }
+  if (epoch_state_->active_leases.load(std::memory_order_acquire) == 0) {
+    std::lock_guard<std::mutex> epoch_lock(epoch_state_->mutex);
+    epoch_state_->retired.clear();
+    epoch_state_->retired_bytes = 0;
+  }
+  lease_index_cache_.clear();
   chains_.clear();
   edge_identities_.erase(
       std::remove_if(edge_identities_.begin(), edge_identities_.end(),
@@ -424,6 +513,14 @@ Status QueryDelta::ResetBase(CommitSeq base) {
   soft_lag_reached_ = false;
   soft_memory_reached_ = false;
   commits_.clear();
+  lease_index_cache_.clear();
+  lease_commits_.clear();
+  chunks_.clear();
+  {
+    std::lock_guard<std::mutex> epoch_lock(epoch_state_->mutex);
+    epoch_state_->retired.clear();
+    epoch_state_->retired_bytes = 0;
+  }
   chains_.clear();
   edge_identities_.clear();
   published_queue_.clear();
@@ -455,7 +552,102 @@ StatusOr<QueryDeltaView> QueryDelta::AcquireThrough(CommitSeq snapshot) const {
       }
     }
   }
+  std::sort(view.facts.begin(), view.facts.end(), [](const FactEvent& left,
+                                                      const FactEvent& right) {
+    if (left.ref.part_id().value != right.ref.part_id().value)
+      return left.ref.part_id().value < right.ref.part_id().value;
+    if (left.ref.family() != right.ref.family())
+      return static_cast<uint8_t>(left.ref.family()) < static_cast<uint8_t>(right.ref.family());
+    if (left.ref.property_id().value != right.ref.property_id().value)
+      return left.ref.property_id().value < right.ref.property_id().value;
+    if (left.ref.entity_id() != right.ref.entity_id())
+      return left.ref.entity_id() < right.ref.entity_id();
+    return std::tie(left.valid_from.value, left.commit_seq.value) <
+           std::tie(right.valid_from.value, right.commit_seq.value);
+  });
   return view;
+}
+
+StatusOr<std::shared_ptr<const QueryDeltaLease>> QueryDelta::AcquireLeaseThrough(
+    CommitSeq snapshot) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (snapshot.value < options_.base_seq.value) {
+    return Status::InvalidArgument("query delta", "snapshot precedes projection base");
+  }
+  if (snapshot.value > indexed_through_.value ||
+      (first_missing_value_.load(std::memory_order_acquire) != 0 &&
+       first_missing_value_.load(std::memory_order_acquire) <= snapshot.value) ||
+      hard_limit_reached_) {
+    return Status::ResourceExhausted("query delta", "delta is not contiguous through snapshot");
+  }
+  std::vector<std::shared_ptr<const QueryDeltaCommit>> visible;
+  visible.reserve(lease_commits_.size());
+  for (const auto& commit : lease_commits_) {
+    if (commit->commit_seq.value > options_.base_seq.value &&
+        commit->commit_seq.value <= snapshot.value) {
+      visible.push_back(commit);
+    }
+  }
+  std::vector<std::shared_ptr<const DeltaChunk>> visible_chunks;
+  visible_chunks.reserve(chunks_.size());
+  for (const auto& chunk : chunks_) {
+    if (chunk->first.value > options_.base_seq.value &&
+        chunk->last.value <= snapshot.value) {
+      visible_chunks.push_back(chunk);
+    }
+  }
+  epoch_state_->active_leases.fetch_add(1, std::memory_order_acq_rel);
+  auto epoch_token = std::shared_ptr<void>(
+      epoch_state_.get(), [epoch_state = epoch_state_](void*) {
+        if (epoch_state->active_leases.fetch_sub(1, std::memory_order_acq_rel) ==
+            1) {
+          std::lock_guard<std::mutex> epoch_lock(epoch_state->mutex);
+          epoch_state->retired.clear();
+          epoch_state->retired_bytes = 0;
+        }
+      });
+  std::shared_ptr<const std::vector<QueryDeltaFactRef>> immutable_events;
+  const auto cached = lease_index_cache_.find(snapshot.value);
+  if (cached != lease_index_cache_.end()) immutable_events = cached->second.lock();
+  if (!immutable_events) {
+    auto events = std::make_shared<std::vector<QueryDeltaFactRef>>();
+    size_t event_count = 0;
+    for (const auto& commit : visible) event_count += commit->facts.size();
+    events->reserve(event_count);
+    for (const auto& commit : visible) {
+      for (size_t index = 0; index < commit->facts.size(); ++index) {
+        events->push_back(QueryDeltaFactRef{commit->facts[index].ref, commit, index});
+      }
+    }
+    const auto less = [](const QueryDeltaFactRef& a,
+                         const QueryDeltaFactRef& b) {
+      if (a.ref.part_id().value != b.ref.part_id().value)
+        return a.ref.part_id().value < b.ref.part_id().value;
+      if (a.ref.family() != b.ref.family())
+        return static_cast<uint8_t>(a.ref.family()) <
+               static_cast<uint8_t>(b.ref.family());
+      if (a.ref.property_id().value != b.ref.property_id().value)
+        return a.ref.property_id().value < b.ref.property_id().value;
+      if (a.ref.entity_id() != b.ref.entity_id())
+        return a.ref.entity_id() < b.ref.entity_id();
+      const FactEvent& ea = a.commit->facts[a.index];
+      const FactEvent& eb = b.commit->facts[b.index];
+      return std::tie(ea.valid_from.value, ea.commit_seq.value) <
+             std::tie(eb.valid_from.value, eb.commit_seq.value);
+    };
+    std::sort(events->begin(), events->end(), less);
+    immutable_events = std::move(events);
+    lease_index_cache_[snapshot.value] = immutable_events;
+    if (lease_index_cache_.size() > 8) {
+      lease_index_cache_.erase(lease_index_cache_.begin());
+    }
+  }
+  return std::shared_ptr<const QueryDeltaLease>(new QueryDeltaLease(
+      options_.base_seq, snapshot,
+      CommitSeq{first_missing_value_.load(std::memory_order_acquire)},
+      std::move(visible), std::move(visible_chunks),
+      std::move(epoch_token),
+      std::move(immutable_events)));
 }
 
 CommitSeq QueryDelta::base_seq() const { std::lock_guard<std::mutex> l(mutex_); return options_.base_seq; }
@@ -466,7 +658,11 @@ CommitSeq QueryDelta::visible_seq() const {
 CommitSeq QueryDelta::first_missing() const {
   return CommitSeq{first_missing_value_.load(std::memory_order_acquire)};
 }
-uint64_t QueryDelta::memory_bytes() const { std::lock_guard<std::mutex> l(mutex_); return memory_bytes_; }
+uint64_t QueryDelta::memory_bytes() const {
+  std::lock_guard<std::mutex> l(mutex_);
+  std::lock_guard<std::mutex> epoch_lock(epoch_state_->mutex);
+  return memory_bytes_ + epoch_state_->retired_bytes;
+}
 bool QueryDelta::mergeable() const {
   std::lock_guard<std::mutex> l(mutex_);
   return !hard_limit_reached_ &&

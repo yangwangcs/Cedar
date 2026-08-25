@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <set>
@@ -19,6 +20,7 @@
 #include "query/runtime/property_binding.h"
 #include "query/runtime/temporal_source.h"
 #include "query/runtime/graph_frontier.h"
+#include "query/runtime/read_context.h"
 #include "query/runtime/journey.h"
 #include "query/resource/query_scratch.h"
 
@@ -64,6 +66,8 @@ struct RuntimeRow {
   std::optional<PathValue> path;
   std::optional<JourneyValue> journey;
   std::map<uint32_t, FactEvent> metadata_events;
+  std::map<uint32_t, VertexRef> graph_vertices;
+  std::map<uint32_t, EdgeRef> graph_edges;
 };
 
 StatusOr<uint64_t> PropertyPayloadBytes(const RuntimeRow& row) {
@@ -286,13 +290,32 @@ Status PopulateMetadataEvents(
   }
   if (wanted.empty()) return Status::OK();
   std::map<MetadataKey, std::vector<FactEvent>> events;
-  const Status scanned = snapshot.ScanFamily(
-      family, [&wanted, &events](const FactEvent& event) {
-        const MetadataKey key{event.ref.part_id().value, event.ref.entity_id()};
-        if (wanted.find(key) != wanted.end()) events[key].push_back(event);
-        return Status::OK();
-      });
-  if (!scanned.ok()) return scanned;
+  std::map<uint32_t, std::pair<uint64_t, uint64_t>> part_bounds;
+  for (const auto& [part, entity] : wanted) {
+    auto& bounds = part_bounds[part];
+    if (bounds.second == 0 && bounds.first == 0) {
+      bounds = {entity, entity + 1};
+    } else {
+      bounds.first = std::min(bounds.first, entity);
+      bounds.second = std::max(bounds.second, entity + 1);
+    }
+  }
+  for (const auto& [part, bounds] : part_bounds) {
+    FactReadSpec spec;
+    spec.part_scope = PartScope::Exact(PartId{part});
+    spec.family = family;
+    spec.entity_range = EntityRange{bounds.first, bounds.second};
+    spec.commit_seq_max = snapshot.commit_seq();
+    const Status scanned = snapshot.canonical_reader().ReadEvents(
+        spec, [&wanted, &events](const FactEventBatch& batch) {
+          for (const FactEvent& event : batch.events) {
+            const MetadataKey key{event.ref.part_id().value, event.ref.entity_id()};
+            if (wanted.find(key) != wanted.end()) events[key].push_back(event);
+          }
+          return Status::OK();
+        });
+    if (!scanned.ok()) return scanned;
+  }
   for (RuntimeRow& row : *rows) {
     const auto ref = selector(row);
     if (!ref.has_value()) continue;
@@ -322,7 +345,8 @@ Status PopulateMetadataEvents(
 }
 
 StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
-    Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
+    const internal::QueryReadContext& context,
+    const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation = nullptr) {
   std::vector<RuntimeRow> result;
   auto append = [&result, reservation](RuntimeRow row) -> Status {
@@ -338,42 +362,42 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
         using T = std::decay_t<decltype(scope)>;
         if constexpr (std::is_same_v<T, At>) {
           auto rows = internal::TemporalSource::ReadAt(
-              snapshot, plan.entity_family, PropertyId{}, scope.time);
+              context, plan.entity_family, PropertyId{}, scope.time);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
             if (Status status = append({row.ref, row.effective, scope.time, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Events>) {
           auto rows = internal::TemporalSource::ReadEvents(
-              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+              context, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (const internal::EventRow& row : rows.ValueOrDie()) {
             if (Status status = append({row.ref, std::nullopt, row.valid_from, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Changes>) {
           auto rows = internal::TemporalSource::ReadChanges(
-              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+              context, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (const internal::ChangeRow& row : rows.ValueOrDie()) {
             if (Status status = append({row.ref, std::nullopt, row.valid_from, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Overlaps>) {
           auto rows = internal::TemporalSource::ReadOverlaps(
-              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+              context, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
             if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt}); !status.ok()) return status;
           }
         } else if constexpr (std::is_same_v<T, Throughout>) {
           auto rows = internal::TemporalSource::ReadThroughout(
-              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+              context, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
             if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt}); !status.ok()) return status;
           }
         } else {
           auto rows = internal::TemporalSource::ReadHistory(
-              snapshot, plan.entity_family, PropertyId{}, scope.interval);
+              context, plan.entity_family, PropertyId{}, scope.interval);
           if (!rows.ok()) return rows.status();
           for (internal::StateRow& row : rows.ValueOrDie()) {
             if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt}); !status.ok()) return status;
@@ -404,6 +428,11 @@ StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
       if (!plan.delta_reader) return Status::NotFound("query runtime", "delta reader unavailable");
       if (plan.bound_delta_view) {
         delta = *plan.bound_delta_view;
+      } else if (plan.bound_delta_lease) {
+        delta = internal::QueryDeltaView{
+            plan.bound_delta_lease->base_seq(),
+            plan.bound_delta_lease->through(),
+            {}, {}, {}, plan.bound_delta_lease->first_missing()};
       } else {
         auto acquired = plan.delta_reader();
         if (!acquired.ok()) return acquired.status();
@@ -456,8 +485,19 @@ StatusOr<std::vector<RuntimeRow>> ReadProjectionRows(
           return a.commit_seq.value < b.commit_seq.value;
         });
         const FactRef& ref = refs.at(key);
+        std::vector<FactEvent> delta_events;
+        if (plan.bound_delta_lease) {
+          auto range = plan.bound_delta_lease->EventsForRange(ref);
+          if (!range.ok()) return range.status();
+          delta_events.reserve(range.ValueOrDie().size());
+          for (const FactEvent& event : range.ValueOrDie()) {
+            delta_events.push_back(event);
+          }
+        } else {
+          delta_events = delta->EventsFor(ref);
+        }
         auto merged = internal::QueryDelta::MergeBoundaries(
-            base, delta->EventsFor(ref), delta->through);
+            base, delta_events, delta->through);
         if (!merged.ok()) return merged.status();
         for (const auto& state : internal::MaterializePresentState(
                  merged.ValueOrDie())) {
@@ -515,9 +555,19 @@ std::optional<RuntimeRow> ClipRowToInterval(
   return clipped;
 }
 
+bool RowMatchesCoverageSlice(const RuntimeRow& row,
+                             const internal::CoverageSlice& slice) {
+  if (slice.part_bound && row.ref.part_id() != slice.part_id) {
+    return false;
+  }
+  return row.ref.entity_id() >= slice.entity_min &&
+         row.ref.entity_id() < slice.entity_max_exclusive;
+}
+
 StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
-    Snapshot& snapshot, std::vector<RuntimeRow> rows,
-    const std::vector<internal::PreparedPropertyBinding>& bindings) {
+    const internal::QueryReadContext& context, std::vector<RuntimeRow> rows,
+    const std::vector<internal::PreparedPropertyBinding>& bindings,
+    const PartScope& part_scope) {
   // Each binding is a temporal join against the same entity row. Applying
   // them in plan order intersects effective intervals while carrying values
   // already materialized for earlier output slots.
@@ -538,7 +588,7 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
       entities.emplace_back(row.ref, entity_interval, std::nullopt);
     }
     auto bound = internal::PropertyBinder::BindIntervals(
-        snapshot, entities, *binding.definition);
+        context, entities, *binding.definition);
     if (!bound.ok()) return bound.status();
     using RefKey = std::tuple<uint32_t, uint8_t, uint16_t, uint64_t>;
     auto key_for = [](const FactRef& ref) {
@@ -598,8 +648,19 @@ StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
     std::vector<RuntimeRow> bound_rows;
     for (const RuntimeRow& row : rows) {
       std::optional<FactRef> entity_ref;
-      if (plan.graph_source_slot && binding.source == *plan.graph_source_slot &&
-          row.graph_source.has_value()) {
+      // Connected sequences retain every bound vertex/edge in slot maps. Use
+      // those maps first so properties on later segments do not depend on the
+      // legacy first-segment endpoint fields.
+      const auto vertex = row.graph_vertices.find(binding.source.value);
+      const auto edge = row.graph_edges.find(binding.source.value);
+      if (vertex != row.graph_vertices.end()) {
+        entity_ref = FactRef(vertex->second.part_id, FactFamily::kVertexState,
+                             PropertyId{}, vertex->second.vertex_id.value);
+      } else if (edge != row.graph_edges.end()) {
+        entity_ref = FactRef(edge->second.home_part_id, FactFamily::kEdgeState,
+                             PropertyId{}, edge->second.edge_id.value);
+      } else if (plan.graph_source_slot && binding.source == *plan.graph_source_slot &&
+                 row.graph_source.has_value()) {
         entity_ref = FactRef(row.graph_source->part_id, FactFamily::kVertexState,
                              PropertyId{}, row.graph_source->vertex_id.value);
       } else if (plan.graph_edge_slot && binding.source == *plan.graph_edge_slot &&
@@ -621,7 +682,7 @@ StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
       state_rows.emplace_back(*entity_ref, entity_interval, std::nullopt);
     }
     auto properties = internal::PropertyBinder::BindIntervals(
-        snapshot, state_rows, *binding.definition);
+        snapshot, state_rows, *binding.definition, plan.execution_scope.part_scope);
     if (!properties.ok()) return properties.status();
     using RefKey = std::tuple<uint32_t, uint8_t, uint16_t, uint64_t>;
     auto key_for = [](const FactRef& ref) {
@@ -653,6 +714,11 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     const Bindings& bindings,
     internal::QueryReservation* reservation = nullptr) {
+  internal::QueryReadContext read_context{
+      snapshot.canonical_reader(), snapshot.commit_seq(),
+      plan.execution_scope.part_scope, snapshot.adjacency_index(), {},
+      std::make_shared<internal::TemporalChainCache>(), plan.safe_read_limit,
+      plan.execution_scope.system_time_range};
   auto reserve_row = [reservation](const RuntimeRow& row) -> Status {
     if (reservation == nullptr) return Status::OK();
     size_t bytes = sizeof(RuntimeRow);
@@ -681,7 +747,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     // read only for explicit fallback slices or when the derived source is
     // unavailable, preserving mixed-slice behavior without an extra scan.
     if (has_canonical_slice || !have_derived) {
-      rows = ReadSourceRows(snapshot, plan, reservation);
+      rows = ReadSourceRows(read_context, plan, reservation);
       if (!rows.ok()) return rows.status();
     }
     std::vector<RuntimeRow> combined;
@@ -691,6 +757,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
                               ? derived.ValueOrDie()
                               : rows.ValueOrDie();
       for (const auto& row : input) {
+        if (!RowMatchesCoverageSlice(row, slice)) continue;
         auto clipped = ClipRowToInterval(row, slice.interval);
         if (clipped) {
           if (Status status = reserve_row(*clipped); !status.ok()) return status;
@@ -700,7 +767,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     }
     rows = std::move(combined);
   } else {
-    rows = ReadSourceRows(snapshot, plan, reservation);
+    rows = ReadSourceRows(read_context, plan, reservation);
     if (!rows.ok()) return rows.status();
   }
   if (!rows.ok()) return rows.status();
@@ -713,8 +780,8 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     if (!metadata.ok()) return metadata;
   }
   if (!plan.property_bindings.empty()) {
-    rows = BindPropertyRows(snapshot, std::move(rows).ConsumeValueOrDie(),
-                            plan.property_bindings);
+    rows = BindPropertyRows(read_context, std::move(rows).ConsumeValueOrDie(),
+                            plan.property_bindings, plan.execution_scope.part_scope);
     if (!rows.ok()) return rows.status();
     // PropertyBinder materializes string/binary values from the canonical
     // history. Charge the actual payload before any subsequent filtering or
@@ -736,9 +803,25 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
         filtered.push_back(std::move(row));
       }
     }
+    if (plan.limit_count.has_value()) {
+      const size_t offset = plan.limit_offset.value_or(0);
+      const size_t count = *plan.limit_count;
+      const size_t begin = std::min(offset, filtered.size());
+      const size_t end = std::min(filtered.size(), begin + count);
+      filtered.erase(filtered.begin() + end, filtered.end());
+      filtered.erase(filtered.begin(), filtered.begin() + begin);
+    }
     return filtered;
   }
-  return std::move(rows).ConsumeValueOrDie();
+  auto result = std::move(rows).ConsumeValueOrDie();
+  if (plan.limit_count.has_value()) {
+    const size_t offset = plan.limit_offset.value_or(0);
+    const size_t begin = std::min(offset, result.size());
+    const size_t end = std::min(result.size(), begin + *plan.limit_count);
+    result.erase(result.begin() + end, result.end());
+    result.erase(result.begin(), result.begin() + begin);
+  }
+  return result;
 }
 
 StatusOr<ValidTimeInterval> ScopeAsInterval(const TemporalScope& scope) {
@@ -782,7 +865,12 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   }
   auto interval = ScopeAsInterval(plan.scope);
   if (!interval.ok()) return interval.status();
-  auto seeds = ReadSourceRows(snapshot, plan, reservation);
+  internal::QueryReadContext read_context{
+      snapshot.canonical_reader(), snapshot.commit_seq(),
+      plan.execution_scope.part_scope, snapshot.adjacency_index(), {},
+      std::make_shared<internal::TemporalChainCache>(), plan.safe_read_limit,
+      plan.execution_scope.system_time_range};
+  auto seeds = ReadSourceRows(read_context, plan, reservation);
   if (!seeds.ok()) return seeds.status();
   // Graph operators consume the source rows directly, so apply bindings and
   // predicates here before frontier expansion. Otherwise a WHERE clause on a
@@ -798,8 +886,8 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     }
   }
   if (!seed_bindings.empty()) {
-    seeds = BindPropertyRows(snapshot, std::move(seeds).ConsumeValueOrDie(),
-                             seed_bindings);
+    seeds = BindPropertyRows(read_context, std::move(seeds).ConsumeValueOrDie(),
+                             seed_bindings, plan.execution_scope.part_scope);
     if (!seeds.ok()) return seeds.status();
   }
   if (plan.predicate) {
@@ -816,6 +904,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   }
   const internal::QueryDeltaView* delta = plan.bound_delta_view ? plan.bound_delta_view.get() : nullptr;
   internal::GraphFrontierOptions options{reservation, delta, plan.graph_k_hops};
+  options.part_scope = plan.execution_scope.part_scope;
   options.trail = plan.graph_expand.has_value() && plan.graph_expand->trail;
   options.check_abort = check_abort;
   options.adjacency_index = snapshot.adjacency_index();
@@ -828,7 +917,70 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   options.fallback_candidate_limit =
       mode == QueryExecutionMode::kAnalytical ? 0 : 4096;
   std::vector<RuntimeRow> result;
-  for (const RuntimeRow& seed : seeds.ValueOrDie()) {
+  if (plan.graph_sequence.size() > 1) {
+    for (const RuntimeRow& seed : seeds.ValueOrDie()) {
+      std::vector<RuntimeRow> frontier{seed};
+      const VertexRef seed_vertex{seed.ref.part_id(),
+                                  VertexId{seed.ref.entity_id()}};
+      frontier.front().graph_vertices[plan.graph_sequence.front().source.id().value] =
+          seed_vertex;
+      for (size_t segment = 0; segment < plan.graph_sequence.size(); ++segment) {
+        const ExpandSpec& spec = plan.graph_sequence[segment];
+        const uint32_t hops = plan.graph_sequence_hops[segment];
+        std::vector<RuntimeRow> next;
+        for (const RuntimeRow& prior : frontier) {
+          const auto endpoint = prior.graph_vertices.find(spec.source.id().value);
+          if (endpoint == prior.graph_vertices.end()) continue;
+          ValidTimeInterval segment_interval = interval.ValueOrDie();
+          if (prior.effective.has_value()) {
+            auto clipped = internal::Intersect(segment_interval, *prior.effective);
+            if (!clipped.has_value()) continue;
+            segment_interval = *clipped;
+          }
+          internal::GraphExpansionRequest request{{endpoint->second}, segment_interval,
+                                                  spec.direction, spec.edge_type};
+          internal::GraphFrontierOptions segment_options = options;
+          segment_options.max_hops = hops;
+          segment_options.trail = spec.trail;
+          StatusOr<std::vector<internal::TemporalTraversal>> traversals =
+              Status::NotSupported("query runtime", "segment expansion unavailable");
+          if (hops > 1) {
+            auto expanded = KHopExpand(snapshot, request, segment_options);
+            if (!expanded.ok()) return expanded.status();
+            traversals = std::move(expanded).ConsumeValueOrDie().traversals;
+          } else {
+            traversals = ExpandTemporal(snapshot, request, segment_options);
+          }
+          if (!traversals.ok()) return traversals.status();
+          for (const internal::TemporalTraversal& traversal : traversals.ValueOrDie()) {
+            VertexRef destination = traversal.target;
+            if (spec.direction == ExpandDirection::kIn) destination = traversal.source;
+            else if (spec.direction == ExpandDirection::kBoth &&
+                     traversal.source == endpoint->second) destination = traversal.target;
+            else if (spec.direction == ExpandDirection::kBoth) destination = traversal.source;
+            RuntimeRow row = prior;
+            row.effective = internal::Intersect(segment_interval, traversal.effective);
+            if (!row.effective.has_value()) continue;
+            row.ref = FactRef{traversal.edge.home_part_id, FactFamily::kEdgeState,
+                              PropertyId{}, traversal.edge.edge_id.value};
+            row.graph_vertices[spec.source.id().value] = endpoint->second;
+            row.graph_vertices[spec.destination.id().value] = destination;
+            row.graph_edges[spec.edge.id().value] = traversal.edge;
+            row.graph_source = endpoint->second;
+            row.graph_edge = traversal.edge;
+            row.graph_destination = destination;
+            row.graph_edge_type = traversal.edge_type;
+            next.push_back(std::move(row));
+          }
+        }
+        frontier = std::move(next);
+      }
+      result.insert(result.end(), std::make_move_iterator(frontier.begin()),
+                    std::make_move_iterator(frontier.end()));
+    }
+  }
+  if (plan.graph_sequence.size() <= 1) {
+    for (const RuntimeRow& seed : seeds.ValueOrDie()) {
     VertexRef vertex{seed.ref.part_id(), VertexId{seed.ref.entity_id()}};
     ValidTimeInterval expansion_interval = interval.ValueOrDie();
     if (seed.effective.has_value()) {
@@ -966,6 +1118,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
                           traversal.edge_type});
       }
     }
+    }
   }
   if (!plan.metadata_bindings.empty()) {
     if (plan.graph_source_slot) {
@@ -1001,11 +1154,54 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
           }, plan.metadata_bindings);
       if (!status.ok()) return status;
     }
+    // A connected sequence carries every endpoint in the row slot maps. The
+    // legacy source/edge/destination fields intentionally describe only the
+    // first segment, so enrich later segments through the same bounded reader
+    // seam instead of silently dropping their metadata.
+    if (plan.graph_sequence.size() > 1) {
+      std::set<std::tuple<uint32_t, uint8_t>> seen;
+      for (const auto& binding : plan.metadata_bindings) {
+        const auto key = std::tuple{binding.source.value,
+                                    static_cast<uint8_t>(binding.kind)};
+        if (!seen.insert(key).second) continue;
+        const bool vertex_source = std::any_of(
+            result.begin(), result.end(), [&](const RuntimeRow& row) {
+              return row.graph_vertices.find(binding.source.value) !=
+                     row.graph_vertices.end();
+            });
+        const FactFamily family = vertex_source ? FactFamily::kVertexState
+                                                 : FactFamily::kEdgeState;
+        const Status status = PopulateMetadataEvents(
+            snapshot, family, binding.source, &result,
+            [source = binding.source, vertex_source](const RuntimeRow& row)
+                -> std::optional<FactRef> {
+              if (vertex_source) {
+                const auto found = row.graph_vertices.find(source.value);
+                if (found == row.graph_vertices.end()) return std::nullopt;
+                return FactRef(found->second.part_id, FactFamily::kVertexState,
+                               PropertyId{}, found->second.vertex_id.value);
+              }
+              const auto found = row.graph_edges.find(source.value);
+              if (found == row.graph_edges.end()) return std::nullopt;
+              return FactRef(found->second.home_part_id, FactFamily::kEdgeState,
+                             PropertyId{}, found->second.edge_id.value);
+            },
+            plan.metadata_bindings);
+        if (!status.ok()) return status;
+      }
+    }
   }
   if (!plan.property_bindings.empty()) {
     auto bound = BindGraphPropertyRows(snapshot, std::move(result), plan);
     if (!bound.ok()) return bound.status();
-    return std::move(bound).ConsumeValueOrDie();
+    result = std::move(bound).ConsumeValueOrDie();
+  }
+  if (plan.limit_count.has_value()) {
+    const size_t offset = plan.limit_offset.value_or(0);
+    const size_t begin = std::min(offset, result.size());
+    const size_t end = std::min(result.size(), begin + *plan.limit_count);
+    result.erase(result.begin() + end, result.end());
+    result.erase(result.begin(), result.begin() + begin);
   }
   return result;
 }
@@ -1113,6 +1309,16 @@ StatusOr<std::vector<QueryColumn>> BuildColumns(
     for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
       QueryColumn* column = &columns[column_index];
       const RowColumn& output = plan.output_columns[column_index];
+      if (const auto vertex = row.graph_vertices.find(output.slot.value);
+          vertex != row.graph_vertices.end()) {
+        Append(column, vertex->second, true);
+        continue;
+      }
+      if (const auto edge = row.graph_edges.find(output.slot.value);
+          edge != row.graph_edges.end()) {
+        Append(column, edge->second, true);
+        continue;
+      }
       if (plan.graph_path_slot && output.slot == *plan.graph_path_slot) {
         if (!row.path) return Status::Corruption("query", "graph path is unavailable");
         path_values.push_back(*row.path);
@@ -1590,6 +1796,64 @@ void QueryExecutionState::RecordBatch(uint64_t rows, uint64_t decoded_bytes,
   }
 }
 
+void QueryExecutionState::RecordStorageRead(uint64_t physical_bytes,
+                                             uint64_t decoded_bytes,
+                                             uint64_t pages,
+                                             uint64_t pages_skipped,
+                                             uint32_t operator_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = std::find_if(profile_.operators.begin(), profile_.operators.end(),
+                         [operator_id](const QueryOperatorProfile& value) {
+                           return value.operator_id == operator_id;
+                         });
+  if (it == profile_.operators.end()) {
+    profile_.operators.push_back(QueryOperatorProfile{});
+    it = std::prev(profile_.operators.end());
+    it->operator_id = operator_id;
+  }
+  it->physical_bytes += physical_bytes;
+  it->decoded_bytes += decoded_bytes;
+  it->pages += pages;
+  it->pages_skipped += pages_skipped;
+}
+
+void QueryExecutionState::RecordCatalogLookup(bool hit) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (hit) {
+    ++profile_.complexity.catalog_hits;
+  } else {
+    ++profile_.complexity.catalog_misses;
+  }
+}
+
+void QueryExecutionState::RecordChainSortFallback(uint64_t events_decoded) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.chain_sort_fallbacks;
+  profile_.complexity.chain_events_decoded += events_decoded;
+}
+
+void QueryExecutionState::RecordPageDirectory(bool hit, uint64_t pages_pruned) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (hit) ++profile_.complexity.page_directory_hits;
+  profile_.complexity.page_pruned += pages_pruned;
+}
+
+void QueryExecutionState::RecordSpillPartitionRead(bool rebuilt) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.spill_partition_reads;
+  if (rebuilt) ++profile_.complexity.spill_partition_rebuilds;
+}
+
+void QueryExecutionState::RecordLimitEarlyStop() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.limit_early_stops;
+}
+
+void QueryExecutionState::RecordMaterializationBytes(uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  profile_.complexity.materialization_bytes += bytes;
+}
+
 class QueryCursor::State {
  public:
   struct TerminalError {
@@ -1908,6 +2172,13 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
       state_->snapshot.reset();
       return *state_->terminal_error;
     }
+    if (state_->plan.projection_stats) {
+      const auto& stats = *state_->plan.projection_stats;
+      state_->execution->RecordStorageRead(stats.physical_bytes,
+                                           stats.decoded_bytes,
+                                           stats.pages_read,
+                                           stats.pages_skipped);
+    }
     const size_t row_count = rows.ValueOrDie().size();
     if (row_count > state_->options.budget.output_rows) {
       state_->terminal_error = Status::ResourceExhausted(
@@ -2173,8 +2444,23 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   }
 
   PreparedQueryPlan plan;
+  if (query.execution_scope().has_value()) {
+    plan.execution_scope = *query.execution_scope();
+  }
   plan.output_columns = root->schema().columns();
   CollectMetadata(*root, &plan);
+  // LIMIT is represented explicitly in the logical tree. Keep its semantics
+  // in the prepared plan while allowing the planner to prove a safe reader
+  // pushdown for the direct canonical-scan shape only.
+  if (root->kind() == LogicalOpKind::kLimit) {
+    if (root->inputs().size() != 1 || !root->limit_offset().has_value() ||
+        !root->limit_count().has_value()) {
+      return Status::Corruption("query planner", "malformed LIMIT node");
+    }
+    plan.limit_offset = root->limit_offset();
+    plan.limit_count = root->limit_count();
+    root = root->inputs().front().get();
+  }
 
   // Graph operators retain the source temporal scope from their vertex scan;
   // unlike the simple canonical scan shape they are executed by the frontier
@@ -2199,7 +2485,30 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   find_graph(root);
   if (graph != nullptr && graph->expand_spec().has_value() &&
       !graph->inputs().empty()) {
-    const ExpandSpec& spec = *graph->expand_spec();
+    std::vector<const LogicalPlanNode*> graph_nodes;
+    const LogicalPlanNode* cursor = graph;
+    while (cursor != nullptr && cursor->expand_spec().has_value()) {
+      graph_nodes.push_back(cursor);
+      if (cursor->inputs().empty()) break;
+      const LogicalPlanNode* input = cursor->inputs().front().get();
+      if (input->kind() != LogicalOpKind::kExpandOut &&
+          input->kind() != LogicalOpKind::kExpandIn &&
+          input->kind() != LogicalOpKind::kExpandBoth &&
+          input->kind() != LogicalOpKind::kKHopExpand &&
+          input->kind() != LogicalOpKind::kCoexistingShortestPath &&
+          input->kind() != LogicalOpKind::kEarliestArrival &&
+          input->kind() != LogicalOpKind::kLatestDeparture &&
+          input->kind() != LogicalOpKind::kFastestDuration) {
+        break;
+      }
+      cursor = input;
+    }
+    std::reverse(graph_nodes.begin(), graph_nodes.end());
+    for (const LogicalPlanNode* node : graph_nodes) {
+      plan.graph_sequence.push_back(*node->expand_spec());
+      plan.graph_sequence_hops.push_back(node->max_hops());
+    }
+    const ExpandSpec& spec = plan.graph_sequence.front();
     plan.graph_expand = spec;
     plan.graph_source_slot = spec.source.id();
     plan.graph_edge_slot = spec.edge.id();
@@ -2258,7 +2567,9 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   }
   const LogicalPlanNode* node = root->inputs().front().get();
   if (node->kind() == LogicalOpKind::kFilter) {
-    if (node->inputs().size() != 1 || !node->predicate()) return plan;
+    if (node->inputs().size() != 1 || !node->predicate()) {
+      return plan;
+    }
     plan.predicate = node->predicate();
     node = node->inputs().front().get();
   }
@@ -2267,12 +2578,18 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   // chain before validating the underlying temporal scan.
   while (node->kind() == LogicalOpKind::kBindProperty ||
          node->kind() == LogicalOpKind::kMetadataProject) {
-    if (node->inputs().size() != 1) return plan;
+    if (node->inputs().size() != 1) {
+      return plan;
+    }
     node = node->inputs().front().get();
   }
-  if (node->inputs().size() != 1 || !node->scope().has_value()) return plan;
+  if (node->inputs().size() != 1 || !node->scope().has_value()) {
+    return plan;
+  }
   const LogicalPlanNode& scan = *node->inputs().front();
-  if (!scan.inputs().empty() || scan.schema().columns().size() != 1) return plan;
+  if (!scan.inputs().empty() || scan.schema().columns().size() != 1) {
+    return plan;
+  }
   if (scan.kind() == LogicalOpKind::kVertexScan) {
     plan.entity_family = FactFamily::kVertexState;
   } else if (scan.kind() == LogicalOpKind::kEdgeScan) {
@@ -2284,7 +2601,9 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   const QueryType expected = plan.entity_family == FactFamily::kVertexState
                                  ? QueryType::kVertexRef
                                  : QueryType::kEdgeRef;
-  if (entity.type != expected || entity.optional) return plan;
+  if (entity.type != expected || entity.optional) {
+    return plan;
+  }
   plan.entity_slot = entity.slot;
   plan.scope = *node->scope();
   if (!std::all_of(plan.output_columns.begin(), plan.output_columns.end(),

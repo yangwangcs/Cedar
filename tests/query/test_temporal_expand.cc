@@ -445,6 +445,86 @@ TEST(TemporalExpandTest, GraphMaterializesSourceEdgeAndDestinationProperties) {
   std::filesystem::remove_all(path);
 }
 
+TEST(TemporalExpandTest,
+     ConnectedSequenceMaterializesLaterSegmentPropertiesAndMetadata) {
+  char pattern[] = "/tmp/cedar_temporal_graph_sequence_properties_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  ASSERT_TRUE(database.ValueOrDie()
+                  ->RegisterProperty(PropertyDefinition{
+                      PropertyId{20}, 0, "destination_score",
+                      PropertyEntityKind::kVertex, PhysicalType::kInt64, 4096})
+                  .ok());
+  const VertexRef a{PartId{0}, VertexId{1}};
+  const VertexRef b{PartId{0}, VertexId{2}};
+  const VertexRef c{PartId{0}, VertexId{3}};
+  const EdgeRef e{PartId{0}, EdgeId{20}};
+  const EdgeRef f{PartId{0}, EdgeId{21}};
+  auto transaction = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (const VertexRef vertex : {a, b, c}) {
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(vertex), ValidTime{0})
+                    .ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EdgeIdentity{e, a, b, 1}, ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EdgeIdentity{f, b, c, 2}, ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(c, PropertyId{20}), ValidTime{0},
+                        Value::Int64(303))
+                  .ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> a_slot = Slot<VertexRef>::Named("a");
+  Slot<EdgeRef> e_slot = Slot<EdgeRef>::Named("e");
+  Slot<VertexRef> b_slot = Slot<VertexRef>::Named("b");
+  Slot<EdgeRef> f_slot = Slot<EdgeRef>::Named("f");
+  Slot<VertexRef> c_slot = Slot<VertexRef>::Named("c");
+  OptionalSlot<int64_t> c_score = OptionalSlot<int64_t>::Named("c_score");
+  Slot<ValidTime> c_valid_from = Slot<ValidTime>::Named("c_valid_from");
+  auto source = Query::Vertices(a_slot, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto first = source.ValueOrDie().Expand(
+      ExpandSpec{a_slot, e_slot, b_slot, ExpandDirection::kOut, 1});
+  ASSERT_TRUE(first.ok());
+  auto second = first.ValueOrDie().Expand(
+      ExpandSpec{b_slot, f_slot, c_slot, ExpandDirection::kOut, 2});
+  ASSERT_TRUE(second.ok());
+  auto with_property = second.ValueOrDie().BindVertexProperty(
+      c_slot, PropertyId{20}, c_score);
+  ASSERT_TRUE(with_property.ok());
+  auto with_metadata = with_property.ValueOrDie().ProjectMetadata(
+      c_slot.id(), MetadataKind::kValidFrom, Project(c_valid_from));
+  ASSERT_TRUE(with_metadata.ok());
+  auto query = with_metadata.ValueOrDie().Select(
+      {Project(a_slot), Project(e_slot), Project(b_slot), Project(f_slot),
+       Project(c_slot), Project(c_score), Project(c_valid_from)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database.ValueOrDie()->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<VertexRef>(c_slot, 0), c);
+  EXPECT_EQ(batch.ValueOrDie()->Get<EdgeRef>(f_slot, 0), f);
+  EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(c_score, 0), 303);
+  EXPECT_EQ(batch.ValueOrDie()->Get<ValidTime>(c_valid_from, 0), ValidTime{0});
+  database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
 TEST(TemporalExpandTest, SourcePropertyPredicateDoesNotDuplicateTemporalExpansion) {
   char pattern[] = "/tmp/cedar_temporal_expand_property_predicate_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

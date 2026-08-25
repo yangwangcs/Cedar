@@ -4,6 +4,7 @@
 #include <barrier>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -19,6 +20,12 @@ StatusOr<CommitHandle> WriteVertexAsync(Database* database, uint64_t id) {
       EntityFact::Vertex({PartId{1}, VertexId{id}}), ValidTime{1});
   if (!asserted.ok()) return asserted;
   return transaction.ValueOrDie()->CommitAsync();
+}
+
+bool IsStalePressureAdmission(const Status& status) {
+  return status.IsResourceExhausted() &&
+         status.ToString().find("runtime pressure snapshot is stale") !=
+             std::string::npos;
 }
 
 }  // namespace
@@ -125,20 +132,29 @@ BoundedWriterResult RunFixedWriters(Database* database, uint32_t clients,
   workers.reserve(clients);
   for (uint32_t index = 0; index < clients; ++index) {
     workers.emplace_back([&] {
-      start_line.arrive_and_wait();
-      for (uint32_t commit = 0; commit < commits_per_client; ++commit) {
-        attempted.fetch_add(1, std::memory_order_relaxed);
-        auto handle = WriteVertexAsync(database, next_id.fetch_add(1));
-        Status status = handle.ok() ? Status::OK() : handle.status();
-        if (status.ok()) {
-          StatusOr<CommitResult> completed_result =
-              std::move(handle).ConsumeValueOrDie().Wait();
-          if (!completed_result.ok()) {
-            status = completed_result.status();
-          } else if (completed_result.ValueOrDie().outcome !=
-                     CommitOutcome::kCommitted) {
-            status = completed_result.ValueOrDie().status;
+    start_line.arrive_and_wait();
+    for (uint32_t commit = 0; commit < commits_per_client; ++commit) {
+        Status status;
+        for (;;) {
+          attempted.fetch_add(1, std::memory_order_relaxed);
+          auto handle = WriteVertexAsync(database, next_id.fetch_add(1));
+          status = handle.ok() ? Status::OK() : handle.status();
+          if (status.ok()) {
+            StatusOr<CommitResult> completed_result =
+                std::move(handle).ConsumeValueOrDie().Wait();
+            if (!completed_result.ok()) {
+              status = completed_result.status();
+            } else if (completed_result.ValueOrDie().outcome !=
+                       CommitOutcome::kCommitted) {
+              status = completed_result.ValueOrDie().status;
+            }
           }
+          // A sampler tick can race this intentionally high-concurrency
+          // benchmark. The request has not entered the append path in this
+          // case, so retry only this freshness admission result. Pressure,
+          // queue, and durability failures remain hard benchmark failures.
+          if (!IsStalePressureAdmission(status)) break;
+          std::this_thread::yield();
         }
         if (!status.ok()) {
           failures.fetch_add(1, std::memory_order_relaxed);

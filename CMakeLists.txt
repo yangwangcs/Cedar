@@ -59,12 +59,16 @@ add_library(cedar_core STATIC
     src/query/logical/expression.cc
     src/query/logical/logical_plan.cc
     src/query/query_api.cc
+    src/query/execution_context.cc
     src/query/runtime/canonical_source.cc
     src/query/runtime/property_binding.cc
     src/query/runtime/query_runtime.cc
     src/query/runtime/graph_frontier.cc
     src/query/runtime/journey.cc
     src/query/runtime/temporal_source.cc
+    src/query/runtime/fact_chain_cursor.cc
+    src/query/read/read_catalog.cc
+    src/query/read/read_binding_capsule.cc
     src/query/runtime/vector_kernels.cc
     src/query/runtime/relational.cc
     src/query/resource/query_resource_pool.cc
@@ -73,15 +77,20 @@ add_library(cedar_core STATIC
     src/query/projection/projection_format.cc
     src/query/projection/projection_manifest.cc
     src/query/projection/projection_store.cc
+    src/query/projection/projection_page_reader.cc
     src/query/projection/query_delta.cc
     src/query/observability/query_metrics.cc
     src/query/planner/query_planner.cc
     src/cypher/lexer.cc
     src/cypher/parser.cc
     src/cypher/fingerprint.cc
+    src/cypher/relationship_type.cc
+    src/cypher/access_profile.cc
     src/cypher/binder.cc
     src/cypher/compiler.cc
     src/cypher/api.cc
+    src/cypher/session.cc
+    src/cypher/schema_manifest.cc
     src/cypher/write.cc
     src/server/server.cc
     src/server/bolt_codec.cc
@@ -158,6 +167,26 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(cedar_query_bench PRIVATE cedar_query_bench_options cedar_query_bench_workload)
     add_executable(cedar_tcypher_fusion_bench benchmarks/cedar_tcypher_fusion_bench.cc)
     target_link_libraries(cedar_tcypher_fusion_bench PRIVATE cedar_core)
+    add_executable(cedar_tcypher_optimization_bench
+        benchmarks/cedar_tcypher_optimization_bench.cc)
+    target_include_directories(cedar_tcypher_optimization_bench PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(cedar_tcypher_optimization_bench PRIVATE cedar_core)
+    add_executable(cedar_query_storage_read_bench
+        benchmarks/cedar_query_storage_read_bench.cc)
+    target_include_directories(cedar_query_storage_read_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(cedar_query_storage_read_bench PRIVATE cedar_core)
+    add_executable(cedar_read_side_complexity_bench
+        benchmarks/cedar_read_side_complexity_bench.cc)
+    target_include_directories(cedar_read_side_complexity_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(cedar_read_side_complexity_bench PRIVATE cedar_core)
+    add_executable(cedar_temporal_range_profile
+        benchmarks/cedar_temporal_range_profile.cc)
+    target_include_directories(cedar_temporal_range_profile PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(cedar_temporal_range_profile PRIVATE cedar_core)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets

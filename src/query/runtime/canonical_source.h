@@ -7,13 +7,15 @@
 #include <vector>
 
 #include "cedar/snapshot.h"
+#include "cedar/fact/read_spec.h"
 
 namespace cedar::internal {
 
 class CanonicalSource {
  public:
   static StatusOr<std::vector<VertexRef>> ReadVerticesAt(
-      Snapshot& snapshot, ValidTime valid_time);
+      Snapshot& snapshot, ValidTime valid_time,
+      const PartScope& part_scope = PartScope::All());
 };
 
 }  // namespace cedar::internal

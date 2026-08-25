@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -57,11 +58,17 @@ struct RelationalCell {
 struct RelationalRow {
   std::vector<RelationalCell> cells;
   std::optional<ValidTimeInterval> effective;
-  bool operator==(const RelationalRow&) const = default;
+  mutable std::optional<size_t> cached_hash;
+  bool operator==(const RelationalRow& other) const {
+    return cells == other.cells && effective == other.effective;
+  }
 };
 
 class QueryReservationLease;
 class QueryScratch;
+
+using SpillPartitionObserver = std::function<void(bool rebuilt)>;
+void SetSpillPartitionObserverForTesting(SpillPartitionObserver observer);
 
 // Test seam for validating framed spill decoding without requiring a full
 // physical join to manufacture a malformed run.

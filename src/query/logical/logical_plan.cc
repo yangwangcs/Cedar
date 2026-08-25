@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <limits>
 
 namespace cedar {
 namespace {
@@ -357,6 +358,15 @@ StatusOr<Query> Query::Select(std::vector<Projection> projections) const {
                       RowSchema(std::move(columns))));
 }
 
+StatusOr<Query> Query::Limit(size_t offset, size_t count) const {
+  if (!root_) return Status::InvalidArgument("query has no logical plan");
+  internal::LogicalPlanPayload payload;
+  payload.limit_offset = offset;
+  payload.limit_count = count;
+  return Query(Append(internal::LogicalOpKind::kLimit, root_, schema(),
+                      std::move(payload)));
+}
+
 StatusOr<Query> Query::ProjectMetadata(SlotId source, MetadataKind kind,
                                        Projection output) const {
   if (!root_ || source.value == 0 || output.column.slot.value == 0 ||
@@ -384,6 +394,12 @@ StatusOr<Query> Query::ProjectMetadata(SlotId source, MetadataKind kind,
 const RowSchema& Query::schema() const {
   static const RowSchema empty;
   return root_ ? root_->schema() : empty;
+}
+
+Query Query::WithExecutionScope(ExecutionScope scope) const {
+  Query result(root_);
+  result.execution_scope_ = std::move(scope);
+  return result;
 }
 
 }  // namespace cedar

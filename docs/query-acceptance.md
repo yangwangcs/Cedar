@@ -1,6 +1,6 @@
 # Cedar Bitemporal Query Acceptance Evidence
 
-Date: 2026-08-24
+Date: 2026-08-25
 
 This document summarizes the correctness, recovery, sanitizer, projection, and
 long-running evidence for the Cedar bitemporal query system on `main`. It is a
@@ -31,7 +31,7 @@ The following gates passed in the recorded Release/Debug evidence:
 
 | Gate | Result | Interpretation |
 | --- | --- | --- |
-| Debug CTest | `711/711` passed | Full debug suite for the recorded build |
+| Debug CTest | `812/812` passed | Full debug suite for the recorded build, including temporal range, connected sequence, and transaction overlay reads |
 | ASAN query/projection/temporal/vacuum suite | `254/254` passed | Leak detection disabled on macOS; no claim of LeakSanitizer coverage |
 | UBSAN query/projection/temporal/vacuum suite | `255/255` passed | No UBSAN failure in the focused suite |
 | TSAN lifecycle/delta/projection/crash/vacuum suite | `51/51` passed | No reported data race in the focused suite |
@@ -40,6 +40,11 @@ The following gates passed in the recorded Release/Debug evidence:
 | Public header/install/embedded-engine contracts | `3/3` passed | Consumer-facing boundary remains intact |
 | Reopen verification | `10/10` passed | Persisted databases reopened and facts/checksums matched |
 | Space audit | `10/10` passed | Zero scratch bytes after reopen; projection bound satisfied |
+
+The additional temporal-range profile gate passed in both Debug and Release
+with zero errors. Its fixture-level throughput and latency are recorded in the
+[development-host performance report](query-performance.md); it is not a
+hardware-independent service capacity claim.
 
 On the recorded development host, the long-running mixed campaign exceeded
 1,800 seconds. It used 32 writers, 32 readers, active maintenance, and

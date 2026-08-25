@@ -8,16 +8,21 @@
 #include "cedar/cypher/compiler.h"
 #include "cedar/database.h"
 
+namespace cedar { class Transaction; }
+
 namespace cedar::cypher {
 
 class PreparedCypher {
  public:
   PreparedCypher(PreparedCypher&&) noexcept = default;
   PreparedCypher& operator=(PreparedCypher&&) noexcept = default;
-  PreparedCypher(const PreparedCypher&) = delete;
-  PreparedCypher& operator=(const PreparedCypher&) = delete;
+  PreparedCypher(const PreparedCypher&) = default;
+  PreparedCypher& operator=(const PreparedCypher&) = default;
 
   StatusOr<QueryCursor> Execute(Snapshot snapshot, const Bindings& bindings,
+                                const QueryOptions& options = {}) const;
+  StatusOr<QueryCursor> Execute(Transaction& transaction,
+                                const Bindings& bindings,
                                 const QueryOptions& options = {}) const;
   uint64_t fingerprint() const { return bound_.fingerprint; }
   // Query text is deliberately not retained by the prepared object.
@@ -25,14 +30,14 @@ class PreparedCypher {
   const BoundStatement& bound_statement() const { return bound_; }
 
  private:
-  PreparedCypher(PreparedQuery prepared, BoundStatement bound, Database* database)
-      : prepared_(std::move(prepared)), bound_(std::move(bound)), database_(database) {}
+  PreparedCypher(PreparedQuery prepared, BoundStatement bound)
+      : prepared_(std::move(prepared)), bound_(std::move(bound)) {}
 
   PreparedQuery prepared_;
   BoundStatement bound_;
-  Database* database_ = nullptr;
   friend StatusOr<PreparedCypher> PrepareCypher(
       Database&, const std::string&, const SchemaCatalog&, BinderOptions);
+  friend class CypherSession;
 };
 
 StatusOr<PreparedCypher> PrepareCypher(

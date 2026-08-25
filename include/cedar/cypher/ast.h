@@ -47,9 +47,11 @@ struct Assignment {
 };
 
 enum class StatementKind : uint8_t { kRead, kWrite };
+enum class StatementHead : uint8_t { kMatch, kCreate };
 
 struct Statement {
   StatementKind kind = StatementKind::kRead;
+  StatementHead head = StatementHead::kMatch;
   std::optional<std::string> graph;
   std::optional<TimeScope> valid_time;
   std::optional<TimeScope> system_time;

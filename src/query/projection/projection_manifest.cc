@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <map>
+#include <queue>
 #include <set>
 
 #include "cedar/core/crc32c.h"
@@ -19,6 +23,63 @@ void PutString(std::string* s, const std::string& v) { P32(s, uint32_t(v.size())
 bool GetString(const std::string& s, size_t* p, std::string* v) { uint32_t n = 0; if (!G32(s, p, &n) || n > s.size() - *p) return false; *v = s.substr(*p, n); *p += n; return true; }
 void PutHeader(std::string* s, const ProjectionHeader& h) { s->push_back(char(h.kind)); P64(s, h.generation_id); P64(s, h.base_seq.value); P32(s, h.part_id.value); P16(s, h.property_id.value); P32(s, h.schema_epoch); P64(s, h.entity_min); P64(s, h.entity_max_exclusive); P64(s, h.valid_from_min.value); s->push_back(char(h.valid_to_max.has_value())); P64(s, h.valid_to_max ? h.valid_to_max->value : 0); }
 bool GetHeader(const std::string& s, size_t* p, ProjectionHeader* h) { uint8_t kind = 0; uint64_t x = 0; uint32_t p32 = 0; uint16_t p16 = 0; if (*p >= s.size()) return false; kind = uint8_t(s[(*p)++]); h->kind = ProjectionKind(kind); if (!G64(s,p,&h->generation_id) || !G64(s,p,&h->base_seq.value) || !G32(s,p,&p32) || !G16(s,p,&p16) || !G32(s,p,&h->schema_epoch) || !G64(s,p,&h->entity_min) || !G64(s,p,&h->entity_max_exclusive) || !G64(s,p,&h->valid_from_min.value) || *p >= s.size()) return false; h->part_id = PartId{p32}; h->property_id = PropertyId{p16}; uint8_t has = uint8_t(s[(*p)++]); if (has > 1 || !G64(s,p,&x)) return false; h->valid_to_max = has ? std::optional<ValidTime>(ValidTime{x}) : std::nullopt; return true; }
+
+struct CoverageKey {
+  ProjectionKind kind;
+  PartId part;
+  std::optional<PropertyId> property;
+  uint32_t epoch;
+  bool operator<(const CoverageKey& other) const {
+    if (kind != other.kind) return kind < other.kind;
+    if (part.value != other.part.value) return part.value < other.part.value;
+    if (property.has_value() != other.property.has_value()) return property.has_value() < other.property.has_value();
+    if (property && property->value != other.property->value) return property->value < other.property->value;
+    return epoch < other.epoch;
+  }
+};
+
+class ValidIntervalTree {
+ public:
+  ~ValidIntervalTree() { Clear(root_); }
+  bool Overlaps(uint64_t from, uint64_t to) const { return Overlaps(root_, from, to); }
+  void Insert(uint64_t from, uint64_t to, uint64_t id) { root_ = Insert(root_, new Node{{from, id}, to, Priority(from, id)}); }
+  void Erase(uint64_t from, uint64_t id) { root_ = Erase(root_, Key{from, id}); }
+ private:
+  struct Key { uint64_t from; uint64_t id; bool operator<(const Key& o) const { return from < o.from || (from == o.from && id < o.id); } };
+  struct Node { Key key; uint64_t to; uint64_t priority; uint64_t max_to; Node* left = nullptr; Node* right = nullptr; Node(Key k, uint64_t e, uint64_t p) : key(k), to(e), priority(p), max_to(e) {} };
+  static uint64_t Priority(uint64_t from, uint64_t id) { uint64_t x = from ^ (id + 0x9e3779b97f4a7c15ULL + (from << 6) + (from >> 2)); x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL; x ^= x >> 27; return x ^ (x >> 31); }
+  static uint64_t Max(const Node* n) { return n ? n->max_to : 0; }
+  static void Pull(Node* n) { if (n) n->max_to = std::max(n->to, std::max(Max(n->left), Max(n->right))); }
+  static Node* Right(Node* n) { Node* x = n->left; n->left = x->right; x->right = n; Pull(n); Pull(x); return x; }
+  static Node* Left(Node* n) { Node* x = n->right; n->right = x->left; x->left = n; Pull(n); Pull(x); return x; }
+  static Node* Insert(Node* root, Node* node) { if (!root) return node; if (node->key < root->key) { root->left = Insert(root->left, node); if (root->left->priority > root->priority) root = Right(root); } else { root->right = Insert(root->right, node); if (root->right->priority > root->priority) root = Left(root); } Pull(root); return root; }
+  static Node* Merge(Node* left, Node* right) { if (!left) return right; if (!right) return left; if (left->priority > right->priority) { left->right = Merge(left->right, right); Pull(left); return left; } right->left = Merge(left, right->left); Pull(right); return right; }
+  static Node* Erase(Node* root, Key key) { if (!root) return nullptr; if (root->key.from == key.from && root->key.id == key.id) { Node* merged = Merge(root->left, root->right); delete root; return merged; } if (key < root->key) root->left = Erase(root->left, key); else root->right = Erase(root->right, key); Pull(root); return root; }
+  static bool Overlaps(const Node* root, uint64_t from, uint64_t to) { if (!root || root->max_to <= from) return false; if (root->left && Overlaps(root->left, from, to)) return true; if (root->key.from < to && root->to > from) return true; return root->key.from < to && Overlaps(root->right, from, to); }
+  static void Clear(Node* n) { if (!n) return; Clear(n->left); Clear(n->right); delete n; }
+  Node* root_ = nullptr;
+};
+
+Status ValidateRegionOverlap(const std::vector<CoverageRegion>& regions) {
+  std::map<CoverageKey, std::vector<const CoverageRegion*>> grouped;
+  for (const auto& region : regions) grouped[{region.kind, region.part_id, region.property_id, region.schema_epoch}].push_back(&region);
+  for (auto& [key, values] : grouped) {
+    (void)key;
+    std::sort(values.begin(), values.end(), [](const auto* a, const auto* b) { if (a->entity_min != b->entity_min) return a->entity_min < b->entity_min; if (a->entity_max_exclusive != b->entity_max_exclusive) return a->entity_max_exclusive < b->entity_max_exclusive; return a->valid_time.from.value < b->valid_time.from.value; });
+    struct Expiration { uint64_t entity_end; uint64_t valid_start; uint64_t id; bool operator>(const Expiration& o) const { return entity_end > o.entity_end; } };
+    std::priority_queue<Expiration, std::vector<Expiration>, std::greater<Expiration>> queue;
+    ValidIntervalTree active;
+    for (uint64_t id = 0; id < values.size(); ++id) {
+      const auto& region = *values[id];
+      while (!queue.empty() && queue.top().entity_end <= region.entity_min) { active.Erase(queue.top().valid_start, queue.top().id); queue.pop(); }
+      const uint64_t valid_end = region.valid_time.to ? region.valid_time.to->value : UINT64_MAX;
+      if (active.Overlaps(region.valid_time.from.value, valid_end)) return Status::Corruption("projection manifest", "overlapping coverage regions");
+      active.Insert(region.valid_time.from.value, valid_end, id);
+      queue.push({region.entity_max_exclusive, region.valid_time.from.value, id});
+    }
+  }
+  return Status::OK();
+}
 }  // namespace
 
 Status ValidateProjectionManifest(const ProjectionManifest& m, const std::string& identity) {
@@ -49,24 +110,7 @@ Status ValidateProjectionManifest(const ProjectionManifest& m, const std::string
     std::sort(ranges.begin(), ranges.end());
     for (size_t i = 1; i < ranges.size(); ++i) if (ranges[i-1].second > ranges[i].first) return Status::Corruption("projection manifest", "overlapping segment coverage");
   }
-  auto times_overlap = [](const ValidTimeInterval& a, const ValidTimeInterval& b) {
-    const uint64_t a_to = a.to ? a.to->value : UINT64_MAX;
-    const uint64_t b_to = b.to ? b.to->value : UINT64_MAX;
-    return a.from.value < b_to && b.from.value < a_to;
-  };
-  for (size_t i = 0; i < m.regions.size(); ++i) {
-    for (size_t j = i + 1; j < m.regions.size(); ++j) {
-      const auto& a = m.regions[i];
-      const auto& b = m.regions[j];
-      if (a.kind != b.kind || a.part_id != b.part_id ||
-          a.property_id != b.property_id || a.schema_epoch != b.schema_epoch)
-        continue;
-      if (a.entity_min < b.entity_max_exclusive &&
-          b.entity_min < a.entity_max_exclusive && times_overlap(a.valid_time, b.valid_time))
-        return Status::Corruption("projection manifest", "overlapping coverage regions");
-    }
-  }
-  return Status::OK();
+  return ValidateRegionOverlap(m.regions);
 }
 
 StatusOr<std::string> EncodeProjectionManifest(const ProjectionManifest& m) {

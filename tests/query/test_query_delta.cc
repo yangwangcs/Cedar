@@ -51,6 +51,52 @@ TEST(QueryDeltaTest, SnapshotCutExcludesFutureCorrections) {
   EXPECT_EQ(events.front().commit_seq, CommitSeq{2});
 }
 
+TEST(QueryDeltaTest, LeaseSharesPublishedDescriptorsAndCutsFutureCommits) {
+  QueryDelta delta({.base_seq = CommitSeq{0}, .queue_capacity = 8});
+  QueryDeltaCommit first{CommitSeq{1}};
+  first.facts.push_back(VertexEvent(1, 10));
+  ASSERT_TRUE(delta.ObservePublished(first).ok());
+  QueryDeltaCommit second{CommitSeq{2}};
+  second.facts.push_back(VertexEvent(2, 20, 8));
+  ASSERT_TRUE(delta.ObservePublished(second).ok());
+
+  auto lease_one = delta.AcquireLeaseThrough(CommitSeq{1});
+  auto lease_two = delta.AcquireLeaseThrough(CommitSeq{1});
+  ASSERT_TRUE(lease_one.ok());
+  ASSERT_TRUE(lease_two.ok());
+  EXPECT_EQ((*lease_one.ValueOrDie()).chunk_count(), 1U);
+  EXPECT_EQ((*lease_two.ValueOrDie()).chunk_count(), 1U);
+  const FactRef ref = first.facts.front().ref;
+  ASSERT_EQ((*lease_one.ValueOrDie()).EventsFor(ref).size(), 1U);
+  EXPECT_EQ((*lease_one.ValueOrDie()).EventsFor(ref).front().commit_seq,
+            CommitSeq{1});
+  EXPECT_TRUE((*lease_two.ValueOrDie()).EventsFor(
+                  second.facts.front().ref)
+                  .empty());
+  auto range = (*lease_one.ValueOrDie()).EventsForRange(ref);
+  ASSERT_TRUE(range.ok());
+  ASSERT_EQ(range.ValueOrDie().size(), 1U);
+  for (const FactEvent& event : range.ValueOrDie()) {
+    EXPECT_EQ(event.commit_seq, CommitSeq{1});
+  }
+}
+
+TEST(QueryDeltaTest, RetiredChunksStayAccountedUntilLastLeaseReleases) {
+  QueryDelta delta({.base_seq = CommitSeq{0}, .queue_capacity = 8,
+                    .hard_memory_bytes = 16ULL << 20});
+  QueryDeltaCommit commit{CommitSeq{1}};
+  commit.facts.push_back(VertexEvent(1, 11, 7));
+  auto observed = delta.ObservePublished(commit);
+  ASSERT_TRUE(observed.ok()) << observed.ToString();
+  auto lease_result = delta.AcquireLeaseThrough(CommitSeq{1});
+  ASSERT_TRUE(lease_result.ok());
+  auto lease = lease_result.ConsumeValueOrDie();
+  ASSERT_TRUE(delta.RetireThrough(CommitSeq{1}).ok());
+  EXPECT_GT(delta.memory_bytes(), 0U);
+  lease.reset();
+  EXPECT_EQ(delta.memory_bytes(), 0U);
+}
+
 TEST(QueryDeltaTest, MergesCorrectionAtAnOldValidTime) {
   const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref();
   const std::vector<CorrectedBoundary> base{{ValidTime{10}, CommitSeq{5},

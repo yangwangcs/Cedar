@@ -1395,6 +1395,22 @@ Status CedarParquetTableReader::ScanProjected(
   }
 
   std::atomic<bool> cancelled{false};
+  std::atomic<bool> limit_reached{false};
+  std::atomic<uint64_t> rows_claimed{0};
+  const auto claim_row = [&]() -> bool {
+    if (!spec.max_rows.has_value()) return true;
+    uint64_t current = rows_claimed.load(std::memory_order_relaxed);
+    while (current < *spec.max_rows) {
+      if (rows_claimed.compare_exchange_weak(
+              current, current + 1, std::memory_order_acq_rel,
+              std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    limit_reached.store(true, std::memory_order_release);
+    cancelled.store(true, std::memory_order_release);
+    return false;
+  };
   const auto scan_row_group = [&](size_t row_group_index) {
     CedarParquetRowGroupScanResult result{Status::OK(), {}, {}};
     CedarParquetColumnarBatch batch;
@@ -1413,6 +1429,11 @@ Status CedarParquetTableReader::ScanProjected(
     for (size_t page_index = 0; page_index < sort_column.page_locations.size();
          ++page_index) {
       if (cancelled.load(std::memory_order_acquire)) {
+        if (limit_reached.load(std::memory_order_acquire)) {
+          flush();
+          result.status = Status::OK();
+          return result;
+        }
         result.status = Status::Incomplete("Cedar Parquet scan", "scan cancelled");
         return result;
       }
@@ -1538,6 +1559,11 @@ Status CedarParquetTableReader::ScanProjected(
               DecodeLittleEndian(*commit_sequences[row]) > *spec.cedar_commit_seq_max))) {
           continue;
         }
+        if (!claim_row()) {
+          flush();
+          result.status = Status::OK();
+          return result;
+        }
         batch.internal_keys.push_back(internal_keys[row]);
         if (request_encoded_values) batch.encoded_values.push_back(encoded_values[row]);
         for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
@@ -1582,6 +1608,7 @@ Status CedarParquetTableReader::ScanProjected(
     for (size_t row_group_index : candidate_row_groups) {
       Status status = deliver(scan_row_group(row_group_index));
       if (!status.ok()) return status;
+      if (limit_reached.load(std::memory_order_acquire)) break;
     }
     if (spec.stats != nullptr && !candidate_row_groups.empty()) {
       spec.stats->max_parallel_row_groups_observed = std::max<uint32_t>(

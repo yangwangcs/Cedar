@@ -14,6 +14,8 @@
 
 namespace cedar::internal {
 
+struct ProjectionReadStats;
+
 struct CoverageRequest {
   ProjectionKind kind = ProjectionKind::kState;
   PartId part_id;
@@ -26,6 +28,16 @@ struct CoverageRequest {
   std::optional<uint64_t> generation_id;
   std::optional<CommitSeq> expected_base_seq;
   std::string database_identity;
+  ProjectionReadStats* stats = nullptr;
+};
+
+// Per-slice decoder evidence. The pointer is caller-owned and is only touched
+// while ReadChains is executing under the caller's read lease.
+struct ProjectionReadStats {
+  uint64_t pages_read = 0;
+  uint64_t pages_skipped = 0;
+  uint64_t physical_bytes = 0;
+  uint64_t decoded_bytes = 0;
 };
 
 struct ProjectionSegmentInput {

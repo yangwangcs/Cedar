@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "cedar/database.h"
+#include "cedar/fact/fact_codec.h"
 #include "kernel/database_impl.h"
 #include "query/runtime/graph_frontier.h"
 
@@ -235,15 +236,39 @@ Status AppendEventColumn(FactColumn* column, const FactEvent& event) {
   return Status::InvalidArgument("fact scan", "unknown projected Cedar column");
 }
 
+FactColumnarBatch PrefixColumnarBatch(const FactColumnarBatch& source,
+                                      size_t rows) {
+  FactColumnarBatch prefix = source;
+  for (FactColumn& column : prefix.columns) {
+    column.present.resize(rows);
+    std::visit(
+        [rows](auto& values) { values.resize(std::min(rows, values.size())); },
+        column.values);
+  }
+  return prefix;
+}
+
 }  // namespace
 
-class Snapshot::State {
+class Snapshot::State final : public CanonicalFactReader {
  public:
   State(std::shared_ptr<Database::Impl> database, StoreSnapshot snapshot)
       : database(std::move(database)), snapshot(std::move(snapshot)) {}
 
   std::shared_ptr<Database::Impl> database;
   StoreSnapshot snapshot;
+  std::shared_ptr<const CanonicalFactReader> reader_override;
+  std::optional<CommitSeq> read_seq_override;
+
+  StatusOr<std::optional<FactEvent>> ReadStateAt(
+      const FactReadSpec& spec, ValidTime valid_time,
+      CommitSeq snapshot_seq) const override;
+  Status ReadEvents(const FactReadSpec& spec,
+                    const CanonicalFactBatchVisitor& visitor) const override;
+  Status ReadColumnar(const FactReadSpec& spec,
+                      const CanonicalColumnarBatchVisitor& visitor) const override;
+  StatusOr<std::vector<FactEvent>> ReadExact(
+      const std::vector<std::string>& encoded_keys) const override;
 
   StatusOr<bool> EdgeVisible(EdgeRef edge_ref, ValidTime valid_time) const {
     const auto edge = database->store.Read(
@@ -268,21 +293,274 @@ class Snapshot::State {
   }
 };
 
+namespace {
+
+FactScanSpec ToFactScanSpec(const FactReadSpec& spec, PartId part) {
+  FactScanSpec scan;
+  scan.part_id = part;
+  scan.family = spec.family;
+  scan.property_id = spec.property_id;
+  scan.batch_row_limit = spec.batch_row_limit;
+  scan.entity_id_min = spec.entity_range.min;
+  if (spec.entity_range.max_exclusive.has_value() &&
+      *spec.entity_range.max_exclusive != 0) {
+    scan.entity_id_max = *spec.entity_range.max_exclusive - 1;
+  }
+  scan.event_valid_from_min = spec.valid_from_min;
+  scan.event_valid_from_max = spec.valid_from_max;
+  scan.event_commit_seq_min = spec.commit_seq_min;
+  scan.event_commit_seq_max = spec.commit_seq_max;
+  scan.max_rows = spec.max_rows;
+  return scan;
+}
+
+bool MatchesReadSpec(const FactReadSpec& spec, const FactEvent& event) {
+  if (!spec.part_scope.Contains(event.ref.part_id()) ||
+      event.ref.family() != spec.family ||
+      event.ref.property_id() != spec.property_id) {
+    return false;
+  }
+  if (spec.entity_range.min.has_value() &&
+      event.ref.entity_id() < *spec.entity_range.min) return false;
+  if (spec.entity_range.max_exclusive.has_value() &&
+      event.ref.entity_id() >= *spec.entity_range.max_exclusive) return false;
+  if (spec.valid_from_min.has_value() &&
+      event.valid_from.value < spec.valid_from_min->value) return false;
+  if (spec.valid_from_max.has_value() &&
+      event.valid_from.value > spec.valid_from_max->value) return false;
+  if (spec.commit_seq_min.has_value() &&
+      event.commit_seq.value < spec.commit_seq_min->value) return false;
+  if (spec.commit_seq_max.has_value() &&
+      event.commit_seq.value > spec.commit_seq_max->value) return false;
+  return true;
+}
+
+}  // namespace
+
+StatusOr<std::optional<FactEvent>> Snapshot::State::ReadStateAt(
+    const FactReadSpec& spec, ValidTime valid_time,
+    CommitSeq snapshot_seq) const {
+  Status status = spec.Validate();
+  if (!status.ok()) return status;
+  if (snapshot_seq.value > snapshot.commit_seq().value && snapshot_seq.value != 0) {
+    return Status::InvalidArgument("canonical reader", "requested sequence exceeds snapshot");
+  }
+  if (spec.part_scope.kind != PartScopeKind::kExact ||
+      spec.part_scope.parts.size() != 1 || !spec.entity_range.min.has_value() ||
+      !spec.entity_range.max_exclusive.has_value() ||
+      *spec.entity_range.max_exclusive != *spec.entity_range.min + 1) {
+    return Status::InvalidArgument("canonical reader", "state-at requires one exact entity");
+  }
+  const FactRef ref{spec.part_scope.parts.front(), spec.family, spec.property_id,
+                    *spec.entity_range.min};
+  auto event = database->store.Read(snapshot, ref, valid_time);
+  if (!event.ok()) return event.status();
+  if (event.ValueOrDie().has_value() &&
+      snapshot_seq.value != 0 &&
+      event.ValueOrDie()->commit_seq.value > snapshot_seq.value) {
+    return std::optional<FactEvent>{};
+  }
+  return event;
+}
+
+Status Snapshot::State::ReadEvents(
+    const FactReadSpec& spec, const CanonicalFactBatchVisitor& visitor) const {
+  Status status = spec.Validate();
+  if (!status.ok()) return status;
+  if (!visitor) return Status::InvalidArgument("canonical reader", "missing visitor");
+  std::vector<FactEvent> batch;
+  batch.reserve(spec.batch_row_limit);
+  uint64_t emitted = 0;
+  bool limit_reached = false;
+  auto append = [&batch, &visitor, &spec, &emitted,
+                 &limit_reached](const FactEvent& event) -> Status {
+    if (spec.max_rows.has_value() && emitted >= *spec.max_rows) {
+      limit_reached = true;
+      return Status::QueryCancelled("canonical reader", "max_rows reached");
+    }
+    batch.push_back(event);
+    const uint64_t remaining = spec.max_rows.has_value()
+                                   ? *spec.max_rows - emitted
+                                   : UINT64_MAX;
+    const bool reaches_limit = spec.max_rows.has_value() &&
+                               batch.size() >= remaining;
+    if (!reaches_limit && batch.size() < batch.capacity()) return Status::OK();
+    FactEventBatch out{std::move(batch)};
+    batch = {};
+    batch.reserve(spec.batch_row_limit);
+    Status status = visitor(out);
+    if (!status.ok()) return status;
+    emitted += out.events.size();
+    if (reaches_limit) {
+      limit_reached = true;
+      return Status::QueryCancelled("canonical reader", "max_rows reached");
+    }
+    return Status::OK();
+  };
+  auto scan_part = [&](PartId part) -> Status {
+    const FactScanSpec scan = ToFactScanSpec(spec, part);
+    return database->store.Scan(snapshot, FactPrefix::Family(part, spec.family,
+                                                               spec.property_id),
+                                FactScanBounds{scan.entity_id_min, scan.entity_id_max},
+                                [&spec, &append](const FactEvent& event) {
+      if (!MatchesReadSpec(spec, event)) return Status::OK();
+      return append(event);
+    });
+  };
+  if (spec.part_scope.kind == PartScopeKind::kAll) {
+    status = database->store.ScanFamily(snapshot, spec.family,
+                                         [&spec, &append](const FactEvent& event) {
+      if (!MatchesReadSpec(spec, event)) return Status::OK();
+      return append(event);
+    });
+  } else {
+    status = Status::OK();
+    for (PartId part : spec.part_scope.parts) {
+      status = scan_part(part);
+      if (!status.ok()) break;
+    }
+  }
+  if (!status.ok() && !limit_reached) return status;
+  if (!batch.empty() && !limit_reached) {
+    if (!batch.empty()) {
+      FactEventBatch out{std::move(batch)};
+      status = visitor(out);
+      if (!status.ok()) return status;
+    }
+  }
+  return Status::OK();
+}
+
+Status Snapshot::State::ReadColumnar(
+    const FactReadSpec& spec, const CanonicalColumnarBatchVisitor& visitor) const {
+  Status status = spec.Validate();
+  if (!status.ok()) return status;
+  if (!visitor) return Status::InvalidArgument("canonical reader", "missing visitor");
+  if (spec.projection.empty()) {
+    return Status::InvalidArgument("canonical reader", "missing projection");
+  }
+  FactColumnarScanOptions options;
+  options.projection = spec.projection;
+  options.batch_row_limit = spec.batch_row_limit;
+  options.event_valid_from_min = spec.valid_from_min;
+  options.event_valid_from_max = spec.valid_from_max;
+  options.event_commit_seq_min = spec.commit_seq_min;
+  options.event_commit_seq_max = spec.commit_seq_max;
+  options.max_rows = spec.max_rows;
+  uint64_t emitted = 0;
+  bool limit_reached = false;
+  const CanonicalColumnarBatchVisitor bounded_visitor =
+      [&visitor, &spec, &emitted, &limit_reached](const FactColumnarBatch& batch) {
+        if (!spec.max_rows.has_value()) return visitor(batch);
+        if (emitted >= *spec.max_rows) {
+          limit_reached = true;
+          return Status::QueryCancelled("canonical reader", "max_rows reached");
+        }
+        const size_t remaining = static_cast<size_t>(*spec.max_rows - emitted);
+        const size_t take = std::min(remaining, batch.row_count());
+        if (take == 0) {
+          limit_reached = true;
+          return Status::QueryCancelled("canonical reader", "max_rows reached");
+        }
+        const FactColumnarBatch* delivered = &batch;
+        FactColumnarBatch prefix;
+        if (take < batch.row_count()) {
+          prefix = PrefixColumnarBatch(batch, take);
+          delivered = &prefix;
+        }
+        Status status = visitor(*delivered);
+        if (!status.ok()) return status;
+        emitted += take;
+        if (emitted >= *spec.max_rows || take < batch.row_count()) {
+          limit_reached = true;
+          return Status::QueryCancelled("canonical reader", "max_rows reached");
+        }
+        return Status::OK();
+      };
+  auto scan_part = [&](PartId part) {
+    const FactScanSpec scan = ToFactScanSpec(spec, part);
+    return database->store.ScanColumnar(
+        snapshot, FactPrefix::Family(part, spec.family, spec.property_id),
+        FactScanBounds{scan.entity_id_min, scan.entity_id_max}, options,
+        bounded_visitor);
+  };
+  if (spec.part_scope.kind == PartScopeKind::kAll) {
+    status = database->store.ScanColumnarFamily(snapshot, spec.family,
+                                                spec.property_id, options,
+                                                bounded_visitor);
+    if (!status.ok() && !limit_reached) return status;
+    return Status::OK();
+  }
+  for (PartId part : spec.part_scope.parts) {
+    status = scan_part(part);
+    if (!status.ok() && !limit_reached) return status;
+    if (limit_reached) break;
+  }
+  return Status::OK();
+}
+
+StatusOr<std::vector<FactEvent>> Snapshot::State::ReadExact(
+    const std::vector<std::string>& encoded_keys) const {
+  // FactStore validates every encoded key against this snapshot and performs
+  // one RocksDB MultiGet, preserving the caller's key order and corruption
+  // semantics for missing referenced facts.
+  return database->store.ReadExactFacts(snapshot, encoded_keys);
+}
+
 Snapshot::Snapshot(std::unique_ptr<State> state) : state_(std::move(state)) {}
 Snapshot::~Snapshot() = default;
 Snapshot::Snapshot(Snapshot&&) noexcept = default;
 Snapshot& Snapshot::operator=(Snapshot&&) noexcept = default;
+
+Snapshot Snapshot::WithCanonicalReader(
+    Snapshot base, std::shared_ptr<const CanonicalFactReader> reader,
+    std::optional<CommitSeq> read_seq_override) {
+  if (base.state_ != nullptr) {
+    base.state_->reader_override = std::move(reader);
+    base.state_->read_seq_override = read_seq_override;
+  }
+  return std::move(base);
+}
 
 bool Snapshot::BelongsToDatabase(const void* database_identity) const {
   return state_ != nullptr && state_->database.get() == database_identity;
 }
 
 CommitSeq Snapshot::commit_seq() const {
-  return state_ == nullptr ? CommitSeq{} : state_->snapshot.commit_seq();
+  return state_ == nullptr ? CommitSeq{}
+                            : state_->read_seq_override.value_or(
+                                  state_->snapshot.commit_seq());
 }
 
 CommitSeq Snapshot::oldest_readable_seq() const {
   return state_ == nullptr ? CommitSeq{} : state_->snapshot.oldest_readable_seq();
+}
+
+const CanonicalFactReader& Snapshot::canonical_reader() const {
+  if (!state_) {
+    static const class InvalidReader final : public CanonicalFactReader {
+     public:
+      StatusOr<std::optional<FactEvent>> ReadStateAt(
+          const FactReadSpec&, ValidTime, CommitSeq) const override {
+        return Status::InvalidArgument("snapshot", "moved-from snapshot");
+      }
+      Status ReadEvents(const FactReadSpec&,
+                        const CanonicalFactBatchVisitor&) const override {
+        return Status::InvalidArgument("snapshot", "moved-from snapshot");
+      }
+      Status ReadColumnar(const FactReadSpec&,
+                          const CanonicalColumnarBatchVisitor&) const override {
+        return Status::InvalidArgument("snapshot", "moved-from snapshot");
+      }
+      StatusOr<std::vector<FactEvent>> ReadExact(
+          const std::vector<std::string>&) const override {
+        return Status::InvalidArgument("snapshot", "moved-from snapshot");
+      }
+    } invalid;
+    return invalid;
+  }
+  if (state_->reader_override != nullptr) return *state_->reader_override;
+  return *state_;
 }
 
 std::shared_ptr<const internal::AdjacencyIndex> Snapshot::adjacency_index() const {
@@ -381,6 +659,7 @@ Status Snapshot::EventColumnarScan(
   options.event_valid_from_max = spec.event_valid_from_max;
   options.event_commit_seq_min = spec.event_commit_seq_min;
   options.event_commit_seq_max = spec.event_commit_seq_max;
+  options.max_rows = spec.max_rows;
   options.projection = projection;
   options.batch_row_limit = spec.batch_row_limit;
   return state_->database->store.ScanColumnar(

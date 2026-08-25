@@ -10,13 +10,19 @@
 #include <cerrno>
 #include <algorithm>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <optional>
 #include <sstream>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "cedar/cypher.h"
+#include "cedar/cypher/schema_manifest.h"
 #include "cedar/cypher/write.h"
 #include "cedar/server/bolt_codec.h"
 
@@ -242,16 +248,43 @@ struct BoltSession {
   std::optional<QueryCursor> cursor;
   std::unique_ptr<Transaction> transaction;
   bool transaction_dirty = false;
+  bool authenticated = false;
+  std::optional<QueryBatch> pending_batch;
+  size_t pending_row = 0;
 };
 
+size_t PullLimit(const std::string& payload, uint32_t configured) {
+  if (payload.size() < 3 || static_cast<uint8_t>(payload[2]) == 0xA0) {
+    return configured;
+  }
+  if (static_cast<uint8_t>(payload[2]) != 0xA1 || payload.size() < 6 ||
+      static_cast<uint8_t>(payload[3]) != 0x81 ||
+      static_cast<uint8_t>(payload[4]) != 0x6E) return 0;
+  const uint8_t value = static_cast<uint8_t>(payload[5]);
+  if (value <= 0x7F) return value;
+  if (value == 0xCC && payload.size() >= 7) return static_cast<uint8_t>(payload[6]);
+  return 0;
+}
+
 StatusOr<std::string> ProcessBoltMessage(
-    Database& database, const std::string& payload, BoltSession* session,
-    uint32_t max_frame_bytes, std::vector<std::string>* extra_frames) {
+    Database& database, cypher::CypherSession& cypher_session,
+    const std::string& payload, BoltSession* session,
+    uint32_t max_frame_bytes, uint32_t max_pull_records,
+    std::vector<std::string>* extra_frames,
+    std::string_view expected_auth_token) {
   const auto kind = DecodeBoltMessageKind(payload);
   if (!kind.ok()) return kind.status();
+  if (kind.ValueOrDie() != BoltMessageKind::kHello &&
+      !expected_auth_token.empty() && !session->authenticated) {
+    return Status::InvalidArgument("bolt", "authentication required before request");
+  }
   switch (kind.ValueOrDie()) {
-    case BoltMessageKind::kHello:
+    case BoltMessageKind::kHello: {
+      const Status authenticated = AuthenticateBoltHello(payload, expected_auth_token);
+      if (!authenticated.ok()) return authenticated;
+      session->authenticated = true;
       return EncodeBoltSuccess(max_frame_bytes);
+    }
     case BoltMessageKind::kRun: {
       auto query = ReadPackString(payload, 2, max_frame_bytes);
       if (!query.ok()) return query.status();
@@ -263,10 +296,11 @@ StatusOr<std::string> ProcessBoltMessage(
       // before touching Cedar.
       auto request_metadata = ReadPackMap(payload, &value_offset, max_frame_bytes);
       if (!request_metadata.ok()) return request_metadata.status();
-      auto prepared = cypher::PrepareCypher(database, query.ValueOrDie().first,
-                                            cypher::SchemaCatalog{});
+      auto prepared = cypher_session.Prepare(query.ValueOrDie().first);
       if (!prepared.ok()) return prepared.status();
       session->prepared = std::move(prepared).ConsumeValueOrDie();
+      session->pending_batch.reset();
+      session->pending_row = 0;
       Bindings bindings;
       for (const auto& parameter : session->prepared->bound_statement().parameters) {
         const auto value = parameters.ValueOrDie().find(parameter.name);
@@ -296,19 +330,20 @@ StatusOr<std::string> ProcessBoltMessage(
           if (!staged.ok()) return staged;
           session->transaction_dirty = true;
         } else {
-          const auto committed = cypher::ExecuteWrite(
-              database, session->prepared->bound_statement(), bindings, valid_time);
+          const auto committed = cypher_session.ExecuteWrite(
+              *session->prepared, cypher::CypherRequest{.bindings = bindings,
+                                                        .valid_time = valid_time});
           if (!committed.ok()) return committed.status();
         }
         return EncodeBoltFields({}, max_frame_bytes);
       }
-      if (session->transaction_dirty) {
-        return Status::InvalidArgument("bolt", "commit the open write transaction before reading");
-      }
-      auto snapshot = database.BeginSnapshot();
-      if (!snapshot.ok()) return snapshot.status();
-      auto cursor = session->prepared->Execute(
-          std::move(snapshot).ConsumeValueOrDie(), bindings);
+      StatusOr<QueryCursor> cursor = session->transaction
+          ? cypher_session.Execute(
+                *session->prepared, *session->transaction,
+                cypher::CypherRequest{.bindings = bindings})
+          : cypher_session.Execute(
+                *session->prepared,
+                cypher::CypherRequest{.bindings = bindings});
       if (!cursor.ok()) return cursor.status();
       session->cursor = std::move(cursor).ConsumeValueOrDie();
       std::vector<std::string> fields;
@@ -319,18 +354,34 @@ StatusOr<std::string> ProcessBoltMessage(
     }
     case BoltMessageKind::kPull: {
       if (!session->cursor.has_value()) return EncodeBoltSuccess(max_frame_bytes);
-      auto batch = session->cursor->Next();
-      if (!batch.ok()) return batch.status();
-      if (batch.ValueOrDie().has_value()) {
-        const QueryBatch& value = *batch.ValueOrDie();
-        for (size_t row = 0; row < value.row_count(); ++row) {
-          auto record = EncodeBoltRecord(value, row, max_frame_bytes);
-          if (!record.ok()) return record.status();
-          extra_frames->push_back(std::move(record).ConsumeValueOrDie());
-        }
-        return EncodeBoltSuccess(max_frame_bytes);
+      const size_t limit = PullLimit(payload, max_pull_records);
+      if (limit == 0 || limit > max_pull_records) {
+        return Status::InvalidArgument("bolt", "invalid PULL fetch size");
       }
-      session->cursor.reset();
+      size_t emitted = 0;
+      while (emitted < limit) {
+        if (!session->pending_batch.has_value()) {
+          auto batch = session->cursor->Next();
+          if (!batch.ok()) return batch.status();
+          if (!batch.ValueOrDie().has_value()) {
+            session->cursor.reset();
+            session->pending_row = 0;
+            break;
+          }
+          session->pending_batch = std::move(batch).ConsumeValueOrDie();
+          session->pending_row = 0;
+        }
+        const QueryBatch& value = *session->pending_batch;
+        auto record = EncodeBoltRecord(value, session->pending_row, max_frame_bytes);
+        if (!record.ok()) return record.status();
+        extra_frames->push_back(std::move(record).ConsumeValueOrDie());
+        ++emitted;
+        ++session->pending_row;
+        if (session->pending_row == value.row_count()) {
+          session->pending_batch.reset();
+          session->pending_row = 0;
+        }
+      }
       return EncodeBoltSuccess(max_frame_bytes);
     }
     case BoltMessageKind::kBegin: {
@@ -353,6 +404,8 @@ StatusOr<std::string> ProcessBoltMessage(
       session->transaction.reset();
       session->transaction_dirty = false;
       session->cursor.reset();
+      session->pending_batch.reset();
+      session->pending_row = 0;
       return EncodeBoltSuccess(max_frame_bytes);
     }
     case BoltMessageKind::kRollback:
@@ -363,6 +416,8 @@ StatusOr<std::string> ProcessBoltMessage(
       session->transaction.reset();
       session->transaction_dirty = false;
       session->cursor.reset();
+      session->pending_batch.reset();
+      session->pending_row = 0;
       return EncodeBoltSuccess(max_frame_bytes);
     case BoltMessageKind::kReset:
       if (session->transaction) session->transaction->Rollback().IgnoreError();
@@ -370,6 +425,8 @@ StatusOr<std::string> ProcessBoltMessage(
       session->transaction_dirty = false;
       session->cursor.reset();
       session->prepared.reset();
+      session->pending_batch.reset();
+      session->pending_row = 0;
       return EncodeBoltSuccess(max_frame_bytes);
     case BoltMessageKind::kGoodbye:
       return EncodeBoltIgnored(max_frame_bytes);
@@ -381,7 +438,9 @@ StatusOr<std::string> ProcessBoltMessage(
 
 Status ServerConfig::Validate() const {
   if (database_path.empty() || bind_address.empty() ||
-      max_frame_bytes == 0 || max_frame_bytes > 64U * 1024U * 1024U) {
+      max_frame_bytes == 0 || max_frame_bytes > 64U * 1024U * 1024U ||
+      max_pull_records == 0 || max_pull_records > 4096 || worker_threads == 0 ||
+      max_sessions == 0 || auth_token.size() > 256) {
     return ServerError("invalid server configuration");
   }
   return Status::OK();
@@ -415,6 +474,24 @@ StatusOr<ServerConfig> ServerConfig::FromArgs(int argc, char** argv) {
       auto parsed = value("--pid");
       if (!parsed.ok()) return parsed.status();
       config.pid_path = parsed.ValueOrDie();
+    } else if (arg == "--schema") {
+      auto parsed = value("--schema");
+      if (!parsed.ok()) return parsed.status();
+      config.schema_path = parsed.ValueOrDie();
+    } else if (arg == "--auth-token") {
+      auto parsed = value("--auth-token");
+      if (!parsed.ok()) return parsed.status();
+      config.auth_token = parsed.ValueOrDie();
+    } else if (arg == "--graph") {
+      auto parsed = value("--graph");
+      if (!parsed.ok()) return parsed.status();
+      config.graph = parsed.ValueOrDie();
+    } else if (arg == "--part-id") {
+      auto parsed = value("--part-id");
+      if (!parsed.ok()) return parsed.status();
+      const unsigned long part = std::stoul(parsed.ValueOrDie());
+      if (part > UINT32_MAX) return ServerError("PartID exceeds uint32");
+      config.part_id = PartId{static_cast<uint32_t>(part)};
     } else {
       return ServerError("unknown server option");
     }
@@ -426,20 +503,43 @@ StatusOr<ServerConfig> ServerConfig::FromArgs(int argc, char** argv) {
   return config;
 }
 
-Server::Server(ServerConfig config) : config_(std::move(config)) {}
+class Server::State {
+ public:
+  explicit State(ServerConfig value) : config(std::move(value)) {}
+
+  ServerConfig config;
+  mutable std::mutex mutex;
+  std::unique_ptr<Database> database;
+  std::unique_ptr<cypher::CypherSession> cypher_session;
+  int listen_fd = -1;
+  int lock_fd = -1;
+  uint16_t bound_port = 0;
+  std::thread accept_thread;
+  std::vector<std::thread> workers;
+  std::mutex queue_mutex;
+  std::condition_variable queue_cv;
+  std::deque<int> client_queue;
+  std::atomic<bool> live{false};
+  std::atomic<bool> ready{false};
+  std::atomic<bool> stopping{false};
+  std::atomic<int> active_client_fd{-1};
+};
+
+Server::Server(ServerConfig config)
+    : state_(std::make_unique<State>(std::move(config))) {}
 
 Server::~Server() { Stop().IgnoreError(); }
 
 Status Server::AcquireLock() {
-  lock_fd_ = ::open(config_.lock_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (lock_fd_ < 0) return Status::Conflict("cedar-server", "database lock is held");
+  state_->lock_fd = ::open(state_->config.lock_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (state_->lock_fd < 0) return Status::Conflict("cedar-server", "database lock is held");
   const std::string pid = std::to_string(static_cast<long long>(::getpid())) + "\n";
-  if (::write(lock_fd_, pid.data(), pid.size()) != static_cast<ssize_t>(pid.size())) {
+  if (::write(state_->lock_fd, pid.data(), pid.size()) != static_cast<ssize_t>(pid.size())) {
     ReleaseLock();
     return Status::IOError("cedar-server", "cannot write lock file");
   }
-  if (!config_.pid_path.empty()) {
-    const int pid_fd = ::open(config_.pid_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (!state_->config.pid_path.empty()) {
+    const int pid_fd = ::open(state_->config.pid_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (pid_fd >= 0) {
       ::write(pid_fd, pid.data(), pid.size());
       ::close(pid_fd);
@@ -449,77 +549,114 @@ Status Server::AcquireLock() {
 }
 
 void Server::ReleaseLock() {
-  if (lock_fd_ >= 0) {
-    ::close(lock_fd_);
-    lock_fd_ = -1;
+  if (state_->lock_fd >= 0) {
+    ::close(state_->lock_fd);
+    state_->lock_fd = -1;
   }
   std::error_code error;
-  std::filesystem::remove(config_.lock_path, error);
-  if (!config_.pid_path.empty()) std::filesystem::remove(config_.pid_path, error);
+  std::filesystem::remove(state_->config.lock_path, error);
+  if (!state_->config.pid_path.empty()) std::filesystem::remove(state_->config.pid_path, error);
 }
 
 Status Server::Start() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (live_.load(std::memory_order_acquire)) return Status::OK();
-  const Status valid = config_.Validate();
+  if (!state_) return Status::InvalidArgument("cedar-server", "moved-from server");
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->live.load(std::memory_order_acquire)) return Status::OK();
+  const Status valid = state_->config.Validate();
   if (!valid.ok()) return valid;
   const Status locked = AcquireLock();
   if (!locked.ok()) return locked;
-  auto database = Database::Open(DatabaseOptions{.path = config_.database_path});
+  auto database = Database::Open(DatabaseOptions{.path = state_->config.database_path});
   if (!database.ok()) {
     ReleaseLock();
     return database.status();
   }
-  database_ = std::move(database).ConsumeValueOrDie();
-  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd_ < 0) {
-    database_->Close().IgnoreError();
-    database_.reset();
+  state_->database = std::move(database).ConsumeValueOrDie();
+  cypher::SchemaCatalog catalog;
+  cypher::BinderOptions binder_options;
+  binder_options.graph = state_->config.graph;
+  binder_options.part_id = state_->config.part_id;
+  if (!state_->config.schema_path.empty()) {
+    const auto manifest = cypher::LoadSchemaManifest(state_->config.schema_path);
+    if (!manifest.ok()) {
+      state_->database->Close().IgnoreError();
+      state_->database.reset();
+      ReleaseLock();
+      return manifest.status();
+    }
+    catalog = manifest.ValueOrDie().catalog;
+    if (state_->config.graph.empty()) binder_options.graph = manifest.ValueOrDie().graph;
+    if (state_->config.part_id.value == 0) binder_options.part_id = manifest.ValueOrDie().part_id;
+  }
+  state_->cypher_session = std::make_unique<cypher::CypherSession>(
+      *state_->database, std::move(catalog), std::move(binder_options));
+  state_->listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (state_->listen_fd < 0) {
+    state_->database->Close().IgnoreError();
+    state_->cypher_session.reset();
+    state_->database.reset();
     ReleaseLock();
     return Status::IOError("cedar-server", "cannot create listener");
   }
   int reuse = 1;
-  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  ::setsockopt(state_->listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_port = htons(config_.port);
-  if (::inet_pton(AF_INET, config_.bind_address.c_str(), &address.sin_addr) != 1 ||
-      ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-      ::listen(listen_fd_, 32) != 0) {
-    ::close(listen_fd_);
-    listen_fd_ = -1;
-    database_->Close().IgnoreError();
-    database_.reset();
+  address.sin_port = htons(state_->config.port);
+  if (::inet_pton(AF_INET, state_->config.bind_address.c_str(), &address.sin_addr) != 1 ||
+      ::bind(state_->listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+      ::listen(state_->listen_fd, 32) != 0) {
+    ::close(state_->listen_fd);
+    state_->listen_fd = -1;
+    state_->database->Close().IgnoreError();
+    state_->cypher_session.reset();
+    state_->database.reset();
     ReleaseLock();
     return Status::IOError("cedar-server", "cannot bind listener");
   }
   socklen_t length = sizeof(address);
-  ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &length);
-  bound_port_ = ntohs(address.sin_port);
-  live_.store(true, std::memory_order_release);
-  ready_.store(true, std::memory_order_release);
-  stopping_.store(false, std::memory_order_release);
-  accept_thread_ = std::thread(&Server::AcceptLoop, this);
+  ::getsockname(state_->listen_fd, reinterpret_cast<sockaddr*>(&address), &length);
+  state_->bound_port = ntohs(address.sin_port);
+  state_->live.store(true, std::memory_order_release);
+  state_->ready.store(true, std::memory_order_release);
+  state_->stopping.store(false, std::memory_order_release);
+  state_->accept_thread = std::thread(&Server::AcceptLoop, this);
+  state_->workers.reserve(state_->config.worker_threads);
+  for (uint32_t i = 0; i < state_->config.worker_threads; ++i) {
+    state_->workers.emplace_back(&Server::WorkerLoop, this);
+  }
   return Status::OK();
 }
 
 Status Server::Stop() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!live_.load(std::memory_order_acquire) && database_ == nullptr) return Status::OK();
-  stopping_.store(true, std::memory_order_release);
-  ready_.store(false, std::memory_order_release);
-  if (listen_fd_ >= 0) {
-    ::shutdown(listen_fd_, SHUT_RDWR);
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+  if (!state_) return Status::OK();
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (!state_->live.load(std::memory_order_acquire) && state_->database == nullptr) return Status::OK();
+  state_->stopping.store(true, std::memory_order_release);
+  state_->ready.store(false, std::memory_order_release);
+  if (state_->listen_fd >= 0) {
+    ::shutdown(state_->listen_fd, SHUT_RDWR);
+    ::close(state_->listen_fd);
+    state_->listen_fd = -1;
   }
-  const int active_client = active_client_fd_.load(std::memory_order_acquire);
+  const int active_client = state_->active_client_fd.load(std::memory_order_acquire);
   if (active_client >= 0) ::shutdown(active_client, SHUT_RDWR);
-  if (accept_thread_.joinable()) accept_thread_.join();
-  live_.store(false, std::memory_order_release);
-  if (database_) {
-    const Status closed = database_->Close();
-    database_.reset();
+  if (state_->accept_thread.joinable()) state_->accept_thread.join();
+  {
+    std::lock_guard<std::mutex> queue_lock(state_->queue_mutex);
+    for (const int fd : state_->client_queue) ::close(fd);
+    state_->client_queue.clear();
+  }
+  state_->queue_cv.notify_all();
+  for (auto& worker : state_->workers) {
+    if (worker.joinable()) worker.join();
+  }
+  state_->workers.clear();
+  state_->live.store(false, std::memory_order_release);
+  if (state_->database) {
+    const Status closed = state_->database->Close();
+    state_->cypher_session.reset();
+    state_->database.reset();
     ReleaseLock();
     return closed;
   }
@@ -527,28 +664,81 @@ Status Server::Stop() {
   return Status::OK();
 }
 
+bool Server::Live() const {
+  return state_ && state_->live.load(std::memory_order_acquire);
+}
+
+bool Server::Ready() const {
+  return state_ && state_->ready.load(std::memory_order_acquire);
+}
+
 uint16_t Server::port() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return bound_port_;
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->bound_port;
 }
 
 std::string Server::Metrics() const {
   std::ostringstream out;
   out << "cedar_server_live " << (Live() ? 1 : 0) << '\n'
       << "cedar_server_ready " << (Ready() ? 1 : 0) << '\n';
+  if (state_->database) {
+    const auto query = state_->database->SampleQueryMetrics();
+    const auto commit = state_->database->GetCommitPipelineMetrics();
+    const auto runtime = state_->database->SampleRuntimeMetrics();
+    out << "cedar_query_physical_bytes " << query.physical_bytes << '\n'
+        << "cedar_query_decoded_bytes " << query.decoded_bytes << '\n'
+        << "cedar_query_interval_fragments " << query.interval_fragments << '\n'
+        << "cedar_query_spill_bytes " << query.spill_bytes << '\n'
+        << "cedar_commit_submitted " << commit.submitted << '\n'
+        << "cedar_commit_published " << commit.published << '\n'
+        << "cedar_commit_wal_sync_total_us " << commit.latency.wal_sync.total_us << '\n';
+    if (runtime.ok()) {
+      out << "cedar_runtime_active_fact_bytes " << runtime.ValueOrDie().active_fact_bytes << '\n'
+          << "cedar_runtime_immutable_fact_bytes " << runtime.ValueOrDie().immutable_fact_bytes << '\n'
+          << "cedar_runtime_l0_file_count " << runtime.ValueOrDie().l0_file_count << '\n'
+          << "cedar_runtime_pending_compaction_bytes " << runtime.ValueOrDie().pending_compaction_bytes << '\n';
+    }
+  }
   return out.str();
 }
 
 void Server::AcceptLoop() {
-  while (!stopping_.load(std::memory_order_acquire)) {
-    const int fd = ::accept(listen_fd_, nullptr, nullptr);
+  while (!state_->stopping.load(std::memory_order_acquire)) {
+    const int fd = ::accept(state_->listen_fd, nullptr, nullptr);
     if (fd < 0) {
-      if (stopping_.load(std::memory_order_acquire)) break;
+      if (state_->stopping.load(std::memory_order_acquire)) break;
       continue;
     }
-    active_client_fd_.store(fd, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(state_->queue_mutex);
+      if (state_->client_queue.size() >= state_->config.max_sessions) {
+        ::close(fd);
+        continue;
+      }
+      state_->client_queue.push_back(fd);
+    }
+    state_->queue_cv.notify_one();
+  }
+}
+
+void Server::WorkerLoop() {
+  while (true) {
+    int fd = -1;
+    {
+      std::unique_lock<std::mutex> lock(state_->queue_mutex);
+      state_->queue_cv.wait(lock, [this] {
+        return state_->stopping.load(std::memory_order_acquire) || !state_->client_queue.empty();
+      });
+      if (state_->client_queue.empty()) {
+        if (state_->stopping.load(std::memory_order_acquire)) return;
+        continue;
+      }
+      fd = state_->client_queue.front();
+      state_->client_queue.pop_front();
+    }
+    state_->active_client_fd.store(fd, std::memory_order_release);
     HandleClient(fd);
-    active_client_fd_.store(-1, std::memory_order_release);
+    state_->active_client_fd.store(-1, std::memory_order_release);
     ::close(fd);
   }
 }
@@ -562,13 +752,20 @@ void Server::HandleClient(int fd) {
     const auto negotiated = NegotiateBoltHandshake(handshake);
     if (!negotiated.ok() || !WriteAll(fd, negotiated.ValueOrDie())) return;
     BoltSession session;
-    while (!stopping_.load(std::memory_order_acquire)) {
-      auto payload = ReadBoltMessage(fd, config_.max_frame_bytes);
+    while (!state_->stopping.load(std::memory_order_acquire)) {
+      auto payload = ReadBoltMessage(fd, state_->config.max_frame_bytes);
       if (!payload.ok()) break;
       std::vector<std::string> extra_frames;
-      auto response = ProcessBoltMessage(*database_, payload.ValueOrDie(), &session,
-                                         config_.max_frame_bytes, &extra_frames);
-      if (!response.ok()) break;
+      auto response = ProcessBoltMessage(*state_->database, *state_->cypher_session, payload.ValueOrDie(), &session,
+                                         state_->config.max_frame_bytes, state_->config.max_pull_records,
+                                         &extra_frames, state_->config.auth_token);
+      if (!response.ok()) {
+        const auto failure = EncodeBoltFailure(response.status(), state_->config.max_frame_bytes);
+        if (!failure.ok() || !WriteBoltFrame(fd, failure.ValueOrDie())) return;
+        const auto failed_kind = DecodeBoltMessageKind(payload.ValueOrDie());
+        if (failed_kind.ok() && failed_kind.ValueOrDie() == BoltMessageKind::kGoodbye) break;
+        continue;
+      }
       for (const std::string& frame : extra_frames) {
         if (!WriteBoltFrame(fd, frame)) return;
       }
@@ -578,15 +775,22 @@ void Server::HandleClient(int fd) {
     }
     return;
   }
-  if (probe_count >= 2 && probe[0] == 0 && probe[1] != 0 && database_) {
+  if (probe_count >= 2 && probe[0] == 0 && probe[1] != 0 && state_->database) {
     BoltSession session;
-    while (!stopping_.load(std::memory_order_acquire)) {
-      auto payload = ReadBoltMessage(fd, config_.max_frame_bytes);
+    while (!state_->stopping.load(std::memory_order_acquire)) {
+      auto payload = ReadBoltMessage(fd, state_->config.max_frame_bytes);
       if (!payload.ok()) break;
       std::vector<std::string> extra_frames;
-      auto response = ProcessBoltMessage(*database_, payload.ValueOrDie(), &session,
-                                         config_.max_frame_bytes, &extra_frames);
-      if (!response.ok()) break;
+      auto response = ProcessBoltMessage(*state_->database, *state_->cypher_session, payload.ValueOrDie(), &session,
+                                         state_->config.max_frame_bytes, state_->config.max_pull_records,
+                                         &extra_frames, state_->config.auth_token);
+      if (!response.ok()) {
+        const auto failure = EncodeBoltFailure(response.status(), state_->config.max_frame_bytes);
+        if (!failure.ok() || !WriteBoltFrame(fd, failure.ValueOrDie())) return;
+        const auto failed_kind = DecodeBoltMessageKind(payload.ValueOrDie());
+        if (failed_kind.ok() && failed_kind.ValueOrDie() == BoltMessageKind::kGoodbye) break;
+        continue;
+      }
       for (const std::string& frame : extra_frames) {
         if (!WriteBoltFrame(fd, frame)) return;
       }
@@ -597,9 +801,9 @@ void Server::HandleClient(int fd) {
     return;
   }
   std::string request;
-  request.resize(config_.max_frame_bytes);
+  request.resize(state_->config.max_frame_bytes);
   const ssize_t count = ::recv(fd, request.data(), request.size(), 0);
-  if (count <= 0 || static_cast<size_t>(count) > config_.max_frame_bytes) return;
+  if (count <= 0 || static_cast<size_t>(count) > state_->config.max_frame_bytes) return;
   request.resize(static_cast<size_t>(count));
   std::string response;
   if (request.size() == 20 && request.compare(0, 4, "\x60\x60\xB0\x17", 4) == 0) {
@@ -612,21 +816,21 @@ void Server::HandleClient(int fd) {
     response = Ready() ? "200 OK\n" : "503 NOT_READY\n";
   } else if (request == "GET /metrics\n" || request == "GET /metrics\r\n") {
     response = Metrics();
-  } else if (request.rfind("RUN ", 0) == 0 && database_) {
+  } else if (request.rfind("RUN ", 0) == 0 && state_->database) {
     const std::string source = request.substr(4);
-    auto prepared = cypher::PrepareCypher(*database_, source, cypher::SchemaCatalog{});
+    auto prepared = state_->cypher_session->Prepare(source);
     response = prepared.ok() ? "200 OK " + std::to_string(prepared.ValueOrDie().fingerprint()) + "\n"
                              : "400 " + prepared.status().ToString() + "\n";
-  } else if (database_) {
+  } else if (state_->database) {
     // Handle one bounded Bolt request per connection. PackStream values stay
     // opaque here; Cedar Cypher remains the only query compiler.
-    const auto payload = DecodeBoltChunk(request, config_.max_frame_bytes);
+    const auto payload = DecodeBoltChunk(request, state_->config.max_frame_bytes);
     if (!payload.ok()) return;
     const auto kind = DecodeBoltMessageKind(payload.ValueOrDie());
     if (!kind.ok()) return;
     const auto encoded = kind.ValueOrDie() == BoltMessageKind::kGoodbye
-                             ? EncodeBoltIgnored(config_.max_frame_bytes)
-                             : EncodeBoltSuccess(config_.max_frame_bytes);
+                             ? EncodeBoltIgnored(state_->config.max_frame_bytes)
+                             : EncodeBoltSuccess(state_->config.max_frame_bytes);
     if (!encoded.ok()) return;
     response = encoded.ValueOrDie();
   } else {

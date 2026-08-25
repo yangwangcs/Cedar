@@ -98,6 +98,23 @@ TEST(LogicalPlanTest, MaterializesTemporalScopesAboveSourceScans) {
   }
 }
 
+TEST(LogicalPlanTest, CarriesLimitAsAnExplicitLogicalNode) {
+  const Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, At{ValidTime{10}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto limited = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(limited.ok()) << limited.status().ToString();
+  limited = limited.ValueOrDie().Limit(0, 7);
+  ASSERT_TRUE(limited.ok()) << limited.status().ToString();
+  const auto* node = internal::LogicalPlanInspector::Inspect(limited.ValueOrDie());
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->kind(), internal::LogicalOpKind::kLimit);
+  ASSERT_TRUE(node->limit_offset().has_value());
+  ASSERT_TRUE(node->limit_count().has_value());
+  EXPECT_EQ(*node->limit_offset(), 0U);
+  EXPECT_EQ(*node->limit_count(), 7U);
+}
+
 template <typename Left, typename Right>
 concept CanCompareEqual = requires(Left left, Right right) {
   Equal(ValueOf(left), Literal<Right>(right));

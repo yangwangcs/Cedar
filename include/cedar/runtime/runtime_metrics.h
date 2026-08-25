@@ -56,6 +56,7 @@ struct RuntimeMetrics {
   uint64_t compression_output_bytes = 0;
   uint64_t point_read_operations = 0;
   uint64_t multi_get_operations = 0;
+  uint64_t multi_get_batches = 0;
   uint64_t projected_scan_rows = 0;
   uint64_t projected_scan_bytes_read = 0;
   uint64_t projected_scan_pages_skipped = 0;

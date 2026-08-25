@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "cedar/cypher.h"
+#include "cedar/cypher/session.h"
 #include "cedar/database.h"
 #include "cedar/transaction.h"
 
@@ -74,9 +75,9 @@ int main(int argc, char** argv) {
           cedar::EntityFact::Vertex({cedar::PartId{0}, vertex.ValueOrDie()}),
           cedar::ValidTime{1}).ok() || !tx.ValueOrDie()->Commit().ok()) return 1;
 
-  auto prepared = cedar::cypher::PrepareCypher(
-      *database.ValueOrDie(), "FOR VALID_TIME AS OF 1 MATCH (v) RETURN v",
-      cedar::cypher::SchemaCatalog{});
+  cedar::cypher::CypherSession session(*database.ValueOrDie(),
+                                       cedar::cypher::SchemaCatalog{});
+  auto prepared = session.Prepare("FOR VALID_TIME AS OF 1 MATCH (v) RETURN v");
   if (!prepared.ok()) {
     std::cerr << prepared.status().ToString() << '\n';
     return 1;
@@ -87,10 +88,7 @@ int main(int argc, char** argv) {
   const auto deadline = Clock::now() + std::chrono::seconds(options.seconds);
   while (Clock::now() < deadline) {
     const auto started = Clock::now();
-    auto snapshot = database.ValueOrDie()->BeginSnapshot();
-    if (!snapshot.ok()) { ++errors; continue; }
-    auto cursor = prepared.ValueOrDie().Execute(std::move(snapshot).ConsumeValueOrDie(),
-                                                cedar::Bindings{});
+    auto cursor = session.Execute(prepared.ValueOrDie(), cedar::cypher::CypherRequest{});
     if (!cursor.ok()) { ++errors; continue; }
     while (true) {
       auto batch = cursor.ValueOrDie().Next();

@@ -12,6 +12,8 @@
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
+#include "cedar/fact/canonical_reader.h"
+#include "cedar/fact/read_spec.h"
 #include "cedar/fact/fact_scan.h"
 
 namespace cedar {
@@ -23,6 +25,7 @@ class AdjacencyIndex;
 class Database;
 class Snapshot;
 class PreparedQuery;
+class Transaction;
 
 using SnapshotFactVisitor = std::function<Status(const FactEvent&)>;
 
@@ -38,13 +41,8 @@ struct FactScanSpec {
   std::optional<ValidTime> event_valid_from_max;
   std::optional<CommitSeq> event_commit_seq_min;
   std::optional<CommitSeq> event_commit_seq_max;
+  std::optional<uint64_t> max_rows;
 };
-
-struct FactEventBatch {
-  std::vector<FactEvent> events;
-};
-
-using FactEventBatchVisitor = std::function<Status(const FactEventBatch&)>;
 
 class Snapshot {
  public:
@@ -57,7 +55,11 @@ class Snapshot {
 
   CommitSeq commit_seq() const;
   CommitSeq oldest_readable_seq() const;
+  const CanonicalFactReader& canonical_reader() const;
   std::shared_ptr<const internal::AdjacencyIndex> adjacency_index() const;
+  static Snapshot WithCanonicalReader(
+      Snapshot base, std::shared_ptr<const CanonicalFactReader> reader,
+      std::optional<CommitSeq> read_seq_override = std::nullopt);
   StatusOr<bool> Exists(EntityFact entity, ValidTime valid_time) const;
   // Evaluates a batch against one pinned Cedar snapshot and preserves caller
   // order. The current adapter is correctness-first; Parquet page-grouped
@@ -93,6 +95,7 @@ class Snapshot {
 
   friend class Database;
   friend class PreparedQuery;
+  friend class Transaction;
 };
 
 }  // namespace cedar

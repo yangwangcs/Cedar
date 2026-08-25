@@ -5,12 +5,14 @@
 #define CEDAR_QUERY_QUERY_H_
 
 #include <memory>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "cedar/query/expression.h"
+#include "cedar/fact/read_spec.h"
 
 namespace cedar {
 struct PathValue;
@@ -94,9 +96,21 @@ class Query {
   }
   StatusOr<Query> Where(Expr<bool> predicate) const;
   StatusOr<Query> Select(std::vector<Projection> projections) const;
+  // Adds a bounded relational LIMIT. The runtime may push this into the
+  // canonical reader only when the complete plan shape proves that doing so
+  // preserves semantics; otherwise it remains a normal relational operator.
+  StatusOr<Query> Limit(size_t offset, size_t count) const;
   StatusOr<Query> ProjectMetadata(SlotId source, MetadataKind kind,
                                   Projection output) const;
   const RowSchema& schema() const;
+
+  // Associates immutable routing and temporal constraints with this logical
+  // query. The execution planner copies this value into its prepared plan;
+  // it never infers a wildcard from PartId{0}.
+  Query WithExecutionScope(ExecutionScope scope) const;
+  const std::optional<ExecutionScope>& execution_scope() const {
+    return execution_scope_;
+  }
  private:
   explicit Query(std::shared_ptr<const internal::LogicalPlanNode> root)
       : root_(std::move(root)) {}
@@ -106,6 +120,7 @@ class Query {
   StatusOr<Query> BindEdgePropertyImpl(SlotId edge, PropertyId property,
                                        RowColumn output) const;
   std::shared_ptr<const internal::LogicalPlanNode> root_;
+  std::optional<ExecutionScope> execution_scope_;
   friend class internal::LogicalPlanInspector;
 };
 }  // namespace cedar

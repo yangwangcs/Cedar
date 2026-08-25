@@ -27,6 +27,7 @@ namespace internal { class QueryMetrics; }
 
 class Database;
 class Snapshot;
+class Transaction;
 template <typename T, bool Optional>
 class Slot;
 template <typename T>
@@ -35,6 +36,19 @@ constexpr QueryType QueryTypeOf();
 namespace internal {
 class QueryRuntime;
 }
+
+enum class QueryAccessSource : uint8_t {
+  kCanonical,
+  kProjection,
+  kDeltaMerge,
+  kMixed,
+};
+
+struct QueryPhysicalSummary {
+  QueryAccessSource source = QueryAccessSource::kCanonical;
+  std::optional<uint64_t> projection_generation;
+  std::optional<CommitSeq> projection_base;
+};
 
 // A path is materialized only for a selected shortest-path target.  Keeping
 // the nested values in this small value type lets the public column use flat
@@ -192,6 +206,22 @@ struct QueryTerminalInfo {
   Status status = Status::OK();
 };
 
+// Fixed-cardinality counters for read-side complexity evidence. These fields
+// intentionally contain no query text, entity ids, property names, or user
+// values, so a query profile remains bounded independently of workload size.
+struct QueryComplexityCounters {
+  uint64_t catalog_hits = 0;
+  uint64_t catalog_misses = 0;
+  uint64_t chain_sort_fallbacks = 0;
+  uint64_t chain_events_decoded = 0;
+  uint64_t page_directory_hits = 0;
+  uint64_t page_pruned = 0;
+  uint64_t spill_partition_reads = 0;
+  uint64_t spill_partition_rebuilds = 0;
+  uint64_t limit_early_stops = 0;
+  uint64_t materialization_bytes = 0;
+};
+
 struct QueryOperatorProfile {
   uint32_t operator_id = 0;
   uint64_t rows = 0;
@@ -203,6 +233,7 @@ struct QueryOperatorProfile {
   uint64_t physical_bytes = 0;
   uint64_t decoded_bytes = 0;
   uint64_t pages = 0;
+  uint64_t pages_skipped = 0;
   uint64_t delta_repairs = 0;
   uint64_t interval_fragments = 0;
   uint64_t spill_bytes = 0;
@@ -212,6 +243,7 @@ struct QueryOperatorProfile {
 struct QueryProfile {
   std::vector<QueryOperatorProfile> operators;
   QueryTerminalInfo terminal;
+  QueryComplexityCounters complexity;
 };
 
 // Shared lifecycle state lets Database shutdown request cancellation without
@@ -242,6 +274,15 @@ class QueryExecutionState {
                    bool capture_profile = true, uint64_t physical_bytes = 0,
                    uint64_t pages = 0, uint64_t interval_fragments = 0,
                    uint32_t operator_id = 0, uint8_t metric_operator = 0);
+  void RecordStorageRead(uint64_t physical_bytes, uint64_t decoded_bytes,
+                         uint64_t pages, uint64_t pages_skipped = 0,
+                         uint32_t operator_id = 0);
+  void RecordCatalogLookup(bool hit);
+  void RecordChainSortFallback(uint64_t events_decoded);
+  void RecordPageDirectory(bool hit, uint64_t pages_pruned);
+  void RecordSpillPartitionRead(bool rebuilt);
+  void RecordLimitEarlyStop();
+  void RecordMaterializationBytes(uint64_t bytes);
   void SetMetrics(internal::QueryMetrics* metrics) { metrics_ = metrics; }
 
  private:
@@ -349,12 +390,17 @@ class PreparedQuery {
 
   StatusOr<QueryCursor> Execute(Snapshot snapshot, const Bindings& bindings,
                                 const QueryOptions& options) const;
+  StatusOr<QueryCursor> Execute(Transaction& transaction,
+                                const Bindings& bindings,
+                                const QueryOptions& options) const;
   // Explain does not execute the query. Logical explanation is independent of
   // any snapshot; physical explanation binds a plan at the borrowed snapshot
   // cut and reports canonical fallback when no derived catalog is available.
   StatusOr<std::string> ExplainLogical() const;
   StatusOr<std::string> ExplainPhysical(const Snapshot& snapshot,
                                          const QueryOptions& options) const;
+  StatusOr<QueryPhysicalSummary> ExplainPhysicalSummary(
+      const Snapshot& snapshot, const QueryOptions& options) const;
 
  private:
   class State;

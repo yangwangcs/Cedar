@@ -399,6 +399,7 @@ class FactStoreImpl {
   std::atomic<uint64_t> published_oldest_readable_seq{0};
   std::atomic<uint64_t> point_read_operations{0};
   std::atomic<uint64_t> multi_get_operations{0};
+  std::atomic<uint64_t> multi_get_batches{0};
   std::atomic<uint64_t> projected_scan_rows{0};
   std::atomic<uint64_t> projected_scan_bytes_read{0};
   std::atomic<uint64_t> projected_scan_pages_skipped{0};
@@ -1694,8 +1695,9 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
     rocks_spec.cedar_commit_seq_min = options.event_commit_seq_min->value;
   }
   if (options.event_commit_seq_max.has_value()) {
-    rocks_spec.cedar_commit_seq_max = options.event_commit_seq_max->value;
+  rocks_spec.cedar_commit_seq_max = options.event_commit_seq_max->value;
   }
+  rocks_spec.max_rows = options.max_rows;
   const std::optional<uint64_t> lower_entity =
       prefix.entity_id().has_value() ? prefix.entity_id() : bounds.entity_id_min;
   const std::optional<uint64_t> upper_entity =
@@ -2046,6 +2048,7 @@ StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
       store->db->MultiGet(options, families, keys, &values);
   store->multi_get_operations.fetch_add(encoded_fact_keys.size(),
                                         std::memory_order_relaxed);
+  store->multi_get_batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<FactEvent> events;
   events.reserve(encoded_fact_keys.size());
   for (size_t i = 0; i < statuses.size(); ++i) {
@@ -3844,6 +3847,8 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
       store->point_read_operations.load(std::memory_order_relaxed);
   metrics.multi_get_operations =
       store->multi_get_operations.load(std::memory_order_relaxed);
+  metrics.multi_get_batches =
+      store->multi_get_batches.load(std::memory_order_relaxed);
   metrics.projected_scan_rows =
       store->projected_scan_rows.load(std::memory_order_relaxed);
   metrics.projected_scan_bytes_read =

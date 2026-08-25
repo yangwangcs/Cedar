@@ -28,6 +28,13 @@ TEST(CypherCompilerTest, LowersBoundedPathToExistingExpandOperator) {
   EXPECT_EQ(query.ValueOrDie().schema().columns().size(), 3U);
 }
 
+TEST(CypherCompilerTest, LowersConnectedMixedPathToLeftDeepExpansions) {
+  const auto query = Compile(Bound(
+      "MATCH (a)-[e:KNOWS]->(b)-[f:LIKES*1..2]->(c) RETURN a, e, b, f, c"));
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  EXPECT_EQ(query.ValueOrDie().schema().columns().size(), 5U);
+}
+
 TEST(CypherCompilerTest, LowersFactMetadataFunctionsToTypedColumns) {
   const auto query = Compile(Bound(
       "MATCH (v) RETURN v, valid_from(v), commit_seq(v)"));

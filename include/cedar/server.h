@@ -1,15 +1,13 @@
 #ifndef CEDAR_SERVER_H_
 #define CEDAR_SERVER_H_
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 
 #include "cedar/core/status.h"
 #include "cedar/database.h"
+#include "cedar/cypher/session.h"
 
 namespace cedar::server {
 
@@ -19,6 +17,16 @@ struct ServerConfig {
   uint16_t port = 7687;
   std::string lock_path;
   std::string pid_path;
+  std::string schema_path;
+  // Optional constant-time Bolt HELLO credential. Empty keeps local anonymous
+  // development behavior; production deployments should set this or use an
+  // authenticated TLS terminator.
+  std::string auth_token;
+  std::string graph;
+  PartId part_id{0};
+  uint32_t worker_threads = 1;
+  uint32_t max_sessions = 64;
+  uint32_t max_pull_records = 128;
   uint32_t max_frame_bytes = 1U * 1024U * 1024U;
 
   Status Validate() const;
@@ -34,28 +42,20 @@ class Server {
 
   Status Start();
   Status Stop();
-  bool Live() const { return live_.load(std::memory_order_acquire); }
-  bool Ready() const { return ready_.load(std::memory_order_acquire); }
+  bool Live() const;
+  bool Ready() const;
   uint16_t port() const;
   std::string Metrics() const;
 
  private:
+  class State;
   void AcceptLoop();
+  void WorkerLoop();
   void HandleClient(int fd);
   Status AcquireLock();
   void ReleaseLock();
 
-  ServerConfig config_;
-  mutable std::mutex mutex_;
-  std::unique_ptr<Database> database_;
-  int listen_fd_ = -1;
-  int lock_fd_ = -1;
-  uint16_t bound_port_ = 0;
-  std::thread accept_thread_;
-  std::atomic<bool> live_{false};
-  std::atomic<bool> ready_{false};
-  std::atomic<bool> stopping_{false};
-  std::atomic<int> active_client_fd_{-1};
+  std::unique_ptr<State> state_;
 };
 
 }  // namespace cedar::server

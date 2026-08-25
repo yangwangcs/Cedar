@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "query/temporal/interval.h"
+#include "query/runtime/read_context.h"
 
 namespace cedar::internal {
 namespace {
@@ -48,19 +49,27 @@ Status ValidateEvents(const std::vector<EventRow>& events,
 
 StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
     Snapshot& snapshot, const std::vector<StateRow>& entities,
+    const PropertyDefinition& definition, const PartScope& part_scope) {
+  return BindIntervals(QueryReadContext{snapshot.canonical_reader(),
+                                        snapshot.commit_seq(), part_scope, {}, {}},
+                       entities, definition);
+}
+
+StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
+    const QueryReadContext& context, const std::vector<StateRow>& entities,
     const PropertyDefinition& definition) {
   const Status valid = definition.Validate();
   if (!valid.ok()) return valid;
   const FactFamily family = PropertyFamily(definition.entity_kind);
   auto events = TemporalSource::ReadEvents(
-      snapshot, family, definition.property_id,
+      context, family, definition.property_id,
       ValidTimeInterval{ValidTime{0}, std::nullopt});
   if (!events.ok()) return events.status();
   const Status event_schema = ValidateEvents(events.ValueOrDie(), definition);
   if (!event_schema.ok()) return event_schema;
 
   auto property_states = TemporalSource::ReadHistory(
-      snapshot, family, definition.property_id, std::nullopt);
+      context, family, definition.property_id, std::nullopt);
   if (!property_states.ok()) return property_states.status();
   using PropertyKey = std::pair<uint32_t, uint64_t>;
   std::map<PropertyKey, std::vector<StateRow>> states_by_entity;
@@ -116,8 +125,17 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
 
 StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindAt(
     Snapshot& snapshot, const std::vector<StateRow>& entities,
+    ValidTime valid_time, const PropertyDefinition& definition,
+    const PartScope& part_scope) {
+  return BindAt(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
+                                 part_scope, {}, {}}, entities, valid_time,
+                definition);
+}
+
+StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindAt(
+    const QueryReadContext& context, const std::vector<StateRow>& entities,
     ValidTime valid_time, const PropertyDefinition& definition) {
-  auto rows = BindIntervals(snapshot, entities, definition);
+  auto rows = BindIntervals(context, entities, definition);
   if (!rows.ok()) return rows.status();
   std::vector<BoundPropertyRow> result;
   for (BoundPropertyRow& row : rows.ValueOrDie()) {

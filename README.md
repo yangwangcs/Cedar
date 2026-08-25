@@ -179,6 +179,15 @@ ctest --test-dir build --output-on-failure
 The installed consumer target is `Cedar::cedar`. Engine headers and
 engine-specific consumer targets are not installed.
 
+### Cedar server security boundary
+
+`cedar-server --auth-token TOKEN --db PATH` enables constant-time application
+authentication in the Bolt `HELLO` message. Cedar's embedded listener is not a
+TLS terminator: production deployments must put it behind an mTLS/TLS proxy or
+service mesh. The token protects application admission but does not encrypt
+the transport. With no token, the local-development Bolt mode remains
+anonymous.
+
 ## Basic Usage
 
 ```cpp

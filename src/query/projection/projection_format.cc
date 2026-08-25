@@ -222,6 +222,139 @@ StatusOr<ProjectionChain> DecodeProjectionPage(const std::string& bytes, size_t 
   return DecodeProjectionPageImpl(bytes, limit, std::nullopt);
 }
 
+StatusOr<ProjectionChain> DecodeProjectionDirectory(const std::string& b,
+                                                     uint64_t file_size,
+                                                     CompressionCodec* codec_out) {
+  if (codec_out == nullptr) {
+    return Status::InvalidArgument("projection", "codec output is required");
+  }
+  if (file_size < kHeaderBytes + 4 || b.size() < kHeaderBytes ||
+      b.compare(0, 8, "CDRPRJ1\0", 8) != 0) {
+    return Status::Corruption("projection", "bad directory header");
+  }
+  size_t p = 8;
+  uint32_t version = 0;
+  if (!G32(b, &p, &version) || version != 1 || p + 2 > b.size()) {
+    return Status::Corruption("projection", "invalid directory header");
+  }
+  const auto kind = ProjectionKind(uint8_t(b[p++]));
+  const auto codec = CompressionCodec(uint8_t(b[p++]));
+  if (uint8_t(kind) < 1 || uint8_t(kind) > 4) {
+    return Status::Corruption("projection", "invalid projection kind");
+  }
+  if (codec != CompressionCodec::kNone && codec != CompressionCodec::kLz4) {
+    return Status::NotSupported("projection", "unknown page codec");
+  }
+  ProjectionChain c;
+  c.header.kind = kind;
+  uint64_t gen = 0, base = 0, emin = 0, emax = 0, from = 0, to = 0;
+  uint32_t part = 0, schema = 0, count = 0;
+  uint16_t prop = 0;
+  if (!G64(b, &p, &gen) || !G64(b, &p, &base) || !G32(b, &p, &part) ||
+      !G16(b, &p, &prop) || !G32(b, &p, &schema) || !G64(b, &p, &emin) ||
+      !G64(b, &p, &emax) || !G64(b, &p, &from) || p >= b.size()) {
+    return Status::Corruption("projection", "truncated directory header");
+  }
+  const uint8_t has = uint8_t(b[p++]);
+  if (has > 1 || !G64(b, &p, &to) || !G32(b, &p, &count) ||
+      count > (file_size - kHeaderBytes - 4) / kDirectoryBytes ||
+      count > (b.size() - kHeaderBytes) / kDirectoryBytes) {
+    return Status::Corruption("projection", "invalid directory count");
+  }
+  uint32_t header_crc = 0;
+  if (!G32(b, &p, &header_crc) || p != kHeaderBytes ||
+      header_crc != crc32c::Value(b.data(), kHeaderBytes - 4)) {
+    return Status::Corruption("projection", "directory header CRC mismatch");
+  }
+  auto header_status = ValidRange(emin, emax, from,
+                                  has ? std::optional<ValidTime>(ValidTime{to})
+                                      : std::nullopt);
+  if (!header_status.ok()) return header_status;
+  c.header.generation_id = gen;
+  c.header.base_seq = {base};
+  c.header.part_id = {part};
+  c.header.property_id = {prop};
+  c.header.schema_epoch = schema;
+  c.header.entity_min = emin;
+  c.header.entity_max_exclusive = emax;
+  c.header.valid_from_min = {from};
+  c.header.valid_to_max = has ? std::optional<ValidTime>(ValidTime{to})
+                              : std::nullopt;
+  c.page_directory.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    ProjectionPageDirectoryEntry d;
+    uint8_t has_to = 0, has_edge = 0;
+    uint64_t vf = 0, vt = 0, edge_min = 0, edge_max = 0;
+    if (!G64(b, &p, &d.offset) || !G32(b, &p, &d.compressed_bytes) ||
+        !G32(b, &p, &d.uncompressed_bytes) || !G32(b, &p, &d.row_count) ||
+        !G64(b, &p, &d.entity_min) || !G64(b, &p, &d.entity_max_exclusive) ||
+        !G64(b, &p, &vf) || p >= b.size()) {
+      return Status::Corruption("projection", "truncated page directory");
+    }
+    d.valid_from_min = {vf};
+    has_to = uint8_t(b[p++]);
+    if (has_to > 1 || !G64(b, &p, &vt) || p >= b.size()) {
+      return Status::Corruption("projection", "invalid page time flag");
+    }
+    has_edge = uint8_t(b[p++]);
+    if (has_edge > 1 || !G64(b, &p, &edge_min) || !G64(b, &p, &edge_max) ||
+        !G32(b, &p, &d.payload_crc32c) || !G64(b, &p, &d.bloom_bits) ||
+        p >= b.size()) {
+      return Status::Corruption("projection", "truncated page directory");
+    }
+    d.bloom_hashes = uint8_t(b[p++]);
+    if (!G64(b, &p, &d.bloom_mask)) {
+      return Status::Corruption("projection", "truncated bloom directory");
+    }
+    d.valid_to_max = has_to ? std::optional<ValidTime>(ValidTime{vt})
+                            : std::nullopt;
+    if (has_edge) {
+      d.edge_type_min = edge_min;
+      d.edge_type_max = edge_max;
+    }
+    auto valid = ValidPage(d);
+    if (!valid.ok()) return valid;
+    c.page_directory.push_back(d);
+  }
+  const size_t directory_end = kHeaderBytes + size_t(count) * kDirectoryBytes;
+  if (p != directory_end) {
+    return Status::Corruption("projection", "directory size mismatch");
+  }
+  auto ranges = ValidDirectory(c.page_directory, directory_end,
+                               static_cast<size_t>(file_size));
+  if (!ranges.ok()) return ranges;
+  *codec_out = codec;
+  return c;
+}
+
+StatusOr<ProjectionChain> ReadProjectionPagePayload(
+    const ProjectionHeader& header, CompressionCodec codec,
+    const ProjectionPageDirectoryEntry& directory, const std::string& payload,
+    size_t allocation_limit) {
+  if (payload.size() != directory.compressed_bytes ||
+      crc32c::Value(payload.data(), payload.size()) != directory.payload_crc32c) {
+    return Status::Corruption("projection", "page payload CRC32C mismatch");
+  }
+  auto raw = DecompressProjectionPayload(
+      codec, payload, std::min<size_t>(directory.uncompressed_bytes,
+                                       allocation_limit));
+  if (!raw.ok()) return raw.status();
+  if (raw.ValueOrDie().size() != directory.uncompressed_bytes) {
+    return Status::Corruption("projection", "decoded page length mismatch");
+  }
+  ProjectionChain result;
+  result.header = header;
+  result.page_directory.push_back(directory);
+  size_t allocation_used = 0;
+  auto decoded = DecodePayload(raw.ValueOrDie(), allocation_limit, &allocation_used,
+                               &result);
+  if (!decoded.ok()) return decoded;
+  if (result.intervals.size() + result.boundaries.size() != directory.row_count) {
+    return Status::Corruption("projection", "directory row count mismatch");
+  }
+  return result;
+}
+
 StatusOr<ProjectionChain> ReadProjectionPage(const std::string& bytes,
                                               size_t page_index,
                                               size_t limit) {

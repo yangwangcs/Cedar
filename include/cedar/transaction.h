@@ -16,6 +16,7 @@
 namespace cedar {
 
 class Database;
+class Snapshot;
 
 using TransactionFactVisitor = std::function<Status(const FactEvent&)>;
 
@@ -78,6 +79,7 @@ class Transaction {
   StatusOr<std::optional<Value>> Get(PropertyFact property, ValidTime valid_time);
   Status Scan(FactFamily family, PropertyId property_id,
               const TransactionFactVisitor& visitor);
+  StatusOr<Snapshot> BeginReadSnapshot(bool include_staged = true) const;
   Status Assert(EntityFact entity, ValidTime valid_time);
   Status Assert(EdgeIdentity identity, ValidTime valid_time);
   Status Retract(EntityFact entity, ValidTime valid_time);

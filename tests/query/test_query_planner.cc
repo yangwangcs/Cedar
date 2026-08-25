@@ -69,6 +69,30 @@ TEST(QueryPlannerTest, RejectsOverlappingManifestRegions) {
   EXPECT_TRUE(plan.status().IsCorruption());
 }
 
+TEST(QueryPlannerTest, ValidatesTenThousandDisjointCoverageRegionsSubquadratically) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 7;
+  catalog.base_seq = CommitSeq{1};
+  catalog.regions.reserve(10000);
+  for (uint64_t index = 0; index < 10000; ++index) {
+    CoverageRegion region = Region(0, 100);
+    region.part_id = PartId{1};
+    region.entity_min = index * 10;
+    region.entity_max_exclusive = index * 10 + 10;
+    region.segments.front().segment_id = "segment-" + std::to_string(index);
+    region.segments.front().filename = region.segments.front().segment_id + ".cfacts";
+    catalog.regions.push_back(std::move(region));
+  }
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{100}}});
+  ASSERT_TRUE(query.ok());
+  auto context = Context(catalog, stats);
+  context.part_scope = PartScope::Exact(PartId{1});
+  auto plan = QueryPlanner::Bind(*LogicalPlanInspector::Inspect(query.ValueOrDie()),
+                                 context);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+}
+
 TEST(QueryPlannerTest, DifferentPartOverlapFallsBackWithoutDroppingCoverage) {
   ProjectionCatalogView catalog;
   catalog.generation_id = 4;
@@ -96,6 +120,53 @@ TEST(QueryPlannerTest, DifferentPartOverlapFallsBackWithoutDroppingCoverage) {
   EXPECT_NE(explain.find("generation=none"), std::string::npos);
   EXPECT_NE(explain.find("base=none"), std::string::npos);
   EXPECT_NE(explain.find("confidence=conservative"), std::string::npos);
+}
+
+TEST(QueryPlannerTest, ExactPartUsesIndependentEntityCoverageSlices) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 9;
+  catalog.base_seq = CommitSeq{10};
+  auto lower = Region(0, 100);
+  lower.entity_min = 0;
+  lower.entity_max_exclusive = 10;
+  auto upper = Region(0, 100);
+  upper.entity_min = 10;
+  upper.entity_max_exclusive = UINT64_MAX;
+  catalog.regions = {lower, upper};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{100}}});
+  ASSERT_TRUE(query.ok());
+  auto context = Context(catalog, stats);
+  context.part_scope = PartScope::Exact(PartId{0});
+  auto plan = QueryPlanner::Bind(
+      *LogicalPlanInspector::Inspect(query.ValueOrDie()), context);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan.ValueOrDie().slices().size(), 2U);
+  EXPECT_EQ(plan.ValueOrDie().slices()[0].entity_min, 0U);
+  EXPECT_EQ(plan.ValueOrDie().slices()[1].entity_min, 10U);
+  EXPECT_TRUE(plan.ValueOrDie().slices()[0].part_bound);
+  EXPECT_EQ(plan.ValueOrDie().slices()[0].source, CoverageSource::kDeltaMerge);
+}
+
+TEST(QueryPlannerTest, FinitePartSetUsesIndependentPartitionSlices) {
+  ProjectionCatalogView catalog;
+  catalog.generation_id = 10;
+  catalog.base_seq = CommitSeq{10};
+  auto first = Region(0, 100);
+  auto second = Region(0, 100);
+  second.part_id = PartId{1};
+  catalog.regions = {first, second};
+  QueryStatisticsView stats;
+  auto query = Scan(Overlaps{{ValidTime{0}, ValidTime{100}}});
+  ASSERT_TRUE(query.ok());
+  auto context = Context(catalog, stats);
+  context.part_scope = PartScope::Set({PartId{0}, PartId{1}});
+  auto plan = QueryPlanner::Bind(
+      *LogicalPlanInspector::Inspect(query.ValueOrDie()), context);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan.ValueOrDie().slices().size(), 2U);
+  EXPECT_TRUE(plan.ValueOrDie().slices()[0].part_bound);
+  EXPECT_TRUE(plan.ValueOrDie().slices()[1].part_bound);
 }
 
 TEST(QueryPlannerTest, EmptyProjectionRegionFallsBackAndExplainsIt) {

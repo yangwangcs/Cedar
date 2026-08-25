@@ -1,6 +1,6 @@
 # Cedar Query Performance: Development-Host Results
 
-Date: 2026-08-24
+Date: 2026-08-25
 
 This report records measurements from the Cedar development host. The numbers
 are reproducible workload observations, not hardware-independent claims or a
@@ -110,9 +110,43 @@ This campaign validates long-running stability, WAL/reopen behavior,
 maintenance, and space accounting. Its latency is not directly comparable to
 the cold/warm read matrix because writers and readers contend simultaneously.
 
+## Temporal Range and Transaction Read Profile
+
+The temporal-range profile is a separate, short fixture-level measurement of
+the newly completed T-Cypher read paths. It uses 16 vertices, 16 typed edges,
+two configured property lanes, three commit sequences, one session, a one
+second per-case window, and a 64 MiB query budget. It reports the effective
+source, output rows, physical/decoded bytes, pages read/skipped, p50/p95/p99,
+RSS, and errors; the acceptance gate requires zero errors and bounded memory.
+
+### Debug profile
+
+| Case | Ops/s | p50/p95/p99 (us) |
+| --- | ---: | ---: |
+| point state | 1,589 | 562/1,010/1,693 |
+| system-time AS OF | 1,613 | 562/886/1,637 |
+| system-time BETWEEN | 1,714 | 526/941/1,565 |
+| two-segment path | 209 | 4,460/6,473/8,301 |
+| transaction read-your-writes | 2,557 | 352/563/1,038 |
+
+### Release profile
+
+| Case | Ops/s | Rows/s | p50/p95/p99 (us) | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| point state | 16,771 | 268,336 | 53/116/168 | 18.9 MiB |
+| system-time AS OF | 17,050 | 272,800 | 53/91/160 | 19.2 MiB |
+| system-time BETWEEN | 18,711 | 299,376 | 48/97/144 | 19.3 MiB |
+| two-segment path | 1,916 | 15,328 | 487/713/1,137 | 19.4 MiB |
+| transaction read-your-writes | 26,297 | 447,049 | 34/49/111 | 19.9 MiB |
+
+These measurements are fixture-level comparisons, not universal capacity
+claims. The profile executable and gate are
+`build-tcypher[-release]/cedar_temporal_range_profile` and
+`benchmarks/check_cedar_temporal_range_profile.sh`.
+
 ## Correctness and Resource Gates
 
-- Debug CTest: `711/711` passed.
+- Debug CTest: `812/812` passed.
 - QueryDifferential + QueryDelta under TSAN: `30/30` passed.
 - QueryDifferential + QueryDelta under UBSAN: `30/30` passed.
 - `base`, `short-delta`, `long-delta`, and `partial-coverage` fixtures passed

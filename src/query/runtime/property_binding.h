@@ -8,9 +8,12 @@
 #include <vector>
 
 #include "cedar/schema.h"
+#include "cedar/fact/read_spec.h"
 #include "query/runtime/temporal_source.h"
 
 namespace cedar::internal {
+
+struct QueryReadContext;
 
 struct BoundPropertyRow {
   FactRef ref;
@@ -23,10 +26,18 @@ struct BoundPropertyRow {
 class PropertyBinder {
  public:
   static StatusOr<std::vector<BoundPropertyRow>> BindIntervals(
-      Snapshot& snapshot, const std::vector<StateRow>& entities,
+      const QueryReadContext& context, const std::vector<StateRow>& entities,
       const PropertyDefinition& definition);
+  static StatusOr<std::vector<BoundPropertyRow>> BindIntervals(
+      Snapshot& snapshot, const std::vector<StateRow>& entities,
+      const PropertyDefinition& definition,
+      const PartScope& part_scope = PartScope::All());
   static StatusOr<std::vector<BoundPropertyRow>> BindAt(
       Snapshot& snapshot, const std::vector<StateRow>& entities,
+      ValidTime valid_time, const PropertyDefinition& definition,
+      const PartScope& part_scope = PartScope::All());
+  static StatusOr<std::vector<BoundPropertyRow>> BindAt(
+      const QueryReadContext& context, const std::vector<StateRow>& entities,
       ValidTime valid_time, const PropertyDefinition& definition);
 };
 

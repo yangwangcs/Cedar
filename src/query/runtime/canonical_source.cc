@@ -3,39 +3,45 @@
 
 #include "query/runtime/canonical_source.h"
 
-#include <map>
-
 #include "query/temporal/corrected_chain.h"
+#include "query/runtime/fact_chain_cursor.h"
 
 namespace cedar::internal {
 
 StatusOr<std::vector<VertexRef>> CanonicalSource::ReadVerticesAt(
-    Snapshot& snapshot, ValidTime valid_time) {
-  struct VertexKey {
-    PartId part_id;
-    uint64_t entity_id = 0;
-
-    bool operator<(const VertexKey& other) const {
-      if (part_id.value != other.part_id.value) {
-        return part_id.value < other.part_id.value;
-      }
-      return entity_id < other.entity_id;
-    }
-  };
-  std::map<VertexKey, std::vector<FactEvent>> chains;
-  const Status scanned = snapshot.ScanFamily(
-      FactFamily::kVertexState, [&chains](const FactEvent& event) {
-        chains[{event.ref.part_id(), event.ref.entity_id()}].push_back(event);
+    Snapshot& snapshot, ValidTime valid_time, const PartScope& part_scope) {
+  FactChainCursor cursor(FactBatchOrder::kIdentityValidDescCommitDesc,
+                         snapshot.commit_seq());
+  auto consume = [&cursor, &part_scope](const FactEvent& event) {
+        if (!part_scope.Contains(event.ref.part_id())) return Status::OK();
+        return cursor.Consume(event);
+      };
+  Status scanned;
+  if (part_scope.kind == PartScopeKind::kAll) {
+    scanned = snapshot.ScanFamily(FactFamily::kVertexState, consume);
+  } else {
+    for (PartId part : part_scope.parts) {
+      FactScanSpec spec;
+      spec.part_id = part;
+      spec.family = FactFamily::kVertexState;
+      spec.property_id = PropertyId{};
+      scanned = snapshot.EventScan(spec, [&consume](const FactEventBatch& batch) {
+        for (const FactEvent& event : batch.events) {
+          Status status = consume(event);
+          if (!status.ok()) return status;
+        }
         return Status::OK();
       });
+      if (!scanned.ok()) break;
+    }
+  }
   if (!scanned.ok()) return scanned;
 
+  const Status finished = cursor.Finish(snapshot.commit_seq());
+  if (!finished.ok()) return finished;
   std::vector<VertexRef> vertices;
-  for (const auto& [key, events] : chains) {
-    const auto corrected =
-        ResolveCorrectedBoundaries(events, snapshot.commit_seq());
-    if (!corrected.ok()) return corrected.status();
-    const auto& boundaries = corrected.ValueOrDie();
+  for (const auto& chain : cursor.chains()) {
+    const auto& boundaries = chain.boundaries;
     for (size_t index = 0; index < boundaries.size(); ++index) {
       if (boundaries[index].valid_from.value > valid_time.value) break;
       const bool contains =
@@ -43,7 +49,7 @@ StatusOr<std::vector<VertexRef>> CanonicalSource::ReadVerticesAt(
           valid_time.value < boundaries[index + 1].valid_from.value;
       if (contains && boundaries[index].operation == FactOperation::kPut) {
         vertices.push_back(
-            VertexRef{key.part_id, VertexId{key.entity_id}});
+            VertexRef{chain.ref.part_id(), VertexId{chain.ref.entity_id()}});
       }
       if (contains) break;
     }

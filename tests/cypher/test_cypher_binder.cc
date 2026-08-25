@@ -18,7 +18,7 @@ SchemaCatalog Catalog() {
 TEST(CypherBinderTest, BindsScopePartAndDemandWithoutParameterValues) {
   const auto parsed = Parse(
       "USE social FOR VALID_TIME BETWEEN 10 AND 20 MATCH "
-      "(a:Person)-[e:KNOWS*1..2]->(b) RETURN a, valid_from(e)");
+      "(a)-[e:KNOWS*1..2]->(b) RETURN a, valid_from(e)");
   ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
   BinderOptions options;
   options.graph = "social";

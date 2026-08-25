@@ -68,6 +68,7 @@ struct PreparedQueryPlan {
         entity_family(other.entity_family),
         entity_slot(other.entity_slot),
         scope(other.scope),
+        execution_scope(other.execution_scope),
         property_bindings(other.property_bindings),
         metadata_bindings(other.metadata_bindings),
         predicate(other.predicate),
@@ -76,9 +77,11 @@ struct PreparedQueryPlan {
         referenced_properties(other.referenced_properties),
         physical_plan(other.physical_plan),
         projection_generation(other.projection_generation),
+        projection_stats(other.projection_stats),
         projection_reader(other.projection_reader),
         delta_reader(other.delta_reader),
         bound_delta_view(other.bound_delta_view),
+        bound_delta_lease(other.bound_delta_lease),
         graph_expand(other.graph_expand),
         graph_source_slot(other.graph_source_slot),
         graph_edge_slot(other.graph_edge_slot),
@@ -88,13 +91,19 @@ struct PreparedQueryPlan {
         graph_path_slot(other.graph_path_slot),
         graph_journey(other.graph_journey),
         graph_journey_slot(other.graph_journey_slot),
-        graph_duration_property(other.graph_duration_property) {}
+        graph_duration_property(other.graph_duration_property),
+        graph_sequence(other.graph_sequence),
+        graph_sequence_hops(other.graph_sequence_hops),
+        limit_offset(other.limit_offset),
+        limit_count(other.limit_count),
+        safe_read_limit(other.safe_read_limit) {}
   PreparedQueryPlan& operator=(const PreparedQueryPlan& other) {
     if (this == &other) return *this;
     canonical_temporal = other.canonical_temporal;
     entity_family = other.entity_family;
     entity_slot = other.entity_slot;
     scope = other.scope;
+    execution_scope = other.execution_scope;
     property_bindings = other.property_bindings;
     metadata_bindings = other.metadata_bindings;
     predicate = other.predicate;
@@ -105,9 +114,11 @@ struct PreparedQueryPlan {
     relational_input.reset();
     physical_plan = other.physical_plan;
     projection_generation = other.projection_generation;
+    projection_stats = other.projection_stats;
     projection_reader = other.projection_reader;
     delta_reader = other.delta_reader;
     bound_delta_view = other.bound_delta_view;
+    bound_delta_lease = other.bound_delta_lease;
     graph_expand = other.graph_expand;
     graph_source_slot = other.graph_source_slot;
     graph_edge_slot = other.graph_edge_slot;
@@ -118,6 +129,11 @@ struct PreparedQueryPlan {
     graph_journey = other.graph_journey;
     graph_journey_slot = other.graph_journey_slot;
     graph_duration_property = other.graph_duration_property;
+    graph_sequence = other.graph_sequence;
+    graph_sequence_hops = other.graph_sequence_hops;
+    limit_offset = other.limit_offset;
+    limit_count = other.limit_count;
+    safe_read_limit = other.safe_read_limit;
     return *this;
   }
   PreparedQueryPlan(PreparedQueryPlan&&) noexcept = default;
@@ -127,6 +143,7 @@ struct PreparedQueryPlan {
   FactFamily entity_family = FactFamily::kVertexState;
   SlotId entity_slot;
   TemporalScope scope = At{ValidTime{0}};
+  ExecutionScope execution_scope;
   std::vector<PreparedPropertyBinding> property_bindings;
   std::vector<PreparedMetadataBinding> metadata_bindings;
   std::shared_ptr<const ExpressionNode> predicate;
@@ -137,10 +154,12 @@ struct PreparedQueryPlan {
   std::optional<RuntimeRelationalInput> relational_input;
   std::shared_ptr<const PhysicalPlan> physical_plan;
   std::optional<ProjectionGeneration> projection_generation;
+  std::shared_ptr<ProjectionReadStats> projection_stats;
   std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
       projection_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;
   std::shared_ptr<const QueryDeltaView> bound_delta_view;
+  std::shared_ptr<const QueryDeltaLease> bound_delta_lease;
   std::optional<ExpandSpec> graph_expand;
   std::optional<SlotId> graph_source_slot;
   std::optional<SlotId> graph_edge_slot;
@@ -151,6 +170,11 @@ struct PreparedQueryPlan {
   uint8_t graph_journey = 0;
   std::optional<SlotId> graph_journey_slot;
   std::optional<PropertyId> graph_duration_property;
+  std::vector<ExpandSpec> graph_sequence;
+  std::vector<uint32_t> graph_sequence_hops;
+  std::optional<size_t> limit_offset;
+  std::optional<size_t> limit_count;
+  std::optional<uint64_t> safe_read_limit;
 };
 
 StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query);

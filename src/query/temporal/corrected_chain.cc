@@ -50,13 +50,21 @@ StatusOr<std::vector<CorrectedBoundary>> ResolveCorrectedBoundaries(
     visible.push_back(event);
   }
 
-  std::sort(visible.begin(), visible.end(), [](const FactEvent& left,
-                                                const FactEvent& right) {
-    if (left.valid_from != right.valid_from) {
-      return left.valid_from.value < right.valid_from.value;
-    }
-    return left.commit_seq.value < right.commit_seq.value;
-  });
+  if (!std::is_sorted(visible.begin(), visible.end(), [](const FactEvent& left,
+                                                         const FactEvent& right) {
+        if (left.valid_from != right.valid_from) {
+          return left.valid_from.value < right.valid_from.value;
+        }
+        return left.commit_seq.value < right.commit_seq.value;
+      })) {
+    std::sort(visible.begin(), visible.end(), [](const FactEvent& left,
+                                                  const FactEvent& right) {
+      if (left.valid_from != right.valid_from) {
+        return left.valid_from.value < right.valid_from.value;
+      }
+      return left.commit_seq.value < right.commit_seq.value;
+    });
+  }
 
   std::vector<CorrectedBoundary> result;
   for (size_t index = 0; index < visible.size();) {

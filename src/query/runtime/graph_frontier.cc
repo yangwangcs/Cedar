@@ -8,6 +8,8 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <tuple>
+#include <unordered_set>
 
 #include "query/temporal/corrected_chain.h"
 #include "query/temporal/interval.h"
@@ -49,6 +51,13 @@ struct IdentityKey {
   }
 };
 
+struct VertexHash {
+  size_t operator()(const VertexRef& ref) const noexcept {
+    return std::hash<uint64_t>{}(ref.part_id.value) * 1315423911ULL ^
+           std::hash<uint64_t>{}(ref.vertex_id.value);
+  }
+};
+
 std::optional<ValidTimeInterval> RequestInterval(const ValidTimeInterval& value) {
   if (!value.Validate().ok()) return std::nullopt;
   return value;
@@ -59,19 +68,19 @@ StatusOr<std::vector<FactEvent>> ReadEvents(Snapshot& snapshot,
                                              const QueryDeltaView* delta,
                                              const std::function<Status()>& check_abort = {}) {
   std::vector<FactEvent> events;
-  FactScanSpec spec;
-  spec.part_id = ref.part_id();
-  spec.family = ref.family();
-  spec.property_id = ref.property_id();
-  spec.entity_id_min = ref.entity_id();
-  spec.entity_id_max = ref.entity_id();
-  Status status = snapshot.EventScan(spec, [&events, &check_abort](const FactEventBatch& batch) {
+  FactReadSpec read_spec;
+  read_spec.part_scope = PartScope::Exact(ref.part_id());
+  read_spec.family = ref.family();
+  read_spec.property_id = ref.property_id();
+  read_spec.entity_range = EntityRange{ref.entity_id(), ref.entity_id() + 1};
+  Status status = snapshot.canonical_reader().ReadEvents(
+      read_spec, [&events, &check_abort](const FactEventBatch& batch) {
     if (check_abort) {
       if (Status status = check_abort(); !status.ok()) return status;
     }
     events.insert(events.end(), batch.events.begin(), batch.events.end());
     return Status::OK();
-  });
+      });
   if (!status.ok()) return status;
   if (delta != nullptr) {
     auto tail = delta->EventsFor(ref);
@@ -96,12 +105,18 @@ StatusOr<std::vector<StateInterval>> VisibleIntervals(
 }
 
 StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
-                                                const QueryDeltaView* delta,
-                                                uint64_t max_candidates = 0,
-                                                const std::function<Status()>& check_abort = {}) {
+                                             const QueryDeltaView* delta,
+                                             uint64_t max_candidates = 0,
+                                             const std::function<Status()>& check_abort = {},
+                                             const PartScope& part_scope = PartScope::All()) {
   std::map<IdentityKey, EdgeIdentity> unique;
-  Status status = snapshot.ScanFamily(FactFamily::kEdgeIdentity,
-                                      [&unique, max_candidates, &check_abort](const FactEvent& event) {
+  FactReadSpec spec;
+  spec.part_scope = part_scope;
+  spec.family = FactFamily::kEdgeIdentity;
+  spec.commit_seq_max = snapshot.commit_seq();
+  Status status = snapshot.canonical_reader().ReadEvents(
+      spec, [&unique, max_candidates, &check_abort](const FactEventBatch& batch) {
+    for (const FactEvent& event : batch.events) {
     if (check_abort) {
       if (Status status = check_abort(); !status.ok()) return status;
     }
@@ -112,6 +127,7 @@ StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
                                 copy.target_ref(), copy.edge_type}, copy);
     if (max_candidates != 0 && unique.size() > max_candidates) {
       return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
+    }
     }
     return Status::OK();
   });
@@ -135,6 +151,11 @@ StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
 
 bool Contains(const VertexRef& ref, const std::vector<VertexRef>& frontier) {
   return std::find(frontier.begin(), frontier.end(), ref) != frontier.end();
+}
+
+bool Contains(const VertexRef& ref,
+              const std::unordered_set<VertexRef, VertexHash>& frontier) {
+  return frontier.find(ref) != frontier.end();
 }
 
 Status ChargeTraversal(const GraphFrontierOptions& options) {
@@ -179,15 +200,31 @@ void AdjacencyIndex::Add(const Entry& entry) {
 
 Status AdjacencyIndex::Build(Snapshot& snapshot, uint64_t generation) {
   postings_.clear();
+  ReadCatalogBuilder catalog_builder;
   generation_ = generation;
   generation_complete_ = true;
   Status status = snapshot.ScanFamily(
-      FactFamily::kEdgeIdentity, [this, generation](const FactEvent& event) {
+      FactFamily::kEdgeIdentity, [this, generation, &catalog_builder](const FactEvent& event) {
         if (!event.edge_identity.has_value()) return Status::OK();
+        const EdgeIdentity& identity = *event.edge_identity;
         Add(Entry{*event.edge_identity, event.commit_seq, generation});
+        for (const auto& descriptor : {
+                 std::tuple<VertexRef, ExpandDirection, std::optional<uint64_t>>{
+                     identity.source_ref(), ExpandDirection::kOut, std::nullopt},
+                 {identity.source_ref(), ExpandDirection::kOut, identity.edge_type},
+                 {identity.target_ref(), ExpandDirection::kIn, std::nullopt},
+                 {identity.target_ref(), ExpandDirection::kIn, identity.edge_type}}) {
+          if (Status catalog_status = catalog_builder.AddAdjacency(
+                  std::get<0>(descriptor), identity, std::get<1>(descriptor),
+                  std::get<2>(descriptor));
+              !catalog_status.ok()) return catalog_status;
+        }
         return Status::OK();
       });
   if (!status.ok()) return status;
+  auto catalog = std::move(catalog_builder).Finish();
+  if (!catalog.ok()) return catalog.status();
+  read_catalog_ = std::move(catalog).ConsumeValueOrDie();
   built_through_ = snapshot.commit_seq();
   return Status::OK();
 }
@@ -195,12 +232,28 @@ Status AdjacencyIndex::Build(Snapshot& snapshot, uint64_t generation) {
 Status AdjacencyIndex::Build(const std::vector<FactEvent>& events,
                              CommitSeq snapshot_seq, uint64_t generation) {
   postings_.clear();
+  ReadCatalogBuilder catalog_builder;
   generation_ = generation;
   generation_complete_ = true;
   for (const FactEvent& event : events) {
     if (!event.edge_identity.has_value()) continue;
-    Add(Entry{*event.edge_identity, event.commit_seq, generation});
+    const EdgeIdentity& identity = *event.edge_identity;
+    Add(Entry{identity, event.commit_seq, generation});
+    for (const auto& descriptor : {
+             std::tuple<VertexRef, ExpandDirection, std::optional<uint64_t>>{
+                 identity.source_ref(), ExpandDirection::kOut, std::nullopt},
+             {identity.source_ref(), ExpandDirection::kOut, identity.edge_type},
+             {identity.target_ref(), ExpandDirection::kIn, std::nullopt},
+             {identity.target_ref(), ExpandDirection::kIn, identity.edge_type}}) {
+      if (Status status = catalog_builder.AddAdjacency(
+              std::get<0>(descriptor), identity, std::get<1>(descriptor),
+              std::get<2>(descriptor));
+          !status.ok()) return status;
+    }
   }
+  auto catalog = std::move(catalog_builder).Finish();
+  if (!catalog.ok()) return catalog.status();
+  read_catalog_ = std::move(catalog).ConsumeValueOrDie();
   built_through_ = snapshot_seq;
   return Status::OK();
 }
@@ -252,6 +305,23 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
   std::map<IdentityKey, EdgeIdentity> unique;
   auto collect = [&](const VertexRef& vertex, ExpandDirection posting_direction) -> Status {
     const Key key{vertex, posting_direction, edge_type};
+    if (delta == nullptr && read_catalog_ != nullptr &&
+        snapshot_seq.value == built_through_.value &&
+        (!generation.has_value() || generation_ == *generation)) {
+      const auto* catalog_posting =
+          read_catalog_->SeekAdjacency(vertex, posting_direction, edge_type);
+      if (catalog_posting != nullptr) {
+        for (const EdgeIdentity& identity : *catalog_posting) {
+          if (check_abort) {
+            if (Status status = check_abort(); !status.ok()) return status;
+          }
+          unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
+                                     identity.target_ref(), identity.edge_type},
+                        identity);
+        }
+        return Status::OK();
+      }
+    }
     const auto found = postings_.find(key);
     if (found == postings_.end()) return Status::OK();
     for (const Entry& entry : found->second) {
@@ -279,10 +349,12 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
     }
   }
   if (delta != nullptr) {
+    std::unordered_set<VertexRef, VertexHash> frontier_set(
+        frontier.begin(), frontier.end());
     auto add_delta = [&](CommitSeq seq, const EdgeIdentity& identity) {
       if (seq.value > snapshot_seq.value) return;
-      const bool out = Contains(identity.source_ref(), frontier);
-      const bool in = Contains(identity.target_ref(), frontier);
+      const bool out = Contains(identity.source_ref(), frontier_set);
+      const bool in = Contains(identity.target_ref(), frontier_set);
       if ((direction == ExpandDirection::kOut && !out) ||
           (direction == ExpandDirection::kIn && !in) ||
           (direction == ExpandDirection::kBoth && !out && !in)) return;
@@ -331,14 +403,14 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
           ? options.adjacency_seek(request.frontier, request.direction,
                                    request.edge_type)
       : Identities(snapshot, options.delta, options.fallback_candidate_limit,
-                   options.check_abort);
+                   options.check_abort, options.part_scope);
   if (!identities.ok() && identities.status().IsNotFound()) {
     // Cache misses are explicit: the canonical lane is only used when the
     // caller supplied a finite fallback bound (or left it unlimited for an
     // analytical query).
     identities = Identities(snapshot, options.delta,
                             options.fallback_candidate_limit,
-                            options.check_abort);
+                            options.check_abort, options.part_scope);
   }
   if (!identities.ok()) return identities.status();
   if (options.fallback_candidate_limit != 0 &&
@@ -349,14 +421,16 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
     *options.candidates_examined += identities.ValueOrDie().size();
   }
   std::vector<TemporalTraversal> output;
+  const std::unordered_set<VertexRef, VertexHash> frontier_set(
+      request.frontier.begin(), request.frontier.end());
   for (const EdgeIdentity& identity : identities.ValueOrDie()) {
     if (options.check_abort) {
       if (Status status = options.check_abort(); !status.ok()) return status;
     }
     if (request.edge_type.has_value() &&
         identity.edge_type != *request.edge_type) continue;
-    const bool out = Contains(identity.source_ref(), request.frontier);
-    const bool in = Contains(identity.target_ref(), request.frontier);
+    const bool out = Contains(identity.source_ref(), frontier_set);
+    const bool in = Contains(identity.target_ref(), frontier_set);
     if ((request.direction == ExpandDirection::kOut && !out) ||
         (request.direction == ExpandDirection::kIn && !in) ||
         (request.direction == ExpandDirection::kBoth && !out && !in)) {

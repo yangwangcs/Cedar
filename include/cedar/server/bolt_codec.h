@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "cedar/core/status.h"
 
@@ -13,6 +14,8 @@ StatusOr<std::string> EncodeBoltChunk(const std::string& payload,
 StatusOr<std::string> DecodeBoltChunk(const std::string& frame,
                                       uint32_t max_chunk_bytes = 1U * 1024U * 1024U);
 StatusOr<std::string> NegotiateBoltHandshake(const std::string& handshake);
+Status AuthenticateBoltHello(const std::string& payload,
+                              std::string_view expected_token);
 
 enum class BoltMessageKind : uint8_t {
   kHello,
@@ -28,6 +31,8 @@ enum class BoltMessageKind : uint8_t {
 StatusOr<BoltMessageKind> DecodeBoltMessageKind(const std::string& payload);
 StatusOr<std::string> EncodeBoltSuccess(uint32_t max_chunk_bytes = 1U * 1024U * 1024U);
 StatusOr<std::string> EncodeBoltIgnored(uint32_t max_chunk_bytes = 1U * 1024U * 1024U);
+StatusOr<std::string> EncodeBoltFailure(const Status& status,
+                                        uint32_t max_chunk_bytes = 1U * 1024U * 1024U);
 
 }  // namespace cedar::server
 

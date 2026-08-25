@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cedar/core/status.h"
@@ -45,6 +46,7 @@ struct CoverageSlice {
   uint64_t entity_min = 0;
   uint64_t entity_max_exclusive = UINT64_MAX;
   std::string database_identity;
+  bool part_bound = false;
   bool operator==(const CoverageSlice&) const = default;
 };
 
@@ -91,10 +93,21 @@ struct PhysicalPlan {
   bool spill_allowed = false;
   bool has_lane_exchange = false;
   bool conservative = false;
+  // Set only when LIMIT can be pushed into a direct canonical scan without
+  // changing filtering, ordering, join, or temporal semantics.
+  std::optional<uint64_t> safe_read_limit;
   QueryPlanNodeDescription explain;
 
   const std::vector<CoverageSlice>& slices() const { return coverage_slices; }
   const std::vector<PhysicalOpKind>& ops() const { return operations; }
+};
+
+// Snapshot-independent preparation collected once per logical query. Dynamic
+// coverage, delta and statistics remain in PhysicalPlan::Bind.
+struct StaticPlanPreparation {
+  uint64_t fingerprint = 0;
+  std::vector<PhysicalOpKind> operations;
+  std::vector<std::string> pushdowns;
 };
 
 // Immutable catalog metadata copied out of a ProjectionGeneration. Keeping
@@ -133,10 +146,13 @@ struct PlanningContext {
   std::string database_identity;
   uint32_t schema_epoch = 0;
   bool allow_delta_merge = false;
+  PartScope part_scope = PartScope::All();
 };
 
 class QueryPlanner {
  public:
+  static StatusOr<StaticPlanPreparation> PrepareStatic(
+      const LogicalPlanNode& logical, std::string_view schema_fingerprint);
   static StatusOr<PhysicalPlan> Bind(const LogicalPlanNode& logical,
                                      const PlanningContext& context);
   static std::string ExplainLogical(const LogicalPlanNode& logical);

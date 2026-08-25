@@ -105,6 +105,50 @@ TEST_F(ProjectionStoreTest, ReadsPublishedChainsForRuntimeProjectionSlice) {
   EXPECT_TRUE(opened.ValueOrDie()->ReadChains(request).status().IsConflict());
 }
 
+TEST_F(ProjectionStoreTest, ReadChainsReportsSlicePhysicalEvidence) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.expected_base_seq = CommitSeq{10};
+  request.database_identity = "test-db";
+  ProjectionReadStats stats;
+  request.stats = &stats;
+  auto chains = opened.ValueOrDie()->ReadChains(request);
+  ASSERT_TRUE(chains.ok()) << chains.status().ToString();
+  EXPECT_GT(stats.pages_read, 0U);
+  EXPECT_GT(stats.physical_bytes, 0U);
+  EXPECT_GT(stats.decoded_bytes, 0U);
+}
+
+TEST_F(ProjectionStoreTest, ReadChainsReportsSkippedPagesForOutOfRangeSlice) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{99};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.expected_base_seq = CommitSeq{10};
+  request.database_identity = "test-db";
+  ProjectionReadStats stats;
+  request.stats = &stats;
+  EXPECT_TRUE(opened.ValueOrDie()->ReadChains(request).status().IsNotFound());
+  EXPECT_EQ(stats.pages_read, 0U);
+  EXPECT_GT(stats.pages_skipped, 0U);
+}
+
 TEST_F(ProjectionStoreTest, OldReaderPinsRetiredGeneration) {
   auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
   ASSERT_TRUE(opened.ok()); auto& store = *opened.ValueOrDie();

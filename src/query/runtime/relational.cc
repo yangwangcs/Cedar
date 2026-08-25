@@ -11,14 +11,40 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "query/temporal/interval.h"
 #include "query/resource/query_scratch.h"
 
 namespace cedar::internal {
+
+namespace {
+std::mutex& SpillObserverMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+SpillPartitionObserver& SpillObserver() {
+  static SpillPartitionObserver observer;
+  return observer;
+}
+void RecordSpillPartition(bool rebuilt) {
+  SpillPartitionObserver observer;
+  {
+    std::lock_guard<std::mutex> lock(SpillObserverMutex());
+    observer = SpillObserver();
+  }
+  if (observer) observer(rebuilt);
+}
+}  // namespace
+
+void SetSpillPartitionObserverForTesting(SpillPartitionObserver observer) {
+  std::lock_guard<std::mutex> lock(SpillObserverMutex());
+  SpillObserver() = std::move(observer);
+}
 
 Status NeedsSpill(size_t requested_bytes, size_t available_bytes);
 
@@ -70,12 +96,28 @@ Status ValidateJoinStreams(const BatchStream& left_stream,
   if (Status status = ValidateKey(right_stream, right_key); !status.ok()) {
     return status;
   }
-  for (const RelationalRow& left : left_stream.rows) {
-    for (const RelationalRow& right : right_stream.rows) {
-      if (left.cells[left_key].type != right.cells[right_key].type) {
-        return Status::InvalidArgument("relational join",
-                                       "join key types differ");
-      }
+  std::optional<QueryType> expected;
+  for (const RelationalRow& row : left_stream.rows) {
+    if (!row.cells[left_key].present) continue;
+    expected = row.cells[left_key].type;
+    break;
+  }
+  if (!expected.has_value()) {
+    for (const RelationalRow& row : right_stream.rows) {
+      if (!row.cells[right_key].present) continue;
+      expected = row.cells[right_key].type;
+      break;
+    }
+  }
+  if (!expected.has_value()) return Status::OK();
+  for (const RelationalRow& row : left_stream.rows) {
+    if (row.cells[left_key].present && row.cells[left_key].type != *expected) {
+      return Status::InvalidArgument("relational join", "join key types differ");
+    }
+  }
+  for (const RelationalRow& row : right_stream.rows) {
+    if (row.cells[right_key].present && row.cells[right_key].type != *expected) {
+      return Status::InvalidArgument("relational join", "join key types differ");
     }
   }
   return Status::OK();
@@ -197,6 +239,24 @@ size_t HashCell(const RelationalCell& cell) {
         }
       },
       cell.value);
+  return hash;
+}
+
+size_t HashRow(const RelationalRow& row) {
+  if (row.cached_hash.has_value()) return *row.cached_hash;
+  size_t hash = 0;
+  for (const RelationalCell& cell : row.cells) {
+    hash ^= HashCell(cell) + 0x9e3779b97f4a7c15ULL + (hash << 6) +
+            (hash >> 2);
+  }
+  if (row.effective.has_value()) {
+    hash ^= std::hash<uint64_t>{}(row.effective->from.value) +
+            0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    hash ^= std::hash<uint64_t>{}(
+                row.effective->to ? row.effective->to->value : UINT64_MAX) +
+            0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+  }
+  row.cached_hash = hash;
   return hash;
 }
 
@@ -546,11 +606,10 @@ bool TemporalRowLess(const RelationalRow& left, const RelationalRow& right,
 
 template <typename Less>
 void StableInsertionSort(std::vector<RelationalRow>* rows, Less less) {
-  for (size_t i = 1; i < rows->size(); ++i) {
-    for (size_t j = i; j > 0 && less((*rows)[j], (*rows)[j - 1]); --j) {
-      std::swap((*rows)[j], (*rows)[j - 1]);
-    }
-  }
+  // Keep the helper name for callers that rely on stable ordering, but use the
+  // library's O(N log N) implementation. The previous insertion sort made
+  // temporal ordering quadratic for reverse-sorted input.
+  std::stable_sort(rows->begin(), rows->end(), less);
 }
 
 Status ValidateSort(const BatchStream& input,
@@ -635,17 +694,32 @@ void SortAndCoalesceTemporalRows(std::vector<RelationalRow>* rows,
 std::vector<ValidTimeInterval> NormalizeIntervals(
     std::vector<ValidTimeInterval> intervals);
 
+using TemporalBucket = std::unordered_map<size_t, std::vector<const RelationalRow*>>;
+
+TemporalBucket BuildTemporalBuckets(const BatchStream& stream, size_t key) {
+  TemporalBucket buckets;
+  buckets.reserve(std::max<size_t>(1, stream.rows.size()));
+  for (const RelationalRow& row : stream.rows) {
+    if (key < row.cells.size()) {
+      buckets[HashCell(row.cells[key])].push_back(&row);
+    }
+  }
+  return buckets;
+}
+
 StatusOr<std::pair<size_t, size_t>> CountCoalescedCoverageRows(
     const TemporalJoinInput& input) {
   BatchStream candidates;
+  const TemporalBucket right_buckets =
+      BuildTemporalBuckets(input.right, input.right_key);
   for (const RelationalRow& left : input.left.rows) {
     std::vector<ValidTimeInterval> overlaps;
-    for (const RelationalRow& right : input.right.rows) {
-      if (!KeysEqual(left.cells[input.left_key],
-                     right.cells[input.right_key])) {
+    const auto found = right_buckets.find(HashCell(left.cells[input.left_key]));
+    if (found != right_buckets.end()) for (const RelationalRow* right : found->second) {
+      if (!KeysEqual(left.cells[input.left_key], right->cells[input.right_key])) {
         continue;
       }
-      auto intersection = Intersect(*left.effective, *right.effective);
+      auto intersection = Intersect(*left.effective, *right->effective);
       if (intersection) overlaps.push_back(*intersection);
     }
     overlaps = NormalizeIntervals(std::move(overlaps));
@@ -718,19 +792,21 @@ std::vector<ValidTimeInterval> NormalizeIntervals(
 StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
                                         const BatchStream& right,
                                         size_t left_key, size_t right_key,
-                                        JoinKind kind) {
+                                        JoinKind kind,
+                                        const TemporalBucket& right_buckets) {
   size_t fragments = 0;
   ValidTime cursor = left.effective->from;
   while (true) {
     bool coverage_found = false;
     std::optional<ValidTime> coverage_end;
     std::optional<ValidTime> next_start;
-    for (const RelationalRow& candidate : right.rows) {
-      if (!KeysEqual(left.cells[left_key], candidate.cells[right_key])) {
+    const auto bucket = right_buckets.find(HashCell(left.cells[left_key]));
+    if (bucket != right_buckets.end()) for (const RelationalRow* candidate : bucket->second) {
+      if (!KeysEqual(left.cells[left_key], candidate->cells[right_key])) {
         continue;
       }
       const auto intersection =
-          Intersect(*left.effective, *candidate.effective);
+          Intersect(*left.effective, *candidate->effective);
       if (!intersection) continue;
       if (!Before(cursor, intersection->from) &&
           EndsAfter(intersection->to, cursor)) {
@@ -761,12 +837,13 @@ StatusOr<size_t> CountCoverageFragments(const RelationalRow& left,
       // region; this is the allocation-free equivalent of NormalizeIntervals.
       while (coverage_end.has_value()) {
         std::optional<ValidTime> extended = coverage_end;
-        for (const RelationalRow& candidate : right.rows) {
-          if (!KeysEqual(left.cells[left_key], candidate.cells[right_key])) {
+        if (bucket == right_buckets.end()) break;
+        for (const RelationalRow* candidate : bucket->second) {
+          if (!KeysEqual(left.cells[left_key], candidate->cells[right_key])) {
             continue;
           }
           const auto intersection =
-              Intersect(*left.effective, *candidate.effective);
+              Intersect(*left.effective, *candidate->effective);
           if (!intersection || Before(*extended, intersection->from) ||
               !EndsAfter(intersection->to, *extended)) {
             continue;
@@ -821,6 +898,15 @@ struct Group {
   std::vector<const RelationalRow*> rows;
 };
 
+size_t HashGroupKey(const std::vector<RelationalCell>& key) {
+  size_t hash = 0x9e3779b97f4a7c15ULL;
+  for (const RelationalCell& cell : key) {
+    hash ^= HashCell(cell) + 0x9e3779b97f4a7c15ULL + (hash << 6) +
+            (hash >> 2);
+  }
+  return hash;
+}
+
 struct TemporalEvent {
   ValidTime time;
   int delta;
@@ -865,16 +951,28 @@ StatusOr<std::vector<Group>> BuildGroups(const BatchStream& input,
   }
   std::vector<Group> groups;
   groups.reserve(std::max(size_t{1}, input.rows.size()));
+  // Hash buckets retain a short list of group indexes so hash collisions are
+  // confirmed through the existing typed-cell equality. Group insertion order
+  // remains deterministic while lookup is O(1) average instead of O(G).
+  std::unordered_map<size_t, std::vector<size_t>> buckets;
+  buckets.reserve(std::max(size_t{1}, input.rows.size()));
   for (const RelationalRow& row : input.rows) {
     std::vector<RelationalCell> key = GroupCells(row, group_by);
-    auto found = std::find_if(groups.begin(), groups.end(),
-                              [&key](const Group& group) {
-                                return group.key == key;
-                              });
-    if (found == groups.end()) {
+    const size_t hash = HashGroupKey(key);
+    auto& candidates = buckets[hash];
+    size_t matched = std::numeric_limits<size_t>::max();
+    for (size_t index : candidates) {
+      if (groups[index].key == key) {
+        matched = index;
+        break;
+      }
+    }
+    if (matched == std::numeric_limits<size_t>::max()) {
+      matched = groups.size();
       groups.push_back({std::move(key), {&row}});
+      candidates.push_back(matched);
     } else {
-      found->rows.push_back(&row);
+      groups[matched].rows.push_back(&row);
     }
   }
   if (input.rows.empty() && group_by.empty()) groups.push_back({{}, {}});
@@ -921,52 +1019,47 @@ bool SameGroup(const RelationalRow& left, const RelationalRow& right,
   return true;
 }
 
-StatusOr<size_t> CountTemporalGroupFragments(
-    const BatchStream& input, const std::vector<size_t>& group_by,
-    size_t representative) {
-  std::optional<ValidTime> cursor;
-  for (const RelationalRow& row : input.rows) {
-    if (!SameGroup(input.rows[representative], row, group_by)) continue;
-    if (!cursor.has_value() || Before(row.effective->from, *cursor)) {
-      cursor = row.effective->from;
+StatusOr<size_t> CountTemporalGroupFragments(const Group& group) {
+  std::vector<std::pair<uint64_t, int64_t>> events;
+  events.reserve(group.rows.size() * 2);
+  for (const RelationalRow* row : group.rows) {
+    if (row == nullptr || !row->effective || !IntervalValid(*row->effective)) {
+      return Status::InvalidArgument("temporal aggregate",
+                                     "input interval is absent or invalid");
     }
+    events.emplace_back(row->effective->from.value, 1);
+    if (row->effective->to) events.emplace_back(row->effective->to->value, -1);
   }
+  if (events.empty()) return size_t{0};
+  std::sort(events.begin(), events.end(),
+            [](const auto& left, const auto& right) {
+              return left.first < right.first;
+            });
   size_t fragments = 0;
+  int64_t active = 0;
   std::optional<int64_t> last_count;
-  while (cursor.has_value()) {
-    int64_t count = 0;
-    std::optional<ValidTime> next;
-    for (const RelationalRow& row : input.rows) {
-      if (!SameGroup(input.rows[representative], row, group_by)) continue;
-      if (!Before(*cursor, row.effective->from) &&
-          (!row.effective->to.has_value() ||
-           Before(*cursor, *row.effective->to))) {
-        ++count;
+  size_t cursor = 0;
+  while (cursor < events.size()) {
+    const uint64_t time = events[cursor].first;
+    if (active > 0 && (!last_count || *last_count != active)) {
+      if (fragments == std::numeric_limits<size_t>::max()) {
+        return Status::ResourceExhausted("query", "temporal output row overflow");
       }
-      if (Before(*cursor, row.effective->from) &&
-          (!next.has_value() || Before(row.effective->from, *next))) {
-        next = row.effective->from;
-      }
-      if (row.effective->to.has_value() &&
-          Before(*cursor, *row.effective->to) &&
-          (!next.has_value() || Before(*row.effective->to, *next))) {
-        next = *row.effective->to;
-      }
-    }
-    if (count > 0) {
-      if (!last_count.has_value() || *last_count != count) {
-        if (fragments == std::numeric_limits<size_t>::max()) {
-          return Status::ResourceExhausted("query",
-                                           "temporal output row overflow");
-        }
-        ++fragments;
-      }
-      last_count = count;
-    } else {
+      ++fragments;
+      last_count = active;
+    } else if (active == 0) {
       last_count.reset();
     }
-    if (!next.has_value()) break;
-    cursor = next;
+    while (cursor < events.size() && events[cursor].first == time) {
+      active += events[cursor].second;
+      ++cursor;
+    }
+  }
+  if (active > 0 && (!last_count || *last_count != active)) {
+    if (fragments == std::numeric_limits<size_t>::max()) {
+      return Status::ResourceExhausted("query", "temporal output row overflow");
+    }
+    ++fragments;
   }
   return fragments;
 }
@@ -976,25 +1069,10 @@ StatusOr<size_t> EstimateTemporalAggregateOutputBytesExact(
     size_t* row_bound) {
   size_t bytes = sizeof(BatchStream);
   *row_bound = 0;
-  for (size_t representative = 0; representative < input.rows.size();
-       ++representative) {
-    bool already_seen = false;
-    for (size_t prior = 0; prior < representative; ++prior) {
-      if (SameGroup(input.rows[representative], input.rows[prior], group_by)) {
-        already_seen = true;
-        break;
-      }
-    }
-    if (already_seen) continue;
-    for (const RelationalRow& row : input.rows) {
-      if (!SameGroup(input.rows[representative], row, group_by) ||
-          !row.effective || !IntervalValid(*row.effective)) {
-        return Status::InvalidArgument("temporal aggregate",
-                                       "input interval is absent or invalid");
-      }
-    }
-    auto group_fragments =
-        CountTemporalGroupFragments(input, group_by, representative);
+  auto groups = BuildGroups(input, group_by);
+  if (!groups.ok()) return groups.status();
+  for (const Group& group : groups.ValueOrDie()) {
+    auto group_fragments = CountTemporalGroupFragments(group);
     if (!group_fragments.ok()) return group_fragments.status();
     if (group_fragments.ValueOrDie() >
         std::numeric_limits<size_t>::max() - *row_bound) {
@@ -1002,8 +1080,8 @@ StatusOr<size_t> EstimateTemporalAggregateOutputBytesExact(
     }
     *row_bound += group_fragments.ValueOrDie();
     size_t row_bytes = sizeof(RelationalRow) + sizeof(RelationalCell);
-    for (size_t column : group_by) {
-      const RelationalCell& cell = input.rows[representative].cells[column];
+    for (size_t key_index = 0; key_index < group_by.size(); ++key_index) {
+      const RelationalCell& cell = group.key[key_index];
       if (!AddBytes(EstimateCellBytes(cell), &row_bytes)) {
         return std::numeric_limits<size_t>::max();
       }
@@ -1402,6 +1480,7 @@ StatusOr<RelationalRow> DeserializeRow(std::string_view payload) {
 
 struct DecodedRows {
   std::vector<RelationalRow> rows;
+  std::vector<std::shared_ptr<QueryReservationLease>> output_leases;
   std::shared_ptr<QueryReservationLease> lease;
   std::vector<std::shared_ptr<QueryReservationLease>> extra_leases;
 };
@@ -1555,37 +1634,68 @@ StatusOr<BatchStream> ExternalHashJoin(const JoinInput& input,
       !status.ok()) return status;
   std::vector<RelationalRow> rows;
   std::vector<std::shared_ptr<QueryReservationLease>> output_leases;
-  // Probe left rows in their original order. This preserves the ordering of
-  // the in-memory hash join while only one right partition is decoded at a
-  // time; the left spill files remain available for verification/cleanup.
-  for (const RelationalRow& original_left : input.left.rows) {
-    const RelationalCell& left_key = original_left.cells[input.left_key];
-    const size_t partition = left_key.present ? HashCell(left_key) % kPartitions : 0;
-    BatchStream right_stream;
-    if (!right_runs[partition].empty()) {
-      auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
-      if (!right.ok()) return right.status();
-      auto decoded_right = std::move(right).ConsumeValueOrDie();
-      right_stream.rows = std::move(decoded_right.rows);
-      right_stream.reservation_lease = std::move(decoded_right.lease);
-      right_stream.reservation_leases = std::move(decoded_right.extra_leases);
+  // Read and decode each right partition exactly once. Probe every left row
+  // assigned to that partition against one typed hash bucket map, while
+  // retaining per-left output vectors so the public ordering remains the same
+  // as the in-memory join.
+  std::vector<std::vector<RelationalRow>> per_left(input.left.rows.size());
+  // Build the left partition index once. The previous implementation scanned
+  // every left row for every partition, making the probe phase O(P*L) even
+  // though each row belongs to exactly one partition.
+  std::array<std::vector<size_t>, kPartitions> left_indices;
+  for (size_t left_index = 0; left_index < input.left.rows.size(); ++left_index) {
+    const RelationalCell& key = input.left.rows[left_index].cells[input.left_key];
+    left_indices[key.present ? HashCell(key) % kPartitions : 0].push_back(left_index);
+  }
+  for (size_t partition = 0; partition < kPartitions; ++partition) {
+    auto right = ReadSpilledRows(right_runs[partition], reservation, scratch);
+    if (!right.ok()) return right.status();
+    auto decoded_right = std::move(right).ConsumeValueOrDie();
+    if (!decoded_right.rows.empty()) RecordSpillPartition(false);
+    std::unordered_map<size_t, std::vector<const RelationalRow*>> buckets;
+    buckets.reserve(decoded_right.rows.size());
+    for (const RelationalRow& row : decoded_right.rows) {
+      const RelationalCell& key = row.cells[input.right_key];
+      buckets[key.present ? HashCell(key) : 0].push_back(&row);
     }
-    JoinInput part{BatchStream(std::vector<RelationalRow>{original_left}),
-                   std::move(right_stream), input.left_key,
-                   input.right_key, input.kind};
-    auto joined = HashJoinInMemory(part, reservation, max_output_rows);
-    if (!joined.ok()) return joined.status();
-    BatchStream result = std::move(joined).ConsumeValueOrDie();
-    if (rows.size() > max_output_rows ||
-        result.rows.size() > max_output_rows - rows.size()) {
+    if (!decoded_right.rows.empty()) RecordSpillPartition(true);
+    std::vector<RelationalRow> partition_output;
+    for (size_t left_index : left_indices[partition]) {
+      const RelationalRow& left = input.left.rows[left_index];
+      const RelationalCell& key = left.cells[input.left_key];
+      bool matched = false;
+      const auto found = buckets.find(key.present ? HashCell(key) : 0);
+      if (found != buckets.end()) {
+        for (const RelationalRow* right_row : found->second) {
+          if (!KeysEqual(key, right_row->cells[input.right_key])) continue;
+          matched = true;
+          if (input.kind == JoinKind::kInner) {
+            per_left[left_index].push_back(Combine(left, *right_row));
+            partition_output.push_back(per_left[left_index].back());
+          } else if (input.kind == JoinKind::kSemi) {
+            per_left[left_index].push_back(left);
+            partition_output.push_back(left);
+            break;
+          }
+        }
+      }
+      if (!matched && input.kind == JoinKind::kAnti) {
+        per_left[left_index].push_back(left);
+        partition_output.push_back(left);
+      }
+    }
+    if (!partition_output.empty()) {
+      auto lease = RetainOutput(reservation, EstimateRowsBytes(partition_output), false);
+      if (!lease.ok()) return NeedsSpill();
+      output_leases.push_back(std::move(lease).ConsumeValueOrDie());
+    }
+  }
+  for (auto& matches : per_left) {
+    if (rows.size() > max_output_rows || matches.size() > max_output_rows - rows.size()) {
       return OutputRowsExhausted();
     }
-    rows.insert(rows.end(), std::make_move_iterator(result.rows.begin()),
-                std::make_move_iterator(result.rows.end()));
-    if (result.reservation_lease) {
-      output_leases.push_back(std::move(result.reservation_lease));
-    }
-    result.rows.clear();
+    rows.insert(rows.end(), std::make_move_iterator(matches.begin()),
+                std::make_move_iterator(matches.end()));
   }
   BatchStream output;
   output.reservation_leases = std::move(output_leases);
@@ -1624,18 +1734,26 @@ StatusOr<BatchStream> UnionAll(const BatchStream& left,
 StatusOr<BatchStream> Distinct(const BatchStream& input,
                                QueryReservation* reservation,
                                size_t max_output_rows) {
+  std::unordered_map<size_t, std::vector<size_t>> seen;
+  seen.reserve(input.rows.size());
+  std::vector<size_t> unique_indices;
+  unique_indices.reserve(input.rows.size());
   size_t row_count = 0;
   size_t bytes = sizeof(BatchStream);
   for (size_t row_index = 0; row_index < input.rows.size(); ++row_index) {
     const RelationalRow& row = input.rows[row_index];
+    const size_t hash = HashRow(row);
     bool duplicate = false;
-    for (size_t previous = 0; previous < row_index; ++previous) {
+    auto& candidates = seen[hash];
+    for (size_t previous : candidates) {
       if (input.rows[previous] == row) {
         duplicate = true;
         break;
       }
     }
     if (duplicate) continue;
+    candidates.push_back(row_index);
+    unique_indices.push_back(row_index);
     if (++row_count > max_output_rows) return OutputRowsExhausted();
     if (!AddBytes(EstimateRowBytes(row), &bytes)) {
       return MemoryExhausted(std::numeric_limits<size_t>::max(),
@@ -1649,13 +1767,66 @@ StatusOr<BatchStream> Distinct(const BatchStream& input,
   BatchStream result;
   result.reservation_lease = std::move(lease).ConsumeValueOrDie();
   result.rows.reserve(row_count);
-  for (const RelationalRow& row : input.rows) {
-    if (std::find(result.rows.begin(), result.rows.end(), row) ==
-        result.rows.end()) {
-      result.rows.push_back(row);
-    }
+  for (size_t index : unique_indices) {
+    result.rows.push_back(input.rows[index]);
   }
   return result;
+}
+
+bool TryFixedWidthRadixSort(std::vector<RelationalRow>* rows,
+                            const SortKey& key) {
+  if (rows->empty()) return true;
+  std::vector<uint64_t> keys;
+  keys.reserve(rows->size());
+  for (const RelationalRow& row : *rows) {
+    if (key.column >= row.cells.size()) return false;
+    const RelationalCell& cell = row.cells[key.column];
+    if (!cell.present) return false;
+    uint64_t value = 0;
+    switch (cell.type) {
+      case QueryType::kInt32:
+        value = uint64_t(uint32_t(std::get<int32_t>(cell.value)) ^ 0x80000000U);
+        break;
+      case QueryType::kInt64:
+        value = uint64_t(std::get<int64_t>(cell.value)) ^ 0x8000000000000000ULL;
+        break;
+      case QueryType::kTimestamp64:
+        value = std::get<Timestamp64>(cell.value).value;
+        break;
+      case QueryType::kValidTime:
+        value = std::get<ValidTime>(cell.value).value;
+        break;
+      case QueryType::kValidDuration:
+        value = std::get<ValidDuration>(cell.value).value;
+        break;
+      case QueryType::kCommitSeq:
+        value = std::get<CommitSeq>(cell.value).value;
+        break;
+      default:
+        return false;
+    }
+    keys.push_back(key.direction == SortDirection::kAscending ? value : ~value);
+  }
+  std::vector<RelationalRow> scratch(rows->size());
+  std::vector<uint64_t> scratch_keys(rows->size());
+  for (size_t shift = 0; shift < 64; shift += 8) {
+    std::array<size_t, 256> counts{};
+    for (uint64_t value : keys) ++counts[(value >> shift) & 0xffU];
+    size_t offset = 0;
+    for (size_t& count : counts) {
+      const size_t next = offset + count;
+      count = offset;
+      offset = next;
+    }
+    for (size_t i = 0; i < rows->size(); ++i) {
+      const size_t slot = counts[(keys[i] >> shift) & 0xffU]++;
+      scratch[slot] = std::move((*rows)[i]);
+      scratch_keys[slot] = keys[i];
+    }
+    rows->swap(scratch);
+    keys.swap(scratch_keys);
+  }
+  return true;
 }
 
 StatusOr<BatchStream> Sort(const BatchStream& input,
@@ -1669,13 +1840,11 @@ StatusOr<BatchStream> Sort(const BatchStream& input,
   BatchStream result;
   result.reservation_lease = std::move(lease).ConsumeValueOrDie();
   result.rows = input.rows;
-  // Stable insertion sort only swaps adjacent moved rows, so it needs no
-  // unreserved auxiliary buffer after the copied stream has been accounted.
-  for (size_t i = 1; i < result.rows.size(); ++i) {
-    for (size_t j = i; j > 0 && RowLess(result.rows[j], result.rows[j - 1], keys);
-         --j) {
-      std::swap(result.rows[j], result.rows[j - 1]);
-    }
+  if (keys.size() != 1 || !TryFixedWidthRadixSort(&result.rows, keys.front())) {
+    std::stable_sort(result.rows.begin(), result.rows.end(),
+                     [&keys](const RelationalRow& left, const RelationalRow& right) {
+                       return RowLess(left, right, keys);
+                     });
   }
   result.order_specified = true;
   return result;
@@ -2020,17 +2189,20 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
   }
   size_t output_rows = 0;
   size_t output_bytes = sizeof(BatchStream);
+  const TemporalBucket preflight_buckets =
+      BuildTemporalBuckets(input.right, input.right_key);
   std::unique_ptr<ReservationGuard> preflight_scratch_guard;
   size_t scratch_bytes = 0;
   for (const RelationalRow& left : input.left.rows) {
     if (input.kind == JoinKind::kInner) {
-      for (const RelationalRow& right : input.right.rows) {
+      const auto bucket = preflight_buckets.find(HashCell(left.cells[input.left_key]));
+      if (bucket != preflight_buckets.end()) for (const RelationalRow* right : bucket->second) {
         if (!KeysEqual(left.cells[input.left_key],
-                       right.cells[input.right_key]) ||
-            !Intersect(*left.effective, *right.effective).has_value()) {
+                       right->cells[input.right_key]) ||
+            !Intersect(*left.effective, *right->effective).has_value()) {
           continue;
         }
-        if (!AddBytes(EstimateCombinedRowBytes(left, right), &output_bytes) ||
+        if (!AddBytes(EstimateCombinedRowBytes(left, *right), &output_bytes) ||
             output_rows == std::numeric_limits<size_t>::max()) {
           return MemoryExhausted(std::numeric_limits<size_t>::max(),
                                  reservation == nullptr
@@ -2041,7 +2213,8 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
       }
     } else {
       auto fragments = CountCoverageFragments(
-          left, input.right, input.left_key, input.right_key, input.kind);
+          left, input.right, input.left_key, input.right_key, input.kind,
+          preflight_buckets);
       if (!fragments.ok()) return fragments.status();
       if (fragments.ValueOrDie() >
           std::numeric_limits<size_t>::max() - output_rows) {
@@ -2177,6 +2350,11 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
                                const RelationalRow& right) {
                         return TemporalRowLess(left, right, input.right_key);
                       });
+  TemporalBucket right_buckets;
+  right_buckets.reserve(std::max<size_t>(1, right_rows.size()));
+  for (const RelationalRow& right : right_rows) {
+    right_buckets[HashCell(right.cells[input.right_key])].push_back(&right);
+  }
   auto output_lease = RetainOutput(reservation, output_bytes, false);
   if (!output_lease.ok()) return output_lease.status();
 
@@ -2186,16 +2364,17 @@ StatusOr<BatchStream> IntervalMergeJoin(const TemporalJoinInput& input,
   result.rows.reserve(output_rows);
   for (const RelationalRow& left : left_rows) {
     std::vector<ValidTimeInterval> overlaps;
-    overlaps.reserve(input.right.rows.size());
-    for (const RelationalRow& right : right_rows) {
+    const auto bucket = right_buckets.find(HashCell(left.cells[input.left_key]));
+    if (bucket != right_buckets.end()) overlaps.reserve(bucket->second.size());
+    if (bucket != right_buckets.end()) for (const RelationalRow* right : bucket->second) {
       if (!KeysEqual(left.cells[input.left_key],
-                     right.cells[input.right_key])) {
+                     right->cells[input.right_key])) {
         continue;
       }
-      auto intersection = Intersect(*left.effective, *right.effective);
+      auto intersection = Intersect(*left.effective, *right->effective);
       if (!intersection) continue;
       if (input.kind == JoinKind::kInner) {
-        RelationalRow row = Combine(left, right);
+        RelationalRow row = Combine(left, *right);
         row.effective = *intersection;
         if (Status status =
                 Publish(std::move(row), budget, max_output_rows, &result);

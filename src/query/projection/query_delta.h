@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <atomic>
@@ -79,6 +80,109 @@ struct QueryDeltaView {
   std::vector<EdgeIdentity> EdgeIdentitiesThrough(CommitSeq snapshot) const;
 };
 
+struct QueryDeltaFactRef {
+  FactRef ref;
+  std::shared_ptr<const QueryDeltaCommit> commit;
+  size_t index = 0;
+};
+
+// Immutable commit-sequence unit retained by leases. A chunk deliberately
+// owns only immutable descriptor storage; query readers never observe the
+// publisher queue or mutable chain maps.
+struct DeltaChunk {
+  CommitSeq first;
+  CommitSeq last;
+  std::shared_ptr<const QueryDeltaCommit> commit;
+  uint64_t memory_bytes = 0;
+};
+
+// Shared lease epoch. Retired chunks stay reachable only while at least one
+// snapshot lease is alive; the final lease releases the retired queue in one
+// bounded critical section.
+struct QueryDeltaEpochState {
+  std::atomic<uint64_t> active_leases{0};
+  std::mutex mutex;
+  std::deque<std::shared_ptr<const DeltaChunk>> retired;
+  uint64_t retired_bytes = 0;
+};
+
+class QueryDeltaFactRange {
+ public:
+  class Iterator {
+   public:
+    const FactEvent& operator*() const {
+      return (*entries_)[position_].commit->facts[(*entries_)[position_].index];
+    }
+    Iterator& operator++() {
+      ++position_;
+      return *this;
+    }
+    bool operator!=(const Iterator& other) const {
+      return entries_ != other.entries_ || position_ != other.position_;
+    }
+
+   private:
+    friend class QueryDeltaFactRange;
+    Iterator(std::shared_ptr<const std::vector<QueryDeltaFactRef>> entries,
+             size_t position)
+        : entries_(std::move(entries)), position_(position) {}
+    std::shared_ptr<const std::vector<QueryDeltaFactRef>> entries_;
+    size_t position_ = 0;
+  };
+
+  Iterator begin() const { return Iterator(entries_, begin_); }
+  Iterator end() const { return Iterator(entries_, end_); }
+  size_t size() const { return end_ - begin_; }
+
+ private:
+  friend class QueryDeltaLease;
+  QueryDeltaFactRange(std::shared_ptr<const std::vector<QueryDeltaFactRef>> entries,
+                      size_t begin, size_t end)
+      : entries_(std::move(entries)), begin_(begin), end_(end) {}
+  std::shared_ptr<const std::vector<QueryDeltaFactRef>> entries_;
+  size_t begin_ = 0;
+  size_t end_ = 0;
+};
+
+// A snapshot lease over immutable published commit descriptors. The lease
+// copies only descriptor pointers; fact payload vectors remain shared by all
+// readers. EventsFor materializes only the requested fact chain.
+class QueryDeltaLease {
+ public:
+  CommitSeq base_seq() const { return base_seq_; }
+  CommitSeq through() const { return through_; }
+  CommitSeq first_missing() const { return first_missing_; }
+  size_t chunk_count() const { return chunks_.size(); }
+  std::vector<FactEvent> EventsFor(const FactRef& ref) const;
+  StatusOr<QueryDeltaFactRange> EventsForRange(const FactRef& ref) const;
+  std::vector<EdgeIdentity> EdgeIdentitiesThrough(CommitSeq snapshot) const;
+
+ private:
+  friend class QueryDelta;
+  QueryDeltaLease(CommitSeq base, CommitSeq through, CommitSeq missing,
+                  std::vector<std::shared_ptr<const QueryDeltaCommit>> commits,
+                  std::vector<std::shared_ptr<const DeltaChunk>> chunks,
+                  std::shared_ptr<void> epoch_token,
+                  std::shared_ptr<const std::vector<QueryDeltaFactRef>> events)
+      : base_seq_(base),
+        through_(through),
+        first_missing_(missing),
+        commits_(std::move(commits)),
+        chunks_(std::move(chunks)),
+        epoch_token_(std::move(epoch_token)),
+        events_(std::move(events)) {}
+
+  CommitSeq base_seq_;
+  CommitSeq through_;
+  CommitSeq first_missing_;
+  std::vector<std::shared_ptr<const QueryDeltaCommit>> commits_;
+  std::vector<std::shared_ptr<const DeltaChunk>> chunks_;
+  std::shared_ptr<void> epoch_token_;
+  // Sorted by canonical FactRef. The descriptor keeps the event storage alive,
+  // so this index adds only references and avoids copying the tail payload.
+  std::shared_ptr<const std::vector<QueryDeltaFactRef>> events_;
+};
+
 class QueryDelta {
  public:
   explicit QueryDelta(QueryDeltaOptions options = {});
@@ -129,6 +233,8 @@ class QueryDelta {
   // Acquires a snapshot-correct immutable view.  A view never exposes changes
   // after its requested cut, even if a publisher advances concurrently.
   StatusOr<QueryDeltaView> AcquireThrough(CommitSeq snapshot) const;
+  StatusOr<std::shared_ptr<const QueryDeltaLease>> AcquireLeaseThrough(
+      CommitSeq snapshot) const;
 
   CommitSeq base_seq() const;
   CommitSeq indexed_through() const;
@@ -180,6 +286,13 @@ class QueryDelta {
   bool soft_lag_reached_ = false;
   bool soft_memory_reached_ = false;
   std::vector<QueryDeltaCommit> commits_;
+  std::deque<std::shared_ptr<const QueryDeltaCommit>> lease_commits_;
+  std::deque<std::shared_ptr<const DeltaChunk>> chunks_;
+  std::shared_ptr<QueryDeltaEpochState> epoch_state_ =
+      std::make_shared<QueryDeltaEpochState>();
+  mutable std::unordered_map<
+      uint64_t, std::weak_ptr<const std::vector<QueryDeltaFactRef>>>
+      lease_index_cache_;
   std::unordered_map<FactRef, std::vector<FactEvent>, FactRefHash> chains_;
   std::vector<std::pair<CommitSeq, EdgeIdentity>> edge_identities_;
 };

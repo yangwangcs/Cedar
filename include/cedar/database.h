@@ -23,6 +23,9 @@
 #include "cedar/transaction.h"
 
 namespace cedar {
+namespace internal {
+class QueryExecutionContextFactory;
+}
 
 class Query;
 
@@ -318,12 +321,15 @@ class Database {
  private:
   class Impl;
   explicit Database(std::shared_ptr<Impl> impl);
+  Database(std::shared_ptr<Impl> impl, bool close_on_destroy);
 
   std::shared_ptr<Impl> impl_;
+  bool close_on_destroy_ = true;
 
   friend class Snapshot;
   friend class Transaction;
   friend class PreparedQuery;
+  friend class internal::QueryExecutionContextFactory;
 };
 
 }  // namespace cedar

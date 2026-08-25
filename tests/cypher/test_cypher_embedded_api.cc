@@ -4,6 +4,7 @@
 #include <filesystem>
 
 #include "cedar/cypher.h"
+#include "cedar/cypher/session.h"
 #include "cedar/database.h"
 
 namespace cedar::cypher {
@@ -67,15 +68,13 @@ TEST(CypherEmbeddedApiTest, AppliesSystemTimeAsSnapshotCeiling) {
       EntityFact::Vertex(VertexRef{PartId{0}, v2.ValueOrDie()}), ValidTime{1}).ok());
   ASSERT_TRUE(second.ValueOrDie()->Commit().ok());
 
-  auto prepared = PrepareCypher(
-      *database.ValueOrDie(),
-      "FOR SYSTEM_TIME AS OF 1 FOR VALID_TIME AS OF 1 MATCH (v) RETURN v",
-      SchemaCatalog{});
+  CypherSession session(*database.ValueOrDie(), SchemaCatalog{});
+  auto prepared = session.Prepare(
+      "FOR SYSTEM_TIME AS OF 1 FOR VALID_TIME AS OF 1 MATCH (v) RETURN v");
   ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
   auto snapshot = database.ValueOrDie()->BeginSnapshot();
   ASSERT_TRUE(snapshot.ok());
-  auto cursor = prepared.ValueOrDie().Execute(
-      std::move(snapshot).ConsumeValueOrDie(), Bindings{});
+  auto cursor = session.Execute(prepared.ValueOrDie(), CypherRequest{});
   ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
   size_t rows = 0;
   while (true) {

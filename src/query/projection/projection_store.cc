@@ -11,6 +11,8 @@
 #include <set>
 
 #include "cedar/core/crc32c.h"
+#include "query/projection/projection_page_reader.h"
+#include "query/read/read_catalog.h"
 
 namespace cedar::internal {
 namespace {
@@ -103,6 +105,7 @@ bool ParseCurrent(const std::string& in, uint64_t* generation) {
 
 struct ProjectionGeneration::State {
   ProjectionManifest manifest;
+  std::shared_ptr<const ReadCatalog> read_catalog;
   std::string directory;
   std::vector<std::string> segment_files;
   std::string manifest_file;
@@ -114,6 +117,19 @@ struct ProjectionGeneration::State {
   mutable bool coverage_hole = false;
   mutable bool rebuild_enqueued = false;
 };
+
+StatusOr<std::shared_ptr<const ReadCatalog>> BuildReadCatalog(
+    const ProjectionManifest& manifest) {
+  ReadCatalogBuilder builder;
+  for (const auto& region : manifest.regions) {
+    Status status = builder.AddCoverage(
+        ReadCatalogKey{region.kind, region.part_id, region.property_id,
+                       region.schema_epoch},
+        region);
+    if (!status.ok()) return status;
+  }
+  return std::move(builder).Finish();
+}
 
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGeneration(
     const std::shared_ptr<ProjectionGeneration::State>& state,
@@ -137,13 +153,26 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
   std::vector<ProjectionChain> result;
   bool matched_region = false;
   bool coverage_hole = false;
-  for (const auto& region : state->manifest.regions) {
-    if (region.kind != request.kind || region.part_id != request.part_id ||
-        region.property_id != request.property_id || region.schema_epoch != request.schema_epoch ||
-        region.entity_min > request.entity_min || region.entity_max_exclusive < request.entity_max_exclusive ||
+  const ReadCatalogKey catalog_key{request.kind, request.part_id,
+                                   request.property_id, request.schema_epoch};
+  const auto candidates = state->read_catalog
+                              ? state->read_catalog->FindCoverageCandidates(
+                                    catalog_key, request.entity_min,
+                                    request.entity_max_exclusive,
+                                    request.valid_time)
+                              : std::vector<const CoverageRegion*>{};
+  if (candidates.empty() && request.stats && state->read_catalog) {
+    request.stats->pages_skipped += state->read_catalog->total_segment_count();
+  }
+  for (const CoverageRegion* region_ptr : candidates) {
+    const auto& region = *region_ptr;
+    if (region.entity_min > request.entity_min ||
+        region.entity_max_exclusive < request.entity_max_exclusive ||
         region.valid_time.from.value > request.valid_time.from.value ||
-        (region.valid_time.to && (!request.valid_time.to ||
-                                  region.valid_time.to->value < request.valid_time.to->value))) {
+        (region.valid_time.to &&
+         (!request.valid_time.to ||
+          region.valid_time.to->value < request.valid_time.to->value))) {
+      if (request.stats) request.stats->pages_skipped += region.segments.size();
       continue;
     }
     matched_region = true;
@@ -152,22 +181,50 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
         coverage_hole = true;
         continue;
       }
-      std::ifstream in(fs::path(state->directory) / segment.filename, std::ios::binary);
-      if (!in) {
+      const std::string filename = (fs::path(state->directory) / segment.filename).string();
+      ProjectionPageReader page_reader;
+      auto directory = page_reader.ReadDirectory(filename);
+      if (!directory.ok() || directory.ValueOrDie().header != segment.header) {
         state->unavailable_segments.insert(segment.filename);
         state->corrupt_segments.insert(segment.filename);
         coverage_hole = true;
         continue;
       }
-      std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      auto decoded = DecodeProjectionPage(bytes);
-      if (!decoded.ok()) {
+      auto selection = page_reader.Select(directory.ValueOrDie(), request);
+      if (!selection.ok()) {
         state->unavailable_segments.insert(segment.filename);
         state->corrupt_segments.insert(segment.filename);
         coverage_hole = true;
         continue;
       }
-      result.push_back(std::move(decoded).ConsumeValueOrDie());
+      if (request.stats) request.stats->pages_skipped += selection.ValueOrDie().pages_skipped;
+      auto decoded_pages = page_reader.ReadSelected(filename, directory.ValueOrDie(),
+                                                     selection.ValueOrDie());
+      if (!decoded_pages.ok()) {
+        state->unavailable_segments.insert(segment.filename);
+        state->corrupt_segments.insert(segment.filename);
+        coverage_hole = true;
+        continue;
+      }
+      for (auto& chain : decoded_pages.ValueOrDie()) {
+        if (request.stats) {
+          ++request.stats->pages_read;
+          const auto& page = chain.page_directory.front();
+          request.stats->physical_bytes += page.compressed_bytes;
+          uint64_t decoded_bytes = sizeof(ProjectionChain) +
+                                   chain.intervals.size() * sizeof(ProjectionInterval) +
+                                   chain.boundaries.size() * sizeof(ProjectionBoundary) +
+                                   chain.page_directory.size() * sizeof(ProjectionPageDirectoryEntry);
+          for (const auto& interval : chain.intervals) {
+            if (interval.value.type() == PhysicalType::kString ||
+                interval.value.type() == PhysicalType::kBinary) {
+              decoded_bytes += std::get<std::string>(interval.value.data()).size();
+            }
+          }
+          request.stats->decoded_bytes += decoded_bytes;
+        }
+        result.push_back(std::move(chain));
+      }
     }
   }
   if (!matched_region || coverage_hole) {
@@ -285,7 +342,16 @@ Status QueryProjectionStore::LoadCurrent() {
     const auto& header = decoded.ValueOrDie().header;
     if (header.generation_id != generation || header.base_seq != manifest.ValueOrDie().base_seq || header.kind != r.kind || header.part_id != r.part_id || header.schema_epoch != r.schema_epoch || r.entity_min > header.entity_min || r.entity_max_exclusive < header.entity_max_exclusive || r.valid_time.from.value > header.valid_from_min.value || (r.valid_time.to && (!header.valid_to_max || r.valid_time.to->value < header.valid_to_max->value)) || (r.property_id.has_value() != (header.property_id.value != 0)) || (r.property_id && r.property_id->value != header.property_id.value)) return Status::Corruption("projection store", "referenced segment metadata mismatch");
   }
-  auto state = std::make_shared<ProjectionGeneration::State>(); state->manifest = manifest.ConsumeValueOrDie(); state->directory = projections_path_; state->manifest_file = manifest_path.string(); for (const auto& r : state->manifest.regions) for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename); current_ = std::move(state); enabled_ = true; return Status::OK();
+  auto state = std::make_shared<ProjectionGeneration::State>();
+  state->manifest = manifest.ConsumeValueOrDie();
+  auto catalog = BuildReadCatalog(state->manifest);
+  if (!catalog.ok()) return catalog.status();
+  state->read_catalog = std::move(catalog).ConsumeValueOrDie();
+  state->directory = projections_path_;
+  state->manifest_file = manifest_path.string();
+  for (const auto& r : state->manifest.regions)
+    for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename);
+  current_ = std::move(state); enabled_ = true; return Status::OK();
 }
 
 Status QueryProjectionStore::PublishCurrent(uint64_t generation) {
@@ -416,7 +482,16 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   if (options_.fault_injector) { s=options_.fault_injector(ProjectionStoreFaultPoint::kDirectorySync); if (!s.ok()) return s; }
   s=PublishCurrent(build.manifest.generation_id); if (!s.ok()) return s;
   if (current_) { current_->retired = true; retired_.push_back(current_); }
-  auto state=std::make_shared<ProjectionGeneration::State>(); state->manifest=build.manifest; state->directory=projections_path_; state->manifest_file=(fs::path(manifests_path_) / (std::to_string(build.manifest.generation_id) + ".cmanifest")).string(); for (const auto& r : build.manifest.regions) for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename); current_=std::move(state); enabled_=true;
+  auto state=std::make_shared<ProjectionGeneration::State>();
+  state->manifest=build.manifest;
+  auto catalog = BuildReadCatalog(state->manifest);
+  if (!catalog.ok()) return catalog.status();
+  state->read_catalog = std::move(catalog).ConsumeValueOrDie();
+  state->directory=projections_path_;
+  state->manifest_file=(fs::path(manifests_path_) / (std::to_string(build.manifest.generation_id) + ".cmanifest")).string();
+  for (const auto& r : build.manifest.regions)
+    for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename);
+  current_=std::move(state); enabled_=true;
   for (auto it=retired_.begin(); it!=retired_.end();) { if ((*it)->pins.load()==0) { (*it)->present=false; it=retired_.erase(it); } else ++it; }
   return Status::OK();
 }

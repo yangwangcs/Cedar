@@ -3,29 +3,20 @@
 
 #include "query/runtime/temporal_source.h"
 
-#include <map>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 
 #include "query/temporal/corrected_chain.h"
 #include "query/temporal/interval.h"
+#include "query/runtime/read_context.h"
+#include "query/runtime/fact_chain_cursor.h"
 
 namespace cedar::internal {
 namespace {
 
-struct FactEntityKey {
-  PartId part_id;
-  uint64_t entity_id = 0;
-
-  bool operator<(const FactEntityKey& other) const {
-    if (part_id.value != other.part_id.value) {
-      return part_id.value < other.part_id.value;
-    }
-    return entity_id < other.entity_id;
-  }
-};
-
-using FactChains = std::map<FactEntityKey, std::vector<FactEvent>>;
+using FactChains = std::vector<FactChainView>;
 
 const FactColumn* FindColumn(const FactColumnarBatch& batch, FactColumnId id) {
   for (const FactColumn& column : batch.columns) {
@@ -97,9 +88,29 @@ StatusOr<std::optional<Value>> DecodeProjectedValue(
   return Status::Corruption("query temporal source", "unknown projected physical type");
 }
 
-StatusOr<FactChains> ReadChains(Snapshot& snapshot, FactFamily family,
-                                PropertyId property) {
+StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
+                                CommitSeq snapshot_seq, FactFamily family,
+                                PropertyId property,
+                                const PartScope& part_scope,
+                                const std::shared_ptr<TemporalChainCache>& cache = nullptr,
+                                std::optional<CommitSeqRange> system_range = std::nullopt) {
   FactChains chains;
+  std::ostringstream cache_key;
+  cache_key << static_cast<unsigned>(family) << ':' << property.value << ':'
+            << static_cast<unsigned>(part_scope.kind);
+  for (const PartId part : part_scope.parts) cache_key << ':' << part.value;
+  cache_key << ':' << snapshot_seq.value;
+  if (system_range.has_value()) {
+    cache_key << ":range:" << system_range->from.value << ':'
+              << system_range->to.value;
+  }
+  if (cache != nullptr) {
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    const auto found = cache->chains.find(cache_key.str());
+    if (found != cache->chains.end()) {
+      return *found->second;
+    }
+  }
   const std::vector<FactColumnId> projection = {
       FactColumnId::kPartId,       FactColumnId::kEntityId,
       FactColumnId::kValidFrom,    FactColumnId::kCedarCommitSeq,
@@ -108,9 +119,9 @@ StatusOr<FactChains> ReadChains(Snapshot& snapshot, FactFamily family,
       FactColumnId::kInt32Value,   FactColumnId::kInt64Value,
       FactColumnId::kFloat32Value, FactColumnId::kFloat64Value,
       FactColumnId::kTimestamp64Value, FactColumnId::kBytesValue};
-  const Status scanned = snapshot.EventColumnarScanFamily(
-      family, property, projection,
-      [&chains, family, property](const FactColumnarBatch& batch) {
+  FactChainCursor cursor(FactBatchOrder::kIdentityValidDescCommitDesc,
+                         snapshot_seq, system_range);
+  auto consume = [&cursor, family, property](const FactColumnarBatch& batch) {
         const size_t rows = batch.row_count();
         for (size_t row = 0; row < rows; ++row) {
           auto part = ColumnValue<uint32_t>(batch, FactColumnId::kPartId, row);
@@ -140,12 +151,31 @@ StatusOr<FactChains> ReadChains(Snapshot& snapshot, FactFamily family,
                           static_cast<FactOperation>(operation.ValueOrDie()),
                           schema_epoch.ValueOrDie(), value.ValueOrDie(),
                           std::nullopt};
-          chains[{event.ref.part_id(), event.ref.entity_id()}].push_back(
-              std::move(event));
+          Status consumed = cursor.Consume(event);
+          if (!consumed.ok()) return consumed;
         }
         return Status::OK();
-      });
+      };
+  FactReadSpec spec;
+  spec.part_scope = part_scope;
+  spec.family = family;
+  spec.property_id = property;
+  spec.projection = projection;
+  spec.batch_row_limit = 1024;
+  spec.commit_seq_max = snapshot_seq.value == 0
+                            ? std::nullopt
+                            : std::optional<CommitSeq>{snapshot_seq};
+  spec.preserve_predecessor_context = system_range.has_value();
+  const Status scanned = reader.ReadColumnar(spec, consume);
   if (!scanned.ok()) return scanned;
+  const Status finished = cursor.Finish(snapshot_seq);
+  if (!finished.ok()) return finished;
+  chains = cursor.chains();
+  if (cache != nullptr) {
+    auto reduced = std::make_shared<const std::vector<FactChainView>>(chains);
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    cache->chains.emplace(cache_key.str(), std::move(reduced));
+  }
   return chains;
 }
 
@@ -155,26 +185,26 @@ bool Contains(const ValidTimeInterval& interval, ValidTime time) {
 }
 
 StatusOr<std::vector<StateRow>> Materialize(
-    Snapshot& snapshot, FactFamily family, PropertyId property,
-    std::optional<ValidTimeInterval> bounds) {
+    const CanonicalFactReader& reader, CommitSeq snapshot_seq,
+    FactFamily family, PropertyId property,
+    std::optional<ValidTimeInterval> bounds, const PartScope& part_scope,
+    const std::shared_ptr<TemporalChainCache>& cache = nullptr,
+    std::optional<CommitSeqRange> system_range = std::nullopt) {
   if (bounds.has_value()) {
     const Status valid = bounds->Validate();
     if (!valid.ok()) return valid;
   }
-  auto chains = ReadChains(snapshot, family, property);
+  auto chains = ReadChains(reader, snapshot_seq, family, property, part_scope, cache,
+                           system_range);
   if (!chains.ok()) return chains.status();
 
   std::vector<StateRow> rows;
-  for (const auto& [key, events] : chains.ValueOrDie()) {
-    auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
-    if (!corrected.ok()) return corrected.status();
-    for (const StateInterval& state :
-         MaterializePresentState(corrected.ValueOrDie())) {
+  for (const auto& view : chains.ValueOrDie()) {
+    for (const StateInterval& state : view.present) {
       std::optional<ValidTimeInterval> effective = state.interval;
       if (bounds.has_value()) effective = Clip(state.interval, *bounds);
       if (!effective.has_value()) continue;
-      rows.push_back({FactRef{key.part_id, family, property, key.entity_id}, *effective,
-                      state.value});
+      rows.push_back({view.ref, *effective, state.value});
     }
   }
   return rows;
@@ -184,20 +214,29 @@ StatusOr<std::vector<StateRow>> Materialize(
 
 StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
     Snapshot& snapshot, FactFamily family, PropertyId property,
+    const ValidTimeInterval& interval, const PartScope& part_scope) {
+  return ReadEvents(QueryReadContext{snapshot.canonical_reader(),
+                                     snapshot.commit_seq(), part_scope, {}, {}},
+                    family, property, interval);
+}
+
+StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
+    const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   const Status valid = interval.Validate();
   if (!valid.ok()) return valid;
-  auto chains = ReadChains(snapshot, family, property);
+  auto chains = ReadChains(context.facts, context.snapshot_seq, family, property,
+                           context.part_scope, context.chain_cache,
+                           context.system_time_range);
   if (!chains.ok()) return chains.status();
 
   std::vector<EventRow> rows;
-  for (const auto& [key, events] : chains.ValueOrDie()) {
-    auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
-    if (!corrected.ok()) return corrected.status();
-    for (const CorrectedBoundary& boundary : corrected.ValueOrDie()) {
+  for (const auto& view : chains.ValueOrDie()) {
+    for (const CorrectedBoundary& boundary : view.boundaries) {
       if (!Contains(interval, boundary.valid_from)) continue;
-      rows.push_back({FactRef{key.part_id, family, property, key.entity_id},
-                      boundary.valid_from, boundary.commit_seq,
+      if (context.system_time_range.has_value() &&
+          !context.system_time_range->Contains(boundary.commit_seq)) continue;
+      rows.push_back({view.ref, boundary.valid_from, boundary.commit_seq,
                       boundary.operation, boundary.value,
                       boundary.schema_epoch});
     }
@@ -207,27 +246,37 @@ StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
 
 StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
     Snapshot& snapshot, FactFamily family, PropertyId property,
+    const ValidTimeInterval& interval, const PartScope& part_scope) {
+  return ReadChanges(QueryReadContext{snapshot.canonical_reader(),
+                                      snapshot.commit_seq(), part_scope, {}, {}},
+                     family, property, interval);
+}
+
+StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
+    const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   const Status valid = interval.Validate();
   if (!valid.ok()) return valid;
-  auto chains = ReadChains(snapshot, family, property);
+  auto chains = ReadChains(context.facts, context.snapshot_seq, family, property,
+                           context.part_scope, context.chain_cache,
+                           context.system_time_range);
   if (!chains.ok()) return chains.status();
 
   std::vector<ChangeRow> rows;
-  for (const auto& [key, events] : chains.ValueOrDie()) {
-    auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
-    if (!corrected.ok()) return corrected.status();
+  for (const auto& view : chains.ValueOrDie()) {
     bool present = false;
     std::optional<Value> value;
-    for (const CorrectedBoundary& boundary : corrected.ValueOrDie()) {
+    for (const CorrectedBoundary& boundary : view.boundaries) {
       const bool after_present = boundary.operation == FactOperation::kPut;
       const std::optional<Value> after = after_present ? boundary.value
                                                        : std::nullopt;
       const bool changed = present != after_present ||
                            (present && value != after);
-      if (changed && Contains(interval, boundary.valid_from)) {
-        rows.push_back({FactRef{key.part_id, family, property, key.entity_id},
-                        boundary.valid_from, present ? value : std::nullopt,
+      if (changed && Contains(interval, boundary.valid_from) &&
+          (!context.system_time_range.has_value() ||
+           context.system_time_range->Contains(boundary.commit_seq))) {
+        rows.push_back({view.ref, boundary.valid_from,
+                        present ? value : std::nullopt,
                         after_present ? after : std::nullopt});
       }
       present = after_present;
@@ -239,34 +288,76 @@ StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
 
 StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
     Snapshot& snapshot, FactFamily family, PropertyId property,
+    ValidTime valid_time, const PartScope& part_scope) {
+  return ReadAt(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
+                                 part_scope, {}, {}}, family, property, valid_time);
+}
+
+StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
+    const QueryReadContext& context, FactFamily family, PropertyId property,
     ValidTime valid_time) {
-  auto rows = Materialize(snapshot, family, property, std::nullopt);
+  auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
+                          std::nullopt, context.part_scope, context.chain_cache,
+                          context.system_time_range);
   if (!rows.ok()) return rows.status();
   std::vector<StateRow> result;
   for (StateRow& row : rows.ValueOrDie()) {
     if (Contains(row.effective, valid_time)) result.push_back(std::move(row));
+  }
+  if (context.max_rows.has_value() &&
+      result.size() > *context.max_rows) {
+    result.erase(result.begin() + static_cast<size_t>(*context.max_rows),
+                 result.end());
   }
   return result;
 }
 
 StatusOr<std::vector<StateRow>> TemporalSource::ReadHistory(
     Snapshot& snapshot, FactFamily family, PropertyId property,
+    std::optional<ValidTimeInterval> interval, const PartScope& part_scope) {
+  return ReadHistory(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
+                                      part_scope, {}, {}}, family, property,
+                     std::move(interval));
+}
+
+StatusOr<std::vector<StateRow>> TemporalSource::ReadHistory(
+    const QueryReadContext& context, FactFamily family, PropertyId property,
     std::optional<ValidTimeInterval> interval) {
-  return Materialize(snapshot, family, property, std::move(interval));
+  return Materialize(context.facts, context.snapshot_seq, family, property,
+                     std::move(interval), context.part_scope, context.chain_cache,
+                     context.system_time_range);
 }
 
 StatusOr<std::vector<StateRow>> TemporalSource::ReadOverlaps(
     Snapshot& snapshot, FactFamily family, PropertyId property,
+    const ValidTimeInterval& interval, const PartScope& part_scope) {
+  return ReadOverlaps(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
+                                       part_scope, {}, {}}, family, property, interval);
+}
+
+StatusOr<std::vector<StateRow>> TemporalSource::ReadOverlaps(
+    const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
-  return Materialize(snapshot, family, property, interval);
+  return Materialize(context.facts, context.snapshot_seq, family, property,
+                     interval, context.part_scope, context.chain_cache,
+                     context.system_time_range);
 }
 
 StatusOr<std::vector<StateRow>> TemporalSource::ReadThroughout(
     Snapshot& snapshot, FactFamily family, PropertyId property,
+    const ValidTimeInterval& interval, const PartScope& part_scope) {
+  return ReadThroughout(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
+                                         part_scope, {}, {}}, family, property, interval);
+}
+
+StatusOr<std::vector<StateRow>> TemporalSource::ReadThroughout(
+    const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   const Status valid = interval.Validate();
   if (!valid.ok()) return valid;
-  auto rows = Materialize(snapshot, family, property, std::nullopt);
+  auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
+                          std::nullopt, context.part_scope, context.chain_cache,
+                          context.system_time_range);
   if (!rows.ok()) return rows.status();
   std::vector<StateRow> result;
   for (const StateRow& row : rows.ValueOrDie()) {

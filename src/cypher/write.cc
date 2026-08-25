@@ -4,6 +4,8 @@
 #include <utility>
 #include <variant>
 
+#include "cedar/cypher/relationship_type.h"
+
 namespace cedar::cypher {
 namespace {
 
@@ -11,15 +13,6 @@ struct WriteEntity {
   std::optional<VertexRef> vertex;
   std::optional<EdgeRef> edge;
 };
-
-uint64_t RelationshipType(const std::string& value) {
-  uint64_t hash = 1469598103934665603ULL;
-  for (unsigned char byte : value) {
-    hash ^= byte;
-    hash *= 1099511628211ULL;
-  }
-  return hash == 0 ? 1 : hash;
-}
 
 Status WriteError(const char* message) {
   return Status::InvalidArgument("cypher write", message);
@@ -83,9 +76,11 @@ Status StageWrite(Database& database, Transaction& tx,
       auto id = database.AllocateEdgeId();
       if (!id.ok()) return id.status();
       const EdgeRef edge_ref{PartId{statement.part_id.value}, id.ValueOrDie()};
+      const auto relationship = ResolveRelationshipType(pattern.relationship);
+      if (!relationship.ok()) return relationship.status();
       const EdgeIdentity identity{edge_ref, *source->second.vertex,
                                   *destination->second.vertex,
-                                  RelationshipType(pattern.relationship)};
+                                  relationship.ValueOrDie()};
       edge = entities.emplace(edge_name, WriteEntity{std::nullopt, edge_ref}).first;
       if (const Status status = tx.Assert(identity, valid_time); !status.ok()) return status;
     }

@@ -10,6 +10,10 @@ add_test(NAME EmbeddedEngineContract
         -DCEDAR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
         -P ${CMAKE_SOURCE_DIR}/tests/test_embedded_engine_contract.cmake)
 
+add_executable(test_public_header_compile public/test_public_header_compile.cc)
+target_link_libraries(test_public_header_compile PRIVATE cedar_core)
+add_test(NAME PublicHeaderCompile COMMAND test_public_header_compile)
+
 if(GTest_FOUND)
     set(GTEST_TARGET GTest::gtest)
     set(GTEST_MAIN_TARGET GTest::gtest_main)
@@ -21,6 +25,24 @@ endif()
 add_executable(test_query_types query/test_query_types.cc)
 target_link_libraries(test_query_types PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_types)
+
+add_executable(test_query_part_scope query/test_query_part_scope.cc)
+target_link_libraries(test_query_part_scope PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_part_scope TEST_PREFIX "QueryPartScope.")
+
+add_executable(test_query_read_context query/test_query_read_context.cc)
+target_include_directories(test_query_read_context PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_read_context PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_read_context TEST_PREFIX "QueryReadContext.")
+
+add_executable(test_query_read_path_baseline query/test_query_read_path_baseline.cc)
+target_link_libraries(test_query_read_path_baseline PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_read_path_baseline TEST_PREFIX "QueryReadBaseline.")
+
+add_executable(test_query_plan_outcome query/test_query_plan_outcome.cc)
+target_include_directories(test_query_plan_outcome PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_plan_outcome PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_plan_outcome TEST_PREFIX "QueryPlanOutcome.")
 
 add_executable(test_cypher_parser cypher/test_cypher_parser.cc)
 target_link_libraries(test_cypher_parser PRIVATE cedar_core ${GTEST_MAIN_TARGET})
@@ -41,6 +63,26 @@ gtest_discover_tests(test_cypher_embedded_api TEST_PREFIX "CypherEmbedded.")
 add_executable(test_cypher_writes cypher/test_cypher_writes.cc)
 target_link_libraries(test_cypher_writes PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_cypher_writes TEST_PREFIX "CypherWrite.")
+
+add_executable(test_tcypher_semantic_matrix cypher/test_tcypher_semantic_matrix.cc)
+target_link_libraries(test_tcypher_semantic_matrix PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_tcypher_semantic_matrix TEST_PREFIX "TCypherSemanticMatrix.")
+
+add_executable(test_cypher_session cypher/test_cypher_session.cc)
+target_link_libraries(test_cypher_session PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_cypher_session TEST_PREFIX "CypherSession.")
+
+add_executable(test_cypher_access_profile cypher/test_cypher_access_profile.cc)
+target_link_libraries(test_cypher_access_profile PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_cypher_access_profile TEST_PREFIX "CypherAccessProfile.")
+
+add_executable(test_schema_manifest cypher/test_schema_manifest.cc)
+target_link_libraries(test_schema_manifest PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_schema_manifest TEST_PREFIX "SchemaManifest.")
+
+add_executable(test_schema_provider cypher/test_schema_provider.cc)
+target_link_libraries(test_schema_provider PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_schema_provider TEST_PREFIX "SchemaProvider.")
 
 add_executable(test_server_lifecycle server/test_server_lifecycle.cc)
 target_link_libraries(test_server_lifecycle PRIVATE cedar_core ${GTEST_MAIN_TARGET})
@@ -76,6 +118,15 @@ target_include_directories(test_query_relational PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_link_libraries(test_query_relational PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_relational TEST_PREFIX "QueryRelational.")
 
+add_executable(test_query_complexity_regressions
+  query/test_query_complexity_regressions.cc)
+target_include_directories(test_query_complexity_regressions
+  PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_query_complexity_regressions
+  PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_query_complexity_regressions
+  TEST_PREFIX "QueryComplexity.")
+
 add_executable(test_query_resources query/test_query_resources.cc)
 target_include_directories(test_query_resources PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_query_resources PRIVATE cedar_core ${GTEST_MAIN_TARGET})
@@ -90,6 +141,11 @@ add_executable(test_projection_store query/test_projection_store.cc)
 target_include_directories(test_projection_store PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_projection_store PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_projection_store)
+
+add_executable(test_projection_page_reader query/test_projection_page_reader.cc)
+target_include_directories(test_projection_page_reader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_projection_page_reader PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_projection_page_reader TEST_PREFIX "ProjectionPageReader.")
 
 add_executable(test_query_delta query/test_query_delta.cc)
 target_include_directories(test_query_delta PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -132,6 +188,21 @@ target_include_directories(test_temporal_model PRIVATE
     ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_temporal_model PRIVATE ${CEDAR_TEST_LIBS})
 gtest_discover_tests(test_temporal_model)
+
+add_executable(test_fact_chain_cursor query/test_fact_chain_cursor.cc)
+target_include_directories(test_fact_chain_cursor PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_fact_chain_cursor PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_fact_chain_cursor TEST_PREFIX "FactChainCursor.")
+
+add_executable(test_read_catalog query/test_read_catalog.cc)
+target_include_directories(test_read_catalog PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_read_catalog PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_read_catalog TEST_PREFIX "ReadCatalog.")
+
+add_executable(test_read_binding_capsule query/test_read_binding_capsule.cc)
+target_include_directories(test_read_binding_capsule PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_read_binding_capsule PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_read_binding_capsule TEST_PREFIX "ReadBindingCapsule.")
 
 function(configure_cedar_parquet_test target)
     target_include_directories(${target} PRIVATE
@@ -278,6 +349,10 @@ target_include_directories(test_columnar_fact_scan PRIVATE
 target_link_libraries(test_columnar_fact_scan
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_columnar_fact_scan)
+
+add_executable(test_canonical_fact_reader storage/test_canonical_fact_reader.cc)
+target_link_libraries(test_canonical_fact_reader PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_canonical_fact_reader TEST_PREFIX "CanonicalFactReader.")
 
 add_executable(test_kernel_mutations kernel/test_kernel_mutations.cc)
 target_include_directories(test_kernel_mutations PRIVATE ${CMAKE_SOURCE_DIR}/src)

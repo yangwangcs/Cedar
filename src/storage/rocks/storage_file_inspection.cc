@@ -26,6 +26,8 @@
 namespace cedar {
 namespace {
 
+constexpr uint64_t kMaxInspectionMetadataBytes = 4ULL * 1024ULL * 1024ULL;
+
 Status FromRocksDb(const rocksdb::Status& status, const char* context) {
   if (status.ok()) return Status::OK();
   const std::string message = status.ToString();
@@ -102,8 +104,26 @@ void AppendCedarFiles(const std::string& root, std::vector<StorageFileInfo>* fil
     info.size_bytes = it->file_size(ec);
     QueryFileMetadata metadata;
     metadata.authority = role == StorageFileRole::kQueryScratch ? StorageFileAuthority::kTemporary : StorageFileAuthority::kDerived;
+    const uint64_t file_size = info.size_bytes;
+    if (file_size > kMaxInspectionMetadataBytes) {
+      metadata.checksum_valid = false;
+      metadata.available = false;
+      info.query_file = std::move(metadata);
+      files->push_back(std::move(info));
+      continue;
+    }
     std::ifstream input(it->path(), std::ios::binary);
-    const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::string bytes(static_cast<size_t>(file_size), '\0');
+    if (!bytes.empty()) {
+      input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+      if (!input) {
+        metadata.checksum_valid = false;
+        metadata.available = false;
+        info.query_file = std::move(metadata);
+        files->push_back(std::move(info));
+        continue;
+      }
+    }
     if (format == StorageTableFormat::kCedarStatistics) {
       const auto decoded = internal::DecodeQueryStatistics(bytes);
       metadata.checksum_valid = decoded.ok();

@@ -47,6 +47,8 @@ struct LogicalPlanPayload {
   std::optional<PropertyId> journey_duration_property;
   std::optional<SlotId> journey_slot;
   uint8_t journey_objective = 0;
+  std::optional<size_t> limit_offset;
+  std::optional<size_t> limit_count;
 };
 
 class LogicalPlanNode {
@@ -76,6 +78,8 @@ class LogicalPlanNode {
   const std::optional<PropertyId>& journey_duration_property() const { return payload_.journey_duration_property; }
   const std::optional<SlotId>& journey_slot() const { return payload_.journey_slot; }
   uint8_t journey_objective() const { return payload_.journey_objective; }
+  const std::optional<size_t>& limit_offset() const { return payload_.limit_offset; }
+  const std::optional<size_t>& limit_count() const { return payload_.limit_count; }
  private:
   const LogicalOpKind kind_;
   const RowSchema schema_;

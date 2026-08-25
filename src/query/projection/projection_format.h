@@ -64,6 +64,16 @@ struct ProjectionChain {
   std::vector<ProjectionPageDirectoryEntry> page_directory;
   bool operator==(const ProjectionChain&) const = default;
 };
+
+// Directory metadata can be decoded without touching any page payload. The
+// returned chain contains header and page_directory only.
+StatusOr<ProjectionChain> DecodeProjectionDirectory(const std::string& bytes,
+                                                     uint64_t file_size,
+                                                     CompressionCodec* codec);
+StatusOr<ProjectionChain> ReadProjectionPagePayload(
+    const ProjectionHeader&, CompressionCodec,
+    const ProjectionPageDirectoryEntry&, const std::string& payload,
+    size_t allocation_limit = 64ULL * 1024ULL * 1024ULL);
 StatusOr<std::string> EncodeProjectionPage(const ProjectionChain&,
                                            CompressionCodec);
 StatusOr<ProjectionChain> DecodeProjectionPage(const std::string&,

@@ -184,6 +184,7 @@ struct CedarParquetScanSpec {
   std::optional<uint64_t> cedar_commit_seq_max;
   std::vector<CedarParquetColumnId> projection;
   uint32_t batch_row_limit = 1024;
+  std::optional<uint64_t> max_rows;
   // Bounds the number of Cedar-owned row-group scan jobs. A value of one
   // preserves the serial scan path and is the default for callers that do not
   // opt into parallel decoding. Values above

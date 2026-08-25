@@ -58,11 +58,19 @@ TEST(CypherParserTest, RejectsUnboundedPath) {
   EXPECT_TRUE(parsed.status().IsParseError());
 }
 
-TEST(CypherParserTest, RejectsMixedPathWithoutASequenceOperator) {
+TEST(CypherParserTest, ParsesConnectedMixedPathSequence) {
   const auto parsed = Parse("MATCH (a)-[e:KNOWS]->(b)-[f:LIKES*1..2]->(c) RETURN a");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  ASSERT_EQ(parsed.ValueOrDie().patterns.size(), 2U);
+  EXPECT_EQ(parsed.ValueOrDie().patterns[0].destination, "b");
+  EXPECT_EQ(parsed.ValueOrDie().patterns[1].source, "b");
+  EXPECT_EQ(parsed.ValueOrDie().patterns[1].max_hops, 2U);
+}
+
+TEST(CypherParserTest, RejectsMalformedMixedPathSequence) {
+  const auto parsed = Parse("MATCH (a)-[e:KNOWS]->(b)-[f:LIKES*1..2 RETURN a");
   EXPECT_FALSE(parsed.ok());
-  EXPECT_TRUE(parsed.status().IsNotSupportedError());
-  EXPECT_NE(parsed.status().ToString().find("sequence operator"), std::string::npos);
+  EXPECT_TRUE(parsed.status().IsParseError());
 }
 
 }  // namespace

@@ -61,23 +61,6 @@ Embedded Cedar-owned LSM engine
 
 ## Project Status and Paper
 
-### 中文
-
-Cedar 当前主分支是在 Cedar 0.1 原型系统基础上持续演进形成的较为完善的
-时态属性图数据库系统。当前版本保留了原型系统关于追加式时态事件、LSM
-存储和列式布局的核心设计，并进一步完善了双时态查询、事务、快照、
-T-Cypher、列式事实存储、投影回退、嵌入式 API 和 Bolt 服务能力。Cedar
-仍在持续开发和优化中。
-
-我们的论文：
-
-> Yang Wang, Xuelian Lin, Jinghe Song, Jianyong Zhu, Yu Zhao, and Shuai Ma.
-> **Cedar: A Columnar LSM-Engine for Temporal Property Graphs.**
-
-该论文已被 VLDB 2026 Demo Track 录用。
-
-### English
-
 The current Cedar `main` branch is a substantially more complete temporal
 property graph database system developed from the Cedar 0.1 prototype. It
 preserves the prototype's core ideas of append-oriented temporal events,

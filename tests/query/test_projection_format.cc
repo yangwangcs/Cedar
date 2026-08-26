@@ -4,6 +4,7 @@
 
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_format.h"
+#include "query/projection/property_index.h"
 
 namespace cedar::internal {
 namespace {
@@ -85,6 +86,31 @@ TEST(ProjectionFormatTest, RoundTripsIntervalsAndLatentBoundaries) {
   EXPECT_FALSE(PageMayContainEntity(decoded.ValueOrDie().page_directory.front(), 7));
   EXPECT_EQ(decoded.ValueOrDie().intervals.front().entity_id, 42U);
   EXPECT_EQ(decoded.ValueOrDie().boundaries.back().entity_id, 43U);
+}
+
+TEST(ProjectionFormatTest, RoundTripsBoundedPropertyIndexSegment) {
+  PropertyIndexSegment segment;
+  segment.generation_id = 4;
+  segment.base_seq = CommitSeq{10};
+  segment.built_through = CommitSeq{12};
+  segment.property = PropertyId{7};
+  segment.part_id = PartId{0};
+  segment.schema_epoch = 2;
+  segment.postings = {
+      {VertexRef{PartId{0}, VertexId{1}}, {ValidTime{0}, ValidTime{20}},
+       CommitSeq{11}, Value::String("CN")},
+      {VertexRef{PartId{0}, VertexId{2}}, {ValidTime{0}, std::nullopt},
+       CommitSeq{12}, Value::String("US")}};
+  auto encoded = EncodePropertyIndexSegment(segment);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  auto decoded = DecodePropertyIndexSegment(encoded.ValueOrDie());
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  EXPECT_EQ(decoded.ValueOrDie().generation_id, 4U);
+  EXPECT_EQ(decoded.ValueOrDie().part_id, PartId{0});
+  EXPECT_EQ(decoded.ValueOrDie().postings, segment.postings);
+  std::string corrupt = encoded.ValueOrDie();
+  corrupt[corrupt.size() / 2] ^= 1;
+  EXPECT_TRUE(DecodePropertyIndexSegment(corrupt).status().IsCorruption());
 }
 
 TEST(ProjectionFormatTest, RejectsBitFlippedPayload) {

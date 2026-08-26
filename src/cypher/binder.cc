@@ -179,6 +179,10 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
     if (pattern.source_part_id.has_value() != pattern.source_vertex_id.has_value()) {
       return BindError("vertex reference requires both part_id and id");
     }
+    if (pattern.destination_part_id.has_value() !=
+        pattern.destination_vertex_id.has_value()) {
+      return BindError("vertex reference requires both part_id and id");
+    }
     if (pattern.max_hops > options.max_hops || pattern.max_hops == 0) {
       return BindError("path hop bound exceeds configured limit");
     }

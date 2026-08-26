@@ -45,6 +45,8 @@ struct QueryReadContext {
   // execution state while still exposing physical read decisions.
   std::function<void()> on_point_read;
   std::function<void()> on_limit_early_stop;
+  std::function<void(uint64_t)> on_property_index_seek;
+  std::optional<cedar::EntityRange> entity_range;
 };
 
 }  // namespace cedar::internal

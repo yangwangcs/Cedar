@@ -18,6 +18,7 @@
 #include "kernel/database_impl.h"
 #include "query/resource/query_scratch.h"
 #include "query/runtime/graph_frontier.h"
+#include "query/projection/property_index_builder.h"
 
 namespace cedar {
 namespace {
@@ -1745,6 +1746,80 @@ StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
   const Status submitted = impl_->async_executor.TrySubmit(ticket);
   if (!submitted.ok()) return submitted;
   return QueryMaintenanceHandle(std::make_unique<QueryMaintenanceHandle::State>(std::move(state)));
+}
+
+StatusOr<QueryMaintenanceHandle> Database::RefreshQueryIndexes(ValidTime valid_time) {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  if (valid_time.value == std::numeric_limits<uint64_t>::max()) {
+    return Status::InvalidArgument("query maintenance", "index valid time overflows interval");
+  }
+  std::shared_ptr<Impl> impl = impl_;
+  std::shared_ptr<Snapshot> snapshot;
+  std::vector<PropertyDefinition> definitions;
+  uint64_t generation = 1;
+  CommitSeq base_seq{0};
+  std::string identity;
+  auto opened_snapshot = BeginSnapshot();
+  if (!opened_snapshot.ok()) return opened_snapshot.status();
+  snapshot = std::make_shared<Snapshot>(
+      std::move(opened_snapshot).ConsumeValueOrDie());
+  {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->closed) return Status::InvalidArgument("database", "database is closed");
+    if (impl->closing) return Status::ShutdownInProgress("database", "database close is in progress");
+    auto listed = impl->store.ListProperties();
+    if (!listed.ok()) return listed.status();
+    definitions = std::move(listed).ConsumeValueOrDie();
+    if (impl->projection_store) {
+      const auto manifest = impl->projection_store->current_manifest();
+      if (manifest) {
+        generation = manifest->generation_id + 1;
+        base_seq = manifest->base_seq;
+        identity = manifest->database_identity;
+      }
+    }
+    if (identity.empty()) identity = impl->query_database_path;
+  }
+  auto state = std::make_shared<QueryMaintenanceHandle::State::Shared>();
+  auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
+  ticket->estimated_bytes = 1;
+  ticket->release_after_handoff = true;
+  ticket->handoff = [state, impl, snapshot, definitions = std::move(definitions),
+                     generation, base_seq, identity, valid_time] {
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->cancelled) {
+        state->status = Status::QueryCancelled("query maintenance", "index refresh cancelled");
+        state->done = true;
+        state->cv.notify_all();
+        return Status::OK();
+      }
+    }
+    const ValidTimeInterval interval{valid_time, ValidTime{valid_time.value + 1}};
+    auto build = internal::BuildPropertyIndexProjection(
+        snapshot->canonical_reader(), definitions, PartScope::All(), interval,
+        base_seq, snapshot->commit_seq(), generation, identity);
+    Status result = build.ok() ? impl->projection_store->Build(build.ValueOrDie())
+                               : build.status();
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->status = std::move(result);
+      state->done = true;
+    }
+    state->cv.notify_all();
+    return Status::OK();
+  };
+  ticket->fail = [state](const Status& status) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->status = status;
+    state->done = true;
+    state->cv.notify_all();
+  };
+  ticket->release = [] {};
+  const Status submitted = impl->async_executor.TrySubmit(ticket);
+  if (!submitted.ok()) return submitted;
+  return QueryMaintenanceHandle(std::make_unique<QueryMaintenanceHandle::State>(
+      std::move(state)));
 }
 
 Status Database::Close() {

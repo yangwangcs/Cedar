@@ -454,6 +454,7 @@ class FactStore {
   StatusOr<std::optional<PropertyDefinition>> LookupProperty(
       const StoreSnapshot& snapshot, PropertyId property_id,
       uint32_t schema_epoch = 0) const;
+  StatusOr<std::vector<PropertyDefinition>> ListProperties() const;
   // Stable fingerprint of the latest registered definition for every property.
   // The value is derived from the authoritative schema catalog and is used to
   // bind derived query statistics to the schema that produced them.

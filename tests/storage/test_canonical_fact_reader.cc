@@ -155,5 +155,55 @@ TEST(CanonicalFactReader, StreamsVisibleStateRowsAndStopsAtStateLimit) {
   database.ValueOrDie()->Close().IgnoreError();
 }
 
+TEST(CanonicalFactReader, StateLimitStopsAcrossPartScopesAndZeroDoesNoRead) {
+  char pattern[] = "/tmp/cedar_canonical_state_rows_parts_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  auto tx = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(tx.ok());
+  for (uint32_t part = 0; part < 2; ++part) {
+    for (uint64_t id = 1; id <= 2; ++id) {
+      ASSERT_TRUE(tx.ValueOrDie()
+                      ->Assert(EntityFact::Vertex(
+                                   VertexRef{PartId{part}, VertexId{id}}),
+                               ValidTime{10})
+                      .ok());
+    }
+  }
+  ASSERT_TRUE(tx.ValueOrDie()->Commit().ok());
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  CanonicalStateReadSpec spec;
+  spec.facts.part_scope = PartScope::Set({PartId{0}, PartId{1}});
+  spec.facts.family = FactFamily::kVertexState;
+  spec.valid_time = ValidTime{10};
+  spec.snapshot_seq = snapshot.ValueOrDie().commit_seq();
+  spec.max_rows = 3;
+  size_t callbacks = 0;
+  size_t rows = 0;
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader()
+                  .ReadStateRows(spec, [&callbacks, &rows](const auto& batch) {
+                    ++callbacks;
+                    rows += batch.size();
+                    return Status::OK();
+                  })
+                  .ok());
+  EXPECT_EQ(rows, 3U);
+  EXPECT_GE(callbacks, 1U);
+
+  spec.max_rows = 0;
+  callbacks = 0;
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader()
+                  .ReadStateRows(spec, [&callbacks](const auto&) {
+                    ++callbacks;
+                    return Status::OK();
+                  })
+                  .ok());
+  EXPECT_EQ(callbacks, 0U);
+  database.ValueOrDie()->Close().IgnoreError();
+}
+
 }  // namespace
 }  // namespace cedar

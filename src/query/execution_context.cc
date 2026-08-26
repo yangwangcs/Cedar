@@ -174,6 +174,37 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
         binding.projection_generation = std::move(acquired);
       }
     }
+    // Property-index regions are derived read capabilities rather than state
+    // slices. Pin the same immutable generation so candidate reads cannot
+    // observe a rollover midway through execution.
+    for (const auto& region : catalog.regions) {
+      if (region.kind != ProjectionKind::kPropertyIndex ||
+          !region.property_id.has_value() || region.segments.empty()) {
+        continue;
+      }
+      CoverageRequest request;
+      request.kind = ProjectionKind::kPropertyIndex;
+      request.part_id = region.part_id;
+      request.property_id = region.property_id;
+      request.schema_epoch = region.schema_epoch;
+      request.entity_min = region.entity_min;
+      request.entity_max_exclusive = region.entity_max_exclusive;
+      request.valid_time = region.valid_time;
+      request.snapshot_seq = snapshot_seq;
+      request.generation_id = catalog.generation_id;
+      request.expected_base_seq = catalog.base_seq;
+      request.database_identity = catalog.database_identity;
+      auto acquired = database->projection_store->Acquire(request);
+      if (!acquired.has_value()) continue;
+      if (binding.projection_generation.has_value() &&
+          binding.projection_generation->generation_id() != acquired->generation_id()) {
+        return Status::Conflict("query", "physical plan spans multiple projection generations");
+      }
+      if (!binding.projection_generation.has_value()) {
+        binding.projection_generation = std::move(acquired);
+      }
+      break;
+    }
   }
   const std::weak_ptr<Database::Impl> weak_database = database;
   const auto pinned_generation = binding.projection_generation;
@@ -209,6 +240,36 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     }
     return db->query_delta->AcquireThrough(snapshot_seq);
   };
+  const auto pinned_property_generation = binding.projection_generation;
+  binding.property_index_reader =
+      [weak_database, snapshot_seq, pinned_property_generation](
+          PartId part, PropertyId property, uint32_t schema_epoch,
+          ValidTimeInterval valid_time) -> StatusOr<PropertyIndexSegment> {
+    const auto db = weak_database.lock();
+    if (!db || !db->projection_store || !pinned_property_generation ||
+        !pinned_property_generation->exists()) {
+      return Status::NotFound("query", "property index generation is unavailable");
+    }
+    CoverageRequest request;
+    request.kind = ProjectionKind::kPropertyIndex;
+    request.part_id = part;
+    request.property_id = property;
+    request.schema_epoch = schema_epoch;
+    request.entity_min = 0;
+    request.entity_max_exclusive = UINT64_MAX;
+    request.valid_time = valid_time;
+    request.snapshot_seq = snapshot_seq;
+    request.generation_id = pinned_property_generation->generation_id();
+    request.expected_base_seq = pinned_property_generation->manifest()
+                                    ? std::optional<CommitSeq>(
+                                          pinned_property_generation->manifest()->base_seq)
+                                    : std::nullopt;
+    request.database_identity = pinned_property_generation->manifest()
+                                    ? pinned_property_generation->manifest()->database_identity
+                                    : std::string{};
+    return db->projection_store->ReadPropertyIndex(request,
+                                                   *pinned_property_generation);
+  };
   // The capsule is the ownership boundary for all snapshot-specific state.
   // Keep the value-shaped fields above for explain/test compatibility, but
   // hand execution one immutable holder so leases and readers are transferred
@@ -219,6 +280,7 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
       std::move(prepared), std::move(binding.delta_view),
       std::move(binding.delta_lease), std::move(binding.projection_generation),
       std::move(binding.projection_stats), std::move(binding.projection_reader),
+      std::move(binding.property_index_reader),
       std::move(binding.delta_reader));
   return binding;
 }

@@ -70,6 +70,13 @@ struct RuntimeRow {
   std::map<uint32_t, EdgeRef> graph_edges;
 };
 
+cedar::EntityRange ExactEntityRange(uint64_t entity_id) {
+  return cedar::EntityRange{
+      entity_id,
+      entity_id == UINT64_MAX ? std::nullopt
+                              : std::optional<uint64_t>(entity_id + 1)};
+}
+
 StatusOr<uint64_t> PropertyPayloadBytes(const RuntimeRow& row) {
   uint64_t bytes = 0;
   auto add = [&bytes](const std::optional<Value>& value) -> Status {
@@ -376,27 +383,83 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
   if (plan.point_ref.has_value()) {
     if (context.on_point_read) context.on_point_read();
     const auto* at = std::get_if<At>(&plan.scope);
-    if (at == nullptr) {
-      return Status::NotSupported("query runtime",
-                                  "VertexPoint currently requires an At scope");
-    }
-    FactReadSpec spec;
-    spec.part_scope = PartScope::Exact(plan.point_ref->part_id);
-    spec.family = FactFamily::kVertexState;
-    spec.entity_range = EntityRange{plan.point_ref->vertex_id.value,
-                                    plan.point_ref->vertex_id.value + 1};
-    auto event = context.facts.ReadStateAt(spec, at->time, context.snapshot_seq);
-    if (!event.ok()) return event.status();
-    if (event.ValueOrDie().has_value() &&
-        event.ValueOrDie()->operation == FactOperation::kPut) {
-      const FactEvent& visible = *event.ValueOrDie();
-      if (Status status = append({visible.ref,
-                                  ValidTimeInterval{visible.valid_from, std::nullopt},
-                                  at->time, std::nullopt});
-          !status.ok()) {
-        return status;
+    if (at != nullptr) {
+      FactReadSpec spec;
+      spec.part_scope = PartScope::Exact(plan.point_ref->part_id);
+      spec.family = FactFamily::kVertexState;
+      spec.entity_range = ExactEntityRange(plan.point_ref->vertex_id.value);
+      auto event = context.facts.ReadStateAt(spec, at->time, context.snapshot_seq);
+      if (!event.ok()) return event.status();
+      if (event.ValueOrDie().has_value() &&
+          event.ValueOrDie()->operation == FactOperation::kPut) {
+        const FactEvent& visible = *event.ValueOrDie();
+        if (Status status = append({visible.ref,
+                                    ValidTimeInterval{visible.valid_from, std::nullopt},
+                                    at->time, std::nullopt});
+            !status.ok()) {
+          return status;
+        }
       }
+      return result;
     }
+    // For already-supported bounded scopes, constrain the canonical reader to
+    // the exact point prefix before temporal reduction. This preserves point
+    // lookup's O(1) entity seek without broadening the user's temporal scope.
+    internal::QueryReadContext exact = context;
+    exact.part_scope = PartScope::Exact(plan.point_ref->part_id);
+    exact.entity_range = ExactEntityRange(plan.point_ref->vertex_id.value);
+    auto append_state = [&](const std::vector<internal::StateRow>& states) {
+      for (const auto& row : states) {
+        if (row.ref.entity_id() != plan.point_ref->vertex_id.value) continue;
+        if (Status status = append({row.ref, row.effective, std::nullopt, std::nullopt});
+            !status.ok()) return status;
+      }
+      return Status::OK();
+    };
+    Status status = std::visit(
+        [&](const auto& scope) -> Status {
+          using T = std::decay_t<decltype(scope)>;
+          if constexpr (std::is_same_v<T, Events>) {
+            auto rows = internal::TemporalSource::ReadEvents(
+                exact, FactFamily::kVertexState, PropertyId{}, scope.interval);
+            if (!rows.ok()) return rows.status();
+            for (const auto& row : rows.ValueOrDie()) {
+              if (row.ref.entity_id() != plan.point_ref->vertex_id.value) continue;
+              if (Status s = append({row.ref, std::nullopt, row.valid_from, std::nullopt});
+                  !s.ok()) return s;
+            }
+            return Status::OK();
+          } else if constexpr (std::is_same_v<T, Changes>) {
+            auto rows = internal::TemporalSource::ReadChanges(
+                exact, FactFamily::kVertexState, PropertyId{}, scope.interval);
+            if (!rows.ok()) return rows.status();
+            for (const auto& row : rows.ValueOrDie()) {
+              if (row.ref.entity_id() != plan.point_ref->vertex_id.value) continue;
+              if (Status s = append({row.ref, std::nullopt, row.valid_from, std::nullopt});
+                  !s.ok()) return s;
+            }
+            return Status::OK();
+          } else if constexpr (std::is_same_v<T, At>) {
+            return Status::OK();
+          } else {
+            std::optional<ValidTimeInterval> bounds;
+            if constexpr (std::is_same_v<T, History>) bounds = scope.interval;
+            else bounds = scope.interval;
+            if (!bounds.has_value()) {
+              return Status::NotSupported("query runtime", "unbounded point history requires analytical execution");
+            }
+            StatusOr<std::vector<internal::StateRow>> rows =
+                std::is_same_v<T, Overlaps>
+                    ? internal::TemporalSource::ReadOverlaps(exact, FactFamily::kVertexState, PropertyId{}, *bounds)
+                    : std::is_same_v<T, Throughout>
+                          ? internal::TemporalSource::ReadThroughout(exact, FactFamily::kVertexState, PropertyId{}, *bounds)
+                          : internal::TemporalSource::ReadHistory(exact, FactFamily::kVertexState, PropertyId{}, *bounds);
+            if (!rows.ok()) return rows.status();
+            return append_state(rows.ValueOrDie());
+          }
+        },
+        plan.scope);
+    if (!status.ok()) return status;
     return result;
   }
   auto rows = std::visit(
@@ -448,6 +511,159 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
         return result;
       },
       plan.scope);
+  return rows;
+}
+
+int CompareIndexedValues(const Value& left, const Value& right) {
+  if (left.type() != right.type()) return 0;
+  return std::visit(
+      [](const auto& a, const auto& b) -> int {
+        using A = std::decay_t<decltype(a)>;
+        using B = std::decay_t<decltype(b)>;
+        if constexpr (!std::is_same_v<A, B>) {
+          return 0;
+        } else if constexpr (std::is_same_v<A, std::string>) {
+          return a < b ? -1 : (a > b ? 1 : 0);
+        } else {
+          return a < b ? -1 : (a > b ? 1 : 0);
+        }
+      },
+      left.data(), right.data());
+}
+
+bool IndexedValueMatches(internal::PropertyIndexOperator op, int cmp) {
+  switch (op) {
+    case internal::PropertyIndexOperator::kEqual: return cmp == 0;
+    case internal::PropertyIndexOperator::kLess: return cmp < 0;
+    case internal::PropertyIndexOperator::kLessEqual: return cmp <= 0;
+    case internal::PropertyIndexOperator::kGreater: return cmp > 0;
+    case internal::PropertyIndexOperator::kGreaterEqual: return cmp >= 0;
+  }
+  return false;
+}
+
+StatusOr<Value> SargableValue(const internal::PreparedSargablePredicate& predicate,
+                              const Bindings& bindings) {
+  const auto& expression = predicate.value_expression;
+  if (!expression) return Status::InvalidArgument("query", "missing index literal");
+  if (expression->kind() == internal::ExpressionKind::kParameter) {
+    auto value = bindings.Lookup(expression->parameter(), expression->type());
+    if (!value.ok()) return value.status();
+    if (!std::holds_alternative<Value>(value.ValueOrDie())) {
+      return Status::BindError("property index parameter must be scalar");
+    }
+    return std::get<Value>(value.ValueOrDie());
+  }
+  if (!expression->literal().has_value()) {
+    return Status::InvalidArgument("query", "property index literal is missing");
+  }
+  return std::visit(
+      [](const auto& value) -> StatusOr<Value> {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, bool>) return Value::Bool(value);
+        if constexpr (std::is_same_v<T, int32_t>) return Value::Int32(value);
+        if constexpr (std::is_same_v<T, int64_t>) return Value::Int64(value);
+        if constexpr (std::is_same_v<T, float>) return Value::Float32(value);
+        if constexpr (std::is_same_v<T, double>) return Value::Float64(value);
+        if constexpr (std::is_same_v<T, Timestamp64>) return Value::Timestamp(value.value);
+        if constexpr (std::is_same_v<T, std::string>) return Value::String(value);
+        if constexpr (std::is_same_v<T, Binary>) return Value::Binary(value.value);
+        return Status::NotSupported("query", "non-scalar property index literal");
+      },
+      *expression->literal());
+}
+
+StatusOr<std::vector<RuntimeRow>> ReadIndexedPropertyRows(
+    const internal::QueryReadContext& context,
+    const internal::PreparedQueryPlan& plan, const Bindings& bindings,
+    QueryExecutionState* execution = nullptr) {
+  if (!plan.sargable_predicate.has_value() || !context.on_property_index_seek ||
+      !plan.property_index_reader) {
+    return Status::NotFound("query", "property index is not selected");
+  }
+  const auto* at = std::get_if<At>(&plan.scope);
+  if (!at) return Status::NotFound("query", "property index requires At scope");
+  const auto value = SargableValue(*plan.sargable_predicate, bindings);
+  if (!value.ok()) return value.status();
+  const auto& predicate = *plan.sargable_predicate;
+  const auto in_part = [&](PartId part) {
+    return plan.execution_scope.part_scope.kind == PartScopeKind::kAll ||
+           std::binary_search(plan.execution_scope.part_scope.parts.begin(),
+                              plan.execution_scope.part_scope.parts.end(), part,
+                              [](PartId left, PartId right) { return left.value < right.value; });
+  };
+  std::vector<RuntimeRow> rows;
+  const auto* manifest = plan.projection_generation
+                             ? plan.projection_generation->manifest()
+                             : nullptr;
+  if (!manifest) return Status::NotFound("query", "property index generation is unavailable");
+  uint64_t candidate_count = 0;
+  for (const auto& region : manifest->regions) {
+    if (region.kind != internal::ProjectionKind::kPropertyIndex ||
+        !region.property_id || *region.property_id != predicate.property ||
+        !in_part(region.part_id)) {
+      continue;
+    }
+    auto segment = plan.property_index_reader(
+        region.part_id, predicate.property, region.schema_epoch,
+        ValidTimeInterval{at->time, ValidTime{at->time.value + 1}});
+    if (!segment.ok()) {
+      if (segment.status().IsNotFound()) {
+        return Status::NotFound("query", "property index coverage is unavailable");
+      }
+      return segment.status();
+    }
+    const auto candidates = internal::SeekPropertyIndexRange(
+        segment.ValueOrDie(), predicate.op, value.ValueOrDie());
+    candidate_count += static_cast<uint64_t>(candidates.size());
+    for (const auto& posting : candidates) {
+      if (posting.commit_seq.value > context.snapshot_seq.value ||
+          posting.value.type() != value.ValueOrDie().type()) {
+        continue;
+      }
+      if (posting.effective.from.value > at->time.value ||
+          (posting.effective.to && at->time.value >= posting.effective.to->value) ||
+          !IndexedValueMatches(predicate.op,
+                               CompareIndexedValues(posting.value, value.ValueOrDie()))) {
+        continue;
+      }
+      FactReadSpec property_spec;
+      property_spec.part_scope = PartScope::Exact(posting.vertex.part_id);
+      property_spec.family = FactFamily::kVertexProperty;
+      property_spec.property_id = predicate.property;
+      property_spec.entity_range = ExactEntityRange(posting.vertex.vertex_id.value);
+      property_spec.commit_seq_max = context.snapshot_seq;
+      auto property_state = context.facts.ReadStateAt(property_spec, at->time,
+                                                      context.snapshot_seq);
+      if (!property_state.ok()) return property_state.status();
+      if (!property_state.ValueOrDie().has_value() ||
+          property_state.ValueOrDie()->operation != FactOperation::kPut ||
+          !property_state.ValueOrDie()->value.has_value() ||
+          *property_state.ValueOrDie()->value != posting.value) {
+        continue;
+      }
+      FactReadSpec vertex_spec;
+      vertex_spec.part_scope = PartScope::Exact(posting.vertex.part_id);
+      vertex_spec.family = FactFamily::kVertexState;
+      vertex_spec.entity_range = ExactEntityRange(posting.vertex.vertex_id.value);
+      vertex_spec.commit_seq_max = context.snapshot_seq;
+      auto vertex_state = context.facts.ReadStateAt(vertex_spec, at->time,
+                                                    context.snapshot_seq);
+      if (!vertex_state.ok()) return vertex_state.status();
+      if (!vertex_state.ValueOrDie().has_value() ||
+          vertex_state.ValueOrDie()->operation != FactOperation::kPut) {
+        continue;
+      }
+      RuntimeRow row{vertex_state.ValueOrDie()->ref,
+                     ValidTimeInterval{vertex_state.ValueOrDie()->valid_from,
+                                       std::nullopt},
+                     at->time, posting.value};
+      row.property_values[predicate.property_output.slot.value] = posting.value;
+      rows.push_back(std::move(row));
+    }
+  }
+  context.on_property_index_seek(candidate_count);
+  (void)execution;
   return rows;
 }
 
@@ -603,7 +819,8 @@ bool RowMatchesCoverageSlice(const RuntimeRow& row,
     return false;
   }
   return row.ref.entity_id() >= slice.entity_min &&
-         row.ref.entity_id() < slice.entity_max_exclusive;
+         (slice.entity_max_exclusive == UINT64_MAX ||
+          row.ref.entity_id() < slice.entity_max_exclusive);
 }
 
 StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
@@ -619,6 +836,12 @@ StatusOr<std::vector<RuntimeRow>> BindPropertyRows(
     if (!binding.definition.has_value()) {
       return Status::SchemaMismatch("query", "property binding was not prepared");
     }
+    const bool already_bound = !rows.empty() && std::all_of(
+        rows.begin(), rows.end(), [&](const RuntimeRow& row) {
+          return row.property_values.find(binding.output.slot.value) !=
+                 row.property_values.end();
+        });
+    if (already_bound) continue;
     // Bind the complete entity batch in one temporal source pass. Calling
     // BindIntervals once per row turns a property predicate into an N+1 scan
     // over the full property family and can dominate query execution.
@@ -763,7 +986,10 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
       std::make_shared<internal::TemporalChainCache>(), plan.safe_read_limit,
       plan.execution_scope.system_time_range,
       execution ? [execution] { execution->RecordPointRead(); } : std::function<void()>{},
-      execution ? [execution] { execution->RecordLimitEarlyStop(); } : std::function<void()>{}};
+      execution ? [execution] { execution->RecordLimitEarlyStop(); } : std::function<void()>{},
+      execution ? [execution](uint64_t candidates) {
+        execution->RecordPropertyIndexSeek(candidates);
+      } : std::function<void(uint64_t)>{}};
   auto reserve_row = [reservation](const RuntimeRow& row) -> Status {
     if (reservation == nullptr) return Status::OK();
     size_t bytes = sizeof(RuntimeRow);
@@ -777,7 +1003,34 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
   };
   StatusOr<std::vector<RuntimeRow>> rows =
       Status::NotFound("query runtime", "canonical source is not required");
-  if (plan.physical_plan) {
+  const bool property_index_selected =
+      plan.physical_plan && plan.sargable_predicate.has_value() &&
+      std::find(plan.physical_plan->operations.begin(),
+                plan.physical_plan->operations.end(),
+                internal::PhysicalOpKind::kPropertyIndexSeek) !=
+          plan.physical_plan->operations.end();
+  if (plan.sargable_predicate.has_value() && !property_index_selected &&
+      execution != nullptr) {
+    // The planner did not prove complete typed-index coverage for this
+    // snapshot/part scope. Keep the canonical predicate path authoritative,
+    // but expose the derived-read miss explicitly in the bounded profile.
+    execution->RecordCanonicalFallback(0);
+  }
+  if (property_index_selected) {
+    auto indexed = ReadIndexedPropertyRows(read_context, plan, bindings, execution);
+    if (indexed.ok()) {
+      rows = std::move(indexed);
+    } else if (!indexed.status().IsNotFound()) {
+      return indexed.status();
+    } else if (execution != nullptr) {
+      // A missing or stale derived generation is an explicit read-path
+      // fallback. Keep the canonical result authoritative and expose the
+      // decision in the bounded profile instead of silently hiding it.
+      execution->RecordCanonicalFallback(0);
+    }
+  }
+  if (!rows.ok()) {
+    if (plan.physical_plan) {
     StatusOr<std::vector<RuntimeRow>> derived =
         Status::NotFound("query runtime", "projection reader is unavailable");
     if (plan.projection_reader) derived = ReadProjectionRows(plan);
@@ -810,12 +1063,20 @@ StatusOr<std::vector<RuntimeRow>> MaterializeRows(
         }
       }
     }
-    rows = std::move(combined);
-  } else {
-    rows = ReadSourceRows(read_context, plan, reservation);
-    if (!rows.ok()) return rows.status();
+      rows = std::move(combined);
+    } else {
+      rows = ReadSourceRows(read_context, plan, reservation);
+      if (!rows.ok()) return rows.status();
+    }
   }
   if (!rows.ok()) return rows.status();
+  if (execution != nullptr && plan.physical_plan &&
+      std::find(plan.physical_plan->operations.begin(),
+                plan.physical_plan->operations.end(),
+                internal::PhysicalOpKind::kCanonicalFallback) !=
+          plan.physical_plan->operations.end()) {
+    execution->RecordCanonicalFallback(rows.ValueOrDie().size());
+  }
   if (!plan.graph_expand && !plan.metadata_bindings.empty()) {
     const Status metadata = PopulateMetadataEvents(
         snapshot, plan.entity_family, plan.entity_slot,
@@ -897,6 +1158,57 @@ bool ExpressionUsesSlot(const internal::ExpressionNode& expression,
   return false;
 }
 
+std::optional<internal::PreparedSargablePredicate> FindSargablePredicate(
+    const std::shared_ptr<const internal::ExpressionNode>& expression,
+    const std::vector<internal::PreparedPropertyBinding>& bindings) {
+  if (!expression) return std::nullopt;
+  if (expression->kind() == internal::ExpressionKind::kAnd) {
+    for (const auto& child : expression->children()) {
+      if (auto found = FindSargablePredicate(child, bindings); found) {
+        return found;
+      }
+    }
+    return std::nullopt;
+  }
+  internal::PropertyIndexOperator op;
+  switch (expression->kind()) {
+    case internal::ExpressionKind::kEqual: op = internal::PropertyIndexOperator::kEqual; break;
+    case internal::ExpressionKind::kLessThan: op = internal::PropertyIndexOperator::kLess; break;
+    case internal::ExpressionKind::kLessThanOrEqual: op = internal::PropertyIndexOperator::kLessEqual; break;
+    case internal::ExpressionKind::kGreaterThan: op = internal::PropertyIndexOperator::kGreater; break;
+    case internal::ExpressionKind::kGreaterThanOrEqual: op = internal::PropertyIndexOperator::kGreaterEqual; break;
+    default: return std::nullopt;
+  }
+  if (expression->children().size() != 2) return std::nullopt;
+  const auto try_pair = [&](const std::shared_ptr<const internal::ExpressionNode>& left,
+                            const std::shared_ptr<const internal::ExpressionNode>& right)
+      -> std::optional<internal::PreparedSargablePredicate> {
+    if (!left || !right || left->kind() != internal::ExpressionKind::kSlot ||
+        (right->kind() != internal::ExpressionKind::kLiteral &&
+         right->kind() != internal::ExpressionKind::kParameter)) {
+      return std::nullopt;
+    }
+    const auto binding = std::find_if(
+        bindings.begin(), bindings.end(), [&](const internal::PreparedPropertyBinding& value) {
+          return value.output.slot == left->slot();
+        });
+    if (binding == bindings.end() || left->type() != right->type()) {
+      return std::nullopt;
+    }
+    return internal::PreparedSargablePredicate{binding->source, binding->property, op,
+                                               right, binding->output};
+  };
+  if (auto found = try_pair(expression->children()[0], expression->children()[1]); found) {
+    return found;
+  }
+  // Reversing an ordered comparison changes its operator. Equality is
+  // symmetric; unsupported reversals remain on the canonical filter path.
+  if (op == internal::PropertyIndexOperator::kEqual) {
+    return try_pair(expression->children()[1], expression->children()[0]);
+  }
+  return std::nullopt;
+}
+
 StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     internal::QueryReservation* reservation,
@@ -917,7 +1229,10 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
       std::make_shared<internal::TemporalChainCache>(), plan.safe_read_limit,
       plan.execution_scope.system_time_range,
       execution ? [execution] { execution->RecordPointRead(); } : std::function<void()>{},
-      execution ? [execution] { execution->RecordLimitEarlyStop(); } : std::function<void()>{}};
+      execution ? [execution] { execution->RecordLimitEarlyStop(); } : std::function<void()>{},
+      execution ? [execution](uint64_t candidates) {
+        execution->RecordPropertyIndexSeek(candidates);
+      } : std::function<void(uint64_t)>{}};
   auto seeds = ReadSourceRows(read_context, plan, reservation);
   if (!seeds.ok()) return seeds.status();
   // Graph operators consume the source rows directly, so apply bindings and
@@ -2696,6 +3011,8 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
     return plan;
   }
   plan.canonical_temporal = true;
+  plan.sargable_predicate = FindSargablePredicate(plan.predicate,
+                                                  plan.property_bindings);
   return plan;
 }
 

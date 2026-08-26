@@ -172,6 +172,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         execution_plan.projection_generation = capsule.projection_generation();
         execution_plan.projection_stats = capsule.projection_stats();
         execution_plan.projection_reader = capsule.projection_reader();
+        execution_plan.property_index_reader = capsule.property_index_reader();
         execution_plan.delta_reader = capsule.delta_reader();
       } else {
         execution_plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(
@@ -182,6 +183,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         execution_plan.projection_generation = bound.projection_generation;
         execution_plan.projection_stats = bound.projection_stats;
         execution_plan.projection_reader = bound.projection_reader;
+        execution_plan.property_index_reader = bound.property_index_reader;
         execution_plan.delta_reader = bound.delta_reader;
       }
       return internal::QueryRuntime::Execute(

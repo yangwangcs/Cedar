@@ -21,6 +21,7 @@ struct QueryExecutionBinding {
   std::shared_ptr<ProjectionReadStats> projection_stats;
   std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
       projection_reader;
+  PropertyIndexReader property_index_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;
 };
 

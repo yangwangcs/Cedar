@@ -93,7 +93,8 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
                                 PropertyId property,
                                 const PartScope& part_scope,
                                 const std::shared_ptr<TemporalChainCache>& cache = nullptr,
-                                std::optional<CommitSeqRange> system_range = std::nullopt) {
+                                std::optional<CommitSeqRange> system_range = std::nullopt,
+                                std::optional<EntityRange> entity_range = std::nullopt) {
   FactChains chains;
   std::ostringstream cache_key;
   cache_key << static_cast<unsigned>(family) << ':' << property.value << ':'
@@ -103,6 +104,12 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
   if (system_range.has_value()) {
     cache_key << ":range:" << system_range->from.value << ':'
               << system_range->to.value;
+  }
+  if (entity_range.has_value()) {
+    cache_key << ":entity:";
+    if (entity_range->min) cache_key << *entity_range->min;
+    cache_key << ':';
+    if (entity_range->max_exclusive) cache_key << *entity_range->max_exclusive;
   }
   if (cache != nullptr) {
     std::lock_guard<std::mutex> lock(cache->mutex);
@@ -160,6 +167,7 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
   spec.part_scope = part_scope;
   spec.family = family;
   spec.property_id = property;
+  if (entity_range.has_value()) spec.entity_range = *entity_range;
   spec.projection = projection;
   spec.batch_row_limit = 1024;
   spec.commit_seq_max = snapshot_seq.value == 0
@@ -189,13 +197,14 @@ StatusOr<std::vector<StateRow>> Materialize(
     FactFamily family, PropertyId property,
     std::optional<ValidTimeInterval> bounds, const PartScope& part_scope,
     const std::shared_ptr<TemporalChainCache>& cache = nullptr,
-    std::optional<CommitSeqRange> system_range = std::nullopt) {
+    std::optional<CommitSeqRange> system_range = std::nullopt,
+    std::optional<cedar::EntityRange> entity_range = std::nullopt) {
   if (bounds.has_value()) {
     const Status valid = bounds->Validate();
     if (!valid.ok()) return valid;
   }
   auto chains = ReadChains(reader, snapshot_seq, family, property, part_scope, cache,
-                           system_range);
+                           system_range, entity_range);
   if (!chains.ok()) return chains.status();
 
   std::vector<StateRow> rows;
@@ -227,7 +236,7 @@ StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
   if (!valid.ok()) return valid;
   auto chains = ReadChains(context.facts, context.snapshot_seq, family, property,
                            context.part_scope, context.chain_cache,
-                           context.system_time_range);
+                           context.system_time_range, context.entity_range);
   if (!chains.ok()) return chains.status();
 
   std::vector<EventRow> rows;
@@ -259,7 +268,7 @@ StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
   if (!valid.ok()) return valid;
   auto chains = ReadChains(context.facts, context.snapshot_seq, family, property,
                            context.part_scope, context.chain_cache,
-                           context.system_time_range);
+                           context.system_time_range, context.entity_range);
   if (!chains.ok()) return chains.status();
 
   std::vector<ChangeRow> rows;
@@ -327,7 +336,7 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
   }
   auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
                           std::nullopt, context.part_scope, context.chain_cache,
-                          context.system_time_range);
+                          context.system_time_range, context.entity_range);
   if (!rows.ok()) return rows.status();
   std::vector<StateRow> result;
   for (StateRow& row : rows.ValueOrDie()) {
@@ -354,7 +363,7 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadHistory(
     std::optional<ValidTimeInterval> interval) {
   return Materialize(context.facts, context.snapshot_seq, family, property,
                      std::move(interval), context.part_scope, context.chain_cache,
-                     context.system_time_range);
+                     context.system_time_range, context.entity_range);
 }
 
 StatusOr<std::vector<StateRow>> TemporalSource::ReadOverlaps(
@@ -369,7 +378,7 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadOverlaps(
     const ValidTimeInterval& interval) {
   return Materialize(context.facts, context.snapshot_seq, family, property,
                      interval, context.part_scope, context.chain_cache,
-                     context.system_time_range);
+                     context.system_time_range, context.entity_range);
 }
 
 StatusOr<std::vector<StateRow>> TemporalSource::ReadThroughout(
@@ -386,7 +395,7 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadThroughout(
   if (!valid.ok()) return valid;
   auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
                           std::nullopt, context.part_scope, context.chain_cache,
-                          context.system_time_range);
+                          context.system_time_range, context.entity_range);
   if (!rows.ok()) return rows.status();
   std::vector<StateRow> result;
   for (const StateRow& row : rows.ValueOrDie()) {

@@ -20,6 +20,7 @@
 #include "query/planner/query_planner.h"
 #include "query/projection/projection_format.h"
 #include "query/projection/projection_store.h"
+#include "query/read/read_binding_capsule.h"
 #include "query/resource/query_resource_pool.h"
 #include "query/observability/query_metrics.h"
 
@@ -31,6 +32,14 @@ struct PreparedPropertyBinding {
   RowColumn output;
   PropertyEntityKind entity_kind;
   std::optional<PropertyDefinition> definition;
+};
+
+struct PreparedSargablePredicate {
+  SlotId source;
+  PropertyId property;
+  PropertyIndexOperator op = PropertyIndexOperator::kEqual;
+  std::shared_ptr<const ExpressionNode> value_expression;
+  RowColumn property_output;
 };
 
 struct PreparedMetadataBinding {
@@ -71,6 +80,7 @@ struct PreparedQueryPlan {
         scope(other.scope),
         execution_scope(other.execution_scope),
         property_bindings(other.property_bindings),
+        sargable_predicate(other.sargable_predicate),
         metadata_bindings(other.metadata_bindings),
         predicate(other.predicate),
         output_columns(other.output_columns),
@@ -80,6 +90,7 @@ struct PreparedQueryPlan {
         projection_generation(other.projection_generation),
         projection_stats(other.projection_stats),
         projection_reader(other.projection_reader),
+        property_index_reader(other.property_index_reader),
         delta_reader(other.delta_reader),
         bound_delta_view(other.bound_delta_view),
         bound_delta_lease(other.bound_delta_lease),
@@ -107,6 +118,7 @@ struct PreparedQueryPlan {
     scope = other.scope;
     execution_scope = other.execution_scope;
     property_bindings = other.property_bindings;
+    sargable_predicate = other.sargable_predicate;
     metadata_bindings = other.metadata_bindings;
     predicate = other.predicate;
     output_columns = other.output_columns;
@@ -118,6 +130,7 @@ struct PreparedQueryPlan {
     projection_generation = other.projection_generation;
     projection_stats = other.projection_stats;
     projection_reader = other.projection_reader;
+    property_index_reader = other.property_index_reader;
     delta_reader = other.delta_reader;
     bound_delta_view = other.bound_delta_view;
     bound_delta_lease = other.bound_delta_lease;
@@ -148,6 +161,7 @@ struct PreparedQueryPlan {
   TemporalScope scope = At{ValidTime{0}};
   ExecutionScope execution_scope;
   std::vector<PreparedPropertyBinding> property_bindings;
+  std::optional<PreparedSargablePredicate> sargable_predicate;
   std::vector<PreparedMetadataBinding> metadata_bindings;
   std::shared_ptr<const ExpressionNode> predicate;
   std::vector<RowColumn> output_columns;
@@ -160,6 +174,7 @@ struct PreparedQueryPlan {
   std::shared_ptr<ProjectionReadStats> projection_stats;
   std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
       projection_reader;
+  PropertyIndexReader property_index_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;
   std::shared_ptr<const QueryDeltaView> bound_delta_view;
   std::shared_ptr<const QueryDeltaLease> bound_delta_lease;

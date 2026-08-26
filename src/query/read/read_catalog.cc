@@ -127,9 +127,9 @@ std::vector<PropertyIndexPosting> ReadCatalog::SeekPropertyIndexRange(
   const auto found = property_indexes_.find(property.value);
   if (found == property_indexes_.end()) return {};
   const auto& postings = found->second;
-  // The builder sorts by Value::Encode(), which is the canonical bytewise
-  // ordering. Use lower_bound to avoid scanning values below the requested
-  // bound, then validate the typed comparison for exact semantics.
+  // The builder sorts by schema-typed value order. Use lower_bound to avoid
+  // scanning values below the requested bound, then validate the typed
+  // comparison for exact semantics.
   const bool lower_bounded = op == PropertyIndexOperator::kEqual ||
                              op == PropertyIndexOperator::kGreater ||
                              op == PropertyIndexOperator::kGreaterEqual;

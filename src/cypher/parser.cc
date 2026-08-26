@@ -227,6 +227,16 @@ class Parser {
     auto destination = Identifier("expected destination variable");
     if (!destination.ok()) return destination.status();
     pattern.destination = destination.ValueOrDie();
+    if (Symbol("{")) {
+      if (!Match("PART_ID") || !Symbol(":")) return Error("expected part_id in vertex reference");
+      auto part = Integer("expected part_id");
+      if (!part.ok() || part.ValueOrDie() > UINT32_MAX || !Symbol(",") ||
+          !Match("ID") || !Symbol(":")) return Error("invalid vertex reference");
+      auto id = Integer("expected vertex id");
+      if (!id.ok() || id.ValueOrDie() == 0 || !Symbol("}")) return Error("invalid vertex reference");
+      pattern.destination_part_id = static_cast<uint32_t>(part.ValueOrDie());
+      pattern.destination_vertex_id = id.ValueOrDie();
+    }
     if (Symbol(":")) {
       auto label = Identifier("expected destination label");
       if (!label.ok()) return label.status();
@@ -295,6 +305,16 @@ class Parser {
     auto destination = Identifier("expected destination variable");
     if (!destination.ok()) return destination.status();
     pattern.destination = destination.ValueOrDie();
+    if (Symbol("{")) {
+      if (!Match("PART_ID") || !Symbol(":")) return Error("expected part_id in vertex reference");
+      auto part = Integer("expected part_id");
+      if (!part.ok() || part.ValueOrDie() > UINT32_MAX || !Symbol(",") ||
+          !Match("ID") || !Symbol(":")) return Error("invalid vertex reference");
+      auto id = Integer("expected vertex id");
+      if (!id.ok() || id.ValueOrDie() == 0 || !Symbol("}")) return Error("invalid vertex reference");
+      pattern.destination_part_id = static_cast<uint32_t>(part.ValueOrDie());
+      pattern.destination_vertex_id = id.ValueOrDie();
+    }
     if (Symbol(":")) {
       auto label = Identifier("expected destination label");
       if (!label.ok()) return label.status();

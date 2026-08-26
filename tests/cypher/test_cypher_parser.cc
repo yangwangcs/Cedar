@@ -77,6 +77,15 @@ TEST(CypherParserTest, ParsesPointReferenceAndLimit) {
   EXPECT_EQ(parsed.ValueOrDie().limit_count, 10U);
 }
 
+TEST(CypherParserTest, ParsesDestinationPointReference) {
+  const auto parsed = Parse(
+      "MATCH (a)-[:LINE]->(b {part_id: 4, id: 99}) RETURN b");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  ASSERT_EQ(parsed.ValueOrDie().patterns.size(), 1U);
+  EXPECT_EQ(parsed.ValueOrDie().patterns.front().destination_part_id, 4U);
+  EXPECT_EQ(parsed.ValueOrDie().patterns.front().destination_vertex_id, 99U);
+}
+
 TEST(CypherParserTest, ParsesTypedWherePredicates) {
   auto parsed = Parse("MATCH (v) WHERE v.country = 'CN' AND v.load_mw >= 10 "
                       "RETURN v LIMIT 5");

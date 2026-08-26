@@ -312,6 +312,9 @@ class Database {
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
   StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;
   StatusOr<QueryMaintenanceHandle> RefreshQueryStatistics();
+  // Builds a snapshot-bound typed property index in the derived-read lane.
+  // The operation never runs on the commit/WAL critical path.
+  StatusOr<QueryMaintenanceHandle> RefreshQueryIndexes(ValidTime valid_time);
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
   CommitPipelineMetrics GetCommitPipelineMetrics() const;
   StatusOr<RuntimeMetrics> SampleRuntimeMetrics() const;

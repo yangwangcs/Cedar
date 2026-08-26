@@ -108,9 +108,98 @@ TEST(ProjectionFormatTest, RoundTripsBoundedPropertyIndexSegment) {
   EXPECT_EQ(decoded.ValueOrDie().generation_id, 4U);
   EXPECT_EQ(decoded.ValueOrDie().part_id, PartId{0});
   EXPECT_EQ(decoded.ValueOrDie().postings, segment.postings);
+  ASSERT_EQ(decoded.ValueOrDie().pages.size(), 1U);
+  EXPECT_EQ(decoded.ValueOrDie().pages.front().first_posting, 0U);
+  EXPECT_EQ(decoded.ValueOrDie().pages.front().row_count, 2U);
+  EXPECT_EQ(decoded.ValueOrDie().pages.front().min_value, Value::String("CN"));
+  EXPECT_EQ(decoded.ValueOrDie().pages.front().max_value, Value::String("US"));
   std::string corrupt = encoded.ValueOrDie();
   corrupt[corrupt.size() / 2] ^= 1;
   EXPECT_TRUE(DecodePropertyIndexSegment(corrupt).status().IsCorruption());
+}
+
+TEST(ProjectionFormatTest, PropertyIndexPageDirectoryBoundsLargeSeek) {
+  PropertyIndexSegment segment;
+  segment.generation_id = 3;
+  segment.base_seq = CommitSeq{1};
+  segment.built_through = CommitSeq{8};
+  segment.property = PropertyId{8};
+  segment.part_id = PartId{0};
+  segment.schema_epoch = 1;
+  for (uint64_t i = 0; i < 600; ++i) {
+    segment.postings.push_back({
+        VertexRef{PartId{0}, VertexId{i + 1}},
+        {ValidTime{0}, std::nullopt}, CommitSeq{2}, Value::Int64(static_cast<int64_t>(i))});
+  }
+  auto encoded = EncodePropertyIndexSegment(segment);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  auto decoded = DecodePropertyIndexSegment(encoded.ValueOrDie());
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  ASSERT_EQ(decoded.ValueOrDie().pages.size(), 3U);
+  EXPECT_EQ(decoded.ValueOrDie().pages[1].first_posting, 256U);
+  EXPECT_EQ(decoded.ValueOrDie().pages[1].row_count, 256U);
+  const auto matches = SeekPropertyIndexRange(
+      decoded.ValueOrDie(), PropertyIndexOperator::kGreaterEqual, Value::Int64(513));
+  ASSERT_EQ(matches.size(), 87U);
+  EXPECT_EQ(matches.front().value, Value::Int64(513));
+}
+
+TEST(ProjectionFormatTest, PropertyIndexSeekUsesTypedNumericOrdering) {
+  PropertyIndexSegment segment;
+  segment.generation_id = 9;
+  segment.base_seq = CommitSeq{1};
+  segment.built_through = CommitSeq{3};
+  segment.property = PropertyId{8};
+  segment.part_id = PartId{0};
+  segment.schema_epoch = 1;
+  segment.postings = {
+      {VertexRef{PartId{0}, VertexId{1}}, {ValidTime{0}, std::nullopt},
+       CommitSeq{1}, Value::Int64(-10)},
+      {VertexRef{PartId{0}, VertexId{2}}, {ValidTime{0}, std::nullopt},
+       CommitSeq{2}, Value::Int64(0)},
+      {VertexRef{PartId{0}, VertexId{3}}, {ValidTime{0}, std::nullopt},
+       CommitSeq{3}, Value::Int64(10)}};
+  ASSERT_TRUE(ValidatePropertyIndexSegment(segment).ok());
+  const auto matches = SeekPropertyIndexRange(
+      segment, PropertyIndexOperator::kGreaterEqual, Value::Int64(0));
+  ASSERT_EQ(matches.size(), 2U);
+  EXPECT_EQ(matches[0].value, Value::Int64(0));
+  EXPECT_EQ(matches[1].value, Value::Int64(10));
+  const auto less = SeekPropertyIndexRange(
+      segment, PropertyIndexOperator::kLess, Value::Int64(0));
+  ASSERT_EQ(less.size(), 1U);
+  EXPECT_EQ(less.front().value, Value::Int64(-10));
+}
+
+TEST(ProjectionFormatTest, PropertyIndexSeekHonorsAllTypedBounds) {
+  PropertyIndexSegment segment;
+  segment.generation_id = 2;
+  segment.base_seq = CommitSeq{1};
+  segment.built_through = CommitSeq{4};
+  segment.property = PropertyId{8};
+  segment.part_id = PartId{0};
+  segment.schema_epoch = 1;
+  for (int64_t value = -2; value <= 2; ++value) {
+    segment.postings.push_back({
+        VertexRef{PartId{0}, VertexId{static_cast<uint64_t>(value + 3)}},
+        {ValidTime{0}, std::nullopt}, CommitSeq{2}, Value::Int64(value)});
+  }
+  ASSERT_TRUE(ValidatePropertyIndexSegment(segment).ok());
+  EXPECT_EQ(SeekPropertyIndexRange(segment, PropertyIndexOperator::kEqual,
+                                   Value::Int64(0)).size(), 1U);
+  EXPECT_EQ(SeekPropertyIndexRange(segment, PropertyIndexOperator::kLess,
+                                   Value::Int64(0)).size(), 2U);
+  EXPECT_EQ(SeekPropertyIndexRange(segment, PropertyIndexOperator::kLessEqual,
+                                   Value::Int64(0)).size(), 3U);
+  EXPECT_EQ(SeekPropertyIndexRange(segment, PropertyIndexOperator::kGreater,
+                                   Value::Int64(0)).size(), 2U);
+  EXPECT_EQ(SeekPropertyIndexRange(segment, PropertyIndexOperator::kGreaterEqual,
+                                   Value::Int64(0)).size(), 3U);
+  EXPECT_EQ(SeekPropertyIndexRange(segment, PropertyIndexOperator::kGreaterEqual,
+                                   Value::Int64(-1), Value::Int64(1)).size(), 3U);
+  EXPECT_TRUE(SeekPropertyIndexRange(segment, PropertyIndexOperator::kEqual,
+                                     Value::String("wrong-type"))
+                  .empty());
 }
 
 TEST(ProjectionFormatTest, RejectsBitFlippedPayload) {

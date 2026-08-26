@@ -39,6 +39,10 @@ add_executable(test_query_read_path_baseline query/test_query_read_path_baseline
 target_link_libraries(test_query_read_path_baseline PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_read_path_baseline TEST_PREFIX "QueryReadBaseline.")
 
+add_executable(test_indexed_read_baseline query/test_indexed_read_baseline.cc)
+target_link_libraries(test_indexed_read_baseline PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_indexed_read_baseline TEST_PREFIX "IndexedReadBaseline.")
+
 add_executable(test_query_plan_outcome query/test_query_plan_outcome.cc)
 target_include_directories(test_query_plan_outcome PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_query_plan_outcome PRIVATE cedar_core ${GTEST_MAIN_TARGET})
@@ -141,6 +145,16 @@ add_executable(test_projection_store query/test_projection_store.cc)
 target_include_directories(test_projection_store PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_projection_store PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_projection_store)
+
+add_executable(test_property_index_builder query/test_property_index_builder.cc)
+target_include_directories(test_property_index_builder PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_property_index_builder PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_property_index_builder)
+
+add_executable(test_indexed_property_runtime query/test_indexed_property_runtime.cc)
+target_include_directories(test_indexed_property_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_indexed_property_runtime PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_indexed_property_runtime)
 
 add_executable(test_projection_page_reader query/test_projection_page_reader.cc)
 target_include_directories(test_projection_page_reader PRIVATE ${CMAKE_SOURCE_DIR}/src)

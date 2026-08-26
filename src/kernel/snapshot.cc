@@ -348,10 +348,16 @@ StatusOr<std::optional<FactEvent>> Snapshot::State::ReadStateAt(
   if (snapshot_seq.value > snapshot.commit_seq().value && snapshot_seq.value != 0) {
     return Status::InvalidArgument("canonical reader", "requested sequence exceeds snapshot");
   }
+  const bool max_id_exact = spec.entity_range.min.has_value() &&
+                            *spec.entity_range.min == UINT64_MAX &&
+                            !spec.entity_range.max_exclusive.has_value();
+  const bool ordinary_exact = spec.entity_range.min.has_value() &&
+                              spec.entity_range.max_exclusive.has_value() &&
+                              *spec.entity_range.max_exclusive ==
+                                  *spec.entity_range.min + 1;
   if (spec.part_scope.kind != PartScopeKind::kExact ||
       spec.part_scope.parts.size() != 1 || !spec.entity_range.min.has_value() ||
-      !spec.entity_range.max_exclusive.has_value() ||
-      *spec.entity_range.max_exclusive != *spec.entity_range.min + 1) {
+      (!ordinary_exact && !max_id_exact)) {
     return Status::InvalidArgument("canonical reader", "state-at requires one exact entity");
   }
   const FactRef ref{spec.part_scope.parts.front(), spec.family, spec.property_id,

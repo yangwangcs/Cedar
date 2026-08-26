@@ -72,7 +72,11 @@ StatusOr<std::vector<FactEvent>> ReadEvents(Snapshot& snapshot,
   read_spec.part_scope = PartScope::Exact(ref.part_id());
   read_spec.family = ref.family();
   read_spec.property_id = ref.property_id();
-  read_spec.entity_range = EntityRange{ref.entity_id(), ref.entity_id() + 1};
+  read_spec.entity_range = EntityRange{
+      ref.entity_id(),
+      ref.entity_id() == UINT64_MAX
+          ? std::nullopt
+          : std::optional<uint64_t>(ref.entity_id() + 1)};
   Status status = snapshot.canonical_reader().ReadEvents(
       read_spec, [&events, &check_abort](const FactEventBatch& batch) {
     if (check_abort) {

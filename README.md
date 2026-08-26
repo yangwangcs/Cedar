@@ -282,6 +282,23 @@ if (!cursor.ok()) return cursor.status();
 auto batch = cursor.ValueOrDie().Next();
 ```
 
+For selective workloads, Cedar exposes read-side operators that keep the
+canonical fact stream authoritative while avoiding unnecessary enumeration:
+
+```cpp
+auto point = cedar::Query::VertexPoint(
+    cedar::VertexRef{cedar::PartId{3}, cedar::VertexId{42}},
+    vertex_slot, cedar::At{cedar::ValidTime{1000}});
+```
+
+Registered typed properties such as `country` and `load_mw` can use a
+generation-pinned CPI1 property index for equality and range predicates. A
+source-bound `Expand` uses the immutable adjacency posting for that source;
+stale or incomplete derived coverage is reported in `QueryProfile` and falls
+back to canonical facts. An unordered `LIMIT K` on a direct state projection
+is pushed into the canonical state reader and stops after `K` visible rows.
+These optimizations do not add a write path or a second log.
+
 The query layer supports:
 
 - `At` point-in-time reads;
@@ -355,6 +372,34 @@ duration, writer count, group-commit limits, and reopen setting match.
 The benchmark reports committed operations, WAL sync count, transactions per
 sync, encoded bytes per transaction, group-fill latency, retained WAL,
 compaction debt, and write, background, and maintenance errors.
+
+### Indexed Read-Path Characterization
+
+The indexed read-path matrix is a separate Release fixture benchmark. It uses
+`-j1` for the build and runs one second per entity-count case:
+
+```bash
+benchmarks/run_cedar_indexed_read_matrix.sh \
+  --build-dir build-indexed-release \
+  --entities 1,10,100,1000 \
+  --seconds 1 \
+  --output /tmp/cedar-indexed-read-release-final.csv
+```
+
+The 2026-08-26 run reported the following latency and peak RSS (host-specific):
+
+| entities | point p50/p95/p99 | source expansion p50/p95/p99 | peak RSS |
+| ---: | ---: | ---: | ---: |
+| 1 | 28/36/60 us | 38/47/73 us | 17.5 MiB |
+| 10 | 130/155/228 us | 559/654/799 us | 17.7 MiB |
+| 100 | 1,580/1,781/2,213 us | 62,561/64,726/64,726 us | 19.1 MiB |
+| 1,000 | 17,545/17,545/17,545 us | 6,487,175/6,487,175/6,487,175 us | 22.8 MiB |
+
+This fixture reports latency/RSS characterization only: canonical physical
+byte counters are zero, so these results are not a production-throughput or
+indexed-vs-full-scan claim. The detailed scope, limitations, and raw CSV
+digest are recorded in
+[`docs/superpowers/evidence/2026-08-26-cedar-indexed-read-optimization.md`](docs/superpowers/evidence/2026-08-26-cedar-indexed-read-optimization.md).
 
 Measured results:
 

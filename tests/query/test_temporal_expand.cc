@@ -95,6 +95,11 @@ TEST(TemporalExpandTest, PublicExpandExecutesFrontierRows) {
   ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
   auto snapshot = database.ValueOrDie()->BeginSnapshot();
   ASSERT_TRUE(snapshot.ok());
+  auto explain = prepared.ValueOrDie().ExplainPhysical(
+      snapshot.ValueOrDie(), QueryOptions{});
+  ASSERT_TRUE(explain.ok()) << explain.status().ToString();
+  EXPECT_NE(explain.ValueOrDie().find("adjacency-seek"), std::string::npos)
+      << explain.ValueOrDie();
   auto cursor = prepared.ValueOrDie().Execute(
       std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
   ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();

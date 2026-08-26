@@ -32,6 +32,8 @@ struct PathPattern {
   bool trail = false;
   std::optional<uint32_t> source_part_id;
   std::optional<uint64_t> source_vertex_id;
+  std::optional<uint32_t> destination_part_id;
+  std::optional<uint64_t> destination_vertex_id;
   SourceSpan span;
 };
 

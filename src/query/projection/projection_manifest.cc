@@ -100,7 +100,7 @@ Status ValidateProjectionManifest(const ProjectionManifest& m, const std::string
     if (fingerprint.empty() || !fingerprints.insert(fingerprint).second) return Status::Corruption("projection manifest", "duplicate or empty schema fingerprint");
   }
   for (const auto& r : m.regions) {
-    if (uint8_t(r.kind) < 1 || uint8_t(r.kind) > 5 || r.entity_max_exclusive <= r.entity_min || !r.valid_time.Validate().ok()) return Status::Corruption("projection manifest", "invalid coverage range");
+    if (uint8_t(r.kind) < 1 || uint8_t(r.kind) > 5 || r.entity_max_exclusive <= r.entity_min || !r.valid_time.Validate().ok() || (r.kind == ProjectionKind::kPropertyIndex && r.built_through.value < m.base_seq.value)) return Status::Corruption("projection manifest", "invalid coverage range");
     std::vector<std::pair<uint64_t,uint64_t>> ranges;
     for (const auto& s : r.segments) {
       if (s.segment_id.empty() || !ids.insert(s.segment_id).second || s.filename.empty() || s.filename.find("..") != std::string::npos || s.filename.front() == '/') return Status::Corruption("projection manifest", "invalid or duplicate segment");
@@ -115,18 +115,103 @@ Status ValidateProjectionManifest(const ProjectionManifest& m, const std::string
 
 StatusOr<std::string> EncodeProjectionManifest(const ProjectionManifest& m) {
   if (m.database_identity.empty()) return Status::InvalidArgument("projection manifest", "missing database identity");
-  std::string out; P32(&out, kMagic); P32(&out, 2); PutString(&out, m.database_identity); P64(&out, m.generation_id); P64(&out, m.base_seq.value); P32(&out, uint32_t(m.schema_fingerprints.size())); for (const auto& s : m.schema_fingerprints) PutString(&out, s);
+  std::string out; P32(&out, kMagic); P32(&out, 3); PutString(&out, m.database_identity); P64(&out, m.generation_id); P64(&out, m.base_seq.value); P32(&out, uint32_t(m.schema_fingerprints.size())); for (const auto& s : m.schema_fingerprints) PutString(&out, s);
   out.push_back(char(m.statistics.has_value()));
   if (m.statistics) { PutString(&out, m.statistics->filename); P64(&out, m.statistics->generation_id); P64(&out, m.statistics->base_seq.value); P32(&out, m.statistics->checksum); out.push_back(char(m.statistics->complete)); }
   P32(&out, uint32_t(m.regions.size()));
-  for (const auto& r : m.regions) { out.push_back(char(r.kind)); P32(&out, r.part_id.value); out.push_back(char(r.property_id.has_value())); P16(&out, r.property_id ? r.property_id->value : 0); P32(&out, r.schema_epoch); P64(&out, r.entity_min); P64(&out, r.entity_max_exclusive); P64(&out, r.valid_time.from.value); out.push_back(char(r.valid_time.to.has_value())); P64(&out, r.valid_time.to ? r.valid_time.to->value : 0); P32(&out, uint32_t(r.segments.size())); for (const auto& s : r.segments) { PutString(&out, s.segment_id); PutString(&out, s.filename); PutHeader(&out, s.header); P64(&out, s.file_bytes); P32(&out, s.checksum); } }
+  for (const auto& r : m.regions) { out.push_back(char(r.kind)); P32(&out, r.part_id.value); out.push_back(char(r.property_id.has_value())); P16(&out, r.property_id ? r.property_id->value : 0); P32(&out, r.schema_epoch); P64(&out, r.entity_min); P64(&out, r.entity_max_exclusive); P64(&out, r.valid_time.from.value); out.push_back(char(r.valid_time.to.has_value())); P64(&out, r.valid_time.to ? r.valid_time.to->value : 0); P64(&out, r.built_through.value); P32(&out, uint32_t(r.segments.size())); for (const auto& s : r.segments) { PutString(&out, s.segment_id); PutString(&out, s.filename); PutHeader(&out, s.header); P64(&out, s.file_bytes); P32(&out, s.checksum); } }
   P32(&out, crc32c::Value(out.data(), out.size())); return out;
 }
 
-StatusOr<ProjectionManifest> DecodeProjectionManifest(const std::string& in, const std::string& identity) {
-  if (in.size() < 12) return Status::Corruption("projection manifest", "truncated"); size_t p = 0; uint32_t magic = 0, version = 0, count = 0; ProjectionManifest m; if (!G32(in,&p,&magic) || !G32(in,&p,&version) || magic != kMagic || (version != 1 && version != 2) || !GetString(in,&p,&m.database_identity) || !G64(in,&p,&m.generation_id) || !G64(in,&p,&m.base_seq.value) || !G32(in,&p,&count) || count > 100000) return Status::Corruption("projection manifest", "invalid header"); for (uint32_t i=0;i<count;++i) { std::string v; if (!GetString(in,&p,&v)) return Status::Corruption("projection manifest", "invalid schema fingerprint"); m.schema_fingerprints.push_back(std::move(v)); } if (version >= 2) { if (p >= in.size()) return Status::Corruption("projection manifest", "truncated statistics reference flag"); const uint8_t has = uint8_t(in[p++]); if (has > 1) return Status::Corruption("projection manifest", "invalid statistics reference flag"); if (has) { StatisticsReference s; if (!GetString(in, &p, &s.filename) || !G64(in, &p, &s.generation_id) || !G64(in, &p, &s.base_seq.value) || !G32(in, &p, &s.checksum) || p >= in.size()) return Status::Corruption("projection manifest", "truncated statistics reference"); const uint8_t complete = uint8_t(in[p++]); if (complete > 1) return Status::Corruption("projection manifest", "invalid statistics completeness flag"); s.complete = complete != 0; m.statistics = std::move(s); } } if (!G32(in,&p,&count) || count > 100000) return Status::Corruption("projection manifest", "invalid regions"); for (uint32_t i=0;i<count;++i) { CoverageRegion r; uint8_t kind=0, has=0; uint32_t part=0, epoch=0, n=0; uint16_t prop=0; uint64_t x=0; if (p>=in.size()) return Status::Corruption("projection manifest", "truncated region"); kind=uint8_t(in[p++]); r.kind=ProjectionKind(kind); if (!G32(in,&p,&part) || p>=in.size()) return Status::Corruption("projection manifest", "invalid region"); r.part_id=PartId{part}; has=uint8_t(in[p++]); if (has>1 || !G16(in,&p,&prop) || !G32(in,&p,&epoch) || !G64(in,&p,&r.entity_min) || !G64(in,&p,&r.entity_max_exclusive) || !G64(in,&p,&r.valid_time.from.value) || p>=in.size()) return Status::Corruption("projection manifest", "invalid region"); r.property_id=has ? std::optional<PropertyId>(PropertyId{prop}) : std::nullopt; r.schema_epoch=epoch; has=uint8_t(in[p++]); if (has>1 || !G64(in,&p,&x)) return Status::Corruption("projection manifest", "invalid region time"); r.valid_time.to=has ? std::optional<ValidTime>(ValidTime{x}) : std::nullopt; if (!G32(in,&p,&n) || n>100000) return Status::Corruption("projection manifest", "invalid segments"); for (uint32_t j=0;j<n;++j) { SegmentDescriptor s; if (!GetString(in,&p,&s.segment_id) || !GetString(in,&p,&s.filename) || !GetHeader(in,&p,&s.header) || !G64(in,&p,&s.file_bytes) || !G32(in,&p,&s.checksum)) return Status::Corruption("projection manifest", "invalid segment"); r.segments.push_back(std::move(s)); } m.regions.push_back(std::move(r)); }
+StatusOr<ProjectionManifest> DecodeProjectionManifest(
+    const std::string& in, const std::string& identity) {
+  if (in.size() < 12) return Status::Corruption("projection manifest", "truncated");
+  size_t p = 0;
+  uint32_t magic = 0, version = 0, count = 0;
+  ProjectionManifest m;
+  if (!G32(in, &p, &magic) || !G32(in, &p, &version) || magic != kMagic ||
+      (version != 1 && version != 2 && version != 3) ||
+      !GetString(in, &p, &m.database_identity) ||
+      !G64(in, &p, &m.generation_id) || !G64(in, &p, &m.base_seq.value) ||
+      !G32(in, &p, &count) || count > 100000) {
+    return Status::Corruption("projection manifest", "invalid header");
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    std::string fingerprint;
+    if (!GetString(in, &p, &fingerprint)) {
+      return Status::Corruption("projection manifest", "invalid schema fingerprint");
+    }
+    m.schema_fingerprints.push_back(std::move(fingerprint));
+  }
+  if (version >= 2) {
+    if (p >= in.size()) return Status::Corruption("projection manifest", "truncated statistics reference flag");
+    const uint8_t has = uint8_t(in[p++]);
+    if (has > 1) return Status::Corruption("projection manifest", "invalid statistics reference flag");
+    if (has) {
+      StatisticsReference statistics;
+      if (!GetString(in, &p, &statistics.filename) ||
+          !G64(in, &p, &statistics.generation_id) ||
+          !G64(in, &p, &statistics.base_seq.value) ||
+          !G32(in, &p, &statistics.checksum) || p >= in.size()) {
+        return Status::Corruption("projection manifest", "truncated statistics reference");
+      }
+      const uint8_t complete = uint8_t(in[p++]);
+      if (complete > 1) return Status::Corruption("projection manifest", "invalid statistics completeness flag");
+      statistics.complete = complete != 0;
+      m.statistics = std::move(statistics);
+    }
+  }
+  if (!G32(in, &p, &count) || count > 100000) {
+    return Status::Corruption("projection manifest", "invalid regions");
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    CoverageRegion region;
+    uint8_t kind = 0, has = 0;
+    uint32_t part = 0, epoch = 0, segments = 0;
+    uint16_t property = 0;
+    uint64_t value = 0;
+    if (p >= in.size()) return Status::Corruption("projection manifest", "truncated region");
+    kind = uint8_t(in[p++]);
+    region.kind = ProjectionKind(kind);
+    if (!G32(in, &p, &part) || p >= in.size()) return Status::Corruption("projection manifest", "invalid region");
+    region.part_id = PartId{part};
+    has = uint8_t(in[p++]);
+    if (has > 1 || !G16(in, &p, &property) || !G32(in, &p, &epoch) ||
+        !G64(in, &p, &region.entity_min) ||
+        !G64(in, &p, &region.entity_max_exclusive) ||
+        !G64(in, &p, &region.valid_time.from.value) || p >= in.size()) {
+      return Status::Corruption("projection manifest", "invalid region");
+    }
+    region.property_id = has ? std::optional<PropertyId>(PropertyId{property}) : std::nullopt;
+    region.schema_epoch = epoch;
+    has = uint8_t(in[p++]);
+    if (has > 1 || !G64(in, &p, &value)) return Status::Corruption("projection manifest", "invalid region time");
+    region.valid_time.to = has ? std::optional<ValidTime>(ValidTime{value}) : std::nullopt;
+    if (version >= 3) {
+      if (!G64(in, &p, &region.built_through.value)) return Status::Corruption("projection manifest", "invalid region watermark");
+    } else {
+      region.built_through = m.base_seq;
+    }
+    if (!G32(in, &p, &segments) || segments > 100000) return Status::Corruption("projection manifest", "invalid segments");
+    for (uint32_t j = 0; j < segments; ++j) {
+      SegmentDescriptor segment;
+      if (!GetString(in, &p, &segment.segment_id) ||
+          !GetString(in, &p, &segment.filename) ||
+          !GetHeader(in, &p, &segment.header) ||
+          !G64(in, &p, &segment.file_bytes) ||
+          !G32(in, &p, &segment.checksum)) {
+        return Status::Corruption("projection manifest", "invalid segment");
+      }
+      region.segments.push_back(std::move(segment));
+    }
+    m.regions.push_back(std::move(region));
+  }
   if (p > in.size() || in.size() - p != 4) return Status::Corruption("projection manifest", "trailing manifest bytes");
   const uint32_t expected = crc32c::Value(in.data(), p);
-  uint32_t checksum=0; if (!G32(in,&p,&checksum) || expected != checksum) return Status::Corruption("projection manifest", "checksum mismatch"); auto valid=ValidateProjectionManifest(m,identity); if (!valid.ok()) return valid; return m;
+  uint32_t checksum = 0;
+  if (!G32(in, &p, &checksum) || expected != checksum) return Status::Corruption("projection manifest", "checksum mismatch");
+  const auto valid = ValidateProjectionManifest(m, identity);
+  if (!valid.ok()) return valid;
+  return m;
 }
 }  // namespace cedar::internal

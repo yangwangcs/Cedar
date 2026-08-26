@@ -29,6 +29,7 @@ struct CoverageRegion {
   uint64_t entity_min = 0;
   uint64_t entity_max_exclusive = 0;
   ValidTimeInterval valid_time;
+  CommitSeq built_through;
   std::vector<SegmentDescriptor> segments;
   bool operator==(const CoverageRegion&) const = default;
 };

@@ -3301,6 +3301,27 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
                                  schema_epoch);
 }
 
+StatusOr<std::vector<PropertyDefinition>> FactStore::ListProperties() const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("property definition", "store is not open");
+  }
+  const auto schemas = std::atomic_load(&store->property_schemas);
+  std::vector<PropertyDefinition> result;
+  result.reserve(schemas->size());
+  for (const auto& [property_id, epochs] : *schemas) {
+    (void)property_id;
+    if (!epochs.empty()) result.push_back(epochs.back());
+  }
+  std::sort(result.begin(), result.end(),
+            [](const PropertyDefinition& left, const PropertyDefinition& right) {
+              return left.property_id.value < right.property_id.value;
+            });
+  return result;
+}
+
 StatusOr<std::string> FactStore::SchemaFingerprint() const {
   std::shared_ptr<FactStoreImpl> store;
   {

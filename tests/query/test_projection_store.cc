@@ -54,6 +54,51 @@ class ProjectionStoreTest : public ::testing::Test {
     b.manifest.regions.push_back(std::move(r));
     return b;
   }
+  ProjectionBuild BuildPropertyIndex(uint64_t generation) {
+    ProjectionBuild b;
+    b.manifest.database_identity = "test-db";
+    b.manifest.generation_id = generation;
+    b.manifest.base_seq = CommitSeq{generation};
+    CoverageRegion r;
+    r.kind = ProjectionKind::kPropertyIndex;
+    r.part_id = PartId{1};
+    r.property_id = PropertyId{7};
+    r.schema_epoch = 1;
+    r.entity_min = 1;
+    r.entity_max_exclusive = 100;
+    r.valid_time = {ValidTime{0}, std::nullopt};
+    r.built_through = CommitSeq{generation};
+    SegmentDescriptor d;
+    d.segment_id = "property-index";
+    d.filename = "property-index.cpi";
+    d.header.kind = ProjectionKind::kPropertyIndex;
+    d.header.generation_id = generation;
+    d.header.base_seq = CommitSeq{generation};
+    d.header.part_id = PartId{1};
+    d.header.property_id = PropertyId{7};
+    d.header.schema_epoch = 1;
+    d.header.entity_min = 1;
+    d.header.entity_max_exclusive = 100;
+    d.header.valid_from_min = ValidTime{0};
+    PropertyIndexSegment index;
+    index.generation_id = generation;
+    index.base_seq = CommitSeq{generation};
+    index.built_through = CommitSeq{generation};
+    index.property = PropertyId{7};
+    index.part_id = PartId{1};
+    index.schema_epoch = 1;
+    index.postings.push_back({VertexRef{PartId{1}, VertexId{42}},
+                              ValidTimeInterval{ValidTime{0}, std::nullopt},
+                              CommitSeq{generation}, Value::String("CN")});
+    auto encoded = EncodePropertyIndexSegment(index);
+    if (!encoded.ok()) return {};
+    d.file_bytes = encoded.ValueOrDie().size();
+    d.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
+    b.segments.push_back({d, encoded.ValueOrDie()});
+    r.segments.push_back(d);
+    b.manifest.regions.push_back(std::move(r));
+    return b;
+  }
   std::string path_;
 };
 
@@ -80,6 +125,39 @@ TEST_F(ProjectionStoreTest, PublishesAndReopensCurrentManifest) {
   auto reopened = QueryProjectionStore::Open({path_, "test-db", {}});
   ASSERT_TRUE(reopened.ok());
   EXPECT_EQ(reopened.ValueOrDie()->current_generation_id(), std::optional<uint64_t>(10));
+}
+
+TEST_F(ProjectionStoreTest, PublishesAndReadsPropertyIndexGeneration) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  const auto property_build = opened.ValueOrDie()->Build(BuildPropertyIndex(10));
+  ASSERT_TRUE(property_build.ok()) << property_build.ToString();
+  CoverageRequest request;
+  request.kind = ProjectionKind::kPropertyIndex;
+  request.part_id = PartId{1};
+  request.property_id = PropertyId{7};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 100;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.database_identity = "test-db";
+  auto generation = opened.ValueOrDie()->Acquire(request);
+  ASSERT_TRUE(generation.has_value());
+  auto index = opened.ValueOrDie()->ReadPropertyIndex(request, *generation);
+  ASSERT_TRUE(index.ok()) << index.status().ToString();
+  ASSERT_EQ(index.ValueOrDie().postings.size(), 1U);
+  EXPECT_EQ(index.ValueOrDie().postings.front().vertex.vertex_id.value, 42U);
+  EXPECT_EQ(index.ValueOrDie().postings.front().value, Value::String("CN"));
+  opened.ValueOrDie().reset();
+  auto reopened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(reopened.ok());
+  auto pin = reopened.ValueOrDie()->Acquire(request);
+  ASSERT_TRUE(pin.has_value());
+  auto reopened_index = reopened.ValueOrDie()->ReadPropertyIndex(request, *pin);
+  ASSERT_TRUE(reopened_index.ok());
+  EXPECT_EQ(reopened_index.ValueOrDie().postings.front().vertex.vertex_id.value, 42U);
 }
 
 TEST_F(ProjectionStoreTest, ReadsPublishedChainsForRuntimeProjectionSlice) {

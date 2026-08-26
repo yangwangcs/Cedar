@@ -352,17 +352,77 @@ bool HasPropertyPredicate(const LogicalPlanNode& node) {
                      [](const auto& child) { return HasPropertyPredicate(*child); });
 }
 
+std::optional<SlotId> PredicateSlot(const ExpressionNode& expression) {
+  if (expression.kind() == ExpressionKind::kSlot) return expression.slot();
+  for (const auto& child : expression.children()) {
+    if (child) {
+      if (auto slot = PredicateSlot(*child); slot.has_value()) return slot;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<PropertyId> PropertyForSlot(const LogicalPlanNode& node,
+                                          SlotId slot) {
+  if (node.property_binding().has_value() &&
+      node.property_binding()->output.slot == slot) {
+    return node.property_binding()->property;
+  }
+  for (const auto& child : node.inputs()) {
+    if (child) {
+      if (auto property = PropertyForSlot(*child, slot); property.has_value()) {
+        return property;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<PropertyId> SargableProperty(const LogicalPlanNode& logical) {
+  const LogicalPlanNode* filter = nullptr;
+  std::function<void(const LogicalPlanNode&)> find_filter =
+      [&](const LogicalPlanNode& node) {
+        if (filter) return;
+        if (node.kind() == LogicalOpKind::kFilter && node.predicate()) {
+          filter = &node;
+          return;
+        }
+        for (const auto& child : node.inputs()) if (child) find_filter(*child);
+      };
+  find_filter(logical);
+  if (!filter) return std::nullopt;
+  const auto slot = PredicateSlot(*filter->predicate());
+  if (!slot) return std::nullopt;
+  return PropertyForSlot(logical, *slot);
+}
+
 bool HasCompletePropertyIndex(const ProjectionCatalogView& catalog,
                               const LogicalPlanNode& logical,
-                              const PartScope& part_scope) {
-  if (!HasPropertyPredicate(logical)) return false;
-  return std::any_of(catalog.regions.begin(), catalog.regions.end(),
-                     [&](const CoverageRegion& region) {
-                       return region.kind == ProjectionKind::kPropertyIndex &&
-                              PartAllowed(part_scope, region.part_id) &&
-                              region.property_id.has_value() &&
-                              !region.segments.empty();
-                     });
+                              const PartScope& part_scope,
+                              CommitSeq snapshot_seq) {
+  const auto property = SargableProperty(logical);
+  if (!property.has_value()) return false;
+  std::vector<uint32_t> indexed_parts;
+  for (const auto& region : catalog.regions) {
+    if (region.kind != ProjectionKind::kPropertyIndex ||
+        region.property_id != property || region.segments.empty() ||
+        region.built_through.value < snapshot_seq.value ||
+        !PartAllowed(part_scope, region.part_id)) {
+      continue;
+    }
+    indexed_parts.push_back(region.part_id.value);
+  }
+  std::sort(indexed_parts.begin(), indexed_parts.end());
+  indexed_parts.erase(std::unique(indexed_parts.begin(), indexed_parts.end()),
+                      indexed_parts.end());
+  if (part_scope.kind == PartScopeKind::kAll) {
+    // A wildcard scope has no finite partition inventory at planning time.
+    // Only a single-part generation can therefore be proven complete; a
+    // multi-part generation stays on the canonical path until the query is
+    // explicitly partition-scoped.
+    return indexed_parts.size() == 1;
+  }
+  return indexed_parts.size() == part_scope.parts.size();
 }
 
 }  // namespace
@@ -515,7 +575,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     plan.pushdowns.push_back("unordered-limit");
   }
   if (HasCompletePropertyIndex(context.projections, logical,
-                               context.part_scope)) {
+                               context.part_scope, context.snapshot_seq)) {
     plan.operations.push_back(PhysicalOpKind::kPropertyIndexSeek);
     plan.pushdowns.push_back("property-index");
   }

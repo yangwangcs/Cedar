@@ -105,6 +105,15 @@ StatusOr<Query> Compile(const BoundStatement& statement) {
       query = query.ValueOrDie().KHopExpand(spec, pattern.max_hops);
     }
     if (!query.ok()) return query.status();
+    if (pattern.destination_part_id.has_value() &&
+        pattern.destination_vertex_id.has_value()) {
+      auto constrained = query.ValueOrDie().Where(Equal(
+          ValueOf(destination),
+          Literal(VertexRef{PartId{*pattern.destination_part_id},
+                            VertexId{*pattern.destination_vertex_id}})));
+      if (!constrained.ok()) return constrained.status();
+      query = std::move(constrained);
+    }
     edges.push_back(edge);
     vertices.push_back(destination);
     edge_names.push_back(edge.name());

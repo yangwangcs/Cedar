@@ -290,6 +290,126 @@ TEST_F(QueryCanonicalTest, VertexPointReadsOnlyTheRequestedPartitionAndEntity) {
             (VertexRef{PartId{0}, VertexId{7}}));
 }
 
+TEST_F(QueryCanonicalTest, VertexPointMissingAndPartZeroRemainBounded) {
+  ASSERT_EQ(AssertVertex(7, 10), CommitSeq{1});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::VertexPoint(VertexRef{PartId{0}, VertexId{99}}, vertex,
+                                   At{ValidTime{15}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  QueryOptions options;
+  options.capture_profile = true;
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  ASSERT_TRUE(cursor.ok());
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok());
+  EXPECT_FALSE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(cursor.ValueOrDie().profile().complexity.point_reads, 1U);
+}
+
+TEST_F(QueryCanonicalTest, VertexPointMaxIdDoesNotWrapEntityRange) {
+  ASSERT_EQ(AssertVertex(UINT64_MAX, 10), CommitSeq{1});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("max_v");
+  auto source = Query::VertexPoint(
+      VertexRef{PartId{0}, VertexId{UINT64_MAX}}, vertex, At{ValidTime{15}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec debug_spec;
+  debug_spec.part_scope = PartScope::Exact(PartId{0});
+  debug_spec.family = FactFamily::kVertexState;
+  debug_spec.entity_range = EntityRange{UINT64_MAX, std::nullopt};
+  size_t debug_events = 0;
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      debug_spec, [&debug_events](const FactEventBatch& batch) {
+        debug_events += batch.events.size();
+        return Status::OK();
+      }).ok());
+  ASSERT_EQ(debug_events, 1U);
+  FactReadSpec point_spec = debug_spec;
+  auto direct = snapshot.ValueOrDie().canonical_reader().ReadStateAt(
+      point_spec, ValidTime{15}, snapshot.ValueOrDie().commit_seq());
+  ASSERT_TRUE(direct.ok()) << direct.status().ToString();
+  ASSERT_TRUE(direct.ValueOrDie().has_value());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<VertexRef>(vertex, 0),
+            (VertexRef{PartId{0}, VertexId{UINT64_MAX}}));
+}
+
+TEST_F(QueryCanonicalTest, UnorderedLimitStopsCanonicalStateStream) {
+  for (uint64_t vertex_id = 1; vertex_id <= 4; ++vertex_id) {
+    ASSERT_EQ(AssertVertex(vertex_id, 0).value, vertex_id);
+  }
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, At{ValidTime{0}});
+  ASSERT_TRUE(source.ok());
+  auto projected = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(projected.ok());
+  auto limited = projected.ValueOrDie().Limit(0, 1);
+  ASSERT_TRUE(limited.ok());
+  auto prepared = database_->PrepareQuery(limited.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto explain = prepared.ValueOrDie().ExplainPhysical(snapshot.ValueOrDie(), QueryOptions{});
+  ASSERT_TRUE(explain.ok());
+  EXPECT_NE(explain.ValueOrDie().find("state-stream-limit"), std::string::npos);
+  QueryOptions options;
+  options.capture_profile = true;
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  ASSERT_TRUE(cursor.ok());
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok());
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(cursor.ValueOrDie().profile().complexity.limit_early_stops, 1U);
+  EXPECT_FALSE(cursor.ValueOrDie().Next().ValueOrDie().has_value());
+}
+
+TEST_F(QueryCanonicalTest, LimitOffsetRemainsRelational) {
+  for (uint64_t vertex_id = 1; vertex_id <= 3; ++vertex_id) {
+    ASSERT_EQ(AssertVertex(vertex_id, 0).value, vertex_id);
+  }
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, At{ValidTime{0}});
+  ASSERT_TRUE(source.ok());
+  auto projected = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(projected.ok());
+  auto limited = projected.ValueOrDie().Limit(1, 1);
+  ASSERT_TRUE(limited.ok());
+  auto prepared = database_->PrepareQuery(limited.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto explain = prepared.ValueOrDie().ExplainPhysical(snapshot.ValueOrDie(), QueryOptions{});
+  ASSERT_TRUE(explain.ok());
+  EXPECT_EQ(explain.ValueOrDie().find("state-stream-limit"), std::string::npos);
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok());
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok());
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+}
+
 TEST_F(QueryCanonicalTest, PinsSnapshotUntilEndOfStreamOrExplicitClose) {
   ASSERT_EQ(AssertVertex(1, 10), CommitSeq{1});
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");

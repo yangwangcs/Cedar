@@ -9,6 +9,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <type_traits>
 
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_page_reader.h"
@@ -125,7 +126,7 @@ StatusOr<std::shared_ptr<const ReadCatalog>> BuildReadCatalog(
     Status status = builder.AddCoverage(
         ReadCatalogKey{region.kind, region.part_id, region.property_id,
                        region.schema_epoch},
-        region);
+                       region);
     if (!status.ok()) return status;
   }
   return std::move(builder).Finish();
@@ -337,6 +338,20 @@ Status QueryProjectionStore::LoadCurrent() {
     const fs::path segment_path = fs::path(projections_path_) / seg.filename;
     std::error_code ec; if (!fs::exists(segment_path, ec) || ec || fs::file_size(segment_path, ec) != seg.file_bytes || ec) return Status::Corruption("projection store", "referenced segment is missing or sized differently");
     auto segment = ReadFile(segment_path); if (!segment.ok() || crc32c::Value(segment.ValueOrDie().data(), segment.ValueOrDie().size()) != seg.checksum) return Status::Corruption("projection store", "referenced segment checksum mismatch");
+    if (r.kind == ProjectionKind::kPropertyIndex) {
+      auto decoded = DecodePropertyIndexSegment(segment.ValueOrDie());
+      if (!decoded.ok()) return decoded.status();
+      const auto& index = decoded.ValueOrDie();
+      if (index.generation_id != generation ||
+          index.base_seq != manifest.ValueOrDie().base_seq ||
+          index.part_id != r.part_id ||
+          index.property != r.property_id.value_or(PropertyId{}) ||
+          index.schema_epoch != r.schema_epoch) {
+        return Status::Corruption("projection store",
+                                  "property index metadata mismatch");
+      }
+      continue;
+    }
     auto decoded = DecodeProjectionPage(segment.ValueOrDie());
     if (!decoded.ok() || !(decoded.ValueOrDie().header == seg.header)) return Status::Corruption("projection store", "referenced segment header mismatch");
     const auto& header = decoded.ValueOrDie().header;
@@ -344,10 +359,10 @@ Status QueryProjectionStore::LoadCurrent() {
   }
   auto state = std::make_shared<ProjectionGeneration::State>();
   state->manifest = manifest.ConsumeValueOrDie();
+  state->directory = projections_path_;
   auto catalog = BuildReadCatalog(state->manifest);
   if (!catalog.ok()) return catalog.status();
   state->read_catalog = std::move(catalog).ConsumeValueOrDie();
-  state->directory = projections_path_;
   state->manifest_file = manifest_path.string();
   for (const auto& r : state->manifest.regions)
     for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename);
@@ -428,20 +443,47 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
     const auto expected_it = expected.find(input.descriptor.segment_id);
     if (expected_it == expected.end() || *expected_it->second != input.descriptor) return Status::InvalidArgument("projection store", "manifest segment descriptor differs from build input");
     if (crc32c::Value(input.bytes.data(), input.bytes.size()) != input.descriptor.checksum) return Status::Corruption("projection store", "segment checksum mismatch");
-    auto decoded = DecodeProjectionPage(input.bytes);
-    if (!decoded.ok()) return decoded.status();
+    std::optional<ProjectionChain> decoded_page;
+    std::optional<PropertyIndexSegment> decoded_index;
+    if (input.descriptor.header.kind == ProjectionKind::kPropertyIndex) {
+      auto index = DecodePropertyIndexSegment(input.bytes);
+      if (!index.ok()) return index.status();
+      decoded_index = std::move(index).ConsumeValueOrDie();
+    } else {
+      auto page = DecodeProjectionPage(input.bytes);
+      if (!page.ok()) return page.status();
+      decoded_page = std::move(page).ConsumeValueOrDie();
+    }
     if (options_.page_bytes != 0) {
-      for (const auto& page : decoded.ValueOrDie().page_directory) {
-        if (page.compressed_bytes > options_.page_bytes) {
-          return Status::ResourceExhausted(
-              "projection store", "projection page exceeds debug bound");
+      if (decoded_page.has_value()) {
+        for (const auto& page : decoded_page->page_directory) {
+          if (page.compressed_bytes > options_.page_bytes) {
+            return Status::ResourceExhausted(
+                "projection store", "projection page exceeds debug bound");
+          }
         }
       }
     }
-    const auto& header = decoded.ValueOrDie().header;
-    if (!(header == input.descriptor.header) || header.generation_id != build.manifest.generation_id || header.base_seq != build.manifest.base_seq) return Status::Corruption("projection store", "segment header differs from descriptor");
+    if (decoded_index.has_value()) {
+      const auto& index = *decoded_index;
+      if (index.generation_id != build.manifest.generation_id ||
+          index.base_seq != build.manifest.base_seq ||
+          index.part_id != input.descriptor.header.part_id ||
+          index.property != input.descriptor.header.property_id ||
+          index.schema_epoch != input.descriptor.header.schema_epoch) {
+        return Status::Corruption("projection store",
+                                  "property index metadata differs from descriptor");
+      }
+    }
+    const ProjectionHeader* header = decoded_page.has_value()
+                                        ? &decoded_page->header
+                                        : &input.descriptor.header;
+    if (decoded_page.has_value() &&
+        (!(decoded_page->header == input.descriptor.header) ||
+         header->generation_id != build.manifest.generation_id ||
+         header->base_seq != build.manifest.base_seq)) return Status::Corruption("projection store", "segment header differs from descriptor");
     const auto* region = expected_regions[input.descriptor.segment_id];
-    if (region->kind != header.kind || region->part_id != header.part_id || region->schema_epoch != header.schema_epoch || region->entity_min > header.entity_min || region->entity_max_exclusive < header.entity_max_exclusive || region->valid_time.from.value > header.valid_from_min.value || (region->valid_time.to && (!header.valid_to_max || region->valid_time.to->value < header.valid_to_max->value)) || (region->property_id.has_value() != (header.property_id.value != 0)) || (region->property_id && region->property_id->value != header.property_id.value)) return Status::Corruption("projection store", "segment metadata is outside coverage region");
+    if (region->kind != header->kind || region->part_id != header->part_id || region->schema_epoch != header->schema_epoch || (decoded_page.has_value() && (region->entity_min > header->entity_min || region->entity_max_exclusive < header->entity_max_exclusive || region->valid_time.from.value > header->valid_from_min.value || (region->valid_time.to && (!header->valid_to_max || region->valid_time.to->value < header->valid_to_max->value)))) || (region->property_id.has_value() != (header->property_id.value != 0)) || (region->property_id && region->property_id->value != header->property_id.value)) return Status::Corruption("projection store", "segment metadata is outside coverage region");
     const fs::path destination = fs::path(projections_path_) / input.descriptor.filename;
     std::error_code exists_error;
     if (fs::exists(destination, exists_error) || exists_error || fs::is_symlink(destination, exists_error) || (fs::exists(destination, exists_error) && !fs::is_regular_file(destination, exists_error))) return Status::Conflict("projection store", "segment filename already exists or is not regular");
@@ -484,10 +526,10 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   if (current_) { current_->retired = true; retired_.push_back(current_); }
   auto state=std::make_shared<ProjectionGeneration::State>();
   state->manifest=build.manifest;
+  state->directory=projections_path_;
   auto catalog = BuildReadCatalog(state->manifest);
   if (!catalog.ok()) return catalog.status();
   state->read_catalog = std::move(catalog).ConsumeValueOrDie();
-  state->directory=projections_path_;
   state->manifest_file=(fs::path(manifests_path_) / (std::to_string(build.manifest.generation_id) + ".cmanifest")).string();
   for (const auto& r : build.manifest.regions)
     for (const auto& seg : r.segments) state->segment_files.push_back(seg.filename);
@@ -621,29 +663,63 @@ StatusOr<PropertyIndexSegment> QueryProjectionStore::ReadPropertyIndex(
   for (const auto& region : state->manifest.regions) {
     if (region.kind != ProjectionKind::kPropertyIndex ||
         region.part_id != request.part_id || region.property_id != request.property_id ||
-        region.schema_epoch != request.schema_epoch || region.segments.empty()) {
+        region.schema_epoch != request.schema_epoch || region.segments.empty() ||
+        region.built_through.value < request.snapshot_seq.value) {
       continue;
     }
-    const auto& descriptor = region.segments.front();
-    if (state->unavailable_segments.count(descriptor.filename) != 0 ||
-        state->corrupt_segments.count(descriptor.filename) != 0) {
-      return Status::NotFound("projection store", "property index segment unavailable");
+    PropertyIndexSegment merged;
+    merged.generation_id = state->manifest.generation_id;
+    merged.base_seq = state->manifest.base_seq;
+    merged.property = *request.property_id;
+    merged.part_id = request.part_id;
+    merged.schema_epoch = request.schema_epoch;
+    for (const auto& descriptor : region.segments) {
+      if (state->unavailable_segments.count(descriptor.filename) != 0 ||
+          state->corrupt_segments.count(descriptor.filename) != 0) {
+        return Status::NotFound("projection store", "property index segment unavailable");
+      }
+      auto bytes = ReadFile(fs::path(state->directory) / descriptor.filename);
+      if (!bytes.ok()) return bytes.status();
+      auto decoded = DecodePropertyIndexSegment(bytes.ValueOrDie());
+      if (!decoded.ok()) {
+        state->corrupt_segments.insert(descriptor.filename);
+        return decoded.status();
+      }
+      if (decoded.ValueOrDie().generation_id != state->manifest.generation_id ||
+          decoded.ValueOrDie().property != *request.property_id ||
+          decoded.ValueOrDie().part_id != request.part_id ||
+          decoded.ValueOrDie().schema_epoch != request.schema_epoch ||
+          decoded.ValueOrDie().built_through.value < request.snapshot_seq.value) {
+        return Status::NotFound("projection store", "property index coverage is stale");
+      }
+      if (merged.built_through.value < decoded.ValueOrDie().built_through.value) {
+        merged.built_through = decoded.ValueOrDie().built_through;
+      }
+      merged.postings.insert(merged.postings.end(),
+                             decoded.ValueOrDie().postings.begin(),
+                             decoded.ValueOrDie().postings.end());
     }
-    auto bytes = ReadFile(fs::path(state->directory) / descriptor.filename);
-    if (!bytes.ok()) return bytes.status();
-    auto decoded = DecodePropertyIndexSegment(bytes.ValueOrDie());
-    if (!decoded.ok()) {
-      state->corrupt_segments.insert(descriptor.filename);
-      return decoded.status();
-    }
-    if (decoded.ValueOrDie().generation_id != state->manifest.generation_id ||
-        decoded.ValueOrDie().property != *request.property_id ||
-        decoded.ValueOrDie().part_id != request.part_id ||
-        decoded.ValueOrDie().schema_epoch != request.schema_epoch ||
-        decoded.ValueOrDie().built_through.value < request.snapshot_seq.value) {
-      return Status::NotFound("projection store", "property index coverage is stale");
-    }
-    return decoded;
+    std::sort(merged.postings.begin(), merged.postings.end(),
+              [](const PropertyIndexPosting& left, const PropertyIndexPosting& right) {
+                const int value_order = std::visit(
+                    [](const auto& a, const auto& b) -> int {
+                      using A = std::decay_t<decltype(a)>;
+                      using B = std::decay_t<decltype(b)>;
+                      if constexpr (!std::is_same_v<A, B>) {
+                        return 0;
+                      } else {
+                        return a < b ? -1 : (a > b ? 1 : 0);
+                      }
+                    },
+                    left.value.data(), right.value.data());
+                if (value_order != 0) return value_order < 0;
+                if (left.vertex.part_id.value != right.vertex.part_id.value)
+                  return left.vertex.part_id.value < right.vertex.part_id.value;
+                return left.vertex.vertex_id.value < right.vertex.vertex_id.value;
+              });
+    const Status pages = BuildPropertyIndexPages(&merged);
+    if (!pages.ok()) return pages;
+    return merged;
   }
   return Status::NotFound("projection store", "property index coverage is missing");
 }

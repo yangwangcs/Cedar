@@ -259,10 +259,12 @@ MATCH (a), (b) RETURN a, b   // rejected: no product operator in the public alge
 ### 4.7 Properties and metadata
 
 The current T-Cypher surface projects variables and the metadata functions
-`valid_from(variable)` and `commit_seq(variable)`. Property predicates are
-available through the typed embedded Query API; the compact T-Cypher parser
-does not accept arbitrary `WHERE` expressions yet. Bind a property in C++ when
-you need a typed predicate or property output:
+`valid_from(variable)` and `commit_seq(variable)`. It also accepts typed scalar
+`WHERE` predicates for registered properties (`=`, `<`, `<=`, `>`, `>=`) and
+combines them with `AND`. These expressions lower to Cedar's existing property
+binding and filter operators; T-Cypher does not maintain a second executor.
+Bind a property in C++ when you need a typed predicate or property output
+outside the supported T-Cypher grammar:
 
 ```cpp
 auto vertex_slot = cedar::Slot<cedar::VertexRef>::Named("v");

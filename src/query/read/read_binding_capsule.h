@@ -14,6 +14,9 @@ namespace cedar::internal {
 
 using ProjectionReader =
     std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>;
+using PropertyIndexReader =
+    std::function<StatusOr<PropertyIndexSegment>(PartId, PropertyId,
+                                                 uint32_t, ValidTimeInterval)>;
 using DeltaReader = std::function<StatusOr<QueryDeltaView>()>;
 
 struct PreparedPlanTemplate {
@@ -49,11 +52,25 @@ class ReadBindingCapsule {
                      std::optional<ProjectionGeneration> generation,
                      std::shared_ptr<ProjectionReadStats> stats,
                      ProjectionReader projection_reader,
+                     PropertyIndexReader property_index_reader,
                      DeltaReader delta_reader)
       : plan_(std::move(plan)), delta_view_(std::move(delta_view)),
         delta_lease_(std::move(delta_lease)), generation_(std::move(generation)),
         stats_(std::move(stats)), projection_reader_(std::move(projection_reader)),
+        property_index_reader_(std::move(property_index_reader)),
         delta_reader_(std::move(delta_reader)) {}
+
+  ReadBindingCapsule(PreparedPlanTemplate plan,
+                     std::shared_ptr<const QueryDeltaView> delta_view,
+                     std::shared_ptr<const QueryDeltaLease> delta_lease,
+                     std::optional<ProjectionGeneration> generation,
+                     std::shared_ptr<ProjectionReadStats> stats,
+                     ProjectionReader projection_reader,
+                     DeltaReader delta_reader)
+      : ReadBindingCapsule(std::move(plan), std::move(delta_view),
+                           std::move(delta_lease), std::move(generation),
+                           std::move(stats), std::move(projection_reader),
+                           PropertyIndexReader{}, std::move(delta_reader)) {}
 
   const PreparedPlanTemplate& plan_template() const { return plan_; }
   const std::shared_ptr<const QueryDeltaView>& delta_view() const { return delta_view_; }
@@ -61,6 +78,9 @@ class ReadBindingCapsule {
   const std::optional<ProjectionGeneration>& projection_generation() const { return generation_; }
   const std::shared_ptr<ProjectionReadStats>& projection_stats() const { return stats_; }
   const ProjectionReader& projection_reader() const { return projection_reader_; }
+  const PropertyIndexReader& property_index_reader() const {
+    return property_index_reader_;
+  }
   const DeltaReader& delta_reader() const { return delta_reader_; }
 
  private:
@@ -70,6 +90,7 @@ class ReadBindingCapsule {
   std::optional<ProjectionGeneration> generation_;
   std::shared_ptr<ProjectionReadStats> stats_;
   ProjectionReader projection_reader_;
+  PropertyIndexReader property_index_reader_;
   DeltaReader delta_reader_;
 };
 

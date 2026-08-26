@@ -24,6 +24,8 @@ struct ServerConfig {
   std::string auth_token;
   std::string graph;
   PartId part_id{0};
+  // Keeps PartId{0} distinct from an omitted --part-id option.
+  bool part_id_explicit = false;
   uint32_t worker_threads = 1;
   uint32_t max_sessions = 64;
   uint32_t max_pull_records = 128;

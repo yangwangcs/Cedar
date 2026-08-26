@@ -454,6 +454,20 @@ StatusOr<ServerConfig> ServerConfig::FromArgs(int argc, char** argv) {
       if (index + 1 >= argc) return ServerError("missing option value");
       return std::string(argv[++index]);
     };
+    auto unsigned_value = [&](const char* name) -> StatusOr<unsigned long> {
+      auto raw = value(name);
+      if (!raw.ok()) return raw.status();
+      const std::string& text = raw.ValueOrDie();
+      if (text.empty()) return ServerError("invalid numeric option");
+      size_t consumed = 0;
+      try {
+        const unsigned long parsed = std::stoul(text, &consumed, 10);
+        if (consumed != text.size()) return ServerError("invalid numeric option");
+        return parsed;
+      } catch (...) {
+        return ServerError("invalid numeric option");
+      }
+    };
     if (arg == "--db") {
       auto parsed = value("--db");
       if (!parsed.ok()) return parsed.status();
@@ -463,9 +477,10 @@ StatusOr<ServerConfig> ServerConfig::FromArgs(int argc, char** argv) {
       if (!parsed.ok()) return parsed.status();
       config.bind_address = parsed.ValueOrDie();
     } else if (arg == "--port") {
-      auto parsed = value("--port");
+      auto parsed = unsigned_value("--port");
       if (!parsed.ok()) return parsed.status();
-      config.port = static_cast<uint16_t>(std::stoul(parsed.ValueOrDie()));
+      if (parsed.ValueOrDie() > UINT16_MAX) return ServerError("port exceeds uint16");
+      config.port = static_cast<uint16_t>(parsed.ValueOrDie());
     } else if (arg == "--lock") {
       auto parsed = value("--lock");
       if (!parsed.ok()) return parsed.status();
@@ -487,11 +502,12 @@ StatusOr<ServerConfig> ServerConfig::FromArgs(int argc, char** argv) {
       if (!parsed.ok()) return parsed.status();
       config.graph = parsed.ValueOrDie();
     } else if (arg == "--part-id") {
-      auto parsed = value("--part-id");
+      auto parsed = unsigned_value("--part-id");
       if (!parsed.ok()) return parsed.status();
-      const unsigned long part = std::stoul(parsed.ValueOrDie());
+      const unsigned long part = parsed.ValueOrDie();
       if (part > UINT32_MAX) return ServerError("PartID exceeds uint32");
       config.part_id = PartId{static_cast<uint32_t>(part)};
+      config.part_id_explicit = true;
     } else {
       return ServerError("unknown server option");
     }
@@ -576,6 +592,7 @@ Status Server::Start() {
   cypher::BinderOptions binder_options;
   binder_options.graph = state_->config.graph;
   binder_options.part_id = state_->config.part_id;
+  binder_options.require_explicit_part_id = state_->config.part_id_explicit;
   if (!state_->config.schema_path.empty()) {
     const auto manifest = cypher::LoadSchemaManifest(state_->config.schema_path);
     if (!manifest.ok()) {
@@ -586,7 +603,10 @@ Status Server::Start() {
     }
     catalog = manifest.ValueOrDie().catalog;
     if (state_->config.graph.empty()) binder_options.graph = manifest.ValueOrDie().graph;
-    if (state_->config.part_id.value == 0) binder_options.part_id = manifest.ValueOrDie().part_id;
+    if (!state_->config.part_id_explicit) {
+      binder_options.part_id = manifest.ValueOrDie().part_id;
+      binder_options.require_explicit_part_id = false;
+    }
   }
   state_->cypher_session = std::make_unique<cypher::CypherSession>(
       *state_->database, std::move(catalog), std::move(binder_options));

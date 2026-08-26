@@ -606,6 +606,48 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
   return chains;
 }
 
+StatusOr<PropertyIndexSegment> QueryProjectionStore::ReadPropertyIndex(
+    const CoverageRequest& request, const ProjectionGeneration& generation) const {
+  if (!generation.state_ || !request.property_id.has_value() ||
+      request.kind != ProjectionKind::kPropertyIndex) {
+    return Status::InvalidArgument("projection store", "invalid property index request");
+  }
+  const auto& state = generation.state_;
+  if (!state->present.load() || request.generation_id.has_value() &&
+      *request.generation_id != state->manifest.generation_id ||
+      request.snapshot_seq.value < state->manifest.base_seq.value) {
+    return Status::NotFound("projection store", "property index generation unavailable");
+  }
+  for (const auto& region : state->manifest.regions) {
+    if (region.kind != ProjectionKind::kPropertyIndex ||
+        region.part_id != request.part_id || region.property_id != request.property_id ||
+        region.schema_epoch != request.schema_epoch || region.segments.empty()) {
+      continue;
+    }
+    const auto& descriptor = region.segments.front();
+    if (state->unavailable_segments.count(descriptor.filename) != 0 ||
+        state->corrupt_segments.count(descriptor.filename) != 0) {
+      return Status::NotFound("projection store", "property index segment unavailable");
+    }
+    auto bytes = ReadFile(fs::path(state->directory) / descriptor.filename);
+    if (!bytes.ok()) return bytes.status();
+    auto decoded = DecodePropertyIndexSegment(bytes.ValueOrDie());
+    if (!decoded.ok()) {
+      state->corrupt_segments.insert(descriptor.filename);
+      return decoded.status();
+    }
+    if (decoded.ValueOrDie().generation_id != state->manifest.generation_id ||
+        decoded.ValueOrDie().property != *request.property_id ||
+        decoded.ValueOrDie().part_id != request.part_id ||
+        decoded.ValueOrDie().schema_epoch != request.schema_epoch ||
+        decoded.ValueOrDie().built_through.value < request.snapshot_seq.value) {
+      return Status::NotFound("projection store", "property index coverage is stale");
+    }
+    return decoded;
+  }
+  return Status::NotFound("projection store", "property index coverage is missing");
+}
+
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     const CoverageRequest& request, const ProjectionGeneration& generation) const {
   std::lock_guard<std::mutex> lock(mutex_);

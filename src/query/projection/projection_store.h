@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "query/projection/projection_manifest.h"
+#include "query/projection/property_index.h"
 
 namespace cedar::internal {
 
@@ -126,6 +127,9 @@ class QueryProjectionStore {
       const CoverageRequest& request) const;
   StatusOr<std::vector<ProjectionChain>> ReadChains(
       const CoverageRequest& request, const ProjectionGeneration& generation) const;
+  StatusOr<PropertyIndexSegment> ReadPropertyIndex(
+      const CoverageRequest& request,
+      const ProjectionGeneration& generation) const;
 
  private:
   explicit QueryProjectionStore(ProjectionStoreOptions options);

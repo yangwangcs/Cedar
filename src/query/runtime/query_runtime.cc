@@ -249,28 +249,44 @@ StatusOr<EvaluatedValue> EvaluateExpression(
     value = *left.ValueOrDie().value == *right.ValueOrDie().value;
   } else if (expression.kind() == ExpressionKind::kNotEqual) {
     value = *left.ValueOrDie().value != *right.ValueOrDie().value;
-  } else if (expression.kind() == ExpressionKind::kGreaterThan) {
+  } else if (expression.kind() == ExpressionKind::kGreaterThan ||
+             expression.kind() == ExpressionKind::kGreaterThanOrEqual ||
+             expression.kind() == ExpressionKind::kLessThan ||
+             expression.kind() == ExpressionKind::kLessThanOrEqual) {
+    const bool greater = expression.kind() == ExpressionKind::kGreaterThan ||
+                          expression.kind() == ExpressionKind::kGreaterThanOrEqual;
+    const bool inclusive = expression.kind() == ExpressionKind::kGreaterThanOrEqual ||
+                            expression.kind() == ExpressionKind::kLessThanOrEqual;
     switch (left.ValueOrDie().type) {
       case QueryType::kInt32:
-        value = std::get<int32_t>(*left.ValueOrDie().value) >
-                std::get<int32_t>(*right.ValueOrDie().value);
+        value = greater ? std::get<int32_t>(*left.ValueOrDie().value) >
+                             std::get<int32_t>(*right.ValueOrDie().value)
+                        : std::get<int32_t>(*left.ValueOrDie().value) <
+                             std::get<int32_t>(*right.ValueOrDie().value);
         break;
       case QueryType::kInt64:
-        value = std::get<int64_t>(*left.ValueOrDie().value) >
-                std::get<int64_t>(*right.ValueOrDie().value);
+        value = greater ? std::get<int64_t>(*left.ValueOrDie().value) >
+                             std::get<int64_t>(*right.ValueOrDie().value)
+                        : std::get<int64_t>(*left.ValueOrDie().value) <
+                             std::get<int64_t>(*right.ValueOrDie().value);
         break;
       case QueryType::kFloat32:
-        value = std::get<float>(*left.ValueOrDie().value) >
-                std::get<float>(*right.ValueOrDie().value);
+        value = greater ? std::get<float>(*left.ValueOrDie().value) >
+                             std::get<float>(*right.ValueOrDie().value)
+                        : std::get<float>(*left.ValueOrDie().value) <
+                             std::get<float>(*right.ValueOrDie().value);
         break;
       case QueryType::kFloat64:
-        value = std::get<double>(*left.ValueOrDie().value) >
-                std::get<double>(*right.ValueOrDie().value);
+        value = greater ? std::get<double>(*left.ValueOrDie().value) >
+                             std::get<double>(*right.ValueOrDie().value)
+                        : std::get<double>(*left.ValueOrDie().value) <
+                             std::get<double>(*right.ValueOrDie().value);
         break;
       default:
         return Status::InvalidArgument(
-            "query", "greater-than requires an arithmetic operand");
+            "query", "ordered comparison requires an arithmetic operand");
     }
+    if (inclusive && *left.ValueOrDie().value == *right.ValueOrDie().value) value = true;
   } else {
     return Status::NotSupported("query", "unsupported canonical expression");
   }
@@ -358,6 +374,7 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
     return Status::OK();
   };
   if (plan.point_ref.has_value()) {
+    if (context.on_point_read) context.on_point_read();
     const auto* at = std::get_if<At>(&plan.scope);
     if (at == nullptr) {
       return Status::NotSupported("query runtime",
@@ -738,12 +755,15 @@ StatusOr<std::vector<RuntimeRow>> BindGraphPropertyRows(
 StatusOr<std::vector<RuntimeRow>> MaterializeRows(
     Snapshot& snapshot, const internal::PreparedQueryPlan& plan,
     const Bindings& bindings,
-    internal::QueryReservation* reservation = nullptr) {
+    internal::QueryReservation* reservation = nullptr,
+    QueryExecutionState* execution = nullptr) {
   internal::QueryReadContext read_context{
       snapshot.canonical_reader(), snapshot.commit_seq(),
       plan.execution_scope.part_scope, snapshot.adjacency_index(), {},
       std::make_shared<internal::TemporalChainCache>(), plan.safe_read_limit,
-      plan.execution_scope.system_time_range};
+      plan.execution_scope.system_time_range,
+      execution ? [execution] { execution->RecordPointRead(); } : std::function<void()>{},
+      execution ? [execution] { execution->RecordLimitEarlyStop(); } : std::function<void()>{}};
   auto reserve_row = [reservation](const RuntimeRow& row) -> Status {
     if (reservation == nullptr) return Status::OK();
     size_t bytes = sizeof(RuntimeRow);
@@ -882,6 +902,7 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
     internal::QueryReservation* reservation,
     QueryExecutionMode mode,
     const Bindings& bindings,
+    QueryExecutionState* execution = nullptr,
     const std::function<Status()>& check_abort = {},
     uint64_t max_journey_labels = 0,
     uint64_t max_journey_interval_fragments = 0) {
@@ -894,7 +915,9 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
       snapshot.canonical_reader(), snapshot.commit_seq(),
       plan.execution_scope.part_scope, snapshot.adjacency_index(), {},
       std::make_shared<internal::TemporalChainCache>(), plan.safe_read_limit,
-      plan.execution_scope.system_time_range};
+      plan.execution_scope.system_time_range,
+      execution ? [execution] { execution->RecordPointRead(); } : std::function<void()>{},
+      execution ? [execution] { execution->RecordLimitEarlyStop(); } : std::function<void()>{}};
   auto seeds = ReadSourceRows(read_context, plan, reservation);
   if (!seeds.ok()) return seeds.status();
   // Graph operators consume the source rows directly, so apply bindings and
@@ -933,6 +956,11 @@ StatusOr<std::vector<RuntimeRow>> MaterializeGraphRows(
   options.trail = plan.graph_expand.has_value() && plan.graph_expand->trail;
   options.check_abort = check_abort;
   options.adjacency_index = snapshot.adjacency_index();
+  uint64_t adjacency_candidates = 0;
+  options.candidates_examined = &adjacency_candidates;
+  if (execution != nullptr && options.adjacency_index != nullptr) {
+    execution->RecordAdjacencyIndexSeek();
+  }
   if (plan.projection_generation.has_value()) {
     options.projection_generation = plan.projection_generation->generation_id();
   }
@@ -2195,6 +2223,7 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                                            &state_->reservation,
                                            state_->options.mode,
                                            state_->bindings,
+                                           state_->execution.get(),
                                            [state = state_.get()]() -> Status {
                                              if (state->cancelled.load(std::memory_order_acquire))
                                                return Status::QueryCancelled("query", "query cancelled");
@@ -2209,7 +2238,8 @@ StatusOr<std::optional<QueryBatch>> QueryCursor::Next() {
                                            state_->options.budget.interval_fragments)
                     : MaterializeRows(*state_->snapshot, state_->plan,
                                       state_->bindings,
-                                      &state_->reservation);
+                                      &state_->reservation,
+                                      state_->execution.get());
     // The lease owns the pre-materialization reservation. Reset it now that
     // MaterializeRows has completed so the reservation is released exactly
     // once, including on an error path.

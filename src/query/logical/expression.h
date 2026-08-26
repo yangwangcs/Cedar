@@ -21,6 +21,9 @@ enum class ExpressionKind : uint8_t {
   kEqual,
   kNotEqual,
   kGreaterThan,
+  kGreaterThanOrEqual,
+  kLessThan,
+  kLessThanOrEqual,
   kAnd,
   kNot,
 };

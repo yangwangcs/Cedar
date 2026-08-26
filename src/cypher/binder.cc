@@ -155,6 +155,7 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
   bound.changes = statement.changes;
   bound.patterns = statement.patterns;
   bound.projections = statement.projections;
+  bound.limit_count = statement.limit_count;
   bound.deletions = statement.deletions;
   bound.demand.needs_event_history = statement.changes;
   bound.demand.needs_system_metadata = statement.system_time.has_value();
@@ -175,6 +176,9 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
   std::unordered_set<std::string> variables;
   for (size_t index = 0; index < statement.patterns.size(); ++index) {
     const auto& pattern = statement.patterns[index];
+    if (pattern.source_part_id.has_value() != pattern.source_vertex_id.has_value()) {
+      return BindError("vertex reference requires both part_id and id");
+    }
     if (pattern.max_hops > options.max_hops || pattern.max_hops == 0) {
       return BindError("path hop bound exceeds configured limit");
     }
@@ -218,6 +222,44 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
     canonical += "|path=" + pattern.source_label + ':' + pattern.relationship + ':' +
                  std::to_string(pattern.min_hops) + ':' + std::to_string(pattern.max_hops) +
                  ':' + std::to_string(pattern.trail ? 1 : 0);
+  }
+  for (const auto& predicate : statement.predicates) {
+    if (variables.find(predicate.variable) == variables.end()) {
+      return BindError("predicate references an unknown graph variable");
+    }
+    auto property = LookupRequired(catalog, predicate.property,
+                                   PropertyEntityKind::kVertex);
+    if (!property.ok()) return property.status();
+    if (property.ValueOrDie().physical_type != PhysicalType::kString &&
+        property.ValueOrDie().physical_type != PhysicalType::kInt32 &&
+        property.ValueOrDie().physical_type != PhysicalType::kInt64 &&
+        property.ValueOrDie().physical_type != PhysicalType::kFloat32 &&
+        property.ValueOrDie().physical_type != PhysicalType::kFloat64) {
+      return Status::NotSupported("cypher binder", "predicate type is not indexable");
+    }
+    BoundPredicate bound_predicate;
+    bound_predicate.variable = predicate.variable;
+    bound_predicate.property_id = property.ValueOrDie().property_id;
+    bound_predicate.physical_type = property.ValueOrDie().physical_type;
+    bound_predicate.op = predicate.op;
+    bound_predicate.literal = predicate.literal;
+    if (predicate.parameter.has_value()) {
+      auto parameter = std::find_if(
+          bound.parameters.begin(), bound.parameters.end(),
+          [&](const BoundParameter& existing) {
+            return existing.name == *predicate.parameter;
+          });
+      if (parameter == bound.parameters.end()) {
+        bound.parameters.push_back(
+            {*predicate.parameter,
+             ParameterId{static_cast<uint32_t>(bound.parameters.size() + 1)}});
+        parameter = std::prev(bound.parameters.end());
+      }
+      bound_predicate.parameter = *parameter;
+    }
+    bound.predicates.push_back(std::move(bound_predicate));
+    bound.demand.properties.push_back(property.ValueOrDie().property_id);
+    canonical += "|where=" + predicate.variable + "." + predicate.property;
   }
   for (const auto& assignment : statement.assignments) {
     auto property = LookupRequired(catalog, assignment.property,

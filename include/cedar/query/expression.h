@@ -90,6 +90,15 @@ std::shared_ptr<const internal::ExpressionNode> MakeNotEqualExpression(
 std::shared_ptr<const internal::ExpressionNode> MakeGreaterThanExpression(
     std::shared_ptr<const internal::ExpressionNode> left,
     std::shared_ptr<const internal::ExpressionNode> right);
+std::shared_ptr<const internal::ExpressionNode> MakeGreaterThanOrEqualExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right);
+std::shared_ptr<const internal::ExpressionNode> MakeLessThanExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right);
+std::shared_ptr<const internal::ExpressionNode> MakeLessThanOrEqualExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right);
 std::shared_ptr<const internal::ExpressionNode> MakeAndExpression(
     std::shared_ptr<const internal::ExpressionNode> left,
     std::shared_ptr<const internal::ExpressionNode> right);
@@ -325,6 +334,102 @@ template <typename T>
 Expr<bool> GreaterThan(OptionalExpr<T> left, OptionalExpr<T> right) {
   return internal::ExpressionInspector::Make<bool>(
       detail::MakeGreaterThanExpression(
+          internal::ExpressionInspector::Share(left),
+          internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> GreaterThanOrEqual(Expr<T> left, Expr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeGreaterThanOrEqualExpression(
+          internal::ExpressionInspector::Share(left),
+          internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> GreaterThanOrEqual(OptionalExpr<T> left, Expr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeGreaterThanOrEqualExpression(
+          internal::ExpressionInspector::Share(left),
+          internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> GreaterThanOrEqual(Expr<T> left, OptionalExpr<T> right) {
+  return GreaterThanOrEqual(std::move(right), std::move(left));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> GreaterThanOrEqual(OptionalExpr<T> left, OptionalExpr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeGreaterThanOrEqualExpression(
+          internal::ExpressionInspector::Share(left),
+          internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThan(Expr<T> left, Expr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeLessThanExpression(internal::ExpressionInspector::Share(left),
+                                     internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThan(OptionalExpr<T> left, Expr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeLessThanExpression(internal::ExpressionInspector::Share(left),
+                                     internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThan(Expr<T> left, OptionalExpr<T> right) {
+  return LessThan(std::move(right), std::move(left));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThan(OptionalExpr<T> left, OptionalExpr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeLessThanExpression(internal::ExpressionInspector::Share(left),
+                                     internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThanOrEqual(Expr<T> left, Expr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeLessThanOrEqualExpression(
+          internal::ExpressionInspector::Share(left),
+          internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThanOrEqual(OptionalExpr<T> left, Expr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeLessThanOrEqualExpression(
+          internal::ExpressionInspector::Share(left),
+          internal::ExpressionInspector::Share(right)));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThanOrEqual(Expr<T> left, OptionalExpr<T> right) {
+  return LessThanOrEqual(std::move(right), std::move(left));
+}
+
+template <typename T>
+  requires std::is_arithmetic_v<T>
+Expr<bool> LessThanOrEqual(OptionalExpr<T> left, OptionalExpr<T> right) {
+  return internal::ExpressionInspector::Make<bool>(
+      detail::MakeLessThanOrEqualExpression(
           internal::ExpressionInspector::Share(left),
           internal::ExpressionInspector::Share(right)));
 }

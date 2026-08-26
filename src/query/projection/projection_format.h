@@ -12,7 +12,8 @@ enum class ProjectionKind : uint8_t {
   kState = 1,
   kAdjacency = 2,
   kProperty = 3,
-  kStatistics = 4
+  kStatistics = 4,
+  kPropertyIndex = 5
 };
 struct ProjectionHeader {
   ProjectionKind kind = ProjectionKind::kState;

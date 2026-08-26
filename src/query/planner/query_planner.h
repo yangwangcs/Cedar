@@ -26,6 +26,7 @@ enum class PhysicalOpKind : uint8_t {
   kDeltaMerge,
   kCanonicalFallback,
   kAdjacencySeek,
+  kPropertyIndexSeek,
   kLaneExchange,
   kFilter,
   kProject,

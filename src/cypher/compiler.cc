@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <type_traits>
 
 namespace cedar::cypher {
 namespace {
@@ -70,7 +72,13 @@ StatusOr<Query> Compile(const BoundStatement& statement) {
   }
   const PathPattern& first = statement.patterns.front();
   const Slot<VertexRef> source = Slot<VertexRef>::WithId(SlotId{1}, first.source);
-  auto query = Query::Vertices(source, scope.ValueOrDie());
+  StatusOr<Query> query = (first.source_part_id.has_value() &&
+                           first.source_vertex_id.has_value())
+                              ? Query::VertexPoint(
+                                    VertexRef{PartId{*first.source_part_id},
+                                              VertexId{*first.source_vertex_id}},
+                                    source, scope.ValueOrDie())
+                              : Query::Vertices(source, scope.ValueOrDie());
   if (!query.ok()) return query.status();
   std::vector<std::string> vertex_names{first.source};
   std::vector<Slot<VertexRef>> vertices{source};
@@ -101,6 +109,94 @@ StatusOr<Query> Compile(const BoundStatement& statement) {
     vertices.push_back(destination);
     edge_names.push_back(edge.name());
     vertex_names.push_back(destination.name());
+  }
+  if (!statement.predicates.empty()) {
+    std::vector<Expr<bool>> predicates;
+    uint32_t property_slot_id = 5000;
+    for (const BoundPredicate& predicate : statement.predicates) {
+      auto vertex_it = std::find(vertex_names.begin(), vertex_names.end(),
+                                 predicate.variable);
+      if (vertex_it == vertex_names.end()) {
+        return Status::BindError("cypher compiler", "predicate variable is not bound");
+      }
+      const size_t vertex_index = static_cast<size_t>(vertex_it - vertex_names.begin());
+      const Slot<VertexRef> vertex = vertices[vertex_index];
+      Expr<bool> comparison;
+      auto apply = [&](auto tag) -> Status {
+        using T = decltype(tag);
+        const OptionalSlot<T> property = OptionalSlot<T>::WithId(
+            SlotId{property_slot_id++}, predicate.variable + "." +
+                                          std::to_string(predicate.property_id.value));
+        auto bound_query = query.ValueOrDie().BindVertexProperty(
+            vertex, predicate.property_id, property);
+        if (!bound_query.ok()) return bound_query.status();
+        query = std::move(bound_query);
+        Expr<T> rhs;
+        if (predicate.parameter.has_value()) {
+          rhs = ValueOf(Parameter<T>::WithId(predicate.parameter->id,
+                                             predicate.parameter->name));
+        } else if (predicate.literal.has_value()) {
+          if constexpr (std::is_same_v<T, std::string>) {
+            rhs = Literal<T>(*predicate.literal);
+          } else if constexpr (std::is_integral_v<T>) {
+            try {
+              rhs = Literal<T>(static_cast<T>(std::stoll(*predicate.literal)));
+            } catch (...) {
+              return Status::ParseError("cypher compiler", "invalid numeric predicate literal");
+            }
+          } else {
+            try {
+              rhs = Literal<T>(static_cast<T>(std::stod(*predicate.literal)));
+            } catch (...) {
+              return Status::ParseError("cypher compiler", "invalid numeric predicate literal");
+            }
+          }
+        } else {
+          return Status::ParseError("cypher compiler", "predicate has no value");
+        }
+        auto left = ValueOf(property);
+        switch (predicate.op) {
+          case PredicateOperator::kEqual:
+            comparison = Equal(left, rhs);
+            break;
+          case PredicateOperator::kGreater:
+            if constexpr (std::is_arithmetic_v<T>) comparison = GreaterThan(left, rhs);
+            else return Status::NotSupported("cypher compiler", "ordered string predicate");
+            break;
+          case PredicateOperator::kGreaterEqual:
+            if constexpr (std::is_arithmetic_v<T>) comparison = GreaterThanOrEqual(left, rhs);
+            else return Status::NotSupported("cypher compiler", "ordered string predicate");
+            break;
+          case PredicateOperator::kLess:
+            if constexpr (std::is_arithmetic_v<T>) comparison = LessThan(left, rhs);
+            else return Status::NotSupported("cypher compiler", "ordered string predicate");
+            break;
+          case PredicateOperator::kLessEqual:
+            if constexpr (std::is_arithmetic_v<T>) comparison = LessThanOrEqual(left, rhs);
+            else return Status::NotSupported("cypher compiler", "ordered string predicate");
+            break;
+        }
+        return Status::OK();
+      };
+      Status status = Status::NotSupported("cypher compiler", "unsupported predicate type");
+      switch (predicate.physical_type) {
+        case PhysicalType::kString: status = apply(std::string{}); break;
+        case PhysicalType::kInt32: status = apply(int32_t{}); break;
+        case PhysicalType::kInt64: status = apply(int64_t{}); break;
+        case PhysicalType::kFloat32: status = apply(float{}); break;
+        case PhysicalType::kFloat64: status = apply(double{}); break;
+        default: break;
+      }
+      if (!status.ok()) return status;
+      predicates.push_back(std::move(comparison));
+    }
+    Expr<bool> combined = predicates.front();
+    for (size_t index = 1; index < predicates.size(); ++index) {
+      combined = combined && predicates[index];
+    }
+    auto filtered = query.ValueOrDie().Where(std::move(combined));
+    if (!filtered.ok()) return filtered.status();
+    query = std::move(filtered);
   }
   if (!statement.projections.empty()) {
     std::vector<Projection> projections;
@@ -173,6 +269,9 @@ StatusOr<Query> Compile(const BoundStatement& statement) {
       }
     }
     query = query.ValueOrDie().Select(std::move(projections));
+  }
+  if (statement.limit_count.has_value()) {
+    query = query.ValueOrDie().Limit(0, *statement.limit_count);
   }
   return query.ValueOrDie().WithExecutionScope(MakeExecutionScope(statement));
 }

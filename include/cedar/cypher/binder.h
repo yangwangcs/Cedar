@@ -85,6 +85,15 @@ struct BoundAssignment {
   ParameterId parameter;
 };
 
+struct BoundPredicate {
+  std::string variable;
+  PropertyId property_id;
+  PhysicalType physical_type = PhysicalType::kBinary;
+  PredicateOperator op = PredicateOperator::kEqual;
+  std::optional<std::string> literal;
+  std::optional<BoundParameter> parameter;
+};
+
 struct BoundStatement {
   StatementKind kind = StatementKind::kRead;
   std::string graph;
@@ -96,8 +105,10 @@ struct BoundStatement {
   std::optional<TimeScope> system_time;
   bool changes = false;
   std::vector<PathPattern> patterns;
+  std::vector<BoundPredicate> predicates;
   std::vector<std::optional<uint64_t>> relationship_types;
   std::vector<ProjectionItem> projections;
+  std::optional<size_t> limit_count;
   std::vector<BoundParameter> parameters;
   std::vector<BoundAssignment> assignments;
   std::vector<std::string> deletions;

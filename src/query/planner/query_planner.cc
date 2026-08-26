@@ -289,6 +289,7 @@ const char* PhysicalName(PhysicalOpKind kind) {
     case PhysicalOpKind::kDeltaMerge: return "delta-merge";
     case PhysicalOpKind::kCanonicalFallback: return "canonical-fallback";
     case PhysicalOpKind::kAdjacencySeek: return "adjacency-seek";
+    case PhysicalOpKind::kPropertyIndexSeek: return "property-index-seek";
     case PhysicalOpKind::kLaneExchange: return "lane-exchange";
     case PhysicalOpKind::kFilter: return "filter";
     case PhysicalOpKind::kProject: return "project";
@@ -341,6 +342,27 @@ bool ContainsKind(const LogicalPlanNode& node, LogicalOpKind kind) {
   if (node.kind() == kind) return true;
   return std::any_of(node.inputs().begin(), node.inputs().end(),
                      [kind](const auto& child) { return ContainsKind(*child, kind); });
+}
+
+bool HasPropertyPredicate(const LogicalPlanNode& node) {
+  if (node.kind() == LogicalOpKind::kFilter && node.predicate()) {
+    return ContainsKind(node, LogicalOpKind::kBindProperty);
+  }
+  return std::any_of(node.inputs().begin(), node.inputs().end(),
+                     [](const auto& child) { return HasPropertyPredicate(*child); });
+}
+
+bool HasCompletePropertyIndex(const ProjectionCatalogView& catalog,
+                              const LogicalPlanNode& logical,
+                              const PartScope& part_scope) {
+  if (!HasPropertyPredicate(logical)) return false;
+  return std::any_of(catalog.regions.begin(), catalog.regions.end(),
+                     [&](const CoverageRegion& region) {
+                       return region.kind == ProjectionKind::kPropertyIndex &&
+                              PartAllowed(part_scope, region.part_id) &&
+                              region.property_id.has_value() &&
+                              !region.segments.empty();
+                     });
 }
 
 }  // namespace
@@ -491,6 +513,11 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
     plan.safe_read_limit = *logical.limit_count();
     plan.operations.push_back(PhysicalOpKind::kStateStreamLimit);
     plan.pushdowns.push_back("unordered-limit");
+  }
+  if (HasCompletePropertyIndex(context.projections, logical,
+                               context.part_scope)) {
+    plan.operations.push_back(PhysicalOpKind::kPropertyIndexSeek);
+    plan.pushdowns.push_back("property-index");
   }
 
   uint64_t cursor = requested->from.value;

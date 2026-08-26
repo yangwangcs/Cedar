@@ -1,8 +1,53 @@
 #include "query/read/read_catalog.h"
 
 #include <algorithm>
+#include <cstring>
+#include <type_traits>
 
 namespace cedar::internal {
+
+namespace {
+
+// Values in a posting list are schema-typed. Comparing only equal physical
+// types keeps an index lookup from accidentally applying numeric coercions
+// that the canonical expression evaluator would reject.
+int CompareValues(const Value& left, const Value& right) {
+  if (left.type() != right.type()) return 0;
+  return std::visit(
+      [](const auto& a, const auto& b) -> int {
+        using A = std::decay_t<decltype(a)>;
+        using B = std::decay_t<decltype(b)>;
+        if constexpr (!std::is_same_v<A, B>) {
+          return 0;
+        } else if constexpr (std::is_same_v<A, std::string>) {
+          return a < b ? -1 : (a > b ? 1 : 0);
+        } else {
+          return a < b ? -1 : (a > b ? 1 : 0);
+        }
+      },
+      left.data(), right.data());
+}
+
+bool Matches(PropertyIndexOperator op, int cmp, bool has_upper,
+             int upper_cmp) {
+  switch (op) {
+    case PropertyIndexOperator::kEqual:
+      return cmp == 0;
+    case PropertyIndexOperator::kLess:
+      return cmp < 0;
+    case PropertyIndexOperator::kLessEqual:
+      return cmp <= 0;
+    case PropertyIndexOperator::kGreater:
+      return cmp > 0;
+    case PropertyIndexOperator::kGreaterEqual:
+      return cmp >= 0;
+  }
+  (void)has_upper;
+  (void)upper_cmp;
+  return false;
+}
+
+}  // namespace
 
 std::string ReadCatalog::Fingerprint() const {
   std::vector<PropertyDefinition> properties;
@@ -74,6 +119,39 @@ const std::vector<PropertyIndexPosting>* ReadCatalog::SeekPropertyIndex(
   (void)lower;
   (void)upper;
   return &found->second;
+}
+
+std::vector<PropertyIndexPosting> ReadCatalog::SeekPropertyIndexRange(
+    PropertyId property, PropertyIndexOperator op, const Value& lower,
+    const std::optional<Value>& upper) const {
+  const auto found = property_indexes_.find(property.value);
+  if (found == property_indexes_.end()) return {};
+  const auto& postings = found->second;
+  // The builder sorts by Value::Encode(), which is the canonical bytewise
+  // ordering. Use lower_bound to avoid scanning values below the requested
+  // bound, then validate the typed comparison for exact semantics.
+  const bool lower_bounded = op == PropertyIndexOperator::kEqual ||
+                             op == PropertyIndexOperator::kGreater ||
+                             op == PropertyIndexOperator::kGreaterEqual;
+  const auto first = lower_bounded
+                         ? std::lower_bound(
+                               postings.begin(), postings.end(), lower,
+                               [](const PropertyIndexPosting& posting,
+                                  const Value& value) {
+                                 return CompareValues(posting.value, value) < 0;
+                               })
+                         : postings.begin();
+  std::vector<PropertyIndexPosting> result;
+  for (auto it = first; it != postings.end(); ++it) {
+    const int cmp = CompareValues(it->value, lower);
+    if (it->value.type() != lower.type()) continue;
+    if (upper.has_value() && CompareValues(it->value, *upper) > 0) break;
+    if (Matches(op, cmp, upper.has_value(),
+                 upper.has_value() ? CompareValues(it->value, *upper) : 0)) {
+      result.push_back(*it);
+    }
+  }
+  return result;
 }
 
 const CoverageRegion* ReadCatalog::FindCoverage(
@@ -190,9 +268,8 @@ StatusOr<std::shared_ptr<const ReadCatalog>> ReadCatalogBuilder::Finish() && {
   for (auto& [property, postings] : catalog_.property_indexes_) {
     (void)property;
     std::sort(postings.begin(), postings.end(), [](const auto& left, const auto& right) {
-      const std::string left_value = left.value.Encode();
-      const std::string right_value = right.value.Encode();
-      if (left_value != right_value) return left_value < right_value;
+      const int value_order = CompareValues(left.value, right.value);
+      if (value_order != 0) return value_order < 0;
       if (left.vertex.part_id.value != right.vertex.part_id.value)
         return left.vertex.part_id.value < right.vertex.part_id.value;
       return left.vertex.vertex_id.value < right.vertex.vertex_id.value;

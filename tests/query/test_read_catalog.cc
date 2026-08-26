@@ -80,5 +80,31 @@ TEST(ReadCatalog, PublishesTypedPropertyPostingCapability) {
   EXPECT_EQ(postings->front().vertex, vertex);
 }
 
+TEST(ReadCatalog, SeeksTypedPropertyRangeWithoutReturningNonMatches) {
+  ReadCatalogBuilder builder;
+  for (int64_t value : {-10, 0, 10, 20}) {
+    ASSERT_TRUE(builder.AddPropertyIndex(
+        PropertyId{8}, PropertyIndexPosting{
+            VertexRef{PartId{1}, VertexId{static_cast<uint64_t>(value + 11)}},
+            {ValidTime{0}, std::nullopt}, CommitSeq{1}, Value::Int64(value)})
+                    .ok());
+  }
+  auto catalog = std::move(builder).Finish();
+  ASSERT_TRUE(catalog.ok()) << catalog.status().ToString();
+  const auto matches = catalog.ValueOrDie()->SeekPropertyIndexRange(
+      PropertyId{8}, PropertyIndexOperator::kGreaterEqual, Value::Int64(10));
+  ASSERT_EQ(matches.size(), 2U);
+  EXPECT_EQ(matches[0].value, Value::Int64(10));
+  EXPECT_EQ(matches[1].value, Value::Int64(20));
+  const auto equal = catalog.ValueOrDie()->SeekPropertyIndexRange(
+      PropertyId{8}, PropertyIndexOperator::kEqual, Value::Int64(0));
+  ASSERT_EQ(equal.size(), 1U);
+  EXPECT_EQ(equal.front().value, Value::Int64(0));
+  const auto less = catalog.ValueOrDie()->SeekPropertyIndexRange(
+      PropertyId{8}, PropertyIndexOperator::kLess, Value::Int64(0));
+  ASSERT_EQ(less.size(), 1U);
+  EXPECT_EQ(less.front().value, Value::Int64(-10));
+}
+
 }  // namespace
 }  // namespace cedar::internal

@@ -151,7 +151,7 @@ Status ValidDirectory(const std::vector<ProjectionPageDirectoryEntry>& d, size_t
 }  // namespace
 
 StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, CompressionCodec codec) {
-  if (uint8_t(c.header.kind) < 1 || uint8_t(c.header.kind) > 4) return Status::InvalidArgument("projection", "invalid projection kind");
+  if (uint8_t(c.header.kind) < 1 || uint8_t(c.header.kind) > 5) return Status::InvalidArgument("projection", "invalid projection kind");
   if (codec != CompressionCodec::kNone && codec != CompressionCodec::kLz4) return Status::NotSupported("projection", "column codec is not a file codec");
   auto hr = ValidRange(c.header.entity_min, c.header.entity_max_exclusive, c.header.valid_from_min.value, c.header.valid_to_max); if (!hr.ok()) return hr;
   uint64_t previous_time = 0, previous_entity = 0;
@@ -206,7 +206,7 @@ StatusOr<ProjectionChain> DecodeProjectionPageImpl(const std::string& b, size_t 
                                                    std::optional<size_t> only_page) {
   if (b.size() < kHeaderBytes + 4 || b.compare(0, 8, "CDRPRJ1\0", 8) != 0) return Status::Corruption("projection", "bad magic or truncated file");
   size_t p = 8; uint32_t version = 0; if (!G32(b, &p, &version)) return Status::Corruption("projection", "truncated version"); if (version != 1) return Status::NotSupported("projection", "unknown format version"); if (p + 2 > b.size()) return Status::Corruption("projection", "truncated header");
-  auto kind = ProjectionKind(uint8_t(b[p++])); auto codec = CompressionCodec(uint8_t(b[p++])); if (uint8_t(kind) < 1 || uint8_t(kind) > 4) return Status::Corruption("projection", "invalid projection kind"); if (codec != CompressionCodec::kNone && codec != CompressionCodec::kLz4) return Status::NotSupported("projection", "column codec is not a file codec");
+  auto kind = ProjectionKind(uint8_t(b[p++])); auto codec = CompressionCodec(uint8_t(b[p++])); if (uint8_t(kind) < 1 || uint8_t(kind) > 5) return Status::Corruption("projection", "invalid projection kind"); if (codec != CompressionCodec::kNone && codec != CompressionCodec::kLz4) return Status::NotSupported("projection", "column codec is not a file codec");
   ProjectionChain c; c.header.kind = kind; uint64_t gen = 0, base = 0, emin = 0, emax = 0, from = 0, to = 0; uint32_t part = 0, schema = 0, count = 0; uint16_t prop = 0;
   if (!G64(b, &p, &gen) || !G64(b, &p, &base) || !G32(b, &p, &part) || !G16(b, &p, &prop) || !G32(b, &p, &schema) || !G64(b, &p, &emin) || !G64(b, &p, &emax) || !G64(b, &p, &from) || p >= b.size()) return Status::Corruption("projection", "truncated header");
   uint8_t has = uint8_t(b[p++]); if (has > 1 || !G64(b, &p, &to) || !G32(b, &p, &count)) return Status::Corruption("projection", "invalid header flag"); auto hr = ValidRange(emin, emax, from, has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt); if (!hr.ok()) return hr;

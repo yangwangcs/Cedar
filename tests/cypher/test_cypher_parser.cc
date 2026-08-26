@@ -67,6 +67,30 @@ TEST(CypherParserTest, ParsesConnectedMixedPathSequence) {
   EXPECT_EQ(parsed.ValueOrDie().patterns[1].max_hops, 2U);
 }
 
+TEST(CypherParserTest, ParsesPointReferenceAndLimit) {
+  const auto parsed = Parse(
+      "MATCH (v {part_id: 3, id: 42}) RETURN v LIMIT 10");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  ASSERT_EQ(parsed.ValueOrDie().patterns.size(), 1U);
+  EXPECT_EQ(parsed.ValueOrDie().patterns.front().source_part_id, 3U);
+  EXPECT_EQ(parsed.ValueOrDie().patterns.front().source_vertex_id, 42U);
+  EXPECT_EQ(parsed.ValueOrDie().limit_count, 10U);
+}
+
+TEST(CypherParserTest, ParsesTypedWherePredicates) {
+  auto parsed = Parse("MATCH (v) WHERE v.country = 'CN' AND v.load_mw >= 10 "
+                      "RETURN v LIMIT 5");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  ASSERT_EQ(parsed.ValueOrDie().predicates.size(), 2U);
+  EXPECT_EQ(parsed.ValueOrDie().predicates[0].variable, "v");
+  EXPECT_EQ(parsed.ValueOrDie().predicates[0].property, "country");
+  EXPECT_EQ(parsed.ValueOrDie().predicates[0].literal, "CN");
+  EXPECT_EQ(parsed.ValueOrDie().predicates[1].op,
+            PredicateOperator::kGreaterEqual);
+  ASSERT_TRUE(parsed.ValueOrDie().limit_count.has_value());
+  EXPECT_EQ(*parsed.ValueOrDie().limit_count, 5U);
+}
+
 TEST(CypherParserTest, RejectsMalformedMixedPathSequence) {
   const auto parsed = Parse("MATCH (a)-[e:KNOWS]->(b)-[f:LIKES*1..2 RETURN a");
   EXPECT_FALSE(parsed.ok());

@@ -53,6 +53,12 @@ class ReadCatalog final : public SchemaProvider {
   const std::vector<PropertyIndexPosting>* SeekPropertyIndex(
       PropertyId property, PropertyIndexOperator op, const Value& lower,
       const std::optional<Value>& upper = std::nullopt) const;
+  // Returns the immutable posting slice matching the typed predicate. The
+  // result is copied so callers can safely retain it across catalog reads;
+  // lookup itself uses binary-search bounds over the sorted posting vector.
+  std::vector<PropertyIndexPosting> SeekPropertyIndexRange(
+      PropertyId property, PropertyIndexOperator op, const Value& lower,
+      const std::optional<Value>& upper = std::nullopt) const;
   const CoverageRegion* FindCoverage(const ReadCatalogKey&, uint64_t entity_min,
                                      uint64_t entity_max_exclusive,
                                      const ValidTimeInterval&) const;

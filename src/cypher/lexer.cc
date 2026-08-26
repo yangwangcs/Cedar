@@ -71,7 +71,13 @@ StatusOr<std::vector<Token>> Lex(const std::string& source,
     } else {
       const char symbol = static_cast<char>(c);
       ++cursor;
-      if (symbol == '.' && cursor < source.size() && source[cursor] == '.') {
+      if ((symbol == '<' || symbol == '>') && cursor < source.size() &&
+          source[cursor] == '=') {
+        ++cursor;
+        tokens.push_back({TokenKind::kSymbol,
+                          std::string{symbol, '='},
+                          {static_cast<uint32_t>(start), 2}});
+      } else if (symbol == '.' && cursor < source.size() && source[cursor] == '.') {
         ++cursor;
         tokens.push_back({TokenKind::kSymbol, "..", {static_cast<uint32_t>(start), 2}});
       } else {

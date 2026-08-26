@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <functional>
 
 #include "cedar/fact/canonical_reader.h"
 #include "cedar/fact/read_spec.h"
@@ -40,6 +41,10 @@ struct QueryReadContext {
   // validation. It is never used to broaden an unbounded scan.
   std::optional<uint64_t> max_rows;
   std::optional<CommitSeqRange> system_time_range;
+  // Optional profile hooks keep the canonical reader independent from query
+  // execution state while still exposing physical read decisions.
+  std::function<void()> on_point_read;
+  std::function<void()> on_limit_early_stop;
 };
 
 }  // namespace cedar::internal

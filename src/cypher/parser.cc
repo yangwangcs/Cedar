@@ -53,6 +53,8 @@ class Parser {
       if (Match("TRAIL")) {
         for (auto& pattern : statement.patterns) pattern.trail = true;
       }
+      status = ParsePredicates(&statement);
+      if (!status.ok()) return status;
       auto projections = ParseReturn(&statement);
       if (!projections.ok()) return projections.status();
     } else if (Match("CREATE")) {
@@ -143,7 +145,8 @@ class Parser {
 
   Status ParsePatterns(Statement* statement) {
     while (!AtEnd() && !PeekKeyword("RETURN") && !PeekKeyword("TRAIL") &&
-           !PeekKeyword("SET") && !PeekKeyword("DELETE")) {
+           !PeekKeyword("SET") && !PeekKeyword("DELETE") &&
+           !PeekKeyword("WHERE")) {
       auto pattern = ParsePattern();
       if (!pattern.ok()) return pattern.status();
       statement->patterns.push_back(std::move(pattern.ValueOrDie()));
@@ -155,6 +158,38 @@ class Parser {
       if (!Symbol(",")) break;
     }
     if (statement->patterns.empty()) return Error("expected graph pattern");
+    return Status::OK();
+  }
+
+  Status ParsePredicates(Statement* statement) {
+    if (!Match("WHERE")) return Status::OK();
+    while (true) {
+      const uint32_t start = Peek().span.offset;
+      auto variable = Identifier("expected predicate variable");
+      if (!variable.ok() || !Symbol(".")) return Error("expected predicate property");
+      auto property = Identifier("expected predicate property");
+      if (!property.ok()) return property.status();
+      Predicate predicate;
+      predicate.variable = variable.ValueOrDie();
+      predicate.property = property.ValueOrDie();
+      predicate.span = {start, 0};
+      if (Symbol("=")) predicate.op = PredicateOperator::kEqual;
+      else if (Symbol("<")) predicate.op = PredicateOperator::kLess;
+      else if (Symbol("<=")) predicate.op = PredicateOperator::kLessEqual;
+      else if (Symbol(">")) predicate.op = PredicateOperator::kGreater;
+      else if (Symbol(">=")) predicate.op = PredicateOperator::kGreaterEqual;
+      else return Error("expected predicate comparison operator");
+      if (Peek().kind == TokenKind::kString || Peek().kind == TokenKind::kInteger) {
+        predicate.literal = Advance().text;
+      } else if (Peek().kind == TokenKind::kParameter) {
+        predicate.parameter = Advance().text;
+      } else {
+        return Error("expected predicate literal or parameter");
+      }
+      predicate.span.length = static_cast<uint32_t>(Peek().span.offset - start);
+      statement->predicates.push_back(std::move(predicate));
+      if (!Match("AND")) break;
+    }
     return Status::OK();
   }
 
@@ -209,6 +244,16 @@ class Parser {
     auto source = Identifier("expected source variable");
     if (!source.ok()) return source.status();
     pattern.source = source.ValueOrDie();
+    if (Symbol("{")) {
+      if (!Match("PART_ID") || !Symbol(":")) return Error("expected part_id in vertex reference");
+      auto part = Integer("expected part_id");
+      if (!part.ok() || part.ValueOrDie() > UINT32_MAX || !Symbol(",") ||
+          !Match("ID") || !Symbol(":")) return Error("invalid vertex reference");
+      auto id = Integer("expected vertex id");
+      if (!id.ok() || id.ValueOrDie() == 0 || !Symbol("}")) return Error("invalid vertex reference");
+      pattern.source_part_id = static_cast<uint32_t>(part.ValueOrDie());
+      pattern.source_vertex_id = id.ValueOrDie();
+    }
     if (Symbol(":")) {
       auto label = Identifier("expected source label");
       if (!label.ok()) return label.status();
@@ -262,7 +307,8 @@ class Parser {
 
   StatusOr<bool> ParseReturn(Statement* statement) {
     if (!Match("RETURN")) return Error("expected RETURN");
-    while (!AtEnd() && !PeekKeyword("SET") && !PeekKeyword("DELETE")) {
+    while (!AtEnd() && !PeekKeyword("SET") && !PeekKeyword("DELETE") &&
+           !PeekKeyword("LIMIT")) {
       const Token start = Peek();
       auto expression = Identifier("expected return expression");
       if (!expression.ok()) return expression.status();
@@ -279,6 +325,13 @@ class Parser {
       if (!Symbol(",")) break;
     }
     if (statement->projections.empty()) return Error("expected return projection");
+    if (Match("LIMIT")) {
+      auto count = Integer("expected LIMIT count");
+      if (!count.ok() || count.ValueOrDie() > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return Error("invalid LIMIT count");
+      }
+      statement->limit_count = static_cast<size_t>(count.ValueOrDie());
+    }
     return true;
   }
 

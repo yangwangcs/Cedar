@@ -69,5 +69,17 @@ TEST(CypherBinderTest, RejectsGraphAndPropertyMismatches) {
   EXPECT_TRUE(Bind(unknown.ValueOrDie(), Catalog(), options).status().IsBindError());
 }
 
+TEST(CypherBinderTest, BindsTypedWherePredicatesToSchemaProperties) {
+  const auto parsed = Parse("MATCH (v) WHERE v.name = 'CN' RETURN v");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  const auto bound = Bind(parsed.ValueOrDie(), Catalog(), BinderOptions{});
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  ASSERT_EQ(bound.ValueOrDie().predicates.size(), 1U);
+  EXPECT_EQ(bound.ValueOrDie().predicates.front().property_id, PropertyId{7});
+  EXPECT_EQ(bound.ValueOrDie().predicates.front().physical_type,
+            PhysicalType::kString);
+  EXPECT_EQ(bound.ValueOrDie().predicates.front().literal, "CN");
+}
+
 }  // namespace
 }  // namespace cedar::cypher

@@ -21,6 +21,20 @@ TEST(CypherCompilerTest, LowersVertexScanAndChangesToCedarQuery) {
   EXPECT_EQ(query.ValueOrDie().schema().columns().front().name, "v");
 }
 
+TEST(CypherCompilerTest, LowersWhereToSharedCedarPropertyBindingAndFilter) {
+  SchemaCatalog catalog;
+  ASSERT_TRUE(catalog.Add(PropertyDefinition{
+      PropertyId{7}, 1, "country", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 64}).ok());
+  const auto parsed = Parse("MATCH (v) WHERE v.country = 'CN' RETURN v");
+  ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+  const auto bound = Bind(parsed.ValueOrDie(), catalog, BinderOptions{});
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto query = Compile(bound.ValueOrDie());
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  EXPECT_EQ(query.ValueOrDie().schema().columns().size(), 1U);
+}
+
 TEST(CypherCompilerTest, LowersBoundedPathToExistingExpandOperator) {
   const auto query = Compile(Bound(
       "MATCH (a)-[e:KNOWS*1..3]->(b) RETURN a, e, b"));

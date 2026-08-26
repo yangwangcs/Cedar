@@ -318,6 +318,11 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
           return Status::OK();
         });
     if (!status.ok()) return status;
+    if (context.on_limit_early_stop &&
+        context.max_rows.has_value() &&
+        bounded.size() >= *context.max_rows && *context.max_rows != 0) {
+      context.on_limit_early_stop();
+    }
     return bounded;
   }
   auto rows = Materialize(context.facts, context.snapshot_seq, family, property,

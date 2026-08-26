@@ -72,6 +72,27 @@ std::shared_ptr<const internal::ExpressionNode> MakeGreaterThanExpression(
                     std::move(right));
 }
 
+std::shared_ptr<const internal::ExpressionNode> MakeGreaterThanOrEqualExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kGreaterThanOrEqual,
+                    std::move(left), std::move(right));
+}
+
+std::shared_ptr<const internal::ExpressionNode> MakeLessThanExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kLessThan, std::move(left),
+                    std::move(right));
+}
+
+std::shared_ptr<const internal::ExpressionNode> MakeLessThanOrEqualExpression(
+    std::shared_ptr<const internal::ExpressionNode> left,
+    std::shared_ptr<const internal::ExpressionNode> right) {
+  return MakeBinary(internal::ExpressionKind::kLessThanOrEqual,
+                    std::move(left), std::move(right));
+}
+
 std::shared_ptr<const internal::ExpressionNode> MakeAndExpression(
     std::shared_ptr<const internal::ExpressionNode> left,
     std::shared_ptr<const internal::ExpressionNode> right) {

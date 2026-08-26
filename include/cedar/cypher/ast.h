@@ -30,12 +30,26 @@ struct PathPattern {
   uint32_t min_hops = 1;
   uint32_t max_hops = 1;
   bool trail = false;
+  std::optional<uint32_t> source_part_id;
+  std::optional<uint64_t> source_vertex_id;
   SourceSpan span;
 };
 
 struct ProjectionItem {
   std::string expression;
   std::string function;
+  SourceSpan span;
+};
+
+enum class PredicateOperator : uint8_t { kEqual, kLess, kLessEqual,
+                                         kGreater, kGreaterEqual };
+
+struct Predicate {
+  std::string variable;
+  std::string property;
+  PredicateOperator op = PredicateOperator::kEqual;
+  std::optional<std::string> literal;
+  std::optional<std::string> parameter;
   SourceSpan span;
 };
 
@@ -57,7 +71,9 @@ struct Statement {
   std::optional<TimeScope> system_time;
   bool changes = false;
   std::vector<PathPattern> patterns;
+  std::vector<Predicate> predicates;
   std::vector<ProjectionItem> projections;
+  std::optional<size_t> limit_count;
   std::vector<std::string> parameters;
   std::vector<Assignment> assignments;
   std::vector<std::string> deletions;

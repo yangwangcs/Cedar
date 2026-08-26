@@ -100,7 +100,7 @@ Status ValidateProjectionManifest(const ProjectionManifest& m, const std::string
     if (fingerprint.empty() || !fingerprints.insert(fingerprint).second) return Status::Corruption("projection manifest", "duplicate or empty schema fingerprint");
   }
   for (const auto& r : m.regions) {
-    if (uint8_t(r.kind) < 1 || uint8_t(r.kind) > 4 || r.entity_max_exclusive <= r.entity_min || !r.valid_time.Validate().ok()) return Status::Corruption("projection manifest", "invalid coverage range");
+    if (uint8_t(r.kind) < 1 || uint8_t(r.kind) > 5 || r.entity_max_exclusive <= r.entity_min || !r.valid_time.Validate().ok()) return Status::Corruption("projection manifest", "invalid coverage range");
     std::vector<std::pair<uint64_t,uint64_t>> ranges;
     for (const auto& s : r.segments) {
       if (s.segment_id.empty() || !ids.insert(s.segment_id).second || s.filename.empty() || s.filename.find("..") != std::string::npos || s.filename.front() == '/') return Status::Corruption("projection manifest", "invalid or duplicate segment");

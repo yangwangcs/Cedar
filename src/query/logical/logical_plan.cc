@@ -98,6 +98,21 @@ std::shared_ptr<const internal::LogicalPlanNode> MakeScopedScan(
                 std::move(payload));
 }
 
+std::shared_ptr<const internal::LogicalPlanNode> MakeScopedPoint(
+    VertexRef ref, RowColumn column, TemporalScope scope) {
+  RowSchema schema({column});
+  internal::LogicalPlanPayload point_payload;
+  point_payload.point_ref = ref;
+  const auto point = std::make_shared<const internal::LogicalPlanNode>(
+      internal::LogicalOpKind::kVertexPointLookup, schema,
+      std::vector<std::shared_ptr<const internal::LogicalPlanNode>>{},
+      std::move(point_payload));
+  internal::LogicalPlanPayload temporal_payload;
+  temporal_payload.scope = std::move(scope);
+  return Append(TemporalKind(*temporal_payload.scope), point,
+                std::move(schema), std::move(temporal_payload));
+}
+
 Status ValidateExpressionSlots(const internal::ExpressionNode& expression,
                                const RowSchema& schema,
                                std::unordered_map<uint32_t, QueryType>&
@@ -141,6 +156,18 @@ StatusOr<Query> Query::Vertices(Slot<VertexRef> vertex, TemporalScope scope) {
   return Query(MakeScopedScan(internal::LogicalOpKind::kVertexScan,
                               {vertex.id(), vertex.name(), vertex.type(), false},
                               std::move(scope)));
+}
+
+StatusOr<Query> Query::VertexPoint(VertexRef ref, Slot<VertexRef> vertex,
+                                   TemporalScope scope) {
+  if (!ref.valid() || vertex.id().value == 0) {
+    return Status::InvalidArgument("vertex point lookup",
+                                   "vertex reference or SlotId is invalid");
+  }
+  if (Status status = ValidateScope(scope); !status.ok()) return status;
+  return Query(MakeScopedPoint(
+      ref, {vertex.id(), vertex.name(), vertex.type(), false},
+      std::move(scope)));
 }
 
 StatusOr<Query> Query::Edges(Slot<EdgeRef> edge, TemporalScope scope) {

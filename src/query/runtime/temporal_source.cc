@@ -296,6 +296,30 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
 StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     ValidTime valid_time) {
+  // A state-row cap is only safe for the planner-proven direct canonical
+  // shape. System-time overlays require predecessor context and stay on the
+  // existing complete chain path.
+  if (context.max_rows.has_value() && !context.system_time_range.has_value()) {
+    CanonicalStateReadSpec spec;
+    spec.facts.part_scope = context.part_scope;
+    spec.facts.family = family;
+    spec.facts.property_id = property;
+    spec.facts.batch_row_limit = 1024;
+    spec.snapshot_seq = context.snapshot_seq;
+    spec.valid_time = valid_time;
+    spec.max_rows = context.max_rows;
+    std::vector<StateRow> bounded;
+    const Status status = context.facts.ReadStateRows(
+        spec, [&bounded](const std::vector<CanonicalStateRow>& batch) {
+          bounded.reserve(bounded.size() + batch.size());
+          for (const CanonicalStateRow& row : batch) {
+            bounded.push_back({row.ref, row.effective, row.value});
+          }
+          return Status::OK();
+        });
+    if (!status.ok()) return status;
+    return bounded;
+  }
   auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
                           std::nullopt, context.part_scope, context.chain_cache,
                           context.system_time_range);

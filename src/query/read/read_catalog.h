@@ -25,6 +25,17 @@ struct ReadCatalogKey {
   bool operator==(const ReadCatalogKey&) const = default;
 };
 
+enum class PropertyIndexOperator : uint8_t {
+  kEqual, kLess, kLessEqual, kGreater, kGreaterEqual
+};
+
+struct PropertyIndexPosting {
+  VertexRef vertex;
+  ValidTimeInterval effective;
+  CommitSeq commit_seq;
+  Value value;
+};
+
 class ReadCatalog final : public SchemaProvider {
  public:
   std::string Fingerprint() const override;
@@ -39,6 +50,9 @@ class ReadCatalog final : public SchemaProvider {
   const std::vector<EdgeIdentity>* SeekAdjacency(
       const VertexRef&, ExpandDirection direction = ExpandDirection::kOut,
       std::optional<uint64_t> edge_type = std::nullopt) const;
+  const std::vector<PropertyIndexPosting>* SeekPropertyIndex(
+      PropertyId property, PropertyIndexOperator op, const Value& lower,
+      const std::optional<Value>& upper = std::nullopt) const;
   const CoverageRegion* FindCoverage(const ReadCatalogKey&, uint64_t entity_min,
                                      uint64_t entity_max_exclusive,
                                      const ValidTimeInterval&) const;
@@ -85,6 +99,7 @@ class ReadCatalog final : public SchemaProvider {
   std::unordered_map<uint16_t, PropertyDefinition> properties_by_id_;
   std::unordered_map<NameKey, PropertyDefinition, NameHash> properties_by_name_;
   std::unordered_map<AdjacencyKey, std::vector<EdgeIdentity>, AdjacencyHash> adjacency_;
+  std::unordered_map<uint16_t, std::vector<PropertyIndexPosting>> property_indexes_;
   std::vector<std::pair<ReadCatalogKey, CoverageRegion>> coverage_;
   uint64_t total_segment_count_ = 0;
 };
@@ -95,6 +110,7 @@ class ReadCatalogBuilder {
   Status AddAdjacency(const VertexRef&, EdgeIdentity,
                       ExpandDirection direction = ExpandDirection::kOut,
                       std::optional<uint64_t> edge_type = std::nullopt);
+  Status AddPropertyIndex(PropertyId property, PropertyIndexPosting posting);
   Status AddCoverage(ReadCatalogKey, CoverageRegion);
   StatusOr<std::shared_ptr<const ReadCatalog>> Finish() &&;
 

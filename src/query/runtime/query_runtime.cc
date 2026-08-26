@@ -357,6 +357,31 @@ StatusOr<std::vector<RuntimeRow>> ReadSourceRows(
     result.push_back(std::move(row));
     return Status::OK();
   };
+  if (plan.point_ref.has_value()) {
+    const auto* at = std::get_if<At>(&plan.scope);
+    if (at == nullptr) {
+      return Status::NotSupported("query runtime",
+                                  "VertexPoint currently requires an At scope");
+    }
+    FactReadSpec spec;
+    spec.part_scope = PartScope::Exact(plan.point_ref->part_id);
+    spec.family = FactFamily::kVertexState;
+    spec.entity_range = EntityRange{plan.point_ref->vertex_id.value,
+                                    plan.point_ref->vertex_id.value + 1};
+    auto event = context.facts.ReadStateAt(spec, at->time, context.snapshot_seq);
+    if (!event.ok()) return event.status();
+    if (event.ValueOrDie().has_value() &&
+        event.ValueOrDie()->operation == FactOperation::kPut) {
+      const FactEvent& visible = *event.ValueOrDie();
+      if (Status status = append({visible.ref,
+                                  ValidTimeInterval{visible.valid_from, std::nullopt},
+                                  at->time, std::nullopt});
+          !status.ok()) {
+        return status;
+      }
+    }
+    return result;
+  }
   auto rows = std::visit(
       [&](const auto& scope) -> StatusOr<std::vector<RuntimeRow>> {
         using T = std::decay_t<decltype(scope)>;
@@ -1849,6 +1874,28 @@ void QueryExecutionState::RecordLimitEarlyStop() {
   ++profile_.complexity.limit_early_stops;
 }
 
+void QueryExecutionState::RecordPointRead() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.point_reads;
+}
+
+void QueryExecutionState::RecordPropertyIndexSeek(uint64_t candidates) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.property_index_seeks;
+  profile_.complexity.property_index_candidates += candidates;
+}
+
+void QueryExecutionState::RecordAdjacencyIndexSeek() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.adjacency_index_seeks;
+}
+
+void QueryExecutionState::RecordCanonicalFallback(uint64_t rows_decoded) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++profile_.complexity.canonical_fallbacks;
+  profile_.complexity.canonical_rows_decoded += rows_decoded;
+}
+
 void QueryExecutionState::RecordMaterializationBytes(uint64_t bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
   profile_.complexity.materialization_bytes += bytes;
@@ -2592,6 +2639,12 @@ StatusOr<PreparedQueryPlan> AnalyzeQuery(const Query& query) {
   }
   if (scan.kind() == LogicalOpKind::kVertexScan) {
     plan.entity_family = FactFamily::kVertexState;
+  } else if (scan.kind() == LogicalOpKind::kVertexPointLookup) {
+    plan.entity_family = FactFamily::kVertexState;
+    plan.point_ref = scan.point_ref();
+    if (!plan.point_ref.has_value()) {
+      return Status::Corruption("query planner", "point source has no VertexRef");
+    }
   } else if (scan.kind() == LogicalOpKind::kEdgeScan) {
     plan.entity_family = FactFamily::kEdgeState;
   } else {

@@ -21,6 +21,7 @@ namespace cedar::internal {
 
 enum class PhysicalOpKind : uint8_t {
   kCanonicalScan,
+  kPointRead,
   kProjectionScan,
   kDeltaMerge,
   kCanonicalFallback,
@@ -30,6 +31,7 @@ enum class PhysicalOpKind : uint8_t {
   kProject,
   kAggregate,
   kSort,
+  kStateStreamLimit,
 };
 
 enum class CoverageSource : uint8_t { kProjection, kCanonical, kDeltaMerge };

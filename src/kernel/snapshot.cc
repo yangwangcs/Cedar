@@ -11,6 +11,7 @@
 #include "cedar/fact/fact_codec.h"
 #include "kernel/database_impl.h"
 #include "query/runtime/graph_frontier.h"
+#include "query/temporal/state_reader.h"
 
 namespace cedar {
 namespace {
@@ -263,6 +264,8 @@ class Snapshot::State final : public CanonicalFactReader {
   StatusOr<std::optional<FactEvent>> ReadStateAt(
       const FactReadSpec& spec, ValidTime valid_time,
       CommitSeq snapshot_seq) const override;
+  Status ReadStateRows(const CanonicalStateReadSpec& spec,
+                       const CanonicalStateBatchVisitor& visitor) const override;
   Status ReadEvents(const FactReadSpec& spec,
                     const CanonicalFactBatchVisitor& visitor) const override;
   Status ReadColumnar(const FactReadSpec& spec,
@@ -361,6 +364,28 @@ StatusOr<std::optional<FactEvent>> Snapshot::State::ReadStateAt(
     return std::optional<FactEvent>{};
   }
   return event;
+}
+
+Status Snapshot::State::ReadStateRows(
+    const CanonicalStateReadSpec& spec,
+    const CanonicalStateBatchVisitor& visitor) const {
+  if (!visitor) return Status::InvalidArgument("canonical reader", "missing visitor");
+  Status status = spec.facts.Validate();
+  if (!status.ok()) return status;
+  if (spec.snapshot_seq.value > snapshot.commit_seq().value &&
+      spec.snapshot_seq.value != 0) {
+    return Status::InvalidArgument("canonical reader", "requested sequence exceeds snapshot");
+  }
+  if (spec.max_rows.has_value() && *spec.max_rows == 0) return Status::OK();
+  internal::StateRowStream stream(spec, visitor);
+  FactReadSpec events = spec.facts;
+  events.max_rows.reset();
+  status = ReadEvents(events, [&stream](const FactEventBatch& batch) {
+    return stream.Consume(batch);
+  });
+  if (status.IsQueryCancelled() && stream.limit_reached()) return Status::OK();
+  if (!status.ok()) return status;
+  return stream.Finish();
 }
 
 Status Snapshot::State::ReadEvents(
@@ -542,6 +567,10 @@ const CanonicalFactReader& Snapshot::canonical_reader() const {
      public:
       StatusOr<std::optional<FactEvent>> ReadStateAt(
           const FactReadSpec&, ValidTime, CommitSeq) const override {
+        return Status::InvalidArgument("snapshot", "moved-from snapshot");
+      }
+      Status ReadStateRows(const CanonicalStateReadSpec&,
+                           const CanonicalStateBatchVisitor&) const override {
         return Status::InvalidArgument("snapshot", "moved-from snapshot");
       }
       Status ReadEvents(const FactReadSpec&,

@@ -61,6 +61,21 @@ const std::vector<EdgeIdentity>* ReadCatalog::SeekAdjacency(
   return found == adjacency_.end() ? nullptr : &found->second;
 }
 
+const std::vector<PropertyIndexPosting>* ReadCatalog::SeekPropertyIndex(
+    PropertyId property, PropertyIndexOperator op, const Value& lower,
+    const std::optional<Value>& upper) const {
+  const auto found = property_indexes_.find(property.value);
+  if (found == property_indexes_.end()) return nullptr;
+  // The catalog owns immutable postings. Filter into a stable scratch-free
+  // view only when the builder has already materialized the requested range.
+  // Callers use this capability as a coverage probe; execution performs the
+  // typed comparison against each posting before canonical validation.
+  (void)op;
+  (void)lower;
+  (void)upper;
+  return &found->second;
+}
+
 const CoverageRegion* ReadCatalog::FindCoverage(
     const ReadCatalogKey& key, uint64_t entity_min, uint64_t entity_max_exclusive,
     const ValidTimeInterval& interval) const {
@@ -145,6 +160,18 @@ Status ReadCatalogBuilder::AddAdjacency(const VertexRef& vertex, EdgeIdentity ed
   return Status::OK();
 }
 
+Status ReadCatalogBuilder::AddPropertyIndex(PropertyId property,
+                                            PropertyIndexPosting posting) {
+  if (!property.valid() || !posting.vertex.valid()) {
+    return Status::InvalidArgument("read catalog", "invalid property index posting");
+  }
+  if (!posting.effective.Validate().ok()) {
+    return Status::InvalidArgument("read catalog", "invalid property index interval");
+  }
+  catalog_.property_indexes_[property.value].push_back(std::move(posting));
+  return Status::OK();
+}
+
 Status ReadCatalogBuilder::AddCoverage(ReadCatalogKey key, CoverageRegion region) {
   if (region.entity_max_exclusive <= region.entity_min || !region.valid_time.Validate().ok())
     return Status::InvalidArgument("read catalog", "invalid coverage range");
@@ -158,6 +185,17 @@ StatusOr<std::shared_ptr<const ReadCatalog>> ReadCatalogBuilder::Finish() && {
     (void)key;
     std::sort(edges.begin(), edges.end(), [](const EdgeIdentity& left, const EdgeIdentity& right) {
       return left.edge_id.value < right.edge_id.value;
+    });
+  }
+  for (auto& [property, postings] : catalog_.property_indexes_) {
+    (void)property;
+    std::sort(postings.begin(), postings.end(), [](const auto& left, const auto& right) {
+      const std::string left_value = left.value.Encode();
+      const std::string right_value = right.value.Encode();
+      if (left_value != right_value) return left_value < right_value;
+      if (left.vertex.part_id.value != right.vertex.part_id.value)
+        return left.vertex.part_id.value < right.vertex.part_id.value;
+      return left.vertex.vertex_id.value < right.vertex.vertex_id.value;
     });
   }
   std::sort(catalog_.coverage_.begin(), catalog_.coverage_.end(),

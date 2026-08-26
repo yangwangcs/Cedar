@@ -15,7 +15,7 @@
 namespace cedar::internal {
 
 enum class LogicalOpKind : uint8_t {
-  kVertexScan, kEdgeScan,
+  kVertexScan, kVertexPointLookup, kEdgeScan,
   kStateAt, kEventsBetween, kChangesBetween, kHistory,
   kStateOverlaps, kStateThroughout,
   kExpandOut, kExpandIn, kExpandBoth,
@@ -39,6 +39,7 @@ struct MetadataBinding {
 
 struct LogicalPlanPayload {
   std::optional<TemporalScope> scope;
+  std::optional<VertexRef> point_ref;
   std::optional<ExpandSpec> expand_spec;
   std::optional<PropertyBinding> property_binding;
   std::optional<MetadataBinding> metadata_binding;
@@ -62,6 +63,7 @@ class LogicalPlanNode {
   const RowSchema& schema() const { return schema_; }
   const std::vector<std::shared_ptr<const LogicalPlanNode>>& inputs() const { return inputs_; }
   const std::optional<TemporalScope>& scope() const { return payload_.scope; }
+  const std::optional<VertexRef>& point_ref() const { return payload_.point_ref; }
   const std::optional<ExpandSpec>& expand_spec() const {
     return payload_.expand_spec;
   }

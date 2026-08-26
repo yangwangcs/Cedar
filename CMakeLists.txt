@@ -66,6 +66,7 @@ add_library(cedar_core STATIC
     src/query/runtime/graph_frontier.cc
     src/query/runtime/journey.cc
     src/query/runtime/temporal_source.cc
+    src/query/temporal/state_reader.cc
     src/query/runtime/fact_chain_cursor.cc
     src/query/read/read_catalog.cc
     src/query/read/read_binding_capsule.cc

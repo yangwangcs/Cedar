@@ -115,5 +115,45 @@ TEST(CanonicalFactReader, MaxRowsBoundsCanonicalAndColumnarReaders) {
   database.ValueOrDie()->Close().IgnoreError();
 }
 
+TEST(CanonicalFactReader, StreamsVisibleStateRowsAndStopsAtStateLimit) {
+  char pattern[] = "/tmp/cedar_canonical_state_rows_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  for (uint64_t vertex_id = 1; vertex_id <= 4; ++vertex_id) {
+    auto transaction = database.ValueOrDie()->BeginTransaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(
+                                 VertexRef{PartId{1}, VertexId{vertex_id}}),
+                             ValidTime{10})
+                    .ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  }
+  auto snapshot = database.ValueOrDie()->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  CanonicalStateReadSpec spec;
+  spec.facts.part_scope = PartScope::Exact(PartId{1});
+  spec.facts.family = FactFamily::kVertexState;
+  spec.facts.entity_range = EntityRange{1, 5};
+  spec.facts.batch_row_limit = 2;
+  spec.valid_time = ValidTime{10};
+  spec.snapshot_seq = snapshot.ValueOrDie().commit_seq();
+  spec.max_rows = 2;
+  std::vector<CanonicalStateRow> rows;
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader()
+                  .ReadStateRows(spec, [&rows](const auto& batch) {
+                    rows.insert(rows.end(), batch.begin(), batch.end());
+                    return Status::OK();
+                  })
+                  .ok());
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0].ref.entity_id(), 1U);
+  EXPECT_EQ(rows[1].ref.entity_id(), 2U);
+  database.ValueOrDie()->Close().IgnoreError();
+}
+
 }  // namespace
 }  // namespace cedar

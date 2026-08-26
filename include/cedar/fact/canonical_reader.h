@@ -23,6 +23,9 @@ class CanonicalFactReader {
   virtual StatusOr<std::optional<FactEvent>> ReadStateAt(
       const FactReadSpec& spec, ValidTime valid_time,
       CommitSeq snapshot_seq) const = 0;
+  virtual Status ReadStateRows(
+      const CanonicalStateReadSpec& spec,
+      const CanonicalStateBatchVisitor& visitor) const = 0;
   virtual Status ReadEvents(const FactReadSpec& spec,
                             const CanonicalFactBatchVisitor& visitor) const = 0;
   virtual Status ReadColumnar(

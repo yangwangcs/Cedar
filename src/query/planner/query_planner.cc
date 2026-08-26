@@ -284,6 +284,7 @@ const char* SourceName(CoverageSource source) {
 const char* PhysicalName(PhysicalOpKind kind) {
   switch (kind) {
     case PhysicalOpKind::kCanonicalScan: return "canonical-scan";
+    case PhysicalOpKind::kPointRead: return "point-read";
     case PhysicalOpKind::kProjectionScan: return "projection-scan";
     case PhysicalOpKind::kDeltaMerge: return "delta-merge";
     case PhysicalOpKind::kCanonicalFallback: return "canonical-fallback";
@@ -293,6 +294,7 @@ const char* PhysicalName(PhysicalOpKind kind) {
     case PhysicalOpKind::kProject: return "project";
     case PhysicalOpKind::kAggregate: return "aggregate";
     case PhysicalOpKind::kSort: return "sort";
+    case PhysicalOpKind::kStateStreamLimit: return "state-stream-limit";
   }
   return "unknown";
 }
@@ -320,7 +322,8 @@ std::optional<CoverageRegion> MatchingRegion(const CoverageRegion& region,
   if (!ValidRange(region.valid_time)) return std::nullopt;
   const LogicalPlanNode* scan = &logical;
   while (!scan->inputs().empty()) scan = scan->inputs().front().get();
-  if (scan->kind() == LogicalOpKind::kVertexScan &&
+  if ((scan->kind() == LogicalOpKind::kVertexScan ||
+       scan->kind() == LogicalOpKind::kVertexPointLookup) &&
       region.kind != ProjectionKind::kState) return std::nullopt;
   if (scan->kind() == LogicalOpKind::kEdgeScan &&
       region.kind != ProjectionKind::kAdjacency &&
@@ -349,6 +352,12 @@ StatusOr<StaticPlanPreparation> QueryPlanner::PrepareStatic(
       [&prepared, &collect](const LogicalPlanNode& node) {
         switch (node.kind()) {
           case LogicalOpKind::kVertexScan:
+          case LogicalOpKind::kVertexPointLookup:
+            prepared.operations.push_back(
+                node.kind() == LogicalOpKind::kVertexPointLookup
+                    ? PhysicalOpKind::kPointRead
+                    : PhysicalOpKind::kCanonicalScan);
+            break;
           case LogicalOpKind::kEdgeScan:
           case LogicalOpKind::kStateAt:
           case LogicalOpKind::kEventsBetween:
@@ -431,10 +440,13 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   }
 
   std::vector<CoverageRegion> regions;
-  for (const auto& region : context.projections.regions) {
-    if (PartAllowed(context.part_scope, region.part_id) &&
-        MatchingRegion(region, logical)) {
-      regions.push_back(region);
+  const bool point_lookup = ContainsKind(logical, LogicalOpKind::kVertexPointLookup);
+  if (!point_lookup) {
+    for (const auto& region : context.projections.regions) {
+      if (PartAllowed(context.part_scope, region.part_id) &&
+          MatchingRegion(region, logical)) {
+        regions.push_back(region);
+      }
     }
   }
   std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
@@ -477,6 +489,8 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
   plan.spill_allowed = plan.lane == QueryExecutionMode::kAnalytical;
   if (SafeCanonicalLimit(logical)) {
     plan.safe_read_limit = *logical.limit_count();
+    plan.operations.push_back(PhysicalOpKind::kStateStreamLimit);
+    plan.pushdowns.push_back("unordered-limit");
   }
 
   uint64_t cursor = requested->from.value;
@@ -655,6 +669,7 @@ StatusOr<PhysicalPlan> QueryPlanner::Bind(const LogicalPlanNode& logical,
                                         ? PhysicalOpKind::kDeltaMerge
                                         : PhysicalOpKind::kCanonicalFallback);
   }
+  if (point_lookup) plan.operations.push_back(PhysicalOpKind::kPointRead);
   CollectPushdowns(logical, &plan);
   if (plan.lane == QueryExecutionMode::kInteractive && plan.coverage_slices.size() > 1) {
     plan.has_lane_exchange = true;

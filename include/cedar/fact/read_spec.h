@@ -145,6 +145,25 @@ struct FactReadSpec {
   }
 };
 
+// A state-row read is distinct from an event read: max_rows counts visible
+// entities after version-chain reduction, not raw canonical events.
+struct CanonicalStateReadSpec {
+  FactReadSpec facts;
+  ValidTime valid_time;
+  CommitSeq snapshot_seq;
+  std::optional<uint64_t> max_rows;
+};
+
+struct CanonicalStateRow {
+  FactRef ref;
+  ValidTimeInterval effective;
+  CommitSeq commit_seq;
+  std::optional<Value> value;
+};
+
+using CanonicalStateBatchVisitor =
+    std::function<Status(const std::vector<CanonicalStateRow>&)>;
+
 struct ExecutionScope {
   PartScope part_scope = PartScope::All();
   std::optional<CommitSeq> system_time_as_of;

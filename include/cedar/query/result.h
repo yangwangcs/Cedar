@@ -220,6 +220,12 @@ struct QueryComplexityCounters {
   uint64_t spill_partition_rebuilds = 0;
   uint64_t limit_early_stops = 0;
   uint64_t materialization_bytes = 0;
+  uint64_t point_reads = 0;
+  uint64_t property_index_seeks = 0;
+  uint64_t property_index_candidates = 0;
+  uint64_t adjacency_index_seeks = 0;
+  uint64_t canonical_fallbacks = 0;
+  uint64_t canonical_rows_decoded = 0;
 };
 
 struct QueryOperatorProfile {
@@ -282,6 +288,10 @@ class QueryExecutionState {
   void RecordPageDirectory(bool hit, uint64_t pages_pruned);
   void RecordSpillPartitionRead(bool rebuilt);
   void RecordLimitEarlyStop();
+  void RecordPointRead();
+  void RecordPropertyIndexSeek(uint64_t candidates);
+  void RecordAdjacencyIndexSeek();
+  void RecordCanonicalFallback(uint64_t rows_decoded = 0);
   void RecordMaterializationBytes(uint64_t bytes);
   void SetMetrics(internal::QueryMetrics* metrics) { metrics_ = metrics; }
 

@@ -67,6 +67,7 @@ struct PreparedQueryPlan {
       : canonical_temporal(other.canonical_temporal),
         entity_family(other.entity_family),
         entity_slot(other.entity_slot),
+        point_ref(other.point_ref),
         scope(other.scope),
         execution_scope(other.execution_scope),
         property_bindings(other.property_bindings),
@@ -102,6 +103,7 @@ struct PreparedQueryPlan {
     canonical_temporal = other.canonical_temporal;
     entity_family = other.entity_family;
     entity_slot = other.entity_slot;
+    point_ref = other.point_ref;
     scope = other.scope;
     execution_scope = other.execution_scope;
     property_bindings = other.property_bindings;
@@ -142,6 +144,7 @@ struct PreparedQueryPlan {
   bool canonical_temporal = false;
   FactFamily entity_family = FactFamily::kVertexState;
   SlotId entity_slot;
+  std::optional<VertexRef> point_ref;
   TemporalScope scope = At{ValidTime{0}};
   ExecutionScope execution_scope;
   std::vector<PreparedPropertyBinding> property_bindings;

@@ -21,6 +21,7 @@
 #include "kernel/epoch_completion.h"
 #include "kernel/temporal_validation.h"
 #include "kernel/transaction_mutation.h"
+#include "query/temporal/state_reader.h"
 
 namespace cedar {
 
@@ -147,6 +148,20 @@ class TransactionOverlayReader final : public CanonicalFactReader {
       }
     }
     return winner;
+  }
+
+  Status ReadStateRows(const CanonicalStateReadSpec& spec,
+                       const CanonicalStateBatchVisitor& visitor) const override {
+    if (!visitor) return Status::InvalidArgument("transaction overlay", "missing visitor");
+    if (!include_staged_) return base_.canonical_reader().ReadStateRows(spec, visitor);
+    if (spec.max_rows.has_value() && *spec.max_rows == 0) return Status::OK();
+    internal::StateRowStream stream(spec, visitor);
+    Status status = ReadEvents(spec.facts, [&stream](const FactEventBatch& batch) {
+      return stream.Consume(batch);
+    });
+    if (status.IsQueryCancelled() && stream.limit_reached()) return Status::OK();
+    if (!status.ok()) return status;
+    return stream.Finish();
   }
 
   Status ReadEvents(const FactReadSpec& spec,

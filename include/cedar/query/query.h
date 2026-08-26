@@ -66,6 +66,8 @@ struct ExpandSpec {
 class Query {
  public:
   static StatusOr<Query> Vertices(Slot<VertexRef> vertex, TemporalScope scope);
+  static StatusOr<Query> VertexPoint(VertexRef ref, Slot<VertexRef> vertex,
+                                     TemporalScope scope);
   static StatusOr<Query> Edges(Slot<EdgeRef> edge, TemporalScope scope);
   StatusOr<Query> Expand(const ExpandSpec& spec) const;
   StatusOr<Query> KHopExpand(const ExpandSpec& spec, uint32_t max_hops) const;

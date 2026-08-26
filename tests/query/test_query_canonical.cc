@@ -263,6 +263,33 @@ TEST_F(QueryCanonicalTest, StreamsStateAtFromTheConsumedSnapshot) {
   EXPECT_FALSE(cursor.ValueOrDie().Next().ValueOrDie().has_value());
 }
 
+TEST_F(QueryCanonicalTest, VertexPointReadsOnlyTheRequestedPartitionAndEntity) {
+  ASSERT_EQ(AssertVertex(7, 10), CommitSeq{1});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::VertexPoint(VertexRef{PartId{0}, VertexId{7}}, vertex,
+                                   At{ValidTime{15}});
+  ASSERT_TRUE(source.ok()) << source.status().ToString();
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok()) << query.status().ToString();
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  auto explain = prepared.ValueOrDie().ExplainPhysical(
+      snapshot.ValueOrDie(), QueryOptions{});
+  ASSERT_TRUE(explain.ok()) << explain.status().ToString();
+  EXPECT_NE(explain.ValueOrDie().find("point-read"), std::string::npos);
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<VertexRef>(vertex, 0),
+            (VertexRef{PartId{0}, VertexId{7}}));
+}
+
 TEST_F(QueryCanonicalTest, PinsSnapshotUntilEndOfStreamOrExplicitClose) {
   ASSERT_EQ(AssertVertex(1, 10), CommitSeq{1});
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");

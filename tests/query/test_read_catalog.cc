@@ -63,5 +63,22 @@ TEST(ReadCatalog, ScalesSchemaLookupAndIndexesTypedAdjacency) {
   EXPECT_EQ(typed->size(), 1U);
 }
 
+TEST(ReadCatalog, PublishesTypedPropertyPostingCapability) {
+  ReadCatalogBuilder builder;
+  const VertexRef vertex{PartId{0}, VertexId{11}};
+  ASSERT_TRUE(builder.AddPropertyIndex(
+      PropertyId{7}, PropertyIndexPosting{vertex,
+                                          {ValidTime{0}, std::nullopt},
+                                          CommitSeq{9}, Value::String("CN")})
+                  .ok());
+  auto catalog = std::move(builder).Finish();
+  ASSERT_TRUE(catalog.ok()) << catalog.status().ToString();
+  const auto* postings = catalog.ValueOrDie()->SeekPropertyIndex(
+      PropertyId{7}, PropertyIndexOperator::kEqual, Value::String("CN"));
+  ASSERT_NE(postings, nullptr);
+  ASSERT_EQ(postings->size(), 1U);
+  EXPECT_EQ(postings->front().vertex, vertex);
+}
+
 }  // namespace
 }  // namespace cedar::internal

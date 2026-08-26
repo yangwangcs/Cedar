@@ -12,6 +12,10 @@ class RejectingReader final : public CanonicalFactReader {
       const FactReadSpec&, ValidTime, CommitSeq) const override {
     return Status::NotSupported("test reader", "not used");
   }
+  Status ReadStateRows(const CanonicalStateReadSpec&,
+                       const CanonicalStateBatchVisitor&) const override {
+    return Status::NotSupported("test reader", "not used");
+  }
   Status ReadEvents(const FactReadSpec& spec,
                     const CanonicalFactBatchVisitor&) const override {
     return spec.part_scope.kind == PartScopeKind::kAll

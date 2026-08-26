@@ -78,6 +78,7 @@ add_library(cedar_core STATIC
     src/query/projection/projection_format.cc
     src/query/projection/projection_manifest.cc
     src/query/projection/projection_store.cc
+    src/query/projection/property_index.cc
     src/query/projection/projection_page_reader.cc
     src/query/projection/query_delta.cc
     src/query/observability/query_metrics.cc

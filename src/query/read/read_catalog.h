@@ -34,6 +34,7 @@ struct PropertyIndexPosting {
   ValidTimeInterval effective;
   CommitSeq commit_seq;
   Value value;
+  bool operator==(const PropertyIndexPosting&) const = default;
 };
 
 class ReadCatalog final : public SchemaProvider {

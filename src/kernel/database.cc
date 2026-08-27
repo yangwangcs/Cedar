@@ -2264,10 +2264,11 @@ Status Database::AbortPreparedCommit(TxnId txn_id,
   auto terminal = impl_->store.ResolvePreparedDecision(txn_id);
   if (!terminal.ok()) return terminal.status();
   if (terminal.ValueOrDie().has_value()) {
-    return *terminal.ValueOrDie() == desired
-               ? Status::OK()
-               : Status::Conflict("prepared commit",
-                                  "terminal certificate differs");
+    if (*terminal.ValueOrDie() != desired) {
+      return Status::Conflict("prepared commit",
+                              "terminal certificate differs");
+    }
+    return impl_->store.AbortPreparedCommit(txn_id);
   }
   const Status persisted = impl_->store.PersistPreparedDecision(desired);
   if (!persisted.ok()) return persisted;

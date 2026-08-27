@@ -242,6 +242,47 @@ TEST(KernelPreparedCommitTest,
   std::filesystem::remove_all(path);
 }
 
+TEST(KernelPreparedCommitTest,
+     CertifiedAbortReplayFinishesInterruptedPreparedCleanup) {
+  char pattern[] = "/tmp/cedar_kernel_external_abort_replay_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  const StoreCommitBatch prepared{
+      TxnId{903}, 7003,
+      {{EntityFact::Vertex(VertexRef{PartId{0}, VertexId{93}}).ref(),
+        ValidTime{13}, FactOperation::kPut, 0, std::nullopt}}};
+  const StorePreparedDecision decision{
+      prepared.txn_id, StorePreparedDecisionOutcome::kAbort,
+      "txnd-abort-interrupted"};
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.PersistPreparedCommit(prepared).ok());
+    ASSERT_TRUE(store.PersistPreparedDecision(decision).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  DatabaseOptions options;
+  options.path = path;
+  options.prepared_commit_recovery =
+      PreparedCommitRecoveryPolicy::kAwaitExternalDecision;
+  auto opened = Database::Open(options);
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto still_prepared = database->ListPreparedCommits();
+  ASSERT_TRUE(still_prepared.ok()) << still_prepared.status().ToString();
+  ASSERT_EQ(still_prepared.ValueOrDie().size(), 1U);
+
+  ASSERT_TRUE(database
+                  ->AbortPreparedCommit(prepared.txn_id, decision.certificate)
+                  .ok());
+  auto cleaned = database->ListPreparedCommits();
+  ASSERT_TRUE(cleaned.ok()) << cleaned.status().ToString();
+  EXPECT_TRUE(cleaned.ValueOrDie().empty());
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 TEST(KernelAsyncCommitTest, UsesOneDurableWriteForIndependentAsyncCommits) {
   char pattern[] = "/tmp/cedar_kernel_async_group_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

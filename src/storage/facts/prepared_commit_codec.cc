@@ -14,6 +14,7 @@ namespace {
 constexpr uint8_t kRecordVersion = 1;
 constexpr uint8_t kPreparedRecord = 1;
 constexpr uint8_t kAbortedRecord = 2;
+constexpr uint8_t kPreparedDecisionRecord = 3;
 constexpr size_t kHeaderBytes = 6;
 constexpr size_t kChecksumBytes = 4;
 constexpr size_t kMaxPayloadBytes = 16U * 1024U * 1024U;
@@ -360,6 +361,54 @@ StatusOr<TxnId> DecodeAsyncAbortTerminal(const std::string& encoded) {
     return Status::Corruption("async terminal", "invalid aborted record");
   }
   return TxnId{txn_id};
+}
+
+StatusOr<std::string> EncodePreparedDecisionKey(TxnId txn_id) {
+  if (!txn_id.valid()) {
+    return Status::InvalidArgument("prepared decision", "zero transaction ID");
+  }
+  std::string key = "external/decision/";
+  AppendU64(&key, txn_id.value);
+  return key;
+}
+
+StatusOr<std::string> EncodePreparedDecision(
+    const StorePreparedDecision& decision) {
+  if (!decision.txn_id.valid() || decision.certificate.empty() ||
+      decision.certificate.size() > kMaxPayloadBytes - 13 ||
+      (decision.outcome != StorePreparedDecisionOutcome::kCommit &&
+       decision.outcome != StorePreparedDecisionOutcome::kAbort)) {
+    return Status::InvalidArgument("prepared decision", "invalid decision");
+  }
+  std::string payload;
+  AppendU64(&payload, decision.txn_id.value);
+  payload.push_back(static_cast<char>(decision.outcome));
+  AppendU32(&payload, static_cast<uint32_t>(decision.certificate.size()));
+  payload.append(decision.certificate);
+  return EncodeRecord(kPreparedDecisionRecord, payload);
+}
+
+StatusOr<StorePreparedDecision> DecodePreparedDecision(
+    const std::string& encoded) {
+  const auto decoded = DecodeRecord(kPreparedDecisionRecord, encoded);
+  if (!decoded.ok()) return decoded.status();
+  const std::string& payload = decoded.ValueOrDie();
+  size_t offset = 0;
+  uint64_t txn_id = 0;
+  uint32_t certificate_size = 0;
+  if (!ReadU64(payload, &offset, &txn_id) || offset == payload.size()) {
+    return Status::Corruption("prepared decision", "truncated decision");
+  }
+  const auto outcome = static_cast<StorePreparedDecisionOutcome>(
+      static_cast<uint8_t>(payload[offset++]));
+  if (!ReadU32(payload, &offset, &certificate_size) || certificate_size == 0 ||
+      certificate_size != payload.size() - offset || !TxnId{txn_id}.valid() ||
+      (outcome != StorePreparedDecisionOutcome::kCommit &&
+       outcome != StorePreparedDecisionOutcome::kAbort)) {
+    return Status::Corruption("prepared decision", "invalid decision");
+  }
+  return StorePreparedDecision{TxnId{txn_id}, outcome,
+                               payload.substr(offset, certificate_size)};
 }
 
 }  // namespace cedar::internal

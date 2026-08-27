@@ -115,6 +115,121 @@ TEST_F(KernelCommitTest, KeepsAsyncCommitHiddenUntilPublicationCompletes) {
                   .ValueOrDie());
 }
 
+TEST(KernelPreparedCommitTest,
+     ExternalDecisionRecoveryPreservesPreparedFactsUntilCertifiedFinalize) {
+  char pattern[] = "/tmp/cedar_kernel_external_prepare_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  const auto options = [&] {
+    DatabaseOptions value;
+    value.path = path;
+    value.prepared_commit_recovery =
+        PreparedCommitRecoveryPolicy::kAwaitExternalDecision;
+    return value;
+  };
+  const PreparedCommitBatch batch{
+      TxnId{901}, 7001,
+      {FactEvent{FactRef{PartId{0}, FactFamily::kVertexState, PropertyId{}, 91},
+                 ValidTime{11}, CommitSeq{1}, FactOperation::kPut, 0,
+                 std::nullopt, std::nullopt}}};
+
+  auto opened = Database::Open(options());
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  ASSERT_TRUE(database->PersistPreparedCommit(batch).ok());
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
+
+  opened = Database::Open(options());
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  database = std::move(opened).ConsumeValueOrDie();
+  const auto prepared = database->ListPreparedCommits();
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  ASSERT_EQ(prepared.ValueOrDie().size(), 1U);
+  EXPECT_EQ(prepared.ValueOrDie().front().txn_id, batch.txn_id);
+  auto hidden = database->BeginSnapshot();
+  ASSERT_TRUE(hidden.ok()) << hidden.status().ToString();
+  EXPECT_FALSE(hidden.ValueOrDie()
+                   .Exists(EntityFact::Vertex(
+                               VertexRef{PartId{0}, VertexId{91}}),
+                           ValidTime{11})
+                   .ValueOrDie());
+
+  const std::string certificate = "txnd=81;term=7;index=23";
+  const auto finalized =
+      database->FinalizePreparedCommit(batch.txn_id, certificate);
+  ASSERT_TRUE(finalized.ok()) << finalized.status().ToString();
+  EXPECT_EQ(finalized.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  const auto replay =
+      database->FinalizePreparedCommit(batch.txn_id, certificate);
+  ASSERT_TRUE(replay.ok()) << replay.status().ToString();
+  EXPECT_EQ(replay.ValueOrDie().commit_seq,
+            finalized.ValueOrDie().commit_seq);
+  EXPECT_TRUE(database
+                  ->FinalizePreparedCommit(batch.txn_id,
+                                           "txnd=81;term=8;index=23")
+                  .status()
+                  .IsConflict());
+  auto visible = database->BeginSnapshot();
+  ASSERT_TRUE(visible.ok()) << visible.status().ToString();
+  EXPECT_TRUE(visible.ValueOrDie()
+                  .Exists(EntityFact::Vertex(
+                              VertexRef{PartId{0}, VertexId{91}}),
+                          ValidTime{11})
+                  .ValueOrDie());
+  hidden = Status::InvalidArgument("test", "released");
+  visible = Status::InvalidArgument("test", "released");
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelPreparedCommitTest,
+     CertifiedAbortSurvivesReopenAndRejectsCommitCertificateSubstitution) {
+  char pattern[] = "/tmp/cedar_kernel_external_abort_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  DatabaseOptions options;
+  options.path = path;
+  options.prepared_commit_recovery =
+      PreparedCommitRecoveryPolicy::kAwaitExternalDecision;
+  const PreparedCommitBatch batch{
+      TxnId{902}, 7002,
+      {FactEvent{FactRef{PartId{0}, FactFamily::kVertexState, PropertyId{}, 92},
+                 ValidTime{12}, CommitSeq{1}, FactOperation::kPut, 0,
+                 std::nullopt, std::nullopt}}};
+
+  auto opened = Database::Open(options);
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  ASSERT_TRUE(database->PersistPreparedCommit(batch).ok());
+  ASSERT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-31").ok());
+  EXPECT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-31").ok());
+  EXPECT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-32")
+                  .IsConflict());
+  EXPECT_TRUE(database->FinalizePreparedCommit(batch.txn_id, "txnd-abort-31")
+                  .status()
+                  .IsConflict());
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
+
+  opened = Database::Open(options);
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  database = std::move(opened).ConsumeValueOrDie();
+  ASSERT_TRUE(database->ListPreparedCommits().ok());
+  EXPECT_TRUE(database->ListPreparedCommits().ValueOrDie().empty());
+  auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  EXPECT_FALSE(snapshot.ValueOrDie()
+                   .Exists(EntityFact::Vertex(
+                               VertexRef{PartId{0}, VertexId{92}}),
+                           ValidTime{12})
+                   .ValueOrDie());
+  snapshot = Status::InvalidArgument("test", "released");
+  EXPECT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-31").ok());
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 TEST(KernelAsyncCommitTest, UsesOneDurableWriteForIndependentAsyncCommits) {
   char pattern[] = "/tmp/cedar_kernel_async_group_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);

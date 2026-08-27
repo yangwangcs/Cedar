@@ -154,7 +154,8 @@ class Database::Impl {
     bool held_ = false;
   };
   explicit Impl(DatabaseOptions options)
-      : append_commit_max_batch_size(options.group_commit_max_batch_size),
+      : prepared_commit_recovery(options.prepared_commit_recovery),
+        append_commit_max_batch_size(options.group_commit_max_batch_size),
         append_commit_window_us(options.group_commit_window_us),
         append_commit_max_batch_bytes(options.group_commit_max_batch_bytes),
         append_commit_max_queue_requests(options.group_commit_max_queue_requests),
@@ -340,6 +341,8 @@ class Database::Impl {
   uint64_t next_edge_id = 0;
   uint64_t edge_lease_limit = 0;
   size_t active_commit_calls = 0;
+  PreparedCommitRecoveryPolicy prepared_commit_recovery =
+      PreparedCommitRecoveryPolicy::kFinalizeOnOpen;
   uint32_t append_commit_max_batch_size = 1;
   uint64_t append_commit_window_us = 0;
   uint64_t append_commit_max_batch_bytes = 2ULL * 1024ULL * 1024ULL;

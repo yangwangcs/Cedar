@@ -82,6 +82,58 @@ CommitResult ToCommitResult(TxnId txn_id,
                       CommitSeq{}, txn_id, status};
 }
 
+StatusOr<StoreCommitBatch> ToStorePreparedBatch(
+    const PreparedCommitBatch& batch) {
+  if (!batch.txn_id.valid() || batch.system_hlc == 0 || batch.events.empty()) {
+    return Status::InvalidArgument("prepared commit", "invalid batch");
+  }
+  StoreCommitBatch stored;
+  stored.txn_id = batch.txn_id;
+  stored.system_hlc = batch.system_hlc;
+  for (const FactEvent& event : batch.events) {
+    const Status valid = event.Validate();
+    if (!valid.ok()) return valid;
+    FactRef mutation_ref = event.ref;
+    if (event.ref.family() == FactFamily::kEdgeIdentity) {
+      if (!event.edge_identity.has_value()) {
+        return Status::InvalidArgument("prepared commit",
+                                       "edge identity is missing");
+      }
+      stored.edge_identities.push_back(*event.edge_identity);
+      mutation_ref = EntityFact::Edge(event.edge_identity->edge_ref()).ref();
+    }
+    stored.mutations.push_back(PendingFactMutation{
+        mutation_ref, event.valid_from, event.operation, event.schema_epoch,
+        event.value});
+  }
+  const Status valid = stored.Validate();
+  if (!valid.ok()) return valid;
+  return stored;
+}
+
+PreparedCommitBatch ToPublicPreparedBatch(const StoreCommitBatch& batch) {
+  PreparedCommitBatch prepared;
+  prepared.txn_id = batch.txn_id;
+  prepared.system_hlc = batch.system_hlc;
+  prepared.events.reserve(batch.mutations.size());
+  for (const PendingFactMutation& mutation : batch.mutations) {
+    std::optional<EdgeIdentity> identity;
+    if (mutation.ref.family() == FactFamily::kEdgeState) {
+      const auto found = std::find_if(
+          batch.edge_identities.begin(), batch.edge_identities.end(),
+          [&mutation](const EdgeIdentity& candidate) {
+            return candidate.edge_ref().home_part_id == mutation.ref.part_id() &&
+                   candidate.edge_ref().edge_id.value == mutation.ref.entity_id();
+          });
+      if (found != batch.edge_identities.end()) identity = *found;
+    }
+    prepared.events.push_back(FactEvent{
+        mutation.ref, mutation.valid_from, CommitSeq{1}, mutation.operation,
+        mutation.schema_epoch, mutation.value, std::move(identity)});
+  }
+  return prepared;
+}
+
 void CompleteCommitHandle(const std::shared_ptr<CommitHandle::State>& handle,
                           CommitResult result) {
   if (!handle) return;
@@ -1587,11 +1639,14 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
     impl->store.Close().IgnoreError();
     return prepared.status();
   }
-  for (const StoreCommitBatch& batch : prepared.ValueOrDie()) {
-    const auto finalized = impl->store.FinalizePreparedCommit(batch);
-    if (!finalized.ok()) {
-      impl->store.Close().IgnoreError();
-      return finalized.status();
+  if (impl->prepared_commit_recovery ==
+      PreparedCommitRecoveryPolicy::kFinalizeOnOpen) {
+    for (const StoreCommitBatch& batch : prepared.ValueOrDie()) {
+      const auto finalized = impl->store.FinalizePreparedCommit(batch);
+      if (!finalized.ok()) {
+        impl->store.Close().IgnoreError();
+        return finalized.status();
+      }
     }
   }
   if (impl->query_open_stage_observer_for_testing) {
@@ -2098,6 +2153,104 @@ StatusOr<std::optional<CommitResult>> Database::ResolveTransaction(
       stored.commit_seq, txn_id,
       stored.outcome == StoreAsyncCommitOutcome::kCommitted
           ? Status::OK() : Status::Conflict("async commit", "validation failed")}};
+}
+
+Status Database::PersistPreparedCommit(const PreparedCommitBatch& batch) {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed || impl_->closing) {
+    return Status::ShutdownInProgress("database", "database is closing");
+  }
+  auto terminal = impl_->store.ResolvePreparedDecision(batch.txn_id);
+  if (!terminal.ok()) return terminal.status();
+  if (terminal.ValueOrDie().has_value()) {
+    return Status::Conflict("prepared commit", "transaction is terminal");
+  }
+  auto stored = ToStorePreparedBatch(batch);
+  if (!stored.ok()) return stored.status();
+  return impl_->store.PersistPreparedCommit(stored.ValueOrDie());
+}
+
+StatusOr<std::vector<PreparedCommitBatch>> Database::ListPreparedCommits() const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed || impl_->closing) {
+    return Status::ShutdownInProgress("database", "database is closing");
+  }
+  auto stored = impl_->store.ListPreparedCommits();
+  if (!stored.ok()) return stored.status();
+  std::vector<PreparedCommitBatch> result;
+  result.reserve(stored.ValueOrDie().size());
+  for (const StoreCommitBatch& batch : stored.ValueOrDie()) {
+    result.push_back(ToPublicPreparedBatch(batch));
+  }
+  return result;
+}
+
+StatusOr<CommitResult> Database::FinalizePreparedCommit(
+    TxnId txn_id, std::string decision_certificate) {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  if (!txn_id.valid() || decision_certificate.empty()) {
+    return Status::InvalidArgument("prepared commit", "invalid terminal decision");
+  }
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed || impl_->closing) {
+    return Status::ShutdownInProgress("database", "database is closing");
+  }
+  const StorePreparedDecision desired{
+      txn_id, StorePreparedDecisionOutcome::kCommit,
+      std::move(decision_certificate)};
+  auto terminal = impl_->store.ResolvePreparedDecision(txn_id);
+  if (!terminal.ok()) return terminal.status();
+  if (terminal.ValueOrDie().has_value() &&
+      *terminal.ValueOrDie() != desired) {
+    return Status::Conflict("prepared commit", "terminal certificate differs");
+  }
+  if (!terminal.ValueOrDie().has_value()) {
+    const Status persisted = impl_->store.PersistPreparedDecision(desired);
+    if (!persisted.ok()) return persisted;
+  }
+  auto batches = impl_->store.ListPreparedCommits();
+  if (!batches.ok()) return batches.status();
+  const auto prepared = std::find_if(
+      batches.ValueOrDie().begin(), batches.ValueOrDie().end(),
+      [txn_id](const StoreCommitBatch& batch) { return batch.txn_id == txn_id; });
+  if (prepared != batches.ValueOrDie().end()) {
+    return ToCommitResult(txn_id,
+                          impl_->store.FinalizePreparedCommit(*prepared));
+  }
+  const auto committed = impl_->store.ResolveTransaction(txn_id);
+  if (!committed.ok()) return committed.status();
+  if (!committed.ValueOrDie().has_value()) {
+    return Status::NotFound("prepared commit", "transaction is not prepared");
+  }
+  return ToCommitResult(txn_id, *committed.ValueOrDie());
+}
+
+Status Database::AbortPreparedCommit(TxnId txn_id,
+                                     std::string decision_certificate) {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  if (!txn_id.valid() || decision_certificate.empty()) {
+    return Status::InvalidArgument("prepared commit", "invalid terminal decision");
+  }
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed || impl_->closing) {
+    return Status::ShutdownInProgress("database", "database is closing");
+  }
+  const StorePreparedDecision desired{
+      txn_id, StorePreparedDecisionOutcome::kAbort,
+      std::move(decision_certificate)};
+  auto terminal = impl_->store.ResolvePreparedDecision(txn_id);
+  if (!terminal.ok()) return terminal.status();
+  if (terminal.ValueOrDie().has_value()) {
+    return *terminal.ValueOrDie() == desired
+               ? Status::OK()
+               : Status::Conflict("prepared commit",
+                                  "terminal certificate differs");
+  }
+  const Status persisted = impl_->store.PersistPreparedDecision(desired);
+  if (!persisted.ok()) return persisted;
+  return impl_->store.AbortPreparedCommit(txn_id);
 }
 
 CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {

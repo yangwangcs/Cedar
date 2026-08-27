@@ -2240,6 +2240,85 @@ Status FactStore::AbortPreparedCommit(TxnId txn_id) {
   return Status::OK();
 }
 
+Status FactStore::PersistPreparedDecision(
+    const StorePreparedDecision& decision) {
+  const auto decision_key = internal::EncodePreparedDecisionKey(decision.txn_id);
+  const auto decision_value = internal::EncodePreparedDecision(decision);
+  if (!decision_key.ok()) return decision_key.status();
+  if (!decision_value.ok()) return decision_value.status();
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) {
+      return Status::InvalidArgument("prepared decision", "store is not open");
+    }
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  std::string existing;
+  const rocksdb::Status got = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, decision_key.ValueOrDie(),
+      &existing);
+  if (got.ok()) {
+    return existing == decision_value.ValueOrDie()
+               ? Status::OK()
+               : Status::Conflict("prepared decision",
+                                  "terminal certificate differs");
+  }
+  if (!got.IsNotFound()) return FromRocksDb(got, "read prepared decision");
+
+  const auto prepare_key = internal::EncodePreparedCommitKey(decision.txn_id);
+  if (!prepare_key.ok()) return prepare_key.status();
+  std::string prepared;
+  const rocksdb::Status got_prepare = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, prepare_key.ValueOrDie(),
+      &prepared);
+  if (got_prepare.IsNotFound()) {
+    return Status::NotFound("prepared decision", "transaction is not prepared");
+  }
+  if (!got_prepare.ok()) {
+    return FromRocksDb(got_prepare, "read prepared transaction");
+  }
+  rocksdb::WriteOptions options;
+  options.sync = true;
+  const rocksdb::Status written = store->db->Put(
+      options, store->meta_cf, decision_key.ValueOrDie(),
+      decision_value.ValueOrDie());
+  if (!written.ok()) {
+    const Status status = FromMetadataWriteFailure(written);
+    if (status.IsIndeterminate()) store->recovery_required = true;
+    return status;
+  }
+  return Status::OK();
+}
+
+StatusOr<std::optional<StorePreparedDecision>>
+FactStore::ResolvePreparedDecision(TxnId txn_id) const {
+  const auto key = internal::EncodePreparedDecisionKey(txn_id);
+  if (!key.ok()) return key.status();
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) {
+      return Status::InvalidArgument("prepared decision", "store is not open");
+    }
+  }
+  std::lock_guard<std::mutex> lock(store->publisher_mutex);
+  std::string encoded;
+  const rocksdb::Status got = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, key.ValueOrDie(), &encoded);
+  if (got.IsNotFound()) return std::optional<StorePreparedDecision>{};
+  if (!got.ok()) return FromRocksDb(got, "read prepared decision");
+  auto decoded = internal::DecodePreparedDecision(encoded);
+  if (!decoded.ok()) return decoded.status();
+  if (decoded.ValueOrDie().txn_id != txn_id) {
+    return Status::Corruption("prepared decision",
+                              "decision key disagrees with record");
+  }
+  return std::optional<StorePreparedDecision>{decoded.ValueOrDie()};
+}
+
 StatusOr<StoreCommitResult> FactStore::CommitGrouped(
     const StoreCommitBatch& batch, const std::optional<std::string>& prepared_key,
     bool sync) {

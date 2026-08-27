@@ -102,6 +102,20 @@ struct StoreCommitResult {
   constexpr bool operator==(const StoreCommitResult&) const = default;
 };
 
+enum class StorePreparedDecisionOutcome : uint8_t {
+  kCommit = 1,
+  kAbort = 2,
+};
+
+struct StorePreparedDecision {
+  TxnId txn_id;
+  StorePreparedDecisionOutcome outcome =
+      StorePreparedDecisionOutcome::kAbort;
+  std::string certificate;
+
+  bool operator==(const StorePreparedDecision&) const = default;
+};
+
 struct RocksDbRuntimeMetrics {
   enum class ColumnFamilyRole : uint8_t {
     kDefault,
@@ -446,6 +460,9 @@ class FactStore {
   StatusOr<StoreCommitResult> FinalizePreparedCommit(
       const StoreCommitBatch& batch);
   Status AbortPreparedCommit(TxnId txn_id);
+  Status PersistPreparedDecision(const StorePreparedDecision& decision);
+  StatusOr<std::optional<StorePreparedDecision>> ResolvePreparedDecision(
+      TxnId txn_id) const;
   StatusOr<TxnId> AllocateTransactionId();
   StatusOr<IdLease> LeaseIds(IdKind kind, uint64_t count);
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);

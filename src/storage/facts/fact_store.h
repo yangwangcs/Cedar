@@ -458,7 +458,8 @@ class FactStore {
   Status PersistPreparedCommits(const std::vector<StoreCommitBatch>& batches);
   StatusOr<std::vector<StoreCommitBatch>> ListPreparedCommits() const;
   StatusOr<StoreCommitResult> FinalizePreparedCommit(
-      const StoreCommitBatch& batch);
+      const StoreCommitBatch& batch, bool sync = false);
+  Status SynchronizeWal();
   Status AbortPreparedCommit(TxnId txn_id);
   Status PersistPreparedDecision(const StorePreparedDecision& decision);
   StatusOr<std::optional<StorePreparedDecision>> ResolvePreparedDecision(

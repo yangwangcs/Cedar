@@ -2018,6 +2018,17 @@ StatusOr<PropertyDefinition> Database::RegisterProperty(
   return impl_->store.RegisterProperty(std::move(definition));
 }
 
+StatusOr<std::optional<PropertyDefinition>> Database::LookupProperty(
+    PropertyId property_id, uint32_t schema_epoch) const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  if (impl_->closing) {
+    return Status::ShutdownInProgress("database", "database close is in progress");
+  }
+  return impl_->store.LookupProperty(property_id, schema_epoch);
+}
+
 Status Database::Impl::ValidatePreparedQuery(
     CommitSeq snapshot_seq,
     const std::vector<PropertyDefinition>& schema_fingerprint) const {
@@ -2209,10 +2220,16 @@ Database::ResolvePreparedCommitDecision(TxnId txn_id) const {
 }
 
 StatusOr<CommitResult> Database::FinalizePreparedCommit(
-    TxnId txn_id, std::string decision_certificate) {
+    TxnId txn_id, std::string decision_certificate,
+    PreparedFinalizeDurability durability) {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   if (!txn_id.valid() || decision_certificate.empty()) {
     return Status::InvalidArgument("prepared commit", "invalid terminal decision");
+  }
+  if (durability != PreparedFinalizeDurability::kBuffered &&
+      durability != PreparedFinalizeDurability::kWalSync) {
+    return Status::InvalidArgument("prepared commit",
+                                   "invalid finalize durability");
   }
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->closed || impl_->closing) {
@@ -2238,12 +2255,19 @@ StatusOr<CommitResult> Database::FinalizePreparedCommit(
       [txn_id](const StoreCommitBatch& batch) { return batch.txn_id == txn_id; });
   if (prepared != batches.ValueOrDie().end()) {
     return ToCommitResult(txn_id,
-                          impl_->store.FinalizePreparedCommit(*prepared));
+                          impl_->store.FinalizePreparedCommit(
+                              *prepared,
+                              durability ==
+                                  PreparedFinalizeDurability::kWalSync));
   }
   const auto committed = impl_->store.ResolveTransaction(txn_id);
   if (!committed.ok()) return committed.status();
   if (!committed.ValueOrDie().has_value()) {
     return Status::NotFound("prepared commit", "transaction is not prepared");
+  }
+  if (durability == PreparedFinalizeDurability::kWalSync) {
+    const Status synchronized = impl_->store.SynchronizeWal();
+    if (!synchronized.ok()) return synchronized;
   }
   return ToCommitResult(txn_id, *committed.ValueOrDie());
 }

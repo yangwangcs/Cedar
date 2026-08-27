@@ -170,6 +170,11 @@ enum class PreparedCommitDecisionOutcome : uint8_t {
   kAbort = 2,
 };
 
+enum class PreparedFinalizeDurability : uint8_t {
+  kBuffered = 0,
+  kWalSync = 1,
+};
+
 struct PreparedCommitDecision {
   PreparedCommitDecisionOutcome outcome =
       PreparedCommitDecisionOutcome::kAbort;
@@ -331,6 +336,8 @@ class Database {
   StatusOr<VertexId> AllocateVertexId();
   StatusOr<EdgeId> AllocateEdgeId();
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);
+  StatusOr<std::optional<PropertyDefinition>> LookupProperty(
+      PropertyId property_id, uint32_t schema_epoch = 0) const;
   StatusOr<std::unique_ptr<Transaction>> BeginTransaction(
       TransactionOptions options = {});
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
@@ -345,7 +352,9 @@ class Database {
   StatusOr<std::optional<PreparedCommitDecision>>
   ResolvePreparedCommitDecision(TxnId txn_id) const;
   StatusOr<CommitResult> FinalizePreparedCommit(
-      TxnId txn_id, std::string decision_certificate);
+      TxnId txn_id, std::string decision_certificate,
+      PreparedFinalizeDurability durability =
+          PreparedFinalizeDurability::kBuffered);
   Status AbortPreparedCommit(TxnId txn_id,
                              std::string decision_certificate);
   CommitPipelineMetrics GetCommitPipelineMetrics() const;

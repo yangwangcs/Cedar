@@ -2202,14 +2202,27 @@ StatusOr<std::vector<StoreCommitBatch>> FactStore::ListPreparedCommits() const {
 }
 
 StatusOr<StoreCommitResult> FactStore::FinalizePreparedCommit(
-    const StoreCommitBatch& batch) {
+    const StoreCommitBatch& batch, bool sync) {
   const auto key = internal::EncodePreparedCommitKey(batch.txn_id);
   if (!key.ok()) return key.status();
   if (options_.group_commit_max_batch_size > 1 &&
       options_.group_commit_window_us > 0) {
-    return CommitGrouped(batch, key.ValueOrDie(), false);
+    return CommitGrouped(batch, key.ValueOrDie(), sync);
   }
-  return CommitDirect(batch, key.ValueOrDie(), false);
+  return CommitDirect(batch, key.ValueOrDie(), sync);
+}
+
+Status FactStore::SynchronizeWal() {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) {
+      return Status::InvalidArgument("sync fact store WAL",
+                                     "store is not open");
+    }
+  }
+  return FromRocksDb(store->db->SyncWAL(), "sync fact store WAL");
 }
 
 Status FactStore::AbortPreparedCommit(TxnId txn_id) {

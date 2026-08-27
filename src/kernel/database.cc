@@ -2187,6 +2187,27 @@ StatusOr<std::vector<PreparedCommitBatch>> Database::ListPreparedCommits() const
   return result;
 }
 
+StatusOr<std::optional<PreparedCommitDecision>>
+Database::ResolvePreparedCommitDecision(TxnId txn_id) const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  if (impl_->closing) {
+    return Status::ShutdownInProgress("database", "database close is in progress");
+  }
+  const auto resolved = impl_->store.ResolvePreparedDecision(txn_id);
+  if (!resolved.ok()) return resolved.status();
+  if (!resolved.ValueOrDie().has_value()) {
+    return std::optional<PreparedCommitDecision>{};
+  }
+  const StorePreparedDecision& stored = *resolved.ValueOrDie();
+  return std::optional<PreparedCommitDecision>{PreparedCommitDecision{
+      stored.outcome == StorePreparedDecisionOutcome::kCommit
+          ? PreparedCommitDecisionOutcome::kCommit
+          : PreparedCommitDecisionOutcome::kAbort,
+      stored.certificate}};
+}
+
 StatusOr<CommitResult> Database::FinalizePreparedCommit(
     TxnId txn_id, std::string decision_certificate) {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");

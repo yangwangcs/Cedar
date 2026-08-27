@@ -165,6 +165,17 @@ struct PreparedCommitBatch {
   std::vector<FactEvent> events;
 };
 
+enum class PreparedCommitDecisionOutcome : uint8_t {
+  kCommit = 1,
+  kAbort = 2,
+};
+
+struct PreparedCommitDecision {
+  PreparedCommitDecisionOutcome outcome =
+      PreparedCommitDecisionOutcome::kAbort;
+  std::string certificate;
+};
+
 struct QueryRuntimeOptions {
   uint32_t query_workers = 4;
   uint32_t reserved_interactive_workers = 1;
@@ -331,6 +342,8 @@ class Database {
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
   Status PersistPreparedCommit(const PreparedCommitBatch& batch);
   StatusOr<std::vector<PreparedCommitBatch>> ListPreparedCommits() const;
+  StatusOr<std::optional<PreparedCommitDecision>>
+  ResolvePreparedCommitDecision(TxnId txn_id) const;
   StatusOr<CommitResult> FinalizePreparedCommit(
       TxnId txn_id, std::string decision_certificate);
   Status AbortPreparedCommit(TxnId txn_id,

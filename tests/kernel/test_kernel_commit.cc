@@ -203,6 +203,12 @@ TEST(KernelPreparedCommitTest,
   auto database = std::move(opened).ConsumeValueOrDie();
   ASSERT_TRUE(database->PersistPreparedCommit(batch).ok());
   ASSERT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-31").ok());
+  auto decision = database->ResolvePreparedCommitDecision(batch.txn_id);
+  ASSERT_TRUE(decision.ok()) << decision.status().ToString();
+  ASSERT_TRUE(decision.ValueOrDie().has_value());
+  EXPECT_EQ(decision.ValueOrDie()->outcome,
+            PreparedCommitDecisionOutcome::kAbort);
+  EXPECT_EQ(decision.ValueOrDie()->certificate, "txnd-abort-31");
   EXPECT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-31").ok());
   EXPECT_TRUE(database->AbortPreparedCommit(batch.txn_id, "txnd-abort-32")
                   .IsConflict());
@@ -215,6 +221,12 @@ TEST(KernelPreparedCommitTest,
   opened = Database::Open(options);
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   database = std::move(opened).ConsumeValueOrDie();
+  decision = database->ResolvePreparedCommitDecision(batch.txn_id);
+  ASSERT_TRUE(decision.ok()) << decision.status().ToString();
+  ASSERT_TRUE(decision.ValueOrDie().has_value());
+  EXPECT_EQ(decision.ValueOrDie()->outcome,
+            PreparedCommitDecisionOutcome::kAbort);
+  EXPECT_EQ(decision.ValueOrDie()->certificate, "txnd-abort-31");
   ASSERT_TRUE(database->ListPreparedCommits().ok());
   EXPECT_TRUE(database->ListPreparedCommits().ValueOrDie().empty());
   auto snapshot = database->BeginSnapshot();

@@ -579,7 +579,7 @@ class PartitionedVersionRadixMemTable final : public MemTableRep {
     const auto normalized = NormalizeInternalKey(internal_key);
     LockForWriteWithRetry();
     struct UnlockWrite {
-      explicit UnlockWrite(port::RWMutex* mutex) : mutex(mutex) {}
+      explicit UnlockWrite(port::RWMutex* write_mutex) : mutex(write_mutex) {}
       ~UnlockWrite() { mutex->WriteUnlock(); }
       port::RWMutex* mutex;
     } lock(&mutex_);

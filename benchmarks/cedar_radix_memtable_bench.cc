@@ -329,7 +329,7 @@ int Run(const Options& options) {
   BenchmarkKeyComparator comparator;
   ConcurrentArena arena;
   std::atomic<uint64_t> branch_loads{0};
-  std::atomic<uint64_t> table_snapshot_cas{0};
+  std::atomic<uint64_t> segment_snapshot_cas{0};
   std::atomic<uint64_t> boundary_candidates{0};
   std::unique_ptr<MemTableRepFactory> factory;
   if (options.implementation == "radix") {
@@ -339,7 +339,7 @@ int Run(const Options& options) {
         branch_loads.fetch_add(1, std::memory_order_relaxed);
       };
       radix_options.table_snapshot_cas_observer_for_testing = [&] {
-        table_snapshot_cas.fetch_add(1, std::memory_order_relaxed);
+        segment_snapshot_cas.fetch_add(1, std::memory_order_relaxed);
       };
       radix_options.boundary_candidate_observer_for_testing = [&] {
         boundary_candidates.fetch_add(1, std::memory_order_relaxed);
@@ -404,8 +404,8 @@ int Run(const Options& options) {
   }
   const uint64_t insertion_branch_loads =
       branch_loads.load(std::memory_order_relaxed);
-  const uint64_t insertion_table_snapshot_cas =
-      table_snapshot_cas.load(std::memory_order_relaxed);
+  const uint64_t insertion_segment_snapshot_cas =
+      segment_snapshot_cas.load(std::memory_order_relaxed);
   const uint64_t insertion_boundary_candidates =
       boundary_candidates.load(std::memory_order_relaxed);
   const auto nanoseconds = [](Clock::time_point begin, Clock::time_point end) {
@@ -415,10 +415,10 @@ int Run(const Options& options) {
   const auto inserted_at = Clock::now();
   const auto emit_stats = [&] {
     if (!options.stats || options.implementation != "radix") return;
-    std::cerr << "radix_stats,branch_loads,table_snapshot_cas,boundary_candidates\n"
+    std::cerr << "radix_stats,branch_loads,segment_snapshot_cas,boundary_candidates\n"
               << "radix_stats,"
               << insertion_branch_loads << ','
-              << insertion_table_snapshot_cas << ','
+              << insertion_segment_snapshot_cas << ','
               << insertion_boundary_candidates << '\n';
   };
   if (read_phase) {

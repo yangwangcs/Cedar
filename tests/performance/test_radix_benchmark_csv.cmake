@@ -50,7 +50,7 @@ if(NOT stats_result EQUAL 0)
   message(FATAL_ERROR "radix benchmark stats run failed: ${stats_error}\n${stats_output}")
 endif()
 string(REGEX MATCH
-  "radix_stats,branch_loads,table_snapshot_cas,boundary_candidates[\r\n]+radix_stats,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*"
+  "radix_stats,branch_loads,segment_snapshot_cas,boundary_candidates[\r\n]+radix_stats,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*"
   stats_match "${stats_error}")
 if(stats_match STREQUAL "")
   message(FATAL_ERROR "missing nonzero radix diagnostics: ${stats_error}")
@@ -69,7 +69,7 @@ if(NOT insertion_only_result EQUAL 0)
   message(FATAL_ERROR "two-entry radix stats run failed: ${insertion_only_error}\n${insertion_only_output}")
 endif()
 string(REGEX MATCH
-  "radix_stats,branch_loads,table_snapshot_cas,boundary_candidates[\r\n]+radix_stats,0,0,0"
+  "radix_stats,branch_loads,segment_snapshot_cas,boundary_candidates[\r\n]+radix_stats,0,0,0"
   insertion_only_match "${insertion_only_error}")
 if(insertion_only_match STREQUAL "")
   message(FATAL_ERROR "diagnostics include post-insert traversal: ${insertion_only_error}")

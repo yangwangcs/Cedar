@@ -31,6 +31,12 @@ class NibbleBranch:
     children: tuple[object | None, ...]
 
 
+@dataclass(frozen=True)
+class SegmentedNibbleBranch:
+    nibble: int
+    blocks: tuple[tuple[object | None, ...], ...]
+
+
 def first_difference(left: int, right: int, width: int) -> int:
     for bit in range(width):
         if ((left >> (width - bit - 1)) & 1) != ((right >> (width - bit - 1)) & 1):
@@ -109,6 +115,46 @@ def direct_child_table_vs_wrapper(broken: bool) -> None:
     assert sorted(nibble_leaves(root)) == [0x40, 0x80, 0xC0, 0xC1]
 
 
+def segmented_leaves(node: object | None) -> list[int]:
+    if node is None:
+        return []
+    if isinstance(node, Leaf):
+        return [node.key]
+    assert isinstance(node, SegmentedNibbleBranch)
+    return [key for block in node.blocks for child in block
+            for key in segmented_leaves(child)]
+
+
+def replace_segment_child(branch: SegmentedNibbleBranch, digit: int,
+                          replacement: object) -> SegmentedNibbleBranch:
+    segment, local = divmod(digit, 4)
+    blocks = [list(block) for block in branch.blocks]
+    blocks[segment][local] = replacement
+    return SegmentedNibbleBranch(branch.nibble,
+                                 tuple(tuple(block) for block in blocks))
+
+
+def direct_child_block_vs_other_segment_wrapper(broken: bool) -> None:
+    # A snapshots segment 2 for nibble 8. B replaces only segment 3 by
+    # wrapping nibble 12. Correct block-local publication preserves B without
+    # retry; an old whole-branch stale publication loses the wrapper.
+    blocks: list[list[object | None]] = [[None] * 4 for _ in range(4)]
+    blocks[1][0] = Leaf(0x40)
+    blocks[3][0] = Leaf(0xC0)
+    root = SegmentedNibbleBranch(0, tuple(tuple(block) for block in blocks))
+    stale_snapshot = root
+
+    wrapped_blocks: list[list[object | None]] = [[None] * 4 for _ in range(4)]
+    wrapped_blocks[0][0] = Leaf(0xC0)
+    wrapped_blocks[0][1] = Leaf(0xC1)
+    wrapped = SegmentedNibbleBranch(1,
+                                    tuple(tuple(block) for block in wrapped_blocks))
+    root = replace_segment_child(root, 12, wrapped)
+    root = replace_segment_child(stale_snapshot if broken else root, 8,
+                                 Leaf(0x80))
+    assert sorted(segmented_leaves(root)) == [0x40, 0x80, 0xC0, 0xC1]
+
+
 def same_key_race(width: int) -> None:
     base = Leaf(0)
     key = 1 << (width - 1)
@@ -161,8 +207,9 @@ def run(width: int, broken: bool) -> None:
     same_key_race(width)
     ancestor_wrap_vs_descendant(width, broken)
     if not broken:
-        path_deeper_than_inline_cache(width)
+      path_deeper_than_inline_cache(width)
     direct_child_table_vs_wrapper(broken)
+    direct_child_block_vs_other_segment_wrapper(broken)
 
 
 def main() -> int:

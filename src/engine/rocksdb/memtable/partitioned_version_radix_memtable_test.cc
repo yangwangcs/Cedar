@@ -1511,7 +1511,7 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     DirectChildTableInsertRetriesAfterConcurrentSubtreeWrapper) {
+     DirectInsertAndWrapperInDifferentSegmentsBothPublishWithoutRetry) {
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
@@ -1571,6 +1571,9 @@ TEST(PartitionedVersionRadixMemTableTest,
   direct_writer.join();
 
   EXPECT_TRUE(direct_inserted.load(std::memory_order_acquire));
+  // The direct child occupies segment 2 and the wrapper replaces segment 3.
+  // Their independent CAS edges mean the paused direct writer does not retry.
+  EXPECT_EQ(observer_calls, 2U);
   for (const auto& key : {key4, key8, key12, key12_child}) {
     EXPECT_TRUE(index.Contains(key));
   }
@@ -1582,6 +1585,67 @@ TEST(PartitionedVersionRadixMemTableTest,
     cursor.Next();
   }
   EXPECT_FALSE(cursor.Valid());
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     DirectInsertsInTheSameSegmentRejectStaleBlockAndRetry) {
+  ConcurrentArena arena;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool paused = false;
+  bool release = false;
+  size_t observer_calls = 0;
+  CedarPureRadixIndex::TestHooks hooks;
+  hooks.table_snapshot_cas_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (observer_calls++ != 0) return;
+    paused = true;
+    condition.notify_all();
+    condition.wait(lock, [&] { return release; });
+  };
+  CedarPureRadixIndex index(&arena, hooks);
+
+  const auto allocate = [&](const CedarPureRadixIndex::Key& key) {
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    EXPECT_NE(handle, nullptr);
+    EXPECT_NE(entry, nullptr);
+    if (entry != nullptr) *entry = static_cast<char>(key[0]);
+    return handle;
+  };
+  CedarPureRadixIndex::Key key0{};
+  CedarPureRadixIndex::Key key1{};
+  CedarPureRadixIndex::Key key2{};
+  CedarPureRadixIndex::Key key3{};
+  key1[0] = 0x10;
+  key2[0] = 0x20;
+  key3[0] = 0x30;
+  ASSERT_TRUE(index.Insert(allocate(key0), key0));
+  ASSERT_TRUE(index.Insert(allocate(key1), key1));
+
+  std::atomic<bool> stale_inserted{false};
+  std::thread stale_writer([&] {
+    stale_inserted.store(index.Insert(allocate(key2), key2),
+                         std::memory_order_release);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2), [&] {
+      return paused;
+    }));
+  }
+  ASSERT_TRUE(index.Insert(allocate(key3), key3));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release = true;
+  }
+  condition.notify_all();
+  stale_writer.join();
+
+  EXPECT_TRUE(stale_inserted.load(std::memory_order_acquire));
+  // One paused stale CAS, one competing publish, then stale retry.
+  EXPECT_EQ(observer_calls, 3U);
+  for (const auto& key : {key0, key1, key2, key3}) EXPECT_TRUE(index.Contains(key));
 }
 
 TEST(PartitionedVersionRadixMemTableTest,

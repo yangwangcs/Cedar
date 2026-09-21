@@ -178,6 +178,11 @@ class MemTableRep {
   // or any writes done directly to entries accessed through the iterator.)
   virtual void MarkReadOnly() {}
 
+  // Prepare immutable, representation-specific read structures before a
+  // flush iterator is created. The default is a no-op so existing reps keep
+  // their behavior.
+  virtual void PrepareForFlush() {}
+
   // Notify this table rep that it has been flushed to stable storage.
   // By default, does nothing.
   //
@@ -424,16 +429,27 @@ class SkipListFactory : public MemTableRepFactory {
 };
 
 // Facts-only MemTable representation for Cedar's fixed-width v2 internal
-// keys. It shares radix prefixes between business versions and emits its
-// contents in internal-key order without a freeze-time comparison sort.
+// keys. Its private implementation is an append-only Patricia radix tree:
+// inserts use a single child-slot CAS and immutable MemTables can derive a
+// read-only successor chain for forward scans.
 class PartitionedVersionRadixFactory : public MemTableRepFactory {
  public:
   struct Options {
-    // Test-only observers make a real write-lock contention/retry cycle
-    // deterministic without changing the production factory configuration.
-    std::function<void()> write_lock_acquired_observer_for_testing;
-    std::function<void()> write_lock_retry_observer_for_testing;
-    std::function<void()> last_entry_visit_observer_for_testing;
+    // Test-only observers bracket a publication CAS. They are disabled in
+    // production and never participate in the radix correctness protocol.
+    std::function<void()> before_cas_observer_for_testing;
+    std::function<void()> after_cas_observer_for_testing;
+    // Invoked by the flush-only frozen-chain builder after it owns kBuilding
+    // and before it walks leaves. It exists only for deterministic reader
+    // fallback tests and is empty in production configurations.
+    std::function<void()> frozen_chain_builder_observer_for_testing;
+    // Counts branch visits in Seek/SeekForPrev for complexity tests only.
+    std::function<void()> branch_visit_observer_for_testing;
+    std::function<void()> branch_load_observer_for_testing;
+    std::function<void()> boundary_candidate_observer_for_testing;
+    // Invoked immediately before a sparse immutable child-table publication
+    // CAS. It stays empty for production factories.
+    std::function<void()> table_snapshot_cas_observer_for_testing;
   };
 
   PartitionedVersionRadixFactory() = default;

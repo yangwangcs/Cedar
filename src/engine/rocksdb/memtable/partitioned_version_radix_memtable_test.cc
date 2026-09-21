@@ -23,6 +23,7 @@
 #include "db/lookup_key.h"
 #include "memory/arena.h"
 #include "memory/concurrent_arena.h"
+#include "memtable/cedar_pure_radix_index.h"
 #include "rocksdb/memtablerep.h"
 #include "util/coding.h"
 
@@ -114,6 +115,21 @@ std::vector<std::string> Collect(MemTableRep* table) {
     keys.emplace_back(GetLengthPrefixedSlice(iterator->key()).ToString());
   }
   return keys;
+}
+
+uint64_t OrderedKeyHash(const std::vector<std::string>& keys) {
+  // Keep a stable result digest so the concurrent differential checks do not
+  // depend on the implementation-defined std::hash specialization.
+  uint64_t hash = 1469598103934665603ULL;
+  for (const std::string& key : keys) {
+    for (unsigned char byte : key) {
+      hash ^= byte;
+      hash *= 1099511628211ULL;
+    }
+    hash ^= 0xffU;
+    hash *= 1099511628211ULL;
+  }
+  return hash;
 }
 
 struct GetCandidates {
@@ -261,7 +277,140 @@ TEST(PartitionedVersionRadixMemTableTest, MatchesInternalOrderingForVersionsAndD
     return comparator(left_entry.data(), right_entry.data()) < 0;
   });
   EXPECT_EQ(Collect(table.get()), expected);
-  EXPECT_GT(table->ApproximateMemoryUsage(), 0U);
+  // Node and entry storage are allocated by the MemTable allocator, which is
+  // excluded from MemTableRep::ApproximateMemoryUsage().
+  EXPECT_EQ(table->ApproximateMemoryUsage(), 0U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     BoundaryCandidateObserverCountsInsertionWork) {
+  TestKeyComparator comparator;
+  Arena arena;
+  std::atomic<size_t> boundary_candidates{0};
+  PartitionedVersionRadixFactory::Options options;
+  options.boundary_candidate_observer_for_testing = [&] {
+    boundary_candidates.fetch_add(1, std::memory_order_relaxed);
+  };
+  PartitionedVersionRadixFactory factory(options);
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+
+  for (uint64_t entity_id = 1; entity_id <= 256; ++entity_id) {
+    ASSERT_TRUE(Insert(table.get(), InternalKeyFor(entity_id, 1, kTypeValue),
+                       "value"));
+  }
+
+  EXPECT_GT(boundary_candidates.load(std::memory_order_relaxed), 0U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     BoundaryPublicationChecksBothCachesForSparsePathAncestors) {
+  Arena arena;
+  std::atomic<size_t> boundary_candidates{0};
+  CedarPureRadixIndex::TestHooks hooks;
+  hooks.boundary_candidate_for_testing = [&] {
+    boundary_candidates.fetch_add(1, std::memory_order_relaxed);
+  };
+  CedarPureRadixIndex index(&arena, hooks);
+
+  const auto insert = [&](const CedarPureRadixIndex::Key& key) {
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = 'v';
+    ASSERT_TRUE(index.Insert(handle, key));
+  };
+
+  CedarPureRadixIndex::Key zero{};
+  insert(zero);
+  for (size_t bit = 1; bit < 16; ++bit) {
+    CedarPureRadixIndex::Key key{};
+    key[bit / 8] = static_cast<unsigned char>(
+        1U << (7U - (bit % 8)));
+    boundary_candidates.store(0, std::memory_order_relaxed);
+    insert(key);
+    const size_t candidates =
+        boundary_candidates.load(std::memory_order_relaxed);
+    // Sparse child tables no longer have a binary all-zero/all-one direction
+    // rule. Publication visits both boundary caches on every retained frame.
+    EXPECT_EQ(candidates % 2, 0U) << "first differing bit " << bit;
+    if (bit > 1) EXPECT_GE(candidates, 2U);
+  }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     FirstDifferingBitPositionsRemainVisibleAcrossFullKeyWidth) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  CedarPureRadixIndex::Key base{};
+  std::vector<CedarPureRadixIndex::Key> probes;
+  probes.reserve(CedarPureRadixIndex::kMaxBits);
+
+  auto insert_key = [&](const CedarPureRadixIndex::Key& key, char value) {
+    char* storage = nullptr;
+    void* handle = index.Allocate(1, &storage);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(storage, nullptr);
+    *storage = value;
+    ASSERT_TRUE(index.Insert(handle, key));
+  };
+
+  insert_key(base, 'b');
+  // This exercises every possible first-differing bit. It includes all bits
+  // in the version-2 key prefix and the inverted RocksDB tag suffix.
+  for (size_t bit = 0; bit < CedarPureRadixIndex::kMaxBits; ++bit) {
+    CedarPureRadixIndex::Key probe = base;
+    probe[bit / 8] = static_cast<unsigned char>(
+        probe[bit / 8] | (1U << (7U - (bit % 8))));
+    probes.push_back(probe);
+    insert_key(probe, 'p');
+  }
+
+  EXPECT_TRUE(index.Contains(base));
+  EXPECT_FALSE(index.Insert(nullptr, base));
+  for (const auto& probe : probes) EXPECT_TRUE(index.Contains(probe));
+  CedarPureRadixIndex::Key absent{};
+  absent.fill(0xff);
+  EXPECT_FALSE(index.Contains(absent));
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     AllNibbleValuesAndFinalNibbleRemainOrdered) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  std::array<CedarPureRadixIndex::Key, 16> keys{};
+  std::array<void*, 16> handles{};
+
+  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
+    keys[nibble][39] = nibble;
+    char* entry = nullptr;
+    handles[nibble] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[nibble], nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(nibble);
+  }
+
+  for (size_t position : {15U, 0U, 9U, 3U, 12U, 6U, 1U, 14U,
+                          7U, 4U, 10U, 2U, 13U, 5U, 11U, 8U}) {
+    ASSERT_TRUE(index.Insert(handles[position], keys[position]));
+  }
+
+  for (const CedarPureRadixIndex::Key& key : keys) EXPECT_TRUE(index.Contains(key));
+
+  CedarPureRadixIndex::Cursor cursor(&index);
+  cursor.SeekToFirst();
+  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), nibble);
+    cursor.Next();
+  }
+  EXPECT_FALSE(cursor.Valid());
+
+  const auto stats = index.GetStructureStatsForTesting();
+  EXPECT_EQ(stats.branches, 1U);
+  EXPECT_EQ(stats.child_tables, 1U);
+  EXPECT_EQ(stats.max_depth, 1U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -279,6 +428,47 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   EXPECT_EQ(Collect(table.get()).size(), 64U);
   EXPECT_LT(table->ApproximateMemoryUsage(), 64U * 1024U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     CanonicalEntriesBackRadixLeafKeysWithoutDuplicateKeyStorage) {
+  TestKeyComparator comparator;
+  ConcurrentArena arena;
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+
+  constexpr size_t kEntries = 1024;
+  for (size_t entity = 1; entity <= kEntries; ++entity) {
+    EXPECT_TRUE(Insert(table.get(), InternalKeyFor(entity, entity, kTypeValue),
+                       ""));
+  }
+
+  EXPECT_EQ(Collect(table.get()).size(), kEntries);
+  // Immutable sparse-table snapshots are arena-owned through MemTable
+  // destruction. This still leaves room below 192 bytes/entry, while a second
+  // 40-byte normalized-key copy would exceed the budget.
+  EXPECT_LT(arena.ApproximateMemoryUsage(), kEntries * 192U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     CanonicalEntriesDoNotReserveTailPaddingForSubmissionState) {
+  TestKeyComparator comparator;
+  ConcurrentArena arena;
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+
+  constexpr size_t kEntries = 1024;
+  for (size_t entity = 1; entity <= kEntries; ++entity) {
+    EXPECT_TRUE(Insert(table.get(), InternalKeyFor(entity, entity, kTypeValue),
+                       ""));
+  }
+
+  EXPECT_EQ(Collect(table.get()).size(), kEntries);
+  // A private branch in every handle would add at least 48 KiB here and
+  // exceed this representation-specific bound.
+  EXPECT_LT(arena.ApproximateMemoryUsage(), 192U * 1024U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -316,15 +506,29 @@ TEST(PartitionedVersionRadixMemTableTest,
   }
 
   Arena iterator_arena;
-  iterator_arena.AllocateAligned(4096);
+  // Fill the 2 KiB inline block and then make Arena install a normal 4 KiB
+  // active block. A large pre-allocation would be an irregular block and is
+  // deliberately not reused by Arena's next allocation.
+  iterator_arena.AllocateAligned(Arena::kInlineSize);
+  iterator_arena.AllocateAligned(1);
   const size_t allocations_before =
       g_heap_allocations.load(std::memory_order_relaxed);
   MemTableRep::Iterator* iterator = table->GetIterator(&iterator_arena);
-  const size_t allocations_after =
+  const size_t allocations_after_construction =
+      g_heap_allocations.load(std::memory_order_relaxed);
+  size_t entries_seen = 0;
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    ++entries_seen;
+  }
+  const size_t allocations_after_scan =
       g_heap_allocations.load(std::memory_order_relaxed);
   iterator->~Iterator();
 
-  EXPECT_EQ(allocations_after, allocations_before);
+  EXPECT_EQ(entries_seen, 256U);
+  // The fixed cursor fits in the prepared caller-owned arena block. The scan
+  // must not materialize facts or allocate once per fact.
+  EXPECT_EQ(allocations_after_construction, allocations_before);
+  EXPECT_EQ(allocations_after_scan, allocations_after_construction);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -362,15 +566,267 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     SeekForPrevVisitsOnlyTheRightmostPathOfALargeLowerSubtree) {
+     DeepPathSeekAndSeekForPrevFindAdjacentBounds) {
   TestKeyComparator comparator;
   Arena arena;
-  std::atomic<size_t> last_entry_visits{0};
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+
+  std::vector<std::string> expected;
+  for (uint64_t bit = 1; bit < 64; ++bit) {
+    const std::string key = InternalKeyFor((uint64_t{1} << bit) | 1U, 1,
+                                           kTypeValue);
+    ASSERT_TRUE(Insert(table.get(), key, "value"));
+    expected.push_back(key);
+  }
+  std::sort(expected.begin(), expected.end(), InternalKeyLess);
+
+  std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
+  for (size_t index = 1; index < expected.size(); ++index) {
+    const std::string& target = expected[index];
+    iterator->Seek(target, nullptr);
+    ASSERT_TRUE(iterator->Valid());
+    EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(target));
+    iterator->SeekForPrev(target, nullptr);
+    ASSERT_TRUE(iterator->Valid());
+    EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(target));
+
+    // The generated keys are entity IDs 2^bit + 1.  Use an entity ID
+    // midpoint so the probe remains a valid canonical/internal key rather
+    // than mutating the sequence/type tag at the end of the key.
+    const uint64_t lower_entity = (uint64_t{1} << index) | 1U;
+    const uint64_t upper_entity = (uint64_t{1} << (index + 1)) | 1U;
+    const uint64_t midpoint = lower_entity + (upper_entity - lower_entity) / 2;
+    const std::string between = InternalKeyFor(midpoint, 1, kTypeValue);
+    iterator->Seek(between, nullptr);
+    ASSERT_TRUE(iterator->Valid());
+    EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(target));
+    iterator->SeekForPrev(between, nullptr);
+    ASSERT_TRUE(iterator->Valid());
+    EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(expected[index - 1]));
+  }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     SeekBranchVisitsRemainLinearInPatriciaHeight) {
+  TestKeyComparator comparator;
+  Arena arena;
+  std::atomic<size_t> branch_visits{0};
   PartitionedVersionRadixFactory::Options options;
-  options.last_entry_visit_observer_for_testing = [&last_entry_visits] {
-    last_entry_visits.fetch_add(1, std::memory_order_relaxed);
+  options.branch_visit_observer_for_testing = [&] {
+    branch_visits.fetch_add(1, std::memory_order_relaxed);
   };
   PartitionedVersionRadixFactory factory(options);
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  for (uint64_t entity_id = 1; entity_id <= 256; ++entity_id) {
+    ASSERT_TRUE(Insert(table.get(), InternalKeyFor(entity_id, 1, kTypeValue),
+                       "value"));
+  }
+
+  std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
+  const size_t linear_bound = 2 * CedarPureRadixIndex::kMaxBits + 2;
+  branch_visits.store(0, std::memory_order_relaxed);
+  iterator->Seek(InternalKeyFor(129, 1, kTypeValue), nullptr);
+  ASSERT_TRUE(iterator->Valid());
+  EXPECT_LE(branch_visits.load(std::memory_order_relaxed), linear_bound);
+
+  branch_visits.store(0, std::memory_order_relaxed);
+  iterator->SeekForPrev(InternalKeyFor(0, 1, kTypeValue), nullptr);
+  EXPECT_FALSE(iterator->Valid());
+  EXPECT_LE(branch_visits.load(std::memory_order_relaxed), linear_bound);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     AdversarialBoundarySeeksVisitEachDeepPatriciaBranchOnce) {
+  TestKeyComparator comparator;
+  Arena arena;
+  std::atomic<size_t> branch_visits{0};
+  PartitionedVersionRadixFactory::Options options;
+  options.branch_visit_observer_for_testing = [&] {
+    branch_visits.fetch_add(1, std::memory_order_relaxed);
+  };
+  PartitionedVersionRadixFactory factory(options);
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+
+  // These keys share the longest possible entity-id prefix with entity 1.
+  // Descending to the zero child at every branch forced the former recursive
+  // boundary algorithm to repeat FirstLeaf/LastLeaf walks at each level.
+  ASSERT_TRUE(Insert(table.get(), InternalKeyFor(1, 1, kTypeValue), "value"));
+  for (uint64_t bit = 1; bit < 64; ++bit) {
+    ASSERT_TRUE(Insert(table.get(),
+                       InternalKeyFor((uint64_t{1} << bit) | 1U, 1,
+                                      kTypeValue),
+                       "value"));
+  }
+
+  std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
+  const size_t linear_bound = 64;
+  branch_visits.store(0, std::memory_order_relaxed);
+  iterator->Seek(InternalKeyFor(0, 1, kValueTypeForSeek), nullptr);
+  ASSERT_TRUE(iterator->Valid());
+  EXPECT_LE(branch_visits.load(std::memory_order_relaxed), linear_bound);
+
+  branch_visits.store(0, std::memory_order_relaxed);
+  iterator->SeekForPrev(InternalKeyFor(0, 1, kValueTypeForSeek), nullptr);
+  EXPECT_FALSE(iterator->Valid());
+  EXPECT_LE(branch_visits.load(std::memory_order_relaxed), linear_bound);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     FrozenMemTableForwardScansRemainOrderedAcrossRepeatedCursors) {
+  TestKeyComparator comparator;
+  Arena arena;
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  for (uint64_t entity_id = 1; entity_id <= 64; ++entity_id) {
+    ASSERT_TRUE(Insert(table.get(), InternalKeyFor(entity_id, 1, kTypeValue),
+                       "value"));
+  }
+  const std::vector<std::string> expected = Collect(table.get());
+
+  table->MarkReadOnly();
+  table->PrepareForFlush();
+  EXPECT_EQ(Collect(table.get()), expected);
+  EXPECT_EQ(Collect(table.get()), expected);
+
+  std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
+  iterator->Seek(expected[expected.size() / 2], nullptr);
+  ASSERT_TRUE(iterator->Valid());
+  for (size_t index = expected.size() / 2; index < expected.size(); ++index) {
+    ASSERT_TRUE(iterator->Valid());
+    EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(expected[index]));
+    iterator->Next();
+  }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     ReadyFrozenChainAvoidsBranchLoadsAfterForwardSeek) {
+  TestKeyComparator comparator;
+  Arena arena;
+  std::atomic<size_t> branch_loads{0};
+  PartitionedVersionRadixFactory::Options options;
+  options.branch_load_observer_for_testing = [&] {
+    branch_loads.fetch_add(1, std::memory_order_relaxed);
+  };
+  PartitionedVersionRadixFactory factory(options);
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  for (uint64_t entity_id = 1; entity_id <= 64; ++entity_id) {
+    ASSERT_TRUE(Insert(table.get(), InternalKeyFor(entity_id, 1, kTypeValue),
+                       "value"));
+  }
+  table->MarkReadOnly();
+  table->PrepareForFlush();
+  std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
+  iterator->Seek(InternalKeyFor(16, 1, kTypeValue), nullptr);
+  ASSERT_TRUE(iterator->Valid());
+  branch_loads.store(0, std::memory_order_relaxed);
+  for (int index = 0; index < 8 && iterator->Valid(); ++index) {
+    iterator->Next();
+  }
+  EXPECT_EQ(branch_loads.load(std::memory_order_relaxed), 0U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     DeepCanonicalPatriciaPathRemainsOrdered) {
+  TestKeyComparator comparator;
+  Arena arena;
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+
+  // Every key is a valid v2 vertex fact. Inserting progressively earlier
+  // entity-id bits creates a path deeper than the inline insertion cache.
+  std::vector<std::string> expected;
+  for (uint64_t bit = 1; bit < 64; ++bit) {
+    const uint64_t entity_id = (uint64_t{1} << bit) | 1U;
+    const std::string key = InternalKeyFor(entity_id, 1, kTypeValue);
+    ASSERT_TRUE(Insert(table.get(), key, "value"));
+    expected.push_back(key);
+  }
+  expected.push_back(InternalKeyFor(1, 1, kTypeValue));
+  ASSERT_TRUE(Insert(table.get(), expected.back(), "value"));
+  std::sort(expected.begin(), expected.end(), InternalKeyLess);
+
+  EXPECT_EQ(Collect(table.get()), expected);
+  table->MarkReadOnly();
+  table->PrepareForFlush();
+  EXPECT_EQ(Collect(table.get()), expected);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     MarkReadOnlyBuildsFrozenChainWithoutBlockingPathReader) {
+  TestKeyComparator comparator;
+  Arena arena;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool builder_paused = false;
+  bool release_builder = false;
+  PartitionedVersionRadixFactory::Options options;
+  options.frozen_chain_builder_observer_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    builder_paused = true;
+    condition.notify_all();
+    condition.wait(lock, [&] { return release_builder; });
+  };
+  PartitionedVersionRadixFactory factory(options);
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  for (uint64_t entity_id = 1; entity_id <= 64; ++entity_id) {
+    ASSERT_TRUE(Insert(table.get(), InternalKeyFor(entity_id, 1, kTypeValue),
+                       "value"));
+  }
+  const std::vector<std::string> expected = Collect(table.get());
+  table->MarkReadOnly();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_FALSE(builder_paused);
+  }
+  std::thread builder([&] { table->PrepareForFlush(); });
+  bool observed_builder = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    observed_builder = condition.wait_for(lock, std::chrono::seconds(10), [&] {
+      return builder_paused;
+    });
+  }
+  EXPECT_TRUE(observed_builder);
+
+  std::atomic<bool> reader_done{false};
+  std::vector<std::string> reader_result;
+  std::thread reader([&] {
+    reader_result = Collect(table.get());
+    reader_done.store(true, std::memory_order_release);
+  });
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(10);
+  while (!reader_done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(reader_done.load(std::memory_order_acquire));
+  if (reader_done.load(std::memory_order_acquire)) {
+    EXPECT_EQ(reader_result, expected);
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_builder = true;
+  }
+  condition.notify_all();
+  reader.join();
+  builder.join();
+  EXPECT_EQ(Collect(table.get()), expected);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     SeekForPrevFindsTheLastEntryOfALargeLowerSubtree) {
+  TestKeyComparator comparator;
+  Arena arena;
+  PartitionedVersionRadixFactory factory;
   std::unique_ptr<MemTableRep> table(
       factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
 
@@ -380,7 +836,6 @@ TEST(PartitionedVersionRadixMemTableTest,
                        InternalKeyFor(entity_id, 1, kTypeValue), "value"));
   }
 
-  last_entry_visits.store(0, std::memory_order_relaxed);
   std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
   iterator->SeekForPrev(
       InternalKeyFor(uint64_t{1} << 56, 1, kTypeValue), nullptr);
@@ -388,7 +843,6 @@ TEST(PartitionedVersionRadixMemTableTest,
   ASSERT_TRUE(iterator->Valid());
   EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()),
             Slice(InternalKeyFor(kLastEntity, 1, kTypeValue)));
-  EXPECT_LE(last_entry_visits.load(std::memory_order_relaxed), 64U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest, RejectsNonV2InternalKeys) {
@@ -696,6 +1150,30 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     PointGetUsesStackCursorWithoutIteratorHeapAllocation) {
+  TestKeyComparator comparator;
+  Arena arena;
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  ASSERT_TRUE(Insert(table.get(), InternalKeyFor(7, 30, kTypeValue), "value"));
+
+  LookupKey lookup(V2UserKey(7), 40);
+  size_t callbacks = 0;
+  const size_t allocations_before =
+      g_heap_allocations.load(std::memory_order_relaxed);
+  table->Get(lookup, &callbacks, [](void* argument, const char*) {
+    ++*static_cast<size_t*>(argument);
+    return false;
+  });
+  const size_t allocations_after =
+      g_heap_allocations.load(std::memory_order_relaxed);
+
+  EXPECT_EQ(callbacks, 1U);
+  EXPECT_EQ(allocations_after, allocations_before);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      ConcurrentInsertionsRemainOrderedAndRejectConcurrentDuplicates) {
   TestKeyComparator comparator;
   ConcurrentArena arena;
@@ -739,27 +1217,89 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     RetriesContendedWriteLockWithoutDroppingOrDuplicatingEntries) {
+     ThreeWriterUniqueAndDuplicateStressMatchesUpstreamSkipList) {
+  TestKeyComparator comparator;
+  ConcurrentArena radix_arena;
+  ConcurrentArena skiplist_arena;
+  PartitionedVersionRadixFactory radix_factory;
+  SkipListFactory skiplist_factory;
+  std::unique_ptr<MemTableRep> radix(
+      radix_factory.CreateMemTableRep(comparator, &radix_arena, nullptr,
+                                      nullptr));
+  std::unique_ptr<MemTableRep> skiplist(
+      skiplist_factory.CreateMemTableRep(comparator, &skiplist_arena, nullptr,
+                                         nullptr));
+
+  constexpr size_t kWriters = 3;
+  constexpr size_t kKeysPerWriter = 192;
+  std::atomic<bool> start{false};
+  std::atomic<bool> insert_failed{false};
+  std::vector<std::thread> writers;
+  writers.reserve(kWriters);
+  for (size_t writer = 0; writer < kWriters; ++writer) {
+    writers.emplace_back([&, writer] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (size_t index = 0; index < kKeysPerWriter; ++index) {
+        const uint64_t entity_id =
+            1 + writer * kKeysPerWriter + ((index * 37) % kKeysPerWriter);
+        const std::string key = InternalKeyFor(
+            entity_id, 1 + (index % 3),
+            index % 17 == 0 ? kTypeDeletion : kTypeValue);
+        if (!InsertConcurrently(radix.get(), key, "radix") ||
+            !InsertConcurrently(skiplist.get(), key, "skiplist")) {
+          insert_failed.store(true, std::memory_order_release);
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (std::thread& writer : writers) writer.join();
+
+  EXPECT_FALSE(insert_failed.load(std::memory_order_acquire));
+  const std::vector<std::string> radix_keys = Collect(radix.get());
+  const std::vector<std::string> skiplist_keys = Collect(skiplist.get());
+  ASSERT_EQ(radix_keys.size(), kWriters * kKeysPerWriter);
+  EXPECT_EQ(radix_keys, skiplist_keys);
+  EXPECT_EQ(OrderedKeyHash(radix_keys), OrderedKeyHash(skiplist_keys));
+  for (size_t index = 1; index < radix_keys.size(); ++index) {
+    EXPECT_TRUE(InternalKeyLess(radix_keys[index - 1], radix_keys[index]));
+  }
+
+  const std::string duplicate = InternalKeyFor(999999, 7, kTypeValue);
+  std::atomic<size_t> duplicate_winners{0};
+  std::vector<std::thread> duplicate_writers;
+  duplicate_writers.reserve(kWriters);
+  for (size_t writer = 0; writer < kWriters; ++writer) {
+    duplicate_writers.emplace_back([&] {
+      if (InsertConcurrently(radix.get(), duplicate, "duplicate")) {
+        duplicate_winners.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (std::thread& writer : duplicate_writers) writer.join();
+
+  EXPECT_EQ(duplicate_winners.load(std::memory_order_relaxed), 1U);
+  EXPECT_EQ(Collect(radix.get()).size(), kWriters * kKeysPerWriter + 1U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     PausedBeforeCasDoesNotBlockUnrelatedWriter) {
   TestKeyComparator comparator;
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
-  bool first_writer_has_lock = false;
+  bool first_writer_paused = false;
   bool release_first_writer = false;
-  uint32_t acquired = 0;
-  std::atomic<uint32_t> retries{0};
+  uint32_t pauses = 0;
   PartitionedVersionRadixFactory::Options options;
-  options.write_lock_acquired_observer_for_testing = [&] {
+  options.before_cas_observer_for_testing = [&] {
     std::unique_lock<std::mutex> lock(mutex);
-    if (acquired++ != 0) return;
-    first_writer_has_lock = true;
+    if (pauses++ != 0) return;
+    first_writer_paused = true;
     condition.notify_all();
     condition.wait_for(lock, std::chrono::seconds(10), [&] {
       return release_first_writer;
     });
-  };
-  options.write_lock_retry_observer_for_testing = [&retries] {
-    retries.fetch_add(1, std::memory_order_relaxed);
   };
   PartitionedVersionRadixFactory factory(options);
   std::unique_ptr<MemTableRep> table(
@@ -776,7 +1316,7 @@ TEST(PartitionedVersionRadixMemTableTest,
   {
     std::unique_lock<std::mutex> lock(mutex);
     observed_first_writer = condition.wait_for(lock, std::chrono::seconds(10), [&] {
-      return first_writer_has_lock;
+      return first_writer_paused;
     });
   }
   EXPECT_TRUE(observed_first_writer);
@@ -785,12 +1325,13 @@ TEST(PartitionedVersionRadixMemTableTest,
         InsertConcurrently(table.get(), InternalKeyFor(2, 1, kTypeValue), "two"),
         std::memory_order_release);
   });
-  const auto retry_deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(10);
-  while (retries.load(std::memory_order_acquire) == 0 &&
-         std::chrono::steady_clock::now() < retry_deadline) {
+  const auto progress_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(10);
+  while (!second_inserted.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < progress_deadline) {
     std::this_thread::yield();
   }
+  EXPECT_TRUE(second_inserted.load(std::memory_order_acquire));
   {
     std::lock_guard<std::mutex> lock(mutex);
     release_first_writer = true;
@@ -801,12 +1342,149 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   EXPECT_TRUE(first_inserted.load(std::memory_order_acquire));
   EXPECT_TRUE(second_inserted.load(std::memory_order_acquire));
-  EXPECT_GT(retries.load(std::memory_order_relaxed), 0U);
   const std::vector<std::string> collected = Collect(table.get());
   ASSERT_EQ(collected.size(), 2U);
   for (size_t index = 1; index < collected.size(); ++index) {
     EXPECT_TRUE(InternalKeyLess(collected[index - 1], collected[index]));
   }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     StaleWrappingCasRetriesAfterAnotherWriterPublishesAncestor) {
+  TestKeyComparator comparator;
+  ConcurrentArena arena;
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool paused = false;
+  bool release = false;
+  bool arm_pause = false;
+  uint32_t before_cas_calls = 0;
+  PartitionedVersionRadixFactory::Options options;
+  options.before_cas_observer_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!arm_pause || before_cas_calls++ != 0) return;
+    paused = true;
+    condition.notify_all();
+    condition.wait(lock, [&] { return release; });
+  };
+  PartitionedVersionRadixFactory factory(options);
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  ASSERT_TRUE(InsertConcurrently(table.get(), InternalKeyFor(1, 1, kTypeValue),
+                                 "base"));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    arm_pause = true;
+  }
+
+  std::atomic<bool> stale_writer_succeeded{false};
+  std::thread stale_writer([&] {
+    stale_writer_succeeded.store(
+        InsertConcurrently(table.get(), InternalKeyFor(2, 1, kTypeValue),
+                           "stale"),
+        std::memory_order_release);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(10), [&] {
+      return paused;
+    }));
+  }
+
+  // This writer publishes a branch over the leaf observed by stale_writer.
+  ASSERT_TRUE(InsertConcurrently(table.get(), InternalKeyFor(8, 1, kTypeValue),
+                                 "ancestor"));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release = true;
+  }
+  condition.notify_all();
+  stale_writer.join();
+
+  ASSERT_TRUE(stale_writer_succeeded.load(std::memory_order_acquire));
+  const std::vector<std::string> collected = Collect(table.get());
+  ASSERT_EQ(collected.size(), 3U);
+  EXPECT_EQ(Slice(collected[0]),
+            Slice(InternalKeyFor(1, 1, kTypeValue)));
+  EXPECT_EQ(Slice(collected[1]),
+            Slice(InternalKeyFor(2, 1, kTypeValue)));
+  EXPECT_EQ(Slice(collected[2]),
+            Slice(InternalKeyFor(8, 1, kTypeValue)));
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     DirectChildTableInsertRetriesAfterConcurrentSubtreeWrapper) {
+  ConcurrentArena arena;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool paused = false;
+  bool release = false;
+  size_t observer_calls = 0;
+  CedarPureRadixIndex::TestHooks hooks;
+  hooks.table_snapshot_cas_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (observer_calls++ != 0) return;
+    paused = true;
+    condition.notify_all();
+    condition.wait(lock, [&] { return release; });
+  };
+  CedarPureRadixIndex index(&arena, hooks);
+
+  const auto allocate = [&](const CedarPureRadixIndex::Key& key) {
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    EXPECT_NE(handle, nullptr);
+    EXPECT_NE(entry, nullptr);
+    if (entry != nullptr) *entry = static_cast<char>(key[0]);
+    return handle;
+  };
+  CedarPureRadixIndex::Key key4{};
+  CedarPureRadixIndex::Key key8{};
+  CedarPureRadixIndex::Key key12{};
+  CedarPureRadixIndex::Key key12_child{};
+  key4[0] = 0x40;
+  key8[0] = 0x80;
+  key12[0] = 0xc0;
+  key12_child[0] = 0xc1;
+  ASSERT_TRUE(index.Insert(allocate(key4), key4));
+  ASSERT_TRUE(index.Insert(allocate(key12), key12));
+
+  std::atomic<bool> direct_inserted{false};
+  std::thread direct_writer([&] {
+    direct_inserted.store(index.Insert(allocate(key8), key8),
+                          std::memory_order_release);
+  });
+  bool observed_pause = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    observed_pause = condition.wait_for(lock, std::chrono::seconds(2), [&] {
+      return paused;
+    });
+  }
+  EXPECT_TRUE(observed_pause);
+  if (observed_pause) {
+    ASSERT_TRUE(index.Insert(allocate(key12_child), key12_child));
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      release = true;
+    }
+    condition.notify_all();
+  }
+  direct_writer.join();
+
+  EXPECT_TRUE(direct_inserted.load(std::memory_order_acquire));
+  for (const auto& key : {key4, key8, key12, key12_child}) {
+    EXPECT_TRUE(index.Contains(key));
+  }
+  CedarPureRadixIndex::Cursor cursor(&index);
+  cursor.SeekToFirst();
+  for (const auto expected : {0x40, 0x80, 0xc0, 0xc1}) {
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), expected);
+    cursor.Next();
+  }
+  EXPECT_FALSE(cursor.Valid());
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -911,6 +1589,114 @@ TEST(PartitionedVersionRadixMemTableTest,
   EXPECT_GT(observations.load(std::memory_order_relaxed), 0U);
   EXPECT_FALSE(failure.load(std::memory_order_acquire));
   EXPECT_EQ(Collect(table.get()).size(), universe.size());
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     ConcurrentSnapshotCandidatesMatchUpstreamSkipList) {
+  TestKeyComparator comparator;
+  ConcurrentArena radix_arena;
+  ConcurrentArena skiplist_arena;
+  PartitionedVersionRadixFactory radix_factory;
+  SkipListFactory skiplist_factory;
+  std::unique_ptr<MemTableRep> radix(
+      radix_factory.CreateMemTableRep(comparator, &radix_arena, nullptr,
+                                      nullptr));
+  std::unique_ptr<MemTableRep> skiplist(
+      skiplist_factory.CreateMemTableRep(comparator, &skiplist_arena, nullptr,
+                                         nullptr));
+  for (MemTableRep* table : {radix.get(), skiplist.get()}) {
+    ASSERT_TRUE(InsertConcurrently(table, InternalKeyFor(1, 30, kTypeValue),
+                                   "v30"));
+    ASSERT_TRUE(InsertConcurrently(table, InternalKeyFor(1, 20, kTypeDeletion),
+                                   "d20"));
+    ASSERT_TRUE(InsertConcurrently(table, InternalKeyFor(1, 10, kTypeValue),
+                                   "v10"));
+  }
+
+  constexpr size_t kWriterCount = 2;
+  constexpr size_t kKeysPerWriter = 128;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool reader_started = false;
+  bool first_writer_in_window = false;
+  bool overlap_observed = false;
+  std::atomic<size_t> writers_remaining{kWriterCount};
+  std::atomic<size_t> observations{0};
+  std::atomic<bool> failure{false};
+  std::vector<std::thread> writers;
+  for (size_t writer = 0; writer < kWriterCount; ++writer) {
+    writers.emplace_back([&, writer] {
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [&] { return reader_started; });
+      }
+      for (size_t index = 0; index < kKeysPerWriter; ++index) {
+        const uint64_t entity_id =
+            2 + writer * kKeysPerWriter + index;
+        const std::string key = InternalKeyFor(entity_id, 1, kTypeValue);
+        if (!InsertConcurrently(radix.get(), key, "value")) {
+          failure.store(true, std::memory_order_release);
+        }
+        if (writer == 0 && index == 0) {
+          std::unique_lock<std::mutex> lock(mutex);
+          first_writer_in_window = true;
+          condition.notify_all();
+          if (!condition.wait_for(lock, std::chrono::seconds(10), [&] {
+                return overlap_observed;
+              })) {
+            failure.store(true, std::memory_order_release);
+          }
+        }
+        if (!InsertConcurrently(skiplist.get(), key, "value")) {
+          failure.store(true, std::memory_order_release);
+        }
+        if (index % 16 == 0) std::this_thread::yield();
+      }
+      writers_remaining.fetch_sub(1, std::memory_order_release);
+    });
+  }
+
+  std::thread reader([&] {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      reader_started = true;
+    }
+    condition.notify_all();
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!overlap_observed && first_writer_in_window) {
+          for (SequenceNumber snapshot : {35U, 25U, 15U}) {
+            if (CollectGetCandidates(radix.get(), V2UserKey(1), snapshot) !=
+                CollectGetCandidates(skiplist.get(), V2UserKey(1), snapshot)) {
+              failure.store(true, std::memory_order_release);
+            }
+          }
+          overlap_observed = true;
+          condition.notify_all();
+        }
+      }
+      for (SequenceNumber snapshot : {35U, 25U, 15U}) {
+        if (CollectGetCandidates(radix.get(), V2UserKey(1), snapshot) !=
+            CollectGetCandidates(skiplist.get(), V2UserKey(1), snapshot)) {
+          failure.store(true, std::memory_order_release);
+        }
+      }
+      observations.fetch_add(1, std::memory_order_relaxed);
+      if (writers_remaining.load(std::memory_order_acquire) == 0) break;
+    }
+  });
+
+  for (std::thread& writer : writers) writer.join();
+  reader.join();
+
+  EXPECT_TRUE(overlap_observed);
+  EXPECT_GT(observations.load(std::memory_order_relaxed), 0U);
+  EXPECT_FALSE(failure.load(std::memory_order_acquire));
+  for (SequenceNumber snapshot : {35U, 25U, 15U}) {
+    EXPECT_EQ(CollectGetCandidates(radix.get(), V2UserKey(1), snapshot),
+              CollectGetCandidates(skiplist.get(), V2UserKey(1), snapshot));
+  }
 }
 
 }  // namespace

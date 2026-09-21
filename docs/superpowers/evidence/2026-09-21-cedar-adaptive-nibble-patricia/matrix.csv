@@ -1,0 +1,10 @@
+measurement,implementation,workload,seed,entries,writers,phase,samples,median_elapsed_ns,reference_median_ns,ratio,arena_bytes,gate
+B0,vector,random,20260921,131072,1,index,5,1360000,NA,NA,5433534,context
+B0,radix,random,20260921,131072,1,index,5,35556708,1360000,26.1446,23548200,fail
+B0,vector,random,20260921,131072,1,memtable,5,14307750,NA,NA,5433534,context
+B0,radix,random,20260921,131072,1,memtable,5,53359042,14307750,3.7293,23529904,fail
+B1,skiplist,random,20260921,131072,4,memtable,5,28016875,NA,NA,NA,context
+B1,radix,random,20260921,131072,4,memtable,5,23933125,28016875,0.8542,25076920,time-pass-memory-fail
+B1,skiplist,random,20260921,131072,8,memtable,5,26477000,NA,NA,NA,context
+B1,radix,random,20260921,131072,8,memtable,5,24930333,26477000,0.9416,25166240,time-pass-memory-fail
+full-matrix,vector-skiplist-radix,ascending-random-versions,20260920-20260922,1024-16384-131072,1-4-8,all,1215,NA,NA,NA,NA,pass-zero-errors-and-matching-hashes

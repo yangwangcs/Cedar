@@ -190,6 +190,14 @@ if(BUILD_BENCHMARKS)
     target_include_directories(cedar_temporal_range_profile PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(cedar_temporal_range_profile PRIVATE cedar_core)
+    add_executable(cedar_radix_memtable_bench
+        benchmarks/cedar_radix_memtable_bench.cc)
+    target_include_directories(cedar_radix_memtable_bench PRIVATE
+        ${CEDAR_ENGINE_SOURCE_DIR})
+    target_compile_definitions(cedar_radix_memtable_bench PRIVATE
+        ROCKSDB_PLATFORM_POSIX ROCKSDB_LIB_IO_POSIX OS_MACOSX HAVE_FULLFSYNC
+        LZ4 ZSTD CEDAR_ZSTD_NO_DICTIONARY_TRAINING)
+    target_link_libraries(cedar_radix_memtable_bench PRIVATE cedar_rocksdb)
 endif()
 
 install(TARGETS cedar_core EXPORT CedarTargets

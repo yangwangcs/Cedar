@@ -901,6 +901,10 @@ Status FlushJob::WriteLevel0Table() {
                              &mems_size);
     assert(job_context_);
     for (ReadOnlyMemTable* m : mems_) {
+      // Build any immutable-memtable flush acceleration after the DB mutex
+      // has been released. Recovery and ordinary read iterators must not
+      // trigger this O(N) preparation implicitly.
+      m->PrepareForFlush();
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] Flushing memtable id %" PRIu64
                      " with next log file: %" PRIu64 ", marked_for_flush: %d\n",

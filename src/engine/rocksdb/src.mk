@@ -144,6 +144,7 @@ LIB_SOURCES =                                                   \
   memtable/alloc_tracker.cc                                     \
   memtable/hash_linklist_rep.cc                                 \
   memtable/hash_skiplist_rep.cc                                 \
+  memtable/cedar_pure_radix_index.cc                             \
   memtable/partitioned_version_radix_memtable.cc                 \
   memtable/skiplistrep.cc                                       \
   memtable/vectorrep.cc                                         \

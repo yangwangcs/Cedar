@@ -497,6 +497,12 @@ if(TARGET cedar_kernel_bench)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
 endif()
 
+if(TARGET cedar_radix_memtable_bench)
+  add_test(NAME RadixBenchmarkCsvContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_RADIX_BENCHMARK=$<TARGET_FILE:cedar_radix_memtable_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_radix_benchmark_csv.cmake)
+endif()
+
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)
 target_include_directories(test_commit_publisher PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_commit_publisher

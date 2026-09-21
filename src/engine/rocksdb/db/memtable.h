@@ -299,6 +299,10 @@ class ReadOnlyMemTable {
   // write anything to this MemTable().  (Ie. do not call Add() or Update()).
   virtual void MarkImmutable() = 0;
 
+  // Prepare one-time read acceleration needed by an unlocked flush. The
+  // default is a no-op for MemTable implementations without such state.
+  virtual void PrepareForFlush() {}
+
   // Notify the underlying storage that all data it contained has been
   // persisted.
   // REQUIRES: external synchronization to prevent simultaneous
@@ -777,6 +781,8 @@ class MemTable final : public ReadOnlyMemTable {
     table_->MarkReadOnly();
     mem_tracker_.DoneAllocating();
   }
+
+  void PrepareForFlush() override { table_->PrepareForFlush(); }
 
   void MarkFlushed() override { table_->MarkFlushed(); }
 

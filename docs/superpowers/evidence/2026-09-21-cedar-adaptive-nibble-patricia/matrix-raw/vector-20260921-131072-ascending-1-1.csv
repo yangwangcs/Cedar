@@ -1,0 +1,2 @@
+revision,workload,seed,entries,allocated_handles,writers,repeat,seconds,ops,p50_ns,p95_ns,p99_ns,peak_rss_bytes,arena_bytes,bytes_per_handle,result_hash,errors,active_scan_ns,frozen_first_scan_ns,frozen_ready_scan_ns,phase,elapsed_ns,index_insert_ns,allocate_and_insert_ns,active_scan_ns_phase,freeze_prepare_ns,first_frozen_scan_ns,ready_frozen_scan_ns
+fdece4e,ascending,20260921,131072,131072,1,0,0.013735,131072,NA,NA,NA,15482880,5433534,41,454339457082336225,0,8312833,9005292,6875375,all,37928542,13735042,13735042,8312833,0,9005292,6875375

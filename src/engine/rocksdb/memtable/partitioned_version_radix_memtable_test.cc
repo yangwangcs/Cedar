@@ -12,6 +12,7 @@
 #include <mutex>
 #include <new>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -606,6 +607,69 @@ TEST(PartitionedVersionRadixMemTableTest,
     ASSERT_TRUE(iterator->Valid());
     EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(expected[index - 1]));
   }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     SparseNibbleSeekChoosesAdjacentOccupiedChildren) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+
+  const auto insert = [&](uint8_t nibble) {
+    CedarPureRadixIndex::Key key{};
+    key[39] = nibble;
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(nibble);
+    ASSERT_TRUE(index.Insert(handle, key));
+  };
+  for (uint8_t nibble : {uint8_t{2}, uint8_t{7}, uint8_t{13}}) insert(nibble);
+
+  const auto seek = [&](uint8_t probe, bool previous,
+                        std::optional<uint8_t> expected) {
+    CedarPureRadixIndex::Key key{};
+    key[39] = probe;
+    CedarPureRadixIndex::Cursor cursor(&index);
+    if (previous) cursor.SeekForPrev(key);
+    else cursor.Seek(key);
+    ASSERT_EQ(cursor.Valid(), expected.has_value());
+    if (expected) EXPECT_EQ(static_cast<uint8_t>(*cursor.entry()), *expected);
+  };
+
+  seek(0, false, 2);
+  seek(3, false, 7);
+  seek(8, false, 13);
+  seek(14, false, std::nullopt);
+  seek(0, true, std::nullopt);
+  seek(3, true, 2);
+  seek(8, true, 7);
+  seek(14, true, 13);
+
+  ConcurrentArena boundary_arena;
+  CedarPureRadixIndex boundary_index(&boundary_arena);
+  const auto insert_boundary = [&](uint8_t nibble) {
+    CedarPureRadixIndex::Key key{};
+    key[39] = nibble;
+    char* entry = nullptr;
+    void* handle = boundary_index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(nibble);
+    ASSERT_TRUE(boundary_index.Insert(handle, key));
+  };
+  insert_boundary(0);
+  insert_boundary(15);
+  CedarPureRadixIndex::Cursor boundary_cursor(&boundary_index);
+  CedarPureRadixIndex::Key zero{};
+  boundary_cursor.Seek(zero);
+  ASSERT_TRUE(boundary_cursor.Valid());
+  EXPECT_EQ(static_cast<uint8_t>(*boundary_cursor.entry()), 0U);
+  CedarPureRadixIndex::Key fifteen{};
+  fifteen[39] = 15;
+  boundary_cursor.SeekForPrev(fifteen);
+  ASSERT_TRUE(boundary_cursor.Valid());
+  EXPECT_EQ(static_cast<uint8_t>(*boundary_cursor.entry()), 15U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,

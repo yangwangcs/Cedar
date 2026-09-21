@@ -448,6 +448,46 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     SegmentedNibbleSeekCrossesEveryBlockBoundary) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  std::array<CedarPureRadixIndex::Key, 16> keys{};
+  std::array<void*, 16> handles{};
+  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
+    keys[nibble][0] = static_cast<unsigned char>(nibble << 4);
+    char* entry = nullptr;
+    handles[nibble] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[nibble], nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(nibble);
+  }
+  for (size_t position : {12U, 3U, 8U, 7U, 4U, 11U, 0U, 15U,
+                          1U, 14U, 5U, 10U, 2U, 13U, 6U, 9U}) {
+    ASSERT_TRUE(index.Insert(handles[position], keys[position]));
+  }
+
+  CedarPureRadixIndex::Cursor cursor(&index);
+  for (uint8_t boundary : {4U, 8U, 12U}) {
+    CedarPureRadixIndex::Key lower{};
+    lower[0] = static_cast<unsigned char>((boundary - 1) << 4 | 0x0f);
+    cursor.Seek(lower);
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
+
+    CedarPureRadixIndex::Key upper{};
+    upper[0] = static_cast<unsigned char>(boundary << 4);
+    cursor.SeekForPrev(upper);
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
+
+    upper[0] = static_cast<unsigned char>(boundary << 4 | 0x0f);
+    cursor.SeekForPrev(upper);
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
+  }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      SharesIdentityPrefixMemoryAcrossVersionHeavyChains) {
   TestKeyComparator comparator;
   Arena arena;

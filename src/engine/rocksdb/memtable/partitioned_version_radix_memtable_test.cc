@@ -410,8 +410,41 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   const auto stats = index.GetStructureStatsForTesting();
   EXPECT_EQ(stats.branches, 1U);
-  EXPECT_EQ(stats.child_tables, 1U);
+  EXPECT_EQ(stats.child_tables, 4U);
+  EXPECT_EQ(stats.child_blocks, 4U);
   EXPECT_EQ(stats.max_depth, 1U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     SegmentedNibbleBlocksPackLocalRanksInGlobalOrder) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  std::array<CedarPureRadixIndex::Key, 16> keys{};
+  std::array<void*, 16> handles{};
+
+  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
+    keys[nibble][0] = static_cast<unsigned char>(nibble << 4);
+    char* entry = nullptr;
+    handles[nibble] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[nibble], nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(nibble);
+  }
+  for (size_t position : {13U, 0U, 7U, 3U, 15U, 4U, 10U, 1U,
+                          8U, 14U, 6U, 11U, 2U, 12U, 5U, 9U}) {
+    ASSERT_TRUE(index.Insert(handles[position], keys[position]));
+  }
+
+  const auto stats = index.GetStructureStatsForTesting();
+  ASSERT_EQ(stats.child_blocks, 4U);
+  EXPECT_EQ(stats.segment_occupied[0], 0x0fU);
+  EXPECT_EQ(stats.segment_occupied[1], 0x0fU);
+  EXPECT_EQ(stats.segment_occupied[2], 0x0fU);
+  EXPECT_EQ(stats.segment_occupied[3], 0x0fU);
+  EXPECT_EQ(stats.segment_child_counts[0], 4U);
+  EXPECT_EQ(stats.segment_child_counts[1], 4U);
+  EXPECT_EQ(stats.segment_child_counts[2], 4U);
+  EXPECT_EQ(stats.segment_child_counts[3], 4U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,

@@ -40,7 +40,10 @@ class CedarPureRadixIndex {
 
   struct StructureStatsForTesting {
     size_t branches = 0;
-    size_t child_tables = 0;
+    size_t child_tables = 0;  // Compatibility total for all child blocks.
+    size_t child_blocks = 0;
+    std::array<uint8_t, 4> segment_occupied{};
+    std::array<uint8_t, 4> segment_child_counts{};
     size_t max_depth = 0;
   };
 
@@ -86,10 +89,10 @@ class CedarPureRadixIndex {
     Leaf* frozen_next = nullptr;
   };
 
-  // An immutable sparse 16-way child snapshot. `children` is a flexible tail
-  // laid out in nibble order according to `occupied`.
-  struct ChildTable {
-    uint16_t occupied = 0;
+  // An immutable sparse snapshot for one four-nibble segment. `children` is
+  // a flexible tail laid out in local-nibble order according to `occupied`.
+  struct ChildBlock {
+    uint8_t occupied = 0;
     uint8_t child_count = 0;
     Node* children[1];
   };
@@ -97,7 +100,7 @@ class CedarPureRadixIndex {
   struct Branch final : Node {
     Branch() : Node(NodeKind::kBranch) {}
     uint8_t nibble_index = 0;
-    std::atomic<ChildTable*> children{nullptr};
+    std::array<std::atomic<ChildBlock*>, 4> segments{};
     // Branches are immutable after publication. These cached boundaries let
     // Seek compare against a child interval without descending to its edge
     // leaf at every ancestor.
@@ -122,7 +125,8 @@ class CedarPureRadixIndex {
 
   struct TraversalFrame {
     Branch* branch;
-    ChildTable* table;
+    uint8_t segment;
+    ChildBlock* block;
     uint8_t nibble;
     Node* child;
   };
@@ -132,18 +136,20 @@ class CedarPureRadixIndex {
   static const Leaf* AsLeaf(const Node* node);
   static Branch* AsBranch(Node* node);
   static const Branch* AsBranch(const Node* node);
-  static Node* ChildAt(const ChildTable* table, uint8_t nibble);
-  static uint8_t FirstChildAtOrAfter(const ChildTable* table,
-                                     uint8_t nibble);
-  static uint8_t LastChildAtOrBefore(const ChildTable* table,
-                                     uint8_t nibble);
-  ChildTable* AllocateChildTable(uint16_t occupied, Node* const* children);
-  ChildTable* CopyTableWithInsertedChild(const ChildTable* old_table,
+  static uint8_t SegmentFor(uint8_t nibble) { return nibble >> 2; }
+  static uint8_t LocalNibbleFor(uint8_t nibble) { return nibble & 0x03; }
+  static ChildBlock* BlockAt(const Branch* branch, uint8_t nibble);
+  static Node* ChildAt(const ChildBlock* block, uint8_t nibble);
+  static Node* ChildAt(const Branch* branch, uint8_t nibble);
+  static uint8_t FirstChildAtOrAfter(const Branch* branch, uint8_t nibble);
+  static uint8_t LastChildAtOrBefore(const Branch* branch, uint8_t nibble);
+  ChildBlock* AllocateChildBlock(uint8_t occupied, Node* const* children);
+  ChildBlock* CopyBlockWithInsertedChild(const ChildBlock* old_block,
                                          uint8_t nibble, Node* child);
-  ChildTable* CopyTableWithReplacedChild(const ChildTable* old_table,
+  ChildBlock* CopyBlockWithReplacedChild(const ChildBlock* old_block,
                                          uint8_t nibble, Node* child);
-  bool ReplaceTable(Branch* branch, ChildTable* observed,
-                    ChildTable* replacement) const;
+  bool ReplaceBlock(Branch* branch, uint8_t segment, ChildBlock* observed,
+                    ChildBlock* replacement) const;
   Branch* AllocateBranch(uint8_t nibble_index, Node* old_node,
                         Leaf* new_leaf);
   static Leaf* MinimumLeaf(Node* node);

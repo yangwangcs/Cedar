@@ -246,6 +246,24 @@ def sparse_final_nibble_contract(broken: bool = False) -> None:
     assert isinstance(root, NibbleBranch)
     assert root.nibble == 1
     assert all(isinstance(child, Leaf) for child in root.children)
+    segmented_nibble_blocks_are_sorted()
+
+
+def segmented_nibble_blocks_are_sorted() -> None:
+    # A four-way block owns a local nibble bitmap. Flattening segment-major,
+    # then local-rank order must recover the original 16-way key order.
+    blocks: list[list[int | None]] = [[None] * 4 for _ in range(4)]
+    for nibble in (13, 0, 7, 3, 15, 4, 10, 1,
+                   8, 14, 6, 11, 2, 12, 5, 9):
+        segment, local = divmod(nibble, 4)
+        blocks[segment][local] = nibble
+    packed = [
+        tuple(value for value in block if value is not None)
+        for block in blocks
+    ]
+    assert packed == [(0, 1, 2, 3), (4, 5, 6, 7),
+                      (8, 9, 10, 11), (12, 13, 14, 15)]
+    assert [value for block in packed for value in block] == list(range(16))
 
 
 def run(width: int, writers: int, broken: bool) -> bool:

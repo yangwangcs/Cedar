@@ -303,7 +303,9 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
   handle->leaf.frozen_next = nullptr;
 
   for (;;) {
-    std::array<TraversalFrame, kNibbles> path{};
+    // Frames are written before depth advances; all consumers read only
+    // [0, depth), so avoid clearing the unused tail on every insertion.
+    std::array<TraversalFrame, kNibbles> path;
     size_t depth = 0;
     Node* node = root_.load(std::memory_order_acquire);
     while (node != nullptr && node->kind == NodeKind::kBranch) {

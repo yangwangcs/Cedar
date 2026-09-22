@@ -15,19 +15,17 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-uint16_t Mask(uint8_t local) {
-  assert(local < 16);
-  return static_cast<uint16_t>(uint16_t{1} << local);
+uint64_t Mask(uint8_t local) {
+  assert(local < 64);
+  return uint64_t{1} << local;
 }
-uint16_t Below(uint8_t local) {
-  assert(local < 16);
-  return static_cast<uint16_t>((uint16_t{1} << local) - 1);
+uint64_t Below(uint8_t local) {
+  assert(local < 64);
+  return (uint64_t{1} << local) - 1;
 }
-uint16_t Through(uint8_t local) {
-  assert(local < 16);
-  return local == 15
-             ? std::numeric_limits<uint16_t>::max()
-             : static_cast<uint16_t>((uint16_t{1} << (local + 1)) - 1);
+uint64_t Through(uint8_t local) {
+  assert(local < 64);
+  return local == 63 ? ~uint64_t{0} : (uint64_t{1} << (local + 1)) - 1;
 }
 }  // namespace
 
@@ -115,8 +113,8 @@ const CedarPureRadixIndex::Branch* CedarPureRadixIndex::AsBranch(const Node* nod
   return static_cast<const Branch*>(node);
 }
 
-// A branch owns 16 independent publication edges. A block's local bitmap
-// packs only the children for its 16-byte-value interval.
+// A branch owns four independent publication edges. A block's local bitmap
+// packs only the children for its 64-byte-value interval.
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::BlockAt(
     const Branch* branch, uint8_t value) {
   assert(branch != nullptr);
@@ -124,11 +122,10 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::BlockAt(
 }
 CedarPureRadixIndex::Node* CedarPureRadixIndex::ChildAt(const ChildBlock* block,
                                                          uint8_t local) {
-  assert(local < 16);
+  assert(local < 64);
   if (block == nullptr || (block->occupied & Mask(local)) == 0)
     return nullptr;
-  const auto rank = std::popcount(
-      static_cast<uint16_t>(block->occupied & Below(local)));
+  const auto rank = std::popcount(block->occupied & Below(local));
   assert(rank < block->child_count);
   return block->children[rank];
 }
@@ -139,15 +136,12 @@ CedarPureRadixIndex::Node* CedarPureRadixIndex::ChildAt(const Branch* branch,
 uint16_t CedarPureRadixIndex::FirstChildAtOrAfter(const Branch* branch,
                                                    uint8_t value) {
   assert(branch != nullptr);
-  for (uint8_t segment = SegmentForByte(value);
-       segment < kByteSegmentCount; ++segment) {
+  for (uint8_t segment = SegmentForByte(value); segment < 4; ++segment) {
     auto* block = branch->segments[segment].load(std::memory_order_acquire);
     const uint8_t local = segment == SegmentForByte(value) ? LocalByte(value) : 0;
-    const uint16_t occupied = block == nullptr ? uint16_t{0} : block->occupied;
-    const uint16_t set = static_cast<uint16_t>(occupied & ~Below(local));
-    if (set != 0) {
-      return static_cast<uint16_t>(segment * 16 + std::countr_zero(set));
-    }
+    const auto occupied = block == nullptr ? uint64_t{0} : block->occupied;
+    const auto set = occupied & ~Below(local);
+    if (set != 0) return static_cast<uint16_t>(segment * 64 + std::countr_zero(set));
   }
   return 256;
 }
@@ -156,21 +150,20 @@ uint16_t CedarPureRadixIndex::LastChildAtOrBefore(const Branch* branch,
   assert(branch != nullptr);
   for (int segment = SegmentForByte(value); segment >= 0; --segment) {
     auto* block = branch->segments[segment].load(std::memory_order_acquire);
-    const uint8_t local =
-        segment == SegmentForByte(value) ? LocalByte(value) : 15;
-    const uint16_t occupied = block == nullptr ? uint16_t{0} : block->occupied;
-    const uint16_t set = static_cast<uint16_t>(occupied & Through(local));
+    const uint8_t local = segment == SegmentForByte(value) ? LocalByte(value) : 63;
+    const auto occupied = block == nullptr ? uint64_t{0} : block->occupied;
+    const auto set = occupied & Through(local);
     if (set != 0) {
-      return static_cast<uint16_t>(segment * 16 + 15 - std::countl_zero(set));
+      return static_cast<uint16_t>(segment * 64 + 63 - std::countl_zero(set));
     }
   }
   return 256;
 }
 
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::AllocateChildBlock(
-    uint16_t occupied, Node* const* children) {
+    uint64_t occupied, Node* const* children) {
   const auto count = static_cast<uint8_t>(std::popcount(occupied));
-  assert(count > 0 && count <= 16);
+  assert(count > 0 && count <= 64);
   const auto bytes = offsetof(ChildBlock, children) + size_t{count} * sizeof(Node*);
   auto* block = reinterpret_cast<ChildBlock*>(allocator_->AllocateAligned(bytes));
   block->occupied = occupied;
@@ -186,10 +179,9 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithInsertedChild
   assert(child != nullptr);
   const uint8_t local = LocalByte(value);
   assert(ChildAt(old, local) == nullptr);
-  std::array<Node*, 16> packed{};
-  const uint16_t old_occupied = old == nullptr ? uint16_t{0} : old->occupied;
-  const size_t rank = std::popcount(
-      static_cast<uint16_t>(old_occupied & Below(local)));
+  std::array<Node*, 64> packed{};
+  const auto old_occupied = old == nullptr ? uint64_t{0} : old->occupied;
+  const size_t rank = std::popcount(old_occupied & Below(local));
   const size_t count = old == nullptr ? 0 : old->child_count;
   for (size_t i = 0; i < rank; ++i) packed[i] = old->children[i];
   packed[rank] = child;
@@ -201,18 +193,16 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithReplacedChild
   assert(old != nullptr && child != nullptr);
   const uint8_t local = LocalByte(value);
   assert(ChildAt(old, local) != nullptr);
-  std::array<Node*, 16> packed{};
+  std::array<Node*, 64> packed{};
   for (size_t i = 0; i < old->child_count; ++i) packed[i] = old->children[i];
-  packed[std::popcount(
-      static_cast<uint16_t>(old->occupied & Below(local)))] = child;
+  packed[std::popcount(old->occupied & Below(local))] = child;
   return AllocateChildBlock(old->occupied, packed.data());
 }
 
 bool CedarPureRadixIndex::ReplaceBlock(Branch* branch, uint8_t segment,
                                         ChildBlock* observed,
                                         ChildBlock* replacement) const {
-  assert(branch != nullptr && segment < kByteSegmentCount &&
-         replacement != nullptr);
+  assert(branch != nullptr && segment < 4 && replacement != nullptr);
   if (test_hooks_.table_snapshot_cas_for_testing) {
     test_hooks_.table_snapshot_cas_for_testing();
   }
@@ -245,13 +235,12 @@ CedarPureRadixIndex::Branch* CedarPureRadixIndex::AllocateBranch(
   assert(index < kKeyBytes && old_byte != new_byte);
   auto* branch = new (allocator_->AllocateAligned(sizeof(Branch))) Branch();
   branch->byte_index = index;
-  std::array<std::array<Node*, 2>, kByteSegmentCount> children{};
-  std::array<uint16_t, kByteSegmentCount> occupied{};
+  std::array<std::array<Node*, 2>, 4> children{};
+  std::array<uint64_t, 4> occupied{};
   const auto add_child = [&](uint8_t value, Node* child) {
     const auto segment = SegmentForByte(value);
     const auto local = LocalByte(value);
-    const size_t rank = std::popcount(
-        static_cast<uint16_t>(occupied[segment] & Below(local)));
+    const size_t rank = std::popcount(occupied[segment] & Below(local));
     const size_t count = std::popcount(occupied[segment]);
     for (size_t i = count; i > rank; --i) children[segment][i] = children[segment][i - 1];
     children[segment][rank] = child;
@@ -259,7 +248,7 @@ CedarPureRadixIndex::Branch* CedarPureRadixIndex::AllocateBranch(
   };
   add_child(old_byte, old);
   add_child(new_byte, added);
-  for (uint8_t segment = 0; segment < kByteSegmentCount; ++segment) {
+  for (uint8_t segment = 0; segment < 4; ++segment) {
     if (occupied[segment] != 0)
       branch->segments[segment].store(AllocateChildBlock(occupied[segment],
                                                           children[segment].data()),
@@ -421,7 +410,7 @@ CedarPureRadixIndex::GetStructureStatsForTesting() const {
     ++stats.branches;
     ++stats.byte_branches;
     stats.max_depth = std::max(stats.max_depth, depth);
-    for (uint8_t segment = 0; segment < kByteSegmentCount; ++segment) {
+    for (uint8_t segment = 0; segment < 4; ++segment) {
       auto* block = branch->segments[segment].load(std::memory_order_acquire);
       if (block == nullptr) continue;
       ++stats.child_tables;

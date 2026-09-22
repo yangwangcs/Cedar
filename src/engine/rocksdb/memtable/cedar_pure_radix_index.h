@@ -21,7 +21,6 @@ class CedarPureRadixIndex {
  public:
   static constexpr size_t kKeyBytes = 40;
   static constexpr size_t kMaxBits = kKeyBytes * 8;
-  static constexpr size_t kByteSegmentCount = 16;
   using Key = std::array<unsigned char, kKeyBytes>;
 
   struct TestHooks {
@@ -40,8 +39,8 @@ class CedarPureRadixIndex {
     size_t branches = 0;
     // Byte-branch representation contract, aggregated across all branches.
     size_t byte_branches = 0;
-    std::array<uint16_t, kByteSegmentCount> byte_segment_occupied{};
-    std::array<uint8_t, kByteSegmentCount> byte_segment_child_counts{};
+    std::array<uint64_t, 4> byte_segment_occupied{};
+    std::array<uint8_t, 4> byte_segment_child_counts{};
     size_t child_tables = 0;  // Compatibility total for all child blocks.
     size_t child_blocks = 0;
     std::array<uint8_t, 4> segment_occupied{};
@@ -53,7 +52,7 @@ class CedarPureRadixIndex {
                                TestHooks test_hooks = {});
 
   static constexpr uint8_t SegmentForByte(uint8_t value) {
-    return value >> 4;
+    return value >> 6;
   }
 
   // The opaque handle owns one leaf and one private branch candidate. The
@@ -95,10 +94,10 @@ class CedarPureRadixIndex {
     Leaf* frozen_next = nullptr;
   };
 
-  // An immutable sparse snapshot for one 16-byte-value segment. `children`
-  // is a flexible tail laid out in low-four-bit order according to `occupied`.
+  // An immutable sparse snapshot for one 64-byte-value segment. `children`
+  // is a flexible tail laid out in low-six-bit order according to `occupied`.
   struct ChildBlock {
-    uint16_t occupied = 0;
+    uint64_t occupied = 0;
     uint8_t child_count = 0;
     Node* children[1];
   };
@@ -106,7 +105,7 @@ class CedarPureRadixIndex {
   struct Branch final : Node {
     Branch() : Node(NodeKind::kBranch) {}
     uint8_t byte_index = 0;
-    std::array<std::atomic<ChildBlock*>, kByteSegmentCount> segments{};
+    std::array<std::atomic<ChildBlock*>, 4> segments{};
     // Branches are immutable after publication. These cached boundaries let
     // Seek compare against a child interval without descending to its edge
     // leaf at every ancestor.
@@ -142,13 +141,13 @@ class CedarPureRadixIndex {
   static const Leaf* AsLeaf(const Node* node);
   static Branch* AsBranch(Node* node);
   static const Branch* AsBranch(const Node* node);
-  static uint8_t LocalByte(uint8_t value) { return value & 0x0f; }
+  static uint8_t LocalByte(uint8_t value) { return value & 0x3f; }
   static ChildBlock* BlockAt(const Branch* branch, uint8_t value);
   static Node* ChildAt(const ChildBlock* block, uint8_t local_byte);
   static Node* ChildAt(const Branch* branch, uint8_t value);
   static uint16_t FirstChildAtOrAfter(const Branch* branch, uint8_t value);
   static uint16_t LastChildAtOrBefore(const Branch* branch, uint8_t value);
-  ChildBlock* AllocateChildBlock(uint16_t occupied, Node* const* children);
+  ChildBlock* AllocateChildBlock(uint64_t occupied, Node* const* children);
   ChildBlock* CopyBlockWithInsertedChild(const ChildBlock* old_block,
                                          uint8_t value, Node* child);
   ChildBlock* CopyBlockWithReplacedChild(const ChildBlock* old_block,

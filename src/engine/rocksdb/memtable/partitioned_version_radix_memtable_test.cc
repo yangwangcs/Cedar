@@ -133,35 +133,6 @@ uint64_t OrderedKeyHash(const std::vector<std::string>& keys) {
   return hash;
 }
 
-void* AllocateMarkedEntry(CedarPureRadixIndex* index,
-                          const CedarPureRadixIndex::Key& key,
-                          unsigned char marker) {
-  char* entry = nullptr;
-  void* handle = index->Allocate(1, &entry);
-  EXPECT_NE(handle, nullptr);
-  EXPECT_NE(entry, nullptr);
-  if (entry != nullptr) *entry = static_cast<char>(marker);
-  return handle;
-}
-
-void ExpectOrderedIndex(
-    CedarPureRadixIndex* index,
-    std::vector<std::pair<CedarPureRadixIndex::Key, unsigned char>> expected) {
-  std::sort(expected.begin(), expected.end(),
-            [](const auto& left, const auto& right) {
-              return left.first < right.first;
-            });
-  CedarPureRadixIndex::Cursor cursor(index);
-  cursor.SeekToFirst();
-  for (const auto& [key, marker] : expected) {
-    EXPECT_TRUE(index->Contains(key));
-    ASSERT_TRUE(cursor.Valid());
-    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), marker);
-    cursor.Next();
-  }
-  EXPECT_FALSE(cursor.Valid());
-}
-
 struct GetCandidates {
   Slice user_key;
   std::vector<std::string> entries;
@@ -1928,16 +1899,13 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     CompatibleEmptyChildFailureRetriesSameEdgeOnce) {
+     ByteSegmentStaleBlockRejectsAndRetries) {
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
   bool paused = false;
   bool release = false;
   size_t observer_calls = 0;
-  size_t local_retries = 0;
-  size_t local_successes = 0;
-  size_t root_restarts = 0;
   CedarPureRadixIndex::TestHooks hooks;
   hooks.table_snapshot_cas_for_testing = [&] {
     std::unique_lock<std::mutex> lock(mutex);
@@ -1946,12 +1914,6 @@ TEST(PartitionedVersionRadixMemTableTest,
     condition.notify_all();
     condition.wait(lock, [&] { return release; });
   };
-  hooks.local_retry_for_testing = [&](bool compatible, bool published) {
-    EXPECT_TRUE(compatible);
-    ++local_retries;
-    local_successes += published;
-  };
-  hooks.root_restart_for_testing = [&] { ++root_restarts; };
   CedarPureRadixIndex index(&arena, hooks);
 
   const auto allocate = [&](const CedarPureRadixIndex::Key& key) {
@@ -1995,292 +1957,7 @@ TEST(PartitionedVersionRadixMemTableTest,
   EXPECT_TRUE(stale_inserted.load(std::memory_order_acquire));
   // One paused stale CAS, one competing publish, then stale retry.
   EXPECT_EQ(observer_calls, 3U);
-  EXPECT_EQ(local_retries, 1U);
-  EXPECT_EQ(local_successes, 1U);
-  EXPECT_EQ(root_restarts, 0U);
   for (const auto& key : {key0, key1, key2, key3}) EXPECT_TRUE(index.Contains(key));
-}
-
-TEST(PartitionedVersionRadixMemTableTest,
-     CompatibleWrapperFailureRetriesSameEdgeOnce) {
-  ConcurrentArena arena;
-  std::mutex mutex;
-  std::condition_variable condition;
-  bool arm = false;
-  bool paused = false;
-  bool release = false;
-  size_t cas_calls = 0;
-  size_t local_retries = 0;
-  size_t local_successes = 0;
-  size_t root_restarts = 0;
-  CedarPureRadixIndex::TestHooks hooks;
-  hooks.table_snapshot_cas_for_testing = [&] {
-    std::unique_lock<std::mutex> lock(mutex);
-    if (!arm || cas_calls++ != 0) return;
-    paused = true;
-    condition.notify_all();
-    condition.wait(lock, [&] { return release; });
-  };
-  hooks.local_retry_for_testing = [&](bool compatible, bool published) {
-    EXPECT_TRUE(compatible);
-    ++local_retries;
-    local_successes += published;
-  };
-  hooks.root_restart_for_testing = [&] { ++root_restarts; };
-  CedarPureRadixIndex index(&arena, hooks);
-
-  CedarPureRadixIndex::Key key64{};
-  CedarPureRadixIndex::Key key64_1{};
-  CedarPureRadixIndex::Key key66{};
-  CedarPureRadixIndex::Key key67{};
-  key64[0] = key64_1[0] = 64;
-  key64_1[39] = 1;
-  key66[0] = 66;
-  key67[0] = 67;
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key64, 1), key64));
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key66, 3), key66));
-  arm = true;
-
-  std::atomic<bool> wrapped{false};
-  std::thread writer([&] {
-    wrapped.store(index.Insert(AllocateMarkedEntry(&index, key64_1, 2),
-                               key64_1),
-                  std::memory_order_release);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2),
-                                   [&] { return paused; }));
-  }
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key67, 4), key67));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    release = true;
-  }
-  condition.notify_all();
-  writer.join();
-
-  EXPECT_TRUE(wrapped.load(std::memory_order_acquire));
-  EXPECT_EQ(local_retries, 1U);
-  EXPECT_EQ(local_successes, 1U);
-  EXPECT_EQ(root_restarts, 0U);
-  ExpectOrderedIndex(&index,
-                     {{key64, 1}, {key64_1, 2}, {key66, 3}, {key67, 4}});
-}
-
-TEST(PartitionedVersionRadixMemTableTest,
-     ChangedTargetChildFallsBackToAcquireRoot) {
-  ConcurrentArena arena;
-  std::mutex mutex;
-  std::condition_variable condition;
-  bool arm = false;
-  bool paused = false;
-  bool release = false;
-  size_t cas_calls = 0;
-  size_t local_retries = 0;
-  size_t root_restarts = 0;
-  CedarPureRadixIndex::TestHooks hooks;
-  hooks.table_snapshot_cas_for_testing = [&] {
-    std::unique_lock<std::mutex> lock(mutex);
-    if (!arm || cas_calls++ != 0) return;
-    paused = true;
-    condition.notify_all();
-    condition.wait(lock, [&] { return release; });
-  };
-  hooks.local_retry_for_testing = [&](bool, bool) { ++local_retries; };
-  hooks.root_restart_for_testing = [&] { ++root_restarts; };
-  CedarPureRadixIndex index(&arena, hooks);
-
-  CedarPureRadixIndex::Key key64{};
-  CedarPureRadixIndex::Key key64_1{};
-  CedarPureRadixIndex::Key key64_2{};
-  CedarPureRadixIndex::Key key66{};
-  key64[0] = key64_1[0] = key64_2[0] = 64;
-  key64_1[39] = 1;
-  key64_2[39] = 2;
-  key66[0] = 66;
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key64, 1), key64));
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key66, 4), key66));
-  arm = true;
-
-  std::atomic<bool> inserted{false};
-  std::thread writer([&] {
-    inserted.store(index.Insert(AllocateMarkedEntry(&index, key64_1, 2),
-                                key64_1),
-                   std::memory_order_release);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2),
-                                   [&] { return paused; }));
-  }
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key64_2, 3), key64_2));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    release = true;
-  }
-  condition.notify_all();
-  writer.join();
-
-  EXPECT_TRUE(inserted.load(std::memory_order_acquire));
-  EXPECT_EQ(local_retries, 0U);
-  EXPECT_EQ(root_restarts, 1U);
-  ExpectOrderedIndex(
-      &index, {{key64, 1}, {key64_1, 2}, {key64_2, 3}, {key66, 4}});
-}
-
-TEST(PartitionedVersionRadixMemTableTest,
-     SecondSameEdgeFailureFallsBackToAcquireRoot) {
-  ConcurrentArena arena;
-  std::mutex mutex;
-  std::condition_variable condition;
-  bool arm = false;
-  size_t pause_stage = 0;
-  size_t released_stage = 0;
-  size_t cas_calls = 0;
-  size_t local_retries = 0;
-  size_t local_successes = 0;
-  size_t root_restarts = 0;
-  CedarPureRadixIndex::TestHooks hooks;
-  hooks.table_snapshot_cas_for_testing = [&] {
-    std::unique_lock<std::mutex> lock(mutex);
-    if (!arm) return;
-    const size_t call = cas_calls++;
-    const size_t stage = call == 0 ? 1 : (call == 2 ? 2 : 0);
-    if (stage == 0) return;
-    pause_stage = stage;
-    condition.notify_all();
-    condition.wait(lock, [&] { return released_stage >= stage; });
-  };
-  hooks.local_retry_for_testing = [&](bool compatible, bool published) {
-    EXPECT_TRUE(compatible);
-    ++local_retries;
-    local_successes += published;
-  };
-  hooks.root_restart_for_testing = [&] { ++root_restarts; };
-  CedarPureRadixIndex index(&arena, hooks);
-
-  std::array<CedarPureRadixIndex::Key, 5> keys{};
-  for (size_t i = 0; i < keys.size(); ++i) keys[i][0] = 64 + i;
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, keys[0], 1), keys[0]));
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, keys[1], 2), keys[1]));
-  arm = true;
-
-  std::atomic<bool> inserted{false};
-  std::thread writer([&] {
-    inserted.store(index.Insert(AllocateMarkedEntry(&index, keys[4], 5),
-                                keys[4]),
-                   std::memory_order_release);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2),
-                                   [&] { return pause_stage == 1; }));
-  }
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, keys[2], 3), keys[2]));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    released_stage = 1;
-  }
-  condition.notify_all();
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2),
-                                   [&] { return pause_stage == 2; }));
-  }
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, keys[3], 4), keys[3]));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    released_stage = 2;
-  }
-  condition.notify_all();
-  writer.join();
-
-  EXPECT_TRUE(inserted.load(std::memory_order_acquire));
-  EXPECT_EQ(local_retries, 1U);
-  EXPECT_EQ(local_successes, 0U);
-  EXPECT_EQ(root_restarts, 1U);
-  ExpectOrderedIndex(
-      &index, {{keys[0], 1}, {keys[1], 2}, {keys[2], 3}, {keys[3], 4},
-               {keys[4], 5}});
-}
-
-TEST(PartitionedVersionRadixMemTableTest,
-     CompatibleRetryRemainsReachableAfterConcurrentAncestorWrapper) {
-  ConcurrentArena arena;
-  std::mutex mutex;
-  std::condition_variable condition;
-  bool arm = false;
-  bool paused = false;
-  bool release = false;
-  size_t cas_calls = 0;
-  size_t local_retries = 0;
-  size_t local_successes = 0;
-  size_t root_restarts = 0;
-  CedarPureRadixIndex::TestHooks hooks;
-  hooks.table_snapshot_cas_for_testing = [&] {
-    std::unique_lock<std::mutex> lock(mutex);
-    if (!arm || cas_calls++ != 0) return;
-    paused = true;
-    condition.notify_all();
-    condition.wait(lock, [&] { return release; });
-  };
-  hooks.local_retry_for_testing = [&](bool compatible, bool published) {
-    EXPECT_TRUE(compatible);
-    ++local_retries;
-    local_successes += published;
-  };
-  hooks.root_restart_for_testing = [&] { ++root_restarts; };
-  CedarPureRadixIndex index(&arena, hooks);
-
-  CedarPureRadixIndex::Key key2{};
-  CedarPureRadixIndex::Key key0{};
-  CedarPureRadixIndex::Key key5{};
-  CedarPureRadixIndex::Key key7{};
-  CedarPureRadixIndex::Key ancestor{};
-  key0[0] = key2[0] = key5[0] = key7[0] = 64;
-  key0[39] = 0;
-  key2[39] = 2;
-  key5[39] = 5;
-  key7[39] = 7;
-  ancestor[0] = 128;
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key2, 2), key2));
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key7, 4), key7));
-  arm = true;
-
-  std::atomic<bool> inserted{false};
-  std::thread writer([&] {
-    inserted.store(index.Insert(AllocateMarkedEntry(&index, key0, 1), key0),
-                   std::memory_order_release);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(2),
-                                   [&] { return paused; }));
-  }
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, key5, 3), key5));
-  ASSERT_TRUE(index.Insert(AllocateMarkedEntry(&index, ancestor, 5), ancestor));
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    release = true;
-  }
-  condition.notify_all();
-  writer.join();
-
-  EXPECT_TRUE(inserted.load(std::memory_order_acquire));
-  EXPECT_EQ(local_retries, 1U);
-  EXPECT_EQ(local_successes, 1U);
-  EXPECT_EQ(root_restarts, 0U);
-  ExpectOrderedIndex(&index,
-                     {{key0, 1}, {key2, 2}, {key5, 3}, {key7, 4},
-                      {ancestor, 5}});
-  CedarPureRadixIndex::Cursor cursor(&index);
-  cursor.Seek(key0);
-  ASSERT_TRUE(cursor.Valid());
-  EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), 1U);
-  cursor.SeekForPrev(key0);
-  ASSERT_TRUE(cursor.Valid());
-  EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), 1U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,

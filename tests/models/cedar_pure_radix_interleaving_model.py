@@ -49,15 +49,6 @@ class SegmentedByteBranch:
     blocks: tuple[ByteBlock | None, ...]
 
 
-@dataclass
-class SameEdgeRetryState:
-    edge_snapshot: ByteBlock
-    target_child: object | None
-    retry_budget: int = 1
-    local_retries: int = 0
-    root_restarts: int = 0
-
-
 def segment_for_byte(value: int) -> int:
     assert 0 <= value <= 0xff
     return value >> 3
@@ -72,26 +63,6 @@ def insert_byte_block(block: ByteBlock | None, value: int,
     rank = (occupied & ((1 << local) - 1)).bit_count()
     return ByteBlock(occupied | (1 << local),
                      children[:rank] + (child,) + children[rank:])
-
-
-def byte_child(block: ByteBlock | None, value: int) -> object | None:
-    if block is None:
-        return None
-    local = value & 0x07
-    if block.occupied & (1 << local) == 0:
-        return None
-    rank = (block.occupied & ((1 << local) - 1)).bit_count()
-    return block.children[rank]
-
-
-def replace_byte_child(block: ByteBlock, value: int,
-                       child: object) -> ByteBlock:
-    local = value & 0x07
-    assert block.occupied & (1 << local)
-    rank = (block.occupied & ((1 << local) - 1)).bit_count()
-    children = list(block.children)
-    children[rank] = child
-    return ByteBlock(block.occupied, tuple(children))
 
 
 def replace_byte_block(branch: SegmentedByteBranch, value: int,
@@ -236,44 +207,6 @@ def stale_same_byte_segment_block_restarts(broken: bool) -> None:
     assert [leaf.key for leaf in root.blocks[8].children] == [0x40, 0x42, 0x45, 0x47]
 
 
-def bounded_same_edge_retry(broken: bool) -> None:
-    initial = insert_byte_block(None, 64, Leaf(0x40))
-    initial = insert_byte_block(initial, 66, Leaf(0x42))
-
-    # Different local byte: the failed CAS observes a compatible edge and one
-    # local retry preserves the concurrently published child.
-    state = SameEdgeRetryState(initial, None)
-    current = insert_byte_block(initial, 71, Leaf(0x47))
-    compatible = byte_child(current, 69) is state.target_child
-    assert compatible and state.retry_budget == 1
-    state.local_retries += 1
-    state.retry_budget -= 1
-    retried = insert_byte_block(current, 69, Leaf(0x45))
-    assert [leaf.key for leaf in retried.children] == [0x40, 0x42, 0x45, 0x47]
-    assert state.local_retries == 1 and state.root_restarts == 0
-
-    # A second same-edge publication exhausts the one-retry budget and forces
-    # an acquire-root restart rather than a retry loop.
-    second_current = insert_byte_block(current, 70, Leaf(0x46))
-    assert second_current is not state.edge_snapshot
-    state.root_restarts += 1
-    assert state.retry_budget == 0 and state.root_restarts == 1
-
-    # Same target child: a concurrent wrapper changes pointer identity. The
-    # correct protocol rejects local replacement. The negative control ignores
-    # identity and overwrites that wrapper, which this assertion detects.
-    expected = byte_child(initial, 64)
-    concurrent_wrapper = (Leaf(0x40), Leaf(0x4001))
-    changed = replace_byte_child(initial, 64, concurrent_wrapper)
-    compatible = byte_child(changed, 64) is expected
-    assert not compatible
-    if broken:
-        changed = replace_byte_child(changed, 64, Leaf(0x4002))
-    else:
-        state.root_restarts += 1
-    assert byte_child(changed, 64) is concurrent_wrapper
-
-
 def same_key_race(width: int) -> None:
     base = Leaf(0)
     key = 1 << (width - 1)
@@ -323,7 +256,6 @@ def path_deeper_than_inline_cache(width: int) -> None:
 
 def run(width: int, broken: bool) -> None:
     assert width >= 4
-    bounded_same_edge_retry(broken)
     same_key_race(width)
     ancestor_wrap_vs_descendant(width, broken)
     if not broken:

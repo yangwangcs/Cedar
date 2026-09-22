@@ -535,29 +535,33 @@ TEST(PartitionedVersionRadixMemTableTest,
      SegmentedByteBlocksPackLocalRanksInGlobalOrder) {
   ConcurrentArena arena;
   CedarPureRadixIndex index(&arena);
-  std::array<CedarPureRadixIndex::Key, 16> keys{};
-  std::array<void*, 16> handles{};
+  std::array<CedarPureRadixIndex::Key, 64> keys{};
+  std::array<void*, 64> handles{};
+  constexpr std::array<uint8_t, 4> kLocals = {0, 5, 10, 15};
 
-  for (uint8_t value = 0; value != keys.size(); ++value) {
-    keys[value][0] = static_cast<unsigned char>(value << 4);
+  for (size_t position = 0; position < keys.size(); ++position) {
+    const auto segment = static_cast<uint8_t>(position / kLocals.size());
+    const auto value = static_cast<uint8_t>(segment * 16 +
+                                            kLocals[position % kLocals.size()]);
+    keys[position][0] = value;
     char* entry = nullptr;
-    handles[value] = index.Allocate(1, &entry);
-    ASSERT_NE(handles[value], nullptr);
+    handles[position] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[position], nullptr);
     ASSERT_NE(entry, nullptr);
     *entry = static_cast<char>(value);
   }
-  for (size_t position : {13U, 0U, 7U, 3U, 15U, 4U, 10U, 1U,
-                          8U, 14U, 6U, 11U, 2U, 12U, 5U, 9U}) {
+  for (size_t index_in_order = 0; index_in_order < keys.size();
+       ++index_in_order) {
+    const size_t position = (index_in_order * 37 + 11) & 0x3f;
     ASSERT_TRUE(index.Insert(handles[position], keys[position]));
   }
 
   const auto stats = index.GetStructureStatsForTesting();
-  ASSERT_EQ(stats.child_blocks, 4U);
-  constexpr uint64_t kEverySixteenthByte =
-      uint64_t{1} | (uint64_t{1} << 16) | (uint64_t{1} << 32) |
-      (uint64_t{1} << 48);
-  for (uint8_t segment = 0; segment < 4; ++segment) {
-    EXPECT_EQ(stats.byte_segment_occupied[segment], kEverySixteenthByte);
+  ASSERT_EQ(stats.child_blocks, 16U);
+  constexpr uint16_t kSparseLocals = 0x8421;
+  for (size_t segment = 0;
+       segment < CedarPureRadixIndex::kByteSegmentCount; ++segment) {
+    EXPECT_EQ(stats.byte_segment_occupied[segment], kSparseLocals);
     EXPECT_EQ(stats.byte_segment_child_counts[segment], 4U);
   }
 }

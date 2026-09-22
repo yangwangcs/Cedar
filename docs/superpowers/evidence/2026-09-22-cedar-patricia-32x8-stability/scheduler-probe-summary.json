@@ -1,0 +1,43 @@
+{
+  "date": "2026-09-23",
+  "host": {
+    "logical_cpus": 8,
+    "performance_cores": 4,
+    "efficiency_cores": 4,
+    "cache_line_bytes": 128,
+    "power": "AC",
+    "thermal_warning": false,
+    "load_average_before_probe": [4.08, 3.98, 4.36],
+    "largest_competing_process_cpu_percent": 184.7
+  },
+  "policy": "taskpolicy -a",
+  "workload": {
+    "seed": 20260922,
+    "entries": 131072,
+    "writers": 8,
+    "processes_per_implementation": 20,
+    "order": "alternating"
+  },
+  "radix": {
+    "median_ms": 23.01745,
+    "mean_ms": 23.495845,
+    "population_cv_percent": 13.43824826671953,
+    "min_ms": 17.822,
+    "max_ms": 31.1828,
+    "average_involuntary_context_switches": 1548.2,
+    "seconds_context_switch_correlation": 0.26676148296041835,
+    "seconds_cycles_correlation": 0.1554963365714577
+  },
+  "skiplist": {
+    "median_ms": 29.70755,
+    "mean_ms": 32.651795,
+    "population_cv_percent": 43.7907072431343,
+    "min_ms": 20.9758,
+    "max_ms": 92.1978,
+    "average_involuntary_context_switches": 593.05,
+    "seconds_context_switch_correlation": -0.05270174192592699,
+    "seconds_cycles_correlation": 0.745100484714225
+  },
+  "median_ratio": 0.7748013552110491,
+  "gate_result": "fail_radix_cv"
+}

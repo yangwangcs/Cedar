@@ -86,6 +86,34 @@ exist. These rare conflicts cannot account for the measured multi-ms
 cross-seed variation by themselves. The diagnostic uses the same 40-byte
 normalization and seed shuffle, but does not enter the timed matrix.
 
+## Scheduler Probe
+
+The 2026-09-23 host audit found no thermal or power warning and AC power, but
+only four performance cores plus four efficiency cores for the eight writer
+threads. At the start of the probe, load average was 4.08 / 3.98 / 4.36 and
+the largest competing remote-desktop process used 184.7% CPU. The benchmark
+timer begins before constructing the eight writer threads, so thread creation,
+placement, and join delay are included in the reported insertion interval.
+
+An alternating 20-process probe per implementation used the existing clean
+binaries, seed 20260922, and `taskpolicy -a`. Raw wall times and process
+resource counters are in `scheduler-probe.csv`; calculated values are in
+`scheduler-probe-summary.json`.
+
+| Implementation | Median | Range | Population CV |
+| --- | ---: | ---: | ---: |
+| 32x8 baseline | 23.017 ms | 17.822-31.183 ms | 13.44% |
+| SkipList | 29.708 ms | 20.976-92.198 ms | 43.79% |
+
+The median ratio was 0.7748x, inside the eight-writer relative gate, while the
+Patricia CV still failed the 5% stability gate. Retired instruction counts
+were comparatively bounded while wall time varied; one Patricia process also
+recorded 1282 involuntary context switches in a 21.807 ms measured interval.
+This confirms that application task policy does not isolate these short,
+eight-thread processes from host scheduling. Negative nice priority was
+permission-denied and passwordless elevation was unavailable. No unrelated
+user process was changed or terminated.
+
 ## Next Gate
 
 The approved two sub-changes are exhausted. No third representation or

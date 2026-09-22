@@ -66,12 +66,12 @@ def first_differing_byte(left: bytes, right: bytes) -> int:
 
 def segment_for_byte(value: int) -> int:
     assert 0 <= value <= 0xff
-    return value >> 3
+    return value >> 6
 
 
 def copy_byte_block_with_inserted_child(block: ByteBlock | None, value: int,
                                         child: int) -> ByteBlock:
-    local = value & 0x07
+    local = value & 0x3f
     occupied = 0 if block is None else block.occupied
     children = () if block is None else block.children
     assert occupied & (1 << local) == 0
@@ -81,7 +81,7 @@ def copy_byte_block_with_inserted_child(block: ByteBlock | None, value: int,
 
 
 def byte_branch_contract(broken: bool = False) -> None:
-    blocks: list[ByteBlock | None] = [None] * 32
+    blocks: list[ByteBlock | None] = [None] * 4
     order = tuple((position * 73 + 19) & 0xff for position in range(256))
     for value in order:
         segment = segment_for_byte(value)
@@ -90,8 +90,8 @@ def byte_branch_contract(broken: bool = False) -> None:
     assert [child for block in blocks for child in block.children] == list(range(256))
     for segment, block in enumerate(blocks):
         assert block is not None
-        assert block.occupied == 0xff
-        assert len(block.children) == 8
+        assert block.occupied == (1 << 64) - 1
+        assert len(block.children) == 64
         assert all(segment_for_byte(value) == segment
                    for value in block.children)
 
@@ -102,7 +102,7 @@ def byte_branch_contract(broken: bool = False) -> None:
         assert first_differing_byte(left, bytes(right)) == position
     assert first_differing_byte(left, left) == 40
 
-    # A snapshots two children in segment 8, B publishes a third, and A's
+    # A snapshots two children in segment 1, B publishes a third, and A's
     # stale insertion must copy B's snapshot before it adds its own child.
     stale = copy_byte_block_with_inserted_child(None, 64, 64)
     stale = copy_byte_block_with_inserted_child(stale, 66, 66)

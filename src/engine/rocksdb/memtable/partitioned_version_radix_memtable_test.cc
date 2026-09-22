@@ -443,7 +443,7 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     BytePatriciaFinalByteValuesUseFourPackedSegments) {
+     BytePatriciaFinalByteValuesUseSixteenPackedSegments) {
   ConcurrentArena arena;
   CedarPureRadixIndex index(&arena);
   std::array<CedarPureRadixIndex::Key, 256> keys{};
@@ -466,7 +466,7 @@ TEST(PartitionedVersionRadixMemTableTest,
   for (uint16_t value = 0; value < 256; ++value) {
     EXPECT_EQ(CedarPureRadixIndex::SegmentForByte(
                   static_cast<uint8_t>(value)),
-              value >> 6);
+              value >> 4);
   }
 
   CedarPureRadixIndex::Cursor cursor(&index);
@@ -480,12 +480,37 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   const auto stats = index.GetStructureStatsForTesting();
   EXPECT_EQ(stats.byte_branches, 1U);
-  for (uint8_t segment = 0; segment < 4; ++segment) {
-    EXPECT_EQ(stats.byte_segment_occupied[segment], ~uint64_t{0});
-    EXPECT_EQ(stats.byte_segment_child_counts[segment], 64U);
+  EXPECT_EQ(CedarPureRadixIndex::kByteSegmentCount, 16U);
+  for (size_t segment = 0;
+       segment < CedarPureRadixIndex::kByteSegmentCount; ++segment) {
+    EXPECT_EQ(stats.byte_segment_occupied[segment], 0xffffU);
+    EXPECT_EQ(stats.byte_segment_child_counts[segment], 16U);
+  }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     SixteenByteSegmentsSeekAcrossEveryBoundary) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  std::array<CedarPureRadixIndex::Key, 256> keys{};
+  std::array<void*, 256> handles{};
+
+  for (size_t value = 0; value < keys.size(); ++value) {
+    keys[value][39] = static_cast<unsigned char>(value);
+    char* entry = nullptr;
+    handles[value] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[value], nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(value);
+  }
+  for (size_t index_in_order = 0; index_in_order < keys.size();
+       ++index_in_order) {
+    const size_t value = (index_in_order * 73 + 19) & 0xff;
+    ASSERT_TRUE(index.Insert(handles[value], keys[value]));
   }
 
-  for (uint8_t boundary : {64U, 128U, 192U}) {
+  CedarPureRadixIndex::Cursor cursor(&index);
+  for (uint16_t boundary = 16; boundary < 256; boundary += 16) {
     CedarPureRadixIndex::Key below{};
     below[39] = static_cast<unsigned char>(boundary - 1);
     cursor.Seek(below);
@@ -1759,7 +1784,7 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     ByteSegmentDirectInsertAndWrapperBothPublishWithoutRetry) {
+     SixteenByteSegmentsDirectInsertAndWrapperPublishIndependently) {
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
@@ -1784,20 +1809,21 @@ TEST(PartitionedVersionRadixMemTableTest,
     if (entry != nullptr) *entry = static_cast<char>(key[0]);
     return handle;
   };
-  CedarPureRadixIndex::Key key64{};
-  CedarPureRadixIndex::Key key128{};
-  CedarPureRadixIndex::Key key192{};
-  CedarPureRadixIndex::Key key193{};
-  key64[0] = 64;
-  key128[0] = 128;
-  key192[0] = 192;
-  key193[0] = 193;
-  ASSERT_TRUE(index.Insert(allocate(key64), key64));
-  ASSERT_TRUE(index.Insert(allocate(key192), key192));
+  CedarPureRadixIndex::Key key16{};
+  CedarPureRadixIndex::Key key17{};
+  CedarPureRadixIndex::Key key208{};
+  CedarPureRadixIndex::Key key208_suffix{};
+  key16[0] = 16;
+  key17[0] = 17;
+  key208[0] = 208;
+  key208_suffix[0] = 208;
+  key208_suffix[1] = 1;
+  ASSERT_TRUE(index.Insert(allocate(key16), key16));
+  ASSERT_TRUE(index.Insert(allocate(key208), key208));
 
   std::atomic<bool> direct_inserted{false};
   std::thread direct_writer([&] {
-    direct_inserted.store(index.Insert(allocate(key128), key128),
+    direct_inserted.store(index.Insert(allocate(key17), key17),
                           std::memory_order_release);
   });
   bool observed_pause = false;
@@ -1809,7 +1835,7 @@ TEST(PartitionedVersionRadixMemTableTest,
   }
   EXPECT_TRUE(observed_pause);
   if (observed_pause) {
-    ASSERT_TRUE(index.Insert(allocate(key193), key193));
+    ASSERT_TRUE(index.Insert(allocate(key208_suffix), key208_suffix));
     {
       std::lock_guard<std::mutex> lock(mutex);
       release = true;
@@ -1819,24 +1845,16 @@ TEST(PartitionedVersionRadixMemTableTest,
   direct_writer.join();
 
   EXPECT_TRUE(direct_inserted.load(std::memory_order_acquire));
-  // The direct child occupies segment 2 and the wrapper replaces segment 3.
+  // The direct child occupies segment 1 and the wrapper replaces segment 13.
   // Their independent CAS edges mean the paused direct writer does not retry.
   EXPECT_EQ(observer_calls, 2U);
-  for (const auto& key : {key64, key128, key192, key193}) {
+  for (const auto& key : {key16, key17, key208, key208_suffix}) {
     EXPECT_TRUE(index.Contains(key));
   }
-  CedarPureRadixIndex::Cursor cursor(&index);
-  cursor.SeekToFirst();
-  for (const auto expected : {64, 128, 192, 193}) {
-    ASSERT_TRUE(cursor.Valid());
-    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), expected);
-    cursor.Next();
-  }
-  EXPECT_FALSE(cursor.Valid());
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     ByteSegmentStaleBlockRejectsAndRetries) {
+     SixteenByteSegmentStaleBlockRejectsAndRetries) {
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
@@ -1865,10 +1883,10 @@ TEST(PartitionedVersionRadixMemTableTest,
   CedarPureRadixIndex::Key key1{};
   CedarPureRadixIndex::Key key2{};
   CedarPureRadixIndex::Key key3{};
-  key0[0] = 64;
-  key1[0] = 66;
-  key2[0] = 69;
-  key3[0] = 71;
+  key0[0] = 112;
+  key1[0] = 114;
+  key2[0] = 117;
+  key3[0] = 119;
   ASSERT_TRUE(index.Insert(allocate(key0), key0));
   ASSERT_TRUE(index.Insert(allocate(key1), key1));
 

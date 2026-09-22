@@ -51,12 +51,12 @@ class SegmentedByteBranch:
 
 def segment_for_byte(value: int) -> int:
     assert 0 <= value <= 0xff
-    return value >> 6
+    return value >> 3
 
 
 def insert_byte_block(block: ByteBlock | None, value: int,
                       child: object) -> ByteBlock:
-    local = value & 0x3f
+    local = value & 0x07
     occupied = 0 if block is None else block.occupied
     children = () if block is None else block.children
     assert occupied & (1 << local) == 0
@@ -191,18 +191,20 @@ def direct_child_block_vs_other_segment_wrapper(broken: bool) -> None:
 
 
 def stale_same_byte_segment_block_restarts(broken: bool) -> None:
-    # A and B both observed segment 1. B publishes byte 69 first; A's CAS
-    # must fail, reload the 64-bit bitmap, and preserve every packed child.
+    # A and B both observed segment 8. B publishes byte 69 first; A's CAS
+    # must fail, reload the eight-bit bitmap, and preserve every packed child.
     initial = insert_byte_block(None, 64, Leaf(0x40))
     initial = insert_byte_block(initial, 66, Leaf(0x42))
-    root = SegmentedByteBranch(0, (None, initial, None, None))
+    blocks: list[ByteBlock | None] = [None] * 32
+    blocks[8] = initial
+    root = SegmentedByteBranch(0, tuple(blocks))
     stale = initial
     published = insert_byte_block(initial, 69, Leaf(0x45))
     root = replace_byte_block(root, 69, published)
     final = insert_byte_block(stale if broken else published, 71, Leaf(0x47))
     root = replace_byte_block(root, 71, final)
-    assert root.blocks[1] is not None
-    assert [leaf.key for leaf in root.blocks[1].children] == [0x40, 0x42, 0x45, 0x47]
+    assert root.blocks[8] is not None
+    assert [leaf.key for leaf in root.blocks[8].children] == [0x40, 0x42, 0x45, 0x47]
 
 
 def same_key_race(width: int) -> None:

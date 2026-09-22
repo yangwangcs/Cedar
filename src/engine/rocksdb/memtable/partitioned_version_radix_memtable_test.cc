@@ -443,7 +443,7 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     BytePatriciaFinalByteValuesUseFourPackedSegments) {
+     BytePatriciaFinalByteValuesUseThirtyTwoEightValueSegments) {
   ConcurrentArena arena;
   CedarPureRadixIndex index(&arena);
   std::array<CedarPureRadixIndex::Key, 256> keys{};
@@ -463,10 +463,11 @@ TEST(PartitionedVersionRadixMemTableTest,
   }
 
   for (const auto& key : keys) EXPECT_TRUE(index.Contains(key));
+  EXPECT_EQ(CedarPureRadixIndex::kByteSegmentCount, 32U);
   for (uint16_t value = 0; value < 256; ++value) {
     EXPECT_EQ(CedarPureRadixIndex::SegmentForByte(
                   static_cast<uint8_t>(value)),
-              value >> 6);
+              value >> 3);
   }
 
   CedarPureRadixIndex::Cursor cursor(&index);
@@ -480,14 +481,16 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   const auto stats = index.GetStructureStatsForTesting();
   EXPECT_EQ(stats.byte_branches, 1U);
-  for (uint8_t segment = 0; segment < 4; ++segment) {
-    EXPECT_EQ(stats.byte_segment_occupied[segment], ~uint64_t{0});
-    EXPECT_EQ(stats.byte_segment_child_counts[segment], 64U);
+  EXPECT_EQ(stats.child_blocks, 32U);
+  for (uint8_t segment = 0;
+       segment < CedarPureRadixIndex::kByteSegmentCount; ++segment) {
+    EXPECT_EQ(stats.byte_segment_occupied[segment], 0xffU);
+    EXPECT_EQ(stats.byte_segment_child_counts[segment], 8U);
   }
 
-  for (uint8_t boundary : {64U, 128U, 192U}) {
+  for (uint16_t boundary = 8; boundary < 256; boundary += 8) {
     CedarPureRadixIndex::Key below{};
-    below[39] = static_cast<unsigned char>(boundary - 1);
+    below[39] = static_cast<uint8_t>(boundary - 1);
     cursor.Seek(below);
     ASSERT_TRUE(cursor.Valid());
     EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary - 1);
@@ -496,13 +499,25 @@ TEST(PartitionedVersionRadixMemTableTest,
     EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
 
     CedarPureRadixIndex::Key above{};
-    above[39] = static_cast<unsigned char>(boundary + 1);
+    above[39] = static_cast<uint8_t>(boundary);
     cursor.SeekForPrev(above);
     ASSERT_TRUE(cursor.Valid());
-    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary + 1);
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
     cursor.Prev();
     ASSERT_TRUE(cursor.Valid());
-    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary - 1);
+  }
+
+  index.MarkReadOnly();
+  index.PrepareForFlush();
+  for (size_t scan = 0; scan < 2; ++scan) {
+    cursor.SeekToFirst();
+    for (uint16_t value = 0; value < 256; ++value) {
+      ASSERT_TRUE(cursor.Valid());
+      EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), value);
+      cursor.Next();
+    }
+    EXPECT_FALSE(cursor.Valid());
   }
 }
 
@@ -527,13 +542,12 @@ TEST(PartitionedVersionRadixMemTableTest,
   }
 
   const auto stats = index.GetStructureStatsForTesting();
-  ASSERT_EQ(stats.child_blocks, 4U);
-  constexpr uint64_t kEverySixteenthByte =
-      uint64_t{1} | (uint64_t{1} << 16) | (uint64_t{1} << 32) |
-      (uint64_t{1} << 48);
-  for (uint8_t segment = 0; segment < 4; ++segment) {
-    EXPECT_EQ(stats.byte_segment_occupied[segment], kEverySixteenthByte);
-    EXPECT_EQ(stats.byte_segment_child_counts[segment], 4U);
+  ASSERT_EQ(stats.child_blocks, 16U);
+  for (uint8_t segment = 0;
+       segment < CedarPureRadixIndex::kByteSegmentCount; ++segment) {
+    const bool occupied = (segment & 1U) == 0;
+    EXPECT_EQ(stats.byte_segment_occupied[segment], occupied ? 1U : 0U);
+    EXPECT_EQ(stats.byte_segment_child_counts[segment], occupied ? 1U : 0U);
   }
 }
 
@@ -1819,7 +1833,7 @@ TEST(PartitionedVersionRadixMemTableTest,
   direct_writer.join();
 
   EXPECT_TRUE(direct_inserted.load(std::memory_order_acquire));
-  // The direct child occupies segment 2 and the wrapper replaces segment 3.
+  // The direct child occupies segment 16 and the wrapper replaces segment 24.
   // Their independent CAS edges mean the paused direct writer does not retry.
   EXPECT_EQ(observer_calls, 2U);
   for (const auto& key : {key64, key128, key192, key193}) {

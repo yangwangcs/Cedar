@@ -404,19 +404,19 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     AllNibbleValuesAndFinalNibbleRemainOrdered) {
+     FinalBytePrefixValuesRemainOrdered) {
   ConcurrentArena arena;
   CedarPureRadixIndex index(&arena);
   std::array<CedarPureRadixIndex::Key, 16> keys{};
   std::array<void*, 16> handles{};
 
-  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
-    keys[nibble][39] = nibble;
+  for (uint8_t value = 0; value != keys.size(); ++value) {
+    keys[value][39] = value;
     char* entry = nullptr;
-    handles[nibble] = index.Allocate(1, &entry);
-    ASSERT_NE(handles[nibble], nullptr);
+    handles[value] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[value], nullptr);
     ASSERT_NE(entry, nullptr);
-    *entry = static_cast<char>(nibble);
+    *entry = static_cast<char>(value);
   }
 
   for (size_t position : {15U, 0U, 9U, 3U, 12U, 6U, 1U, 14U,
@@ -428,17 +428,17 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   CedarPureRadixIndex::Cursor cursor(&index);
   cursor.SeekToFirst();
-  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
+  for (uint8_t value = 0; value != keys.size(); ++value) {
     ASSERT_TRUE(cursor.Valid());
-    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), nibble);
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), value);
     cursor.Next();
   }
   EXPECT_FALSE(cursor.Valid());
 
   const auto stats = index.GetStructureStatsForTesting();
   EXPECT_EQ(stats.branches, 1U);
-  EXPECT_EQ(stats.child_tables, 4U);
-  EXPECT_EQ(stats.child_blocks, 4U);
+  EXPECT_EQ(stats.child_tables, 1U);
+  EXPECT_EQ(stats.child_blocks, 1U);
   EXPECT_EQ(stats.max_depth, 1U);
 }
 
@@ -507,19 +507,19 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     SegmentedNibbleBlocksPackLocalRanksInGlobalOrder) {
+     SegmentedByteBlocksPackLocalRanksInGlobalOrder) {
   ConcurrentArena arena;
   CedarPureRadixIndex index(&arena);
   std::array<CedarPureRadixIndex::Key, 16> keys{};
   std::array<void*, 16> handles{};
 
-  for (uint8_t nibble = 0; nibble != keys.size(); ++nibble) {
-    keys[nibble][0] = static_cast<unsigned char>(nibble << 4);
+  for (uint8_t value = 0; value != keys.size(); ++value) {
+    keys[value][0] = static_cast<unsigned char>(value << 4);
     char* entry = nullptr;
-    handles[nibble] = index.Allocate(1, &entry);
-    ASSERT_NE(handles[nibble], nullptr);
+    handles[value] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[value], nullptr);
     ASSERT_NE(entry, nullptr);
-    *entry = static_cast<char>(nibble);
+    *entry = static_cast<char>(value);
   }
   for (size_t position : {13U, 0U, 7U, 3U, 15U, 4U, 10U, 1U,
                           8U, 14U, 6U, 11U, 2U, 12U, 5U, 9U}) {
@@ -528,14 +528,13 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   const auto stats = index.GetStructureStatsForTesting();
   ASSERT_EQ(stats.child_blocks, 4U);
-  EXPECT_EQ(stats.segment_occupied[0], 0x0fU);
-  EXPECT_EQ(stats.segment_occupied[1], 0x0fU);
-  EXPECT_EQ(stats.segment_occupied[2], 0x0fU);
-  EXPECT_EQ(stats.segment_occupied[3], 0x0fU);
-  EXPECT_EQ(stats.segment_child_counts[0], 4U);
-  EXPECT_EQ(stats.segment_child_counts[1], 4U);
-  EXPECT_EQ(stats.segment_child_counts[2], 4U);
-  EXPECT_EQ(stats.segment_child_counts[3], 4U);
+  constexpr uint64_t kEverySixteenthByte =
+      uint64_t{1} | (uint64_t{1} << 16) | (uint64_t{1} << 32) |
+      (uint64_t{1} << 48);
+  for (uint8_t segment = 0; segment < 4; ++segment) {
+    EXPECT_EQ(stats.byte_segment_occupied[segment], kEverySixteenthByte);
+    EXPECT_EQ(stats.byte_segment_child_counts[segment], 4U);
+  }
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -610,10 +609,10 @@ TEST(PartitionedVersionRadixMemTableTest,
   }
 
   EXPECT_EQ(Collect(table.get()).size(), kEntries);
-  // Immutable sparse-table snapshots are arena-owned through MemTable
-  // destruction. This still leaves room below 192 bytes/entry, while a second
-  // 40-byte normalized-key copy would exceed the budget.
-  EXPECT_LT(arena.ApproximateMemoryUsage(), kEntries * 192U);
+  // Immutable 64-value block snapshots are arena-owned through MemTable
+  // destruction. This leaves room below 448 bytes/entry without reserving a
+  // second normalized-key copy per entry.
+  EXPECT_LT(arena.ApproximateMemoryUsage(), kEntries * 448U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -632,8 +631,8 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   EXPECT_EQ(Collect(table.get()).size(), kEntries);
   // A private branch in every handle would add at least 48 KiB here and
-  // exceed this representation-specific bound.
-  EXPECT_LT(arena.ApproximateMemoryUsage(), 192U * 1024U);
+  // exceed this byte-block representation-specific bound.
+  EXPECT_LT(arena.ApproximateMemoryUsage(), 448U * 1024U);
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
@@ -1642,7 +1641,7 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     DirectInsertAndWrapperInDifferentSegmentsBothPublishWithoutRetry) {
+     ByteSegmentDirectInsertAndWrapperBothPublishWithoutRetry) {
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
@@ -1667,20 +1666,20 @@ TEST(PartitionedVersionRadixMemTableTest,
     if (entry != nullptr) *entry = static_cast<char>(key[0]);
     return handle;
   };
-  CedarPureRadixIndex::Key key4{};
-  CedarPureRadixIndex::Key key8{};
-  CedarPureRadixIndex::Key key12{};
-  CedarPureRadixIndex::Key key12_child{};
-  key4[0] = 0x40;
-  key8[0] = 0x80;
-  key12[0] = 0xc0;
-  key12_child[0] = 0xc1;
-  ASSERT_TRUE(index.Insert(allocate(key4), key4));
-  ASSERT_TRUE(index.Insert(allocate(key12), key12));
+  CedarPureRadixIndex::Key key64{};
+  CedarPureRadixIndex::Key key128{};
+  CedarPureRadixIndex::Key key192{};
+  CedarPureRadixIndex::Key key193{};
+  key64[0] = 64;
+  key128[0] = 128;
+  key192[0] = 192;
+  key193[0] = 193;
+  ASSERT_TRUE(index.Insert(allocate(key64), key64));
+  ASSERT_TRUE(index.Insert(allocate(key192), key192));
 
   std::atomic<bool> direct_inserted{false};
   std::thread direct_writer([&] {
-    direct_inserted.store(index.Insert(allocate(key8), key8),
+    direct_inserted.store(index.Insert(allocate(key128), key128),
                           std::memory_order_release);
   });
   bool observed_pause = false;
@@ -1692,7 +1691,7 @@ TEST(PartitionedVersionRadixMemTableTest,
   }
   EXPECT_TRUE(observed_pause);
   if (observed_pause) {
-    ASSERT_TRUE(index.Insert(allocate(key12_child), key12_child));
+    ASSERT_TRUE(index.Insert(allocate(key193), key193));
     {
       std::lock_guard<std::mutex> lock(mutex);
       release = true;
@@ -1705,12 +1704,12 @@ TEST(PartitionedVersionRadixMemTableTest,
   // The direct child occupies segment 2 and the wrapper replaces segment 3.
   // Their independent CAS edges mean the paused direct writer does not retry.
   EXPECT_EQ(observer_calls, 2U);
-  for (const auto& key : {key4, key8, key12, key12_child}) {
+  for (const auto& key : {key64, key128, key192, key193}) {
     EXPECT_TRUE(index.Contains(key));
   }
   CedarPureRadixIndex::Cursor cursor(&index);
   cursor.SeekToFirst();
-  for (const auto expected : {0x40, 0x80, 0xc0, 0xc1}) {
+  for (const auto expected : {64, 128, 192, 193}) {
     ASSERT_TRUE(cursor.Valid());
     EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), expected);
     cursor.Next();
@@ -1719,7 +1718,7 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     DirectInsertsInTheSameSegmentRejectStaleBlockAndRetry) {
+     ByteSegmentStaleBlockRejectsAndRetries) {
   ConcurrentArena arena;
   std::mutex mutex;
   std::condition_variable condition;
@@ -1748,9 +1747,10 @@ TEST(PartitionedVersionRadixMemTableTest,
   CedarPureRadixIndex::Key key1{};
   CedarPureRadixIndex::Key key2{};
   CedarPureRadixIndex::Key key3{};
-  key1[0] = 0x10;
-  key2[0] = 0x20;
-  key3[0] = 0x30;
+  key0[0] = 64;
+  key1[0] = 66;
+  key2[0] = 69;
+  key3[0] = 71;
   ASSERT_TRUE(index.Insert(allocate(key0), key0));
   ASSERT_TRUE(index.Insert(allocate(key1), key1));
 

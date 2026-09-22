@@ -15,9 +15,17 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-uint16_t Mask(uint8_t n) { return static_cast<uint16_t>(uint16_t{1} << n); }
-uint16_t Below(uint8_t n) {
-  return static_cast<uint16_t>((uint32_t{1} << n) - 1);
+uint64_t Mask(uint8_t local) {
+  assert(local < 64);
+  return uint64_t{1} << local;
+}
+uint64_t Below(uint8_t local) {
+  assert(local < 64);
+  return (uint64_t{1} << local) - 1;
+}
+uint64_t Through(uint8_t local) {
+  assert(local < 64);
+  return local == 63 ? ~uint64_t{0} : (uint64_t{1} << (local + 1)) - 1;
 }
 }  // namespace
 
@@ -45,18 +53,15 @@ const char* CedarPureRadixIndex::EntryForHandle(void* opaque) const {
   return handle == nullptr ? nullptr : handle->leaf.entry;
 }
 
-uint8_t CedarPureRadixIndex::NibbleAt(const Key& key, uint8_t index) {
-  assert(index < kNibbles);
-  const auto byte = key[index / 2];
-  return static_cast<uint8_t>(index % 2 == 0 ? byte >> 4 : byte & 0x0f);
+uint8_t CedarPureRadixIndex::ByteAt(const Key& key, uint8_t index) {
+  assert(index < kKeyBytes);
+  return key[index];
 }
 
-uint8_t CedarPureRadixIndex::NibbleAt(const Leaf* leaf, uint8_t index) {
-  assert(leaf != nullptr && leaf->key_prefix != nullptr && index < kNibbles);
-  const size_t byte_index = index / 2;
-  const auto byte = byte_index < 32 ? leaf->key_prefix[byte_index]
-                                    : leaf->normalized_suffix[byte_index - 32];
-  return static_cast<uint8_t>(index % 2 == 0 ? byte >> 4 : byte & 0x0f);
+uint8_t CedarPureRadixIndex::ByteAt(const Leaf* leaf, uint8_t index) {
+  assert(leaf != nullptr && leaf->key_prefix != nullptr && index < kKeyBytes);
+  return index < 32 ? leaf->key_prefix[index]
+                    : leaf->normalized_suffix[index - 32];
 }
 
 int CedarPureRadixIndex::Compare(const Key& left, const Key& right) {
@@ -74,23 +79,21 @@ int CedarPureRadixIndex::Compare(const Leaf* left, const Leaf* right) {
                      : prefix;
 }
 
-uint8_t CedarPureRadixIndex::FirstDifferingNibble(const Key& left,
-                                                   const Key& right) {
+uint8_t CedarPureRadixIndex::FirstDifferingByte(const Key& left,
+                                                 const Key& right) {
   for (size_t byte = 0; byte < kKeyBytes; ++byte) {
-    const auto delta = static_cast<unsigned char>(left[byte] ^ right[byte]);
-    if (delta != 0) return static_cast<uint8_t>(byte * 2 + ((delta & 0xf0) == 0));
+    if (left[byte] != right[byte]) return static_cast<uint8_t>(byte);
   }
-  return static_cast<uint8_t>(kNibbles);
+  return static_cast<uint8_t>(kKeyBytes);
 }
-uint8_t CedarPureRadixIndex::FirstDifferingNibble(const Leaf* left,
-                                                   const Key& right) {
+uint8_t CedarPureRadixIndex::FirstDifferingByte(const Leaf* left,
+                                                 const Key& right) {
   for (size_t byte = 0; byte < kKeyBytes; ++byte) {
-    const auto value = byte < 32 ? left->key_prefix[byte]
-                                 : left->normalized_suffix[byte - 32];
-    const auto delta = static_cast<unsigned char>(value ^ right[byte]);
-    if (delta != 0) return static_cast<uint8_t>(byte * 2 + ((delta & 0xf0) == 0));
+    if (ByteAt(left, static_cast<uint8_t>(byte)) != right[byte]) {
+      return static_cast<uint8_t>(byte);
+    }
   }
-  return static_cast<uint8_t>(kNibbles);
+  return static_cast<uint8_t>(kKeyBytes);
 }
 
 CedarPureRadixIndex::Leaf* CedarPureRadixIndex::AsLeaf(Node* node) {
@@ -111,55 +114,56 @@ const CedarPureRadixIndex::Branch* CedarPureRadixIndex::AsBranch(const Node* nod
 }
 
 // A branch owns four independent publication edges. A block's local bitmap
-// packs only the children for its four-nibble interval.
+// packs only the children for its 64-byte-value interval.
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::BlockAt(
-    const Branch* branch, uint8_t nibble) {
-  assert(branch != nullptr && nibble < 16);
-  return branch->segments[SegmentFor(nibble)].load(std::memory_order_acquire);
+    const Branch* branch, uint8_t value) {
+  assert(branch != nullptr);
+  return branch->segments[SegmentForByte(value)].load(std::memory_order_acquire);
 }
 CedarPureRadixIndex::Node* CedarPureRadixIndex::ChildAt(const ChildBlock* block,
-                                                         uint8_t nibble) {
-  assert(nibble < 4);
-  if (block == nullptr || (block->occupied & static_cast<uint8_t>(Mask(nibble))) == 0)
+                                                         uint8_t local) {
+  assert(local < 64);
+  if (block == nullptr || (block->occupied & Mask(local)) == 0)
     return nullptr;
-  const auto rank = std::popcount(static_cast<uint8_t>(block->occupied & Below(nibble)));
+  const auto rank = std::popcount(block->occupied & Below(local));
   assert(rank < block->child_count);
   return block->children[rank];
 }
 CedarPureRadixIndex::Node* CedarPureRadixIndex::ChildAt(const Branch* branch,
-                                                         uint8_t nibble) {
-  return ChildAt(BlockAt(branch, nibble), LocalNibbleFor(nibble));
+                                                         uint8_t value) {
+  return ChildAt(BlockAt(branch, value), LocalByte(value));
 }
-uint8_t CedarPureRadixIndex::FirstChildAtOrAfter(const Branch* branch,
-                                                 uint8_t nibble) {
-  assert(branch != nullptr && nibble < 16);
-  for (uint8_t segment = SegmentFor(nibble); segment < 4; ++segment) {
+uint16_t CedarPureRadixIndex::FirstChildAtOrAfter(const Branch* branch,
+                                                   uint8_t value) {
+  assert(branch != nullptr);
+  for (uint8_t segment = SegmentForByte(value); segment < 4; ++segment) {
     auto* block = branch->segments[segment].load(std::memory_order_acquire);
-    const uint8_t local = segment == SegmentFor(nibble) ? LocalNibbleFor(nibble) : 0;
-    const auto occupied = block == nullptr ? uint8_t{0} : block->occupied;
-    const auto set = static_cast<uint8_t>(occupied & ~Below(local));
-    if (set != 0) return static_cast<uint8_t>(segment * 4 + std::countr_zero(set));
+    const uint8_t local = segment == SegmentForByte(value) ? LocalByte(value) : 0;
+    const auto occupied = block == nullptr ? uint64_t{0} : block->occupied;
+    const auto set = occupied & ~Below(local);
+    if (set != 0) return static_cast<uint16_t>(segment * 64 + std::countr_zero(set));
   }
-  return 16;
+  return 256;
 }
-uint8_t CedarPureRadixIndex::LastChildAtOrBefore(const Branch* branch,
-                                                 uint8_t nibble) {
-  assert(branch != nullptr && nibble < 16);
-  for (int segment = SegmentFor(nibble); segment >= 0; --segment) {
+uint16_t CedarPureRadixIndex::LastChildAtOrBefore(const Branch* branch,
+                                                   uint8_t value) {
+  assert(branch != nullptr);
+  for (int segment = SegmentForByte(value); segment >= 0; --segment) {
     auto* block = branch->segments[segment].load(std::memory_order_acquire);
-    const uint8_t local = segment == SegmentFor(nibble) ? LocalNibbleFor(nibble) : 3;
-    const auto occupied = block == nullptr ? uint8_t{0} : block->occupied;
-    const auto set = static_cast<uint8_t>(occupied & ((uint8_t{1} << (local + 1)) - 1));
-    if (set != 0) return static_cast<uint8_t>(segment * 4 + 7 - std::countl_zero(set));
+    const uint8_t local = segment == SegmentForByte(value) ? LocalByte(value) : 63;
+    const auto occupied = block == nullptr ? uint64_t{0} : block->occupied;
+    const auto set = occupied & Through(local);
+    if (set != 0) {
+      return static_cast<uint16_t>(segment * 64 + 63 - std::countl_zero(set));
+    }
   }
-  return 16;
+  return 256;
 }
 
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::AllocateChildBlock(
-    uint8_t occupied, Node* const* children) {
-  assert((occupied & 0xf0) == 0);
+    uint64_t occupied, Node* const* children) {
   const auto count = static_cast<uint8_t>(std::popcount(occupied));
-  assert(count > 0 && count <= 4);
+  assert(count > 0 && count <= 64);
   const auto bytes = offsetof(ChildBlock, children) + size_t{count} * sizeof(Node*);
   auto* block = reinterpret_cast<ChildBlock*>(allocator_->AllocateAligned(bytes));
   block->occupied = occupied;
@@ -171,27 +175,27 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::AllocateChildBlock(
   return block;
 }
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithInsertedChild(
-    const ChildBlock* old, uint8_t nibble, Node* child) {
-  assert(nibble < 16 && child != nullptr);
-  const uint8_t local = LocalNibbleFor(nibble);
+    const ChildBlock* old, uint8_t value, Node* child) {
+  assert(child != nullptr);
+  const uint8_t local = LocalByte(value);
   assert(ChildAt(old, local) == nullptr);
-  std::array<Node*, 4> packed{};
-  const auto old_occupied = old == nullptr ? uint8_t{0} : old->occupied;
-  const size_t rank = std::popcount(static_cast<uint8_t>(old_occupied & Below(local)));
+  std::array<Node*, 64> packed{};
+  const auto old_occupied = old == nullptr ? uint64_t{0} : old->occupied;
+  const size_t rank = std::popcount(old_occupied & Below(local));
   const size_t count = old == nullptr ? 0 : old->child_count;
   for (size_t i = 0; i < rank; ++i) packed[i] = old->children[i];
   packed[rank] = child;
   for (size_t i = rank; i < count; ++i) packed[i + 1] = old->children[i];
-  return AllocateChildBlock(static_cast<uint8_t>(old_occupied | Mask(local)), packed.data());
+  return AllocateChildBlock(old_occupied | Mask(local), packed.data());
 }
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithReplacedChild(
-    const ChildBlock* old, uint8_t nibble, Node* child) {
-  assert(old != nullptr && nibble < 16 && child != nullptr);
-  const uint8_t local = LocalNibbleFor(nibble);
+    const ChildBlock* old, uint8_t value, Node* child) {
+  assert(old != nullptr && child != nullptr);
+  const uint8_t local = LocalByte(value);
   assert(ChildAt(old, local) != nullptr);
-  std::array<Node*, 4> packed{};
+  std::array<Node*, 64> packed{};
   for (size_t i = 0; i < old->child_count; ++i) packed[i] = old->children[i];
-  packed[std::popcount(static_cast<uint8_t>(old->occupied & Below(local)))] = child;
+  packed[std::popcount(old->occupied & Below(local))] = child;
   return AllocateChildBlock(old->occupied, packed.data());
 }
 
@@ -210,14 +214,15 @@ bool CedarPureRadixIndex::ReplaceBlock(Branch* branch, uint8_t segment,
 CedarPureRadixIndex::Leaf* CedarPureRadixIndex::MinimumLeaf(Node* node) {
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     auto* branch = AsBranch(node);
-    node = ChildAt(branch, FirstChildAtOrAfter(branch, 0));
+    node = ChildAt(branch,
+                   static_cast<uint8_t>(FirstChildAtOrAfter(branch, 0)));
   }
   return node == nullptr ? nullptr : AsLeaf(node);
 }
 CedarPureRadixIndex::Leaf* CedarPureRadixIndex::MaximumLeaf(Node* node) {
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     auto* branch = AsBranch(node);
-    node = ChildAt(branch, LastChildAtOrBefore(branch, 15));
+    node = ChildAt(branch, static_cast<uint8_t>(LastChildAtOrBefore(branch, 255)));
   }
   return node == nullptr ? nullptr : AsLeaf(node);
 }
@@ -225,25 +230,24 @@ CedarPureRadixIndex::Branch* CedarPureRadixIndex::AllocateBranch(
     uint8_t index, Node* old, Leaf* added) {
   auto* old_min = MinimumLeaf(old);
   auto* old_max = MaximumLeaf(old);
-  const auto old_nibble = NibbleAt(old_min, index);
-  const auto new_nibble = NibbleAt(added, index);
-  assert(index < kNibbles && old_nibble != new_nibble);
+  const auto old_byte = ByteAt(old_min, index);
+  const auto new_byte = ByteAt(added, index);
+  assert(index < kKeyBytes && old_byte != new_byte);
   auto* branch = new (allocator_->AllocateAligned(sizeof(Branch))) Branch();
-  branch->nibble_index = index;
+  branch->byte_index = index;
   std::array<std::array<Node*, 2>, 4> children{};
-  std::array<uint8_t, 4> occupied{};
-  const auto add_child = [&](uint8_t nibble, Node* child) {
-    const auto segment = SegmentFor(nibble);
-    const auto local = LocalNibbleFor(nibble);
-    const size_t rank = std::popcount(
-        static_cast<uint8_t>(occupied[segment] & Below(local)));
+  std::array<uint64_t, 4> occupied{};
+  const auto add_child = [&](uint8_t value, Node* child) {
+    const auto segment = SegmentForByte(value);
+    const auto local = LocalByte(value);
+    const size_t rank = std::popcount(occupied[segment] & Below(local));
     const size_t count = std::popcount(occupied[segment]);
     for (size_t i = count; i > rank; --i) children[segment][i] = children[segment][i - 1];
     children[segment][rank] = child;
-    occupied[segment] = static_cast<uint8_t>(occupied[segment] | Mask(local));
+    occupied[segment] |= Mask(local);
   };
-  add_child(old_nibble, old);
-  add_child(new_nibble, added);
+  add_child(old_byte, old);
+  add_child(new_byte, added);
   for (uint8_t segment = 0; segment < 4; ++segment) {
     if (occupied[segment] != 0)
       branch->segments[segment].store(AllocateChildBlock(occupied[segment],
@@ -261,7 +265,7 @@ CedarPureRadixIndex::Leaf* CedarPureRadixIndex::FindLeaf(const Key& key) const {
   Node* node = root_.load(std::memory_order_acquire);
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(node);
-    node = ChildAt(branch, NibbleAt(key, branch->nibble_index));
+    node = ChildAt(branch, ByteAt(key, branch->byte_index));
   }
   return node == nullptr ? nullptr : AsLeaf(node);
 }
@@ -305,24 +309,24 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
   for (;;) {
     // Frames are written before depth advances; all consumers read only
     // [0, depth), so avoid clearing the unused tail on every insertion.
-    std::array<TraversalFrame, kNibbles> path;
+    std::array<TraversalFrame, kKeyBytes> path;
     size_t depth = 0;
     Node* node = root_.load(std::memory_order_acquire);
     while (node != nullptr && node->kind == NodeKind::kBranch) {
       auto* branch = AsBranch(node);
-      // A branch below the first differing nibble cannot receive this leaf
+      // A branch below the first differing byte cannot receive this leaf
       // directly. Stop before it so the branch is wrapped as one old subtree.
-      if (FirstDifferingNibble(
+      if (FirstDifferingByte(
               branch->min_leaf.load(std::memory_order_acquire), key) <
-          branch->nibble_index) {
+          branch->byte_index) {
         break;
       }
-      const auto nibble = NibbleAt(key, branch->nibble_index);
-      const auto segment = SegmentFor(nibble);
-      auto* block = BlockAt(branch, nibble);
-      auto* child = ChildAt(block, LocalNibbleFor(nibble));
+      const auto value = ByteAt(key, branch->byte_index);
+      const auto segment = SegmentForByte(value);
+      auto* block = BlockAt(branch, value);
+      auto* child = ChildAt(block, LocalByte(value));
       assert(depth < path.size());
-      path[depth++] = {branch, segment, block, nibble, child};
+      path[depth++] = {branch, segment, block, value, child};
       if (test_hooks_.branch_load_for_testing) test_hooks_.branch_load_for_testing();
       node = child;
     }
@@ -337,7 +341,7 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
         }
       } else {
         auto& parent = path[depth - 1];
-        auto* replacement = CopyBlockWithInsertedChild(parent.block, parent.nibble,
+        auto* replacement = CopyBlockWithInsertedChild(parent.block, parent.byte,
                                                         &handle->leaf);
         if (test_hooks_.before_cas) test_hooks_.before_cas();
         if (ReplaceBlock(parent.branch, parent.segment, parent.block, replacement)) {
@@ -350,15 +354,15 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
     }
     auto* matched = node->kind == NodeKind::kLeaf ? AsLeaf(node)
                                                    : MinimumLeaf(node);
-    const auto differing = FirstDifferingNibble(matched, key);
-    if (differing == kNibbles) return false;
+    const auto differing = FirstDifferingByte(matched, key);
+    if (differing == kKeyBytes) return false;
     size_t wrapper = 0;
-    while (wrapper < depth && path[wrapper].branch->nibble_index < differing) ++wrapper;
-    if (wrapper < depth && path[wrapper].branch->nibble_index == differing) {
+    while (wrapper < depth && path[wrapper].branch->byte_index < differing) ++wrapper;
+    if (wrapper < depth && path[wrapper].branch->byte_index == differing) {
       auto& direct = path[wrapper];
-      const auto nibble = NibbleAt(key, differing);
-      if (ChildAt(direct.block, LocalNibbleFor(nibble)) == nullptr) {
-        auto* replacement = CopyBlockWithInsertedChild(direct.block, nibble, &handle->leaf);
+      const auto value = ByteAt(key, differing);
+      if (ChildAt(direct.block, LocalByte(value)) == nullptr) {
+        auto* replacement = CopyBlockWithInsertedChild(direct.block, value, &handle->leaf);
         if (test_hooks_.before_cas) test_hooks_.before_cas();
         if (ReplaceBlock(direct.branch, direct.segment, direct.block, replacement)) {
           PublishBoundaryUpdates(key, &handle->leaf, path.data(), wrapper + 1);
@@ -381,7 +385,8 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
       }
     } else {
       auto& parent = path[wrapper - 1];
-      auto* block = CopyBlockWithReplacedChild(parent.block, parent.nibble, replacement);
+      auto* block = CopyBlockWithReplacedChild(parent.block, parent.byte,
+                                                replacement);
       if (test_hooks_.before_cas) test_hooks_.before_cas();
       if (ReplaceBlock(parent.branch, parent.segment, parent.block, block)) {
         PublishBoundaryUpdates(key, &handle->leaf, path.data(), wrapper);
@@ -403,16 +408,16 @@ CedarPureRadixIndex::GetStructureStatsForTesting() const {
     if (node == nullptr || node->kind == NodeKind::kLeaf) return;
     const auto* branch = AsBranch(node);
     ++stats.branches;
+    ++stats.byte_branches;
     stats.max_depth = std::max(stats.max_depth, depth);
     for (uint8_t segment = 0; segment < 4; ++segment) {
       auto* block = branch->segments[segment].load(std::memory_order_acquire);
       if (block == nullptr) continue;
       ++stats.child_tables;
       ++stats.child_blocks;
-      stats.segment_occupied[segment] = static_cast<uint8_t>(
-          stats.segment_occupied[segment] | block->occupied);
-      stats.segment_child_counts[segment] = static_cast<uint8_t>(
-          stats.segment_child_counts[segment] + block->child_count);
+      stats.byte_segment_occupied[segment] |= block->occupied;
+      stats.byte_segment_child_counts[segment] = static_cast<uint8_t>(
+          stats.byte_segment_child_counts[segment] + block->child_count);
       for (size_t rank = 0; rank < block->child_count; ++rank)
         self(self, block->children[rank], depth + 1);
     }
@@ -431,8 +436,8 @@ bool CedarPureRadixIndex::TryBuildFrozenChain() const {
           state, ChainState::kBuilding, std::memory_order_acq_rel,
           std::memory_order_acquire)) return state == ChainState::kReady;
   if (test_hooks_.frozen_chain_builder) test_hooks_.frozen_chain_builder();
-  struct Frame { const Branch* branch; uint8_t nibble; };
-  std::array<Frame, kNibbles> path{};
+  struct Frame { const Branch* branch; uint8_t value; };
+  std::array<Frame, kKeyBytes> path{};
   size_t depth = 0;
   Node* node = root_.load(std::memory_order_acquire);
   Leaf* first = nullptr;
@@ -440,10 +445,10 @@ bool CedarPureRadixIndex::TryBuildFrozenChain() const {
   while (node != nullptr || depth != 0) {
     while (node != nullptr && node->kind == NodeKind::kBranch) {
       auto* branch = AsBranch(node);
-      const auto nibble = FirstChildAtOrAfter(branch, 0);
-      assert(nibble < 16 && depth < path.size());
-      path[depth++] = {branch, nibble};
-      node = ChildAt(branch, nibble);
+      const auto value = FirstChildAtOrAfter(branch, 0);
+      assert(value < 256 && depth < path.size());
+      path[depth++] = {branch, static_cast<uint8_t>(value)};
+      node = ChildAt(branch, static_cast<uint8_t>(value));
     }
     if (node != nullptr) {
       auto* leaf = AsLeaf(node);
@@ -454,9 +459,13 @@ bool CedarPureRadixIndex::TryBuildFrozenChain() const {
     }
     while (node == nullptr && depth != 0) {
       auto& frame = path[depth - 1];
-      const auto next = frame.nibble == 15 ? 16 : FirstChildAtOrAfter(
-          frame.branch, static_cast<uint8_t>(frame.nibble + 1));
-      if (next < 16) { frame.nibble = next; node = ChildAt(frame.branch, next); break; }
+      const auto next = frame.value == 255 ? 256 : FirstChildAtOrAfter(
+          frame.branch, static_cast<uint8_t>(frame.value + 1));
+      if (next < 256) {
+        frame.value = static_cast<uint8_t>(next);
+        node = ChildAt(frame.branch, static_cast<uint8_t>(next));
+        break;
+      }
       --depth;
     }
   }
@@ -475,20 +484,22 @@ void CedarPureRadixIndex::Cursor::Clear() { depth_ = 0; leaf_ = nullptr; frozen_
 void CedarPureRadixIndex::Cursor::DescendLeft(const Node* node) {
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(node);
-    const auto nibble = FirstChildAtOrAfter(branch, 0);
-    assert(nibble < 16 && depth_ < branches_.size());
-    branches_[depth_] = branch; directions_[depth_++] = nibble;
-    node = ChildAt(branch, nibble);
+    const auto value = FirstChildAtOrAfter(branch, 0);
+    assert(value < 256 && depth_ < branches_.size());
+    branches_[depth_] = branch;
+    directions_[depth_++] = static_cast<uint8_t>(value);
+    node = ChildAt(branch, static_cast<uint8_t>(value));
   }
   leaf_ = node == nullptr ? nullptr : AsLeaf(node);
 }
 void CedarPureRadixIndex::Cursor::DescendRight(const Node* node) {
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(node);
-    const auto nibble = LastChildAtOrBefore(branch, 15);
-    assert(nibble < 16 && depth_ < branches_.size());
-    branches_[depth_] = branch; directions_[depth_++] = nibble;
-    node = ChildAt(branch, nibble);
+    const auto value = LastChildAtOrBefore(branch, 255);
+    assert(value < 256 && depth_ < branches_.size());
+    branches_[depth_] = branch;
+    directions_[depth_++] = static_cast<uint8_t>(value);
+    node = ChildAt(branch, static_cast<uint8_t>(value));
   }
   leaf_ = node == nullptr ? nullptr : AsLeaf(node);
 }
@@ -507,22 +518,26 @@ bool CedarPureRadixIndex::Cursor::SeekLowerBound(const Node* node, const Key& ke
     assert(minimum != nullptr && maximum != nullptr);
     if (Compare(minimum, key) >= 0) {
       const auto first = FirstChildAtOrAfter(branch, 0);
-      assert(first < 16 && depth_ < branches_.size());
+      assert(first < 256 && depth_ < branches_.size());
       branches_[depth_] = branch;
-      directions_[depth_++] = first;
-      DescendLeft(ChildAt(branch, first));
+      directions_[depth_++] = static_cast<uint8_t>(first);
+      DescendLeft(ChildAt(branch, static_cast<uint8_t>(first)));
       return Valid();
     }
     if (Compare(maximum, key) < 0) {
       NextPath();
       return Valid();
     }
-    const auto target = NibbleAt(key, branch->nibble_index);
+    const auto target = ByteAt(key, branch->byte_index);
     const auto selected = FirstChildAtOrAfter(branch, target);
-    if (selected == 16) { NextPath(); return Valid(); }
-    branches_[depth_] = branch; directions_[depth_++] = selected;
-    if (selected > target) { DescendLeft(ChildAt(branch, selected)); return Valid(); }
-    current = ChildAt(branch, selected);
+    if (selected == 256) { NextPath(); return Valid(); }
+    branches_[depth_] = branch;
+    directions_[depth_++] = static_cast<uint8_t>(selected);
+    if (selected > target) {
+      DescendLeft(ChildAt(branch, static_cast<uint8_t>(selected)));
+      return Valid();
+    }
+    current = ChildAt(branch, static_cast<uint8_t>(selected));
   }
   if (current == nullptr) return false;
   leaf_ = AsLeaf(current);
@@ -537,23 +552,27 @@ bool CedarPureRadixIndex::Cursor::SeekUpperBound(const Node* node, const Key& ke
     const auto* maximum = branch->max_leaf.load(std::memory_order_acquire);
     assert(minimum != nullptr && maximum != nullptr);
     if (Compare(maximum, key) <= 0) {
-      const auto last = LastChildAtOrBefore(branch, 15);
-      assert(last < 16 && depth_ < branches_.size());
+      const auto last = LastChildAtOrBefore(branch, 255);
+      assert(last < 256 && depth_ < branches_.size());
       branches_[depth_] = branch;
-      directions_[depth_++] = last;
-      DescendRight(ChildAt(branch, last));
+      directions_[depth_++] = static_cast<uint8_t>(last);
+      DescendRight(ChildAt(branch, static_cast<uint8_t>(last)));
       return Valid();
     }
     if (Compare(minimum, key) > 0) {
       PrevPath();
       return Valid();
     }
-    const auto target = NibbleAt(key, branch->nibble_index);
+    const auto target = ByteAt(key, branch->byte_index);
     const auto selected = LastChildAtOrBefore(branch, target);
-    if (selected == 16) { PrevPath(); return Valid(); }
-    branches_[depth_] = branch; directions_[depth_++] = selected;
-    if (selected < target) { DescendRight(ChildAt(branch, selected)); return Valid(); }
-    current = ChildAt(branch, selected);
+    if (selected == 256) { PrevPath(); return Valid(); }
+    branches_[depth_] = branch;
+    directions_[depth_++] = static_cast<uint8_t>(selected);
+    if (selected < target) {
+      DescendRight(ChildAt(branch, static_cast<uint8_t>(selected)));
+      return Valid();
+    }
+    current = ChildAt(branch, static_cast<uint8_t>(selected));
   }
   if (current == nullptr) return false;
   leaf_ = AsLeaf(current);
@@ -578,9 +597,13 @@ void CedarPureRadixIndex::Cursor::NextPath() {
   for (size_t i = depth_; i > 0; --i) {
     const auto* branch = branches_[i - 1];
     const auto current = directions_[i - 1];
-    const auto next = current == 15 ? 16 : FirstChildAtOrAfter(branch, static_cast<uint8_t>(current + 1));
-    if (next == 16) continue;
-    depth_ = i; directions_[i - 1] = next; DescendLeft(ChildAt(branch, next)); return;
+    const auto next = current == 255 ? 256 : FirstChildAtOrAfter(
+        branch, static_cast<uint8_t>(current + 1));
+    if (next == 256) continue;
+    depth_ = i;
+    directions_[i - 1] = static_cast<uint8_t>(next);
+    DescendLeft(ChildAt(branch, static_cast<uint8_t>(next)));
+    return;
   }
   leaf_ = nullptr; depth_ = 0;
 }
@@ -588,9 +611,13 @@ void CedarPureRadixIndex::Cursor::PrevPath() {
   for (size_t i = depth_; i > 0; --i) {
     const auto* branch = branches_[i - 1];
     const auto current = directions_[i - 1];
-    const auto previous = current == 0 ? 16 : LastChildAtOrBefore(branch, static_cast<uint8_t>(current - 1));
-    if (previous == 16) continue;
-    depth_ = i; directions_[i - 1] = previous; DescendRight(ChildAt(branch, previous)); return;
+    const auto previous = current == 0 ? 256 : LastChildAtOrBefore(
+        branch, static_cast<uint8_t>(current - 1));
+    if (previous == 256) continue;
+    depth_ = i;
+    directions_[i - 1] = static_cast<uint8_t>(previous);
+    DescendRight(ChildAt(branch, static_cast<uint8_t>(previous)));
+    return;
   }
   leaf_ = nullptr; depth_ = 0;
 }

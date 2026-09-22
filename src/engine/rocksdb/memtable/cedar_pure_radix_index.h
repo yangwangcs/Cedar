@@ -20,9 +20,6 @@ class Allocator;
 class CedarPureRadixIndex {
  public:
   static constexpr size_t kKeyBytes = 40;
-  static constexpr size_t kNibbles = kKeyBytes * 2;
-  // Kept as a compatibility name for deep-path test construction. Tree
-  // discrimination itself is nibble based.
   static constexpr size_t kMaxBits = kKeyBytes * 8;
   using Key = std::array<unsigned char, kKeyBytes>;
 
@@ -40,8 +37,7 @@ class CedarPureRadixIndex {
 
   struct StructureStatsForTesting {
     size_t branches = 0;
-    // These fields define the byte-branch representation contract. They
-    // remain zero until the implementation switches from nibble branches.
+    // Byte-branch representation contract, aggregated across all branches.
     size_t byte_branches = 0;
     std::array<uint64_t, 4> byte_segment_occupied{};
     std::array<uint8_t, 4> byte_segment_child_counts{};
@@ -98,17 +94,17 @@ class CedarPureRadixIndex {
     Leaf* frozen_next = nullptr;
   };
 
-  // An immutable sparse snapshot for one four-nibble segment. `children` is
-  // a flexible tail laid out in local-nibble order according to `occupied`.
+  // An immutable sparse snapshot for one 64-byte-value segment. `children`
+  // is a flexible tail laid out in low-six-bit order according to `occupied`.
   struct ChildBlock {
-    uint8_t occupied = 0;
+    uint64_t occupied = 0;
     uint8_t child_count = 0;
     Node* children[1];
   };
 
   struct Branch final : Node {
     Branch() : Node(NodeKind::kBranch) {}
-    uint8_t nibble_index = 0;
+    uint8_t byte_index = 0;
     std::array<std::atomic<ChildBlock*>, 4> segments{};
     // Branches are immutable after publication. These cached boundaries let
     // Seek compare against a child interval without descending to its edge
@@ -124,19 +120,19 @@ class CedarPureRadixIndex {
 
   enum class ChainState : uint8_t { kUnbuilt, kBuilding, kReady };
 
-  static uint8_t NibbleAt(const Key& key, uint8_t nibble_index);
-  static uint8_t NibbleAt(const Leaf* leaf, uint8_t nibble_index);
+  static uint8_t ByteAt(const Key& key, uint8_t byte_index);
+  static uint8_t ByteAt(const Leaf* leaf, uint8_t byte_index);
   static int Compare(const Key& left, const Key& right);
   static int Compare(const Leaf* left, const Key& right);
   static int Compare(const Leaf* left, const Leaf* right);
-  static uint8_t FirstDifferingNibble(const Key& left, const Key& right);
-  static uint8_t FirstDifferingNibble(const Leaf* left, const Key& right);
+  static uint8_t FirstDifferingByte(const Key& left, const Key& right);
+  static uint8_t FirstDifferingByte(const Leaf* left, const Key& right);
 
   struct TraversalFrame {
     Branch* branch;
     uint8_t segment;
     ChildBlock* block;
-    uint8_t nibble;
+    uint8_t byte;
     Node* child;
   };
 
@@ -145,21 +141,20 @@ class CedarPureRadixIndex {
   static const Leaf* AsLeaf(const Node* node);
   static Branch* AsBranch(Node* node);
   static const Branch* AsBranch(const Node* node);
-  static uint8_t SegmentFor(uint8_t nibble) { return nibble >> 2; }
-  static uint8_t LocalNibbleFor(uint8_t nibble) { return nibble & 0x03; }
-  static ChildBlock* BlockAt(const Branch* branch, uint8_t nibble);
-  static Node* ChildAt(const ChildBlock* block, uint8_t nibble);
-  static Node* ChildAt(const Branch* branch, uint8_t nibble);
-  static uint8_t FirstChildAtOrAfter(const Branch* branch, uint8_t nibble);
-  static uint8_t LastChildAtOrBefore(const Branch* branch, uint8_t nibble);
-  ChildBlock* AllocateChildBlock(uint8_t occupied, Node* const* children);
+  static uint8_t LocalByte(uint8_t value) { return value & 0x3f; }
+  static ChildBlock* BlockAt(const Branch* branch, uint8_t value);
+  static Node* ChildAt(const ChildBlock* block, uint8_t local_byte);
+  static Node* ChildAt(const Branch* branch, uint8_t value);
+  static uint16_t FirstChildAtOrAfter(const Branch* branch, uint8_t value);
+  static uint16_t LastChildAtOrBefore(const Branch* branch, uint8_t value);
+  ChildBlock* AllocateChildBlock(uint64_t occupied, Node* const* children);
   ChildBlock* CopyBlockWithInsertedChild(const ChildBlock* old_block,
-                                         uint8_t nibble, Node* child);
+                                         uint8_t value, Node* child);
   ChildBlock* CopyBlockWithReplacedChild(const ChildBlock* old_block,
-                                         uint8_t nibble, Node* child);
+                                         uint8_t value, Node* child);
   bool ReplaceBlock(Branch* branch, uint8_t segment, ChildBlock* observed,
                     ChildBlock* replacement) const;
-  Branch* AllocateBranch(uint8_t nibble_index, Node* old_node,
+  Branch* AllocateBranch(uint8_t byte_index, Node* old_node,
                         Leaf* new_leaf);
   static Leaf* MinimumLeaf(Node* node);
   static Leaf* MaximumLeaf(Node* node);
@@ -206,10 +201,10 @@ class CedarPureRadixIndex::Cursor {
   void SeekPath(const Key& key, bool seek_for_prev);
 
   const CedarPureRadixIndex* const index_;
-  // A direction bit is stored separately so a 320-level cursor consumes one
+  // A direction byte is stored separately so a 40-level cursor consumes one
   // pointer per branch rather than a pointer-sized padded frame per level.
-  std::array<const Branch*, kNibbles> branches_{};
-  std::array<uint8_t, kNibbles> directions_{};
+  std::array<const Branch*, kKeyBytes> branches_{};
+  std::array<uint8_t, kKeyBytes> directions_{};
   size_t depth_ = 0;
   const Leaf* leaf_ = nullptr;
   bool frozen_chain_mode_ = false;

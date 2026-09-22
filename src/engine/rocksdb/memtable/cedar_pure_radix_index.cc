@@ -484,6 +484,9 @@ void CedarPureRadixIndex::Cursor::Clear() { depth_ = 0; leaf_ = nullptr; frozen_
 void CedarPureRadixIndex::Cursor::DescendLeft(const Node* node) {
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(node);
+    if (index_->test_hooks_.branch_load_for_testing) {
+      index_->test_hooks_.branch_load_for_testing();
+    }
     const auto value = FirstChildAtOrAfter(branch, 0);
     assert(value < 256 && depth_ < branches_.size());
     branches_[depth_] = branch;
@@ -495,6 +498,9 @@ void CedarPureRadixIndex::Cursor::DescendLeft(const Node* node) {
 void CedarPureRadixIndex::Cursor::DescendRight(const Node* node) {
   while (node != nullptr && node->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(node);
+    if (index_->test_hooks_.branch_load_for_testing) {
+      index_->test_hooks_.branch_load_for_testing();
+    }
     const auto value = LastChildAtOrBefore(branch, 255);
     assert(value < 256 && depth_ < branches_.size());
     branches_[depth_] = branch;
@@ -513,6 +519,9 @@ bool CedarPureRadixIndex::Cursor::SeekLowerBound(const Node* node, const Key& ke
   const Node* current = node;
   while (current != nullptr && current->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(current);
+    if (index_->test_hooks_.branch_load_for_testing) {
+      index_->test_hooks_.branch_load_for_testing();
+    }
     const auto* minimum = branch->min_leaf.load(std::memory_order_acquire);
     const auto* maximum = branch->max_leaf.load(std::memory_order_acquire);
     assert(minimum != nullptr && maximum != nullptr);
@@ -548,6 +557,9 @@ bool CedarPureRadixIndex::Cursor::SeekUpperBound(const Node* node, const Key& ke
   const Node* current = node;
   while (current != nullptr && current->kind == NodeKind::kBranch) {
     const auto* branch = AsBranch(current);
+    if (index_->test_hooks_.branch_load_for_testing) {
+      index_->test_hooks_.branch_load_for_testing();
+    }
     const auto* minimum = branch->min_leaf.load(std::memory_order_acquire);
     const auto* maximum = branch->max_leaf.load(std::memory_order_acquire);
     assert(minimum != nullptr && maximum != nullptr);

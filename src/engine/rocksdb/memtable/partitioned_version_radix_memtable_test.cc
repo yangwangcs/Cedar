@@ -836,6 +836,124 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     SparseByteSegmentsSeekAcrossEvery64ValueBoundary) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  const auto insert = [&](uint8_t value) {
+    CedarPureRadixIndex::Key key{};
+    key[39] = value;
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(value);
+    ASSERT_TRUE(index.Insert(handle, key));
+  };
+  for (uint8_t value : {uint8_t{0}, uint8_t{63}, uint8_t{64},
+                        uint8_t{127}, uint8_t{128}, uint8_t{191},
+                        uint8_t{192}, uint8_t{255}}) {
+    insert(value);
+  }
+
+  const auto seek = [&](uint8_t probe, bool previous, uint8_t expected) {
+    CedarPureRadixIndex::Key key{};
+    key[39] = probe;
+    CedarPureRadixIndex::Cursor cursor(&index);
+    if (previous) cursor.SeekForPrev(key);
+    else cursor.Seek(key);
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<uint8_t>(*cursor.entry()), expected);
+  };
+  seek(1, false, 63);
+  seek(62, true, 0);
+  seek(65, false, 127);
+  seek(126, true, 64);
+  seek(129, false, 191);
+  seek(190, true, 128);
+  seek(193, false, 255);
+  seek(254, true, 192);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     FortyByteBytePatriciaPathPreservesOrderAndBounds) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  std::vector<std::pair<CedarPureRadixIndex::Key, uint8_t>> expected;
+  const auto insert = [&](const CedarPureRadixIndex::Key& key, uint8_t value) {
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(value);
+    ASSERT_TRUE(index.Insert(handle, key));
+    expected.emplace_back(key, value);
+  };
+  CedarPureRadixIndex::Key zero{};
+  insert(zero, 40);
+  for (uint8_t byte = 0; byte < 39; ++byte) {
+    CedarPureRadixIndex::Key key{};
+    key[byte] = 1;
+    insert(key, byte);
+  }
+  std::sort(expected.begin(), expected.end(), [](const auto& left, const auto& right) {
+    return left.first < right.first;
+  });
+
+  const auto stats = index.GetStructureStatsForTesting();
+  EXPECT_EQ(stats.max_depth, 39U);
+  CedarPureRadixIndex::Cursor cursor(&index);
+  cursor.SeekToFirst();
+  for (const auto& [key, value] : expected) {
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<uint8_t>(*cursor.entry()), value);
+    cursor.Next();
+  }
+  EXPECT_FALSE(cursor.Valid());
+
+  CedarPureRadixIndex::Key between{};
+  between[38] = 1;
+  cursor.SeekForPrev(between);
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_EQ(static_cast<uint8_t>(*cursor.entry()), 38U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
+     FrozenByteCursorLoadsBranchesOnlyWhileSeeking) {
+  ConcurrentArena arena;
+  std::atomic<size_t> branch_loads{0};
+  CedarPureRadixIndex::TestHooks hooks;
+  hooks.branch_load_for_testing = [&] {
+    branch_loads.fetch_add(1, std::memory_order_relaxed);
+  };
+  CedarPureRadixIndex index(&arena, hooks);
+  for (uint16_t value = 0; value < 256; ++value) {
+    CedarPureRadixIndex::Key key{};
+    key[39] = static_cast<uint8_t>(value);
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(value);
+    ASSERT_TRUE(index.Insert(handle, key));
+  }
+  index.MarkReadOnly();
+  index.PrepareForFlush();
+  branch_loads.store(0, std::memory_order_relaxed);
+  CedarPureRadixIndex::Cursor cursor(&index);
+  CedarPureRadixIndex::Key seek_key{};
+  seek_key[39] = 127;
+  cursor.Seek(seek_key);
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_GT(branch_loads.load(std::memory_order_relaxed), 0U);
+  branch_loads.store(0, std::memory_order_relaxed);
+  for (size_t count = 0; count < 64; ++count) {
+    ASSERT_TRUE(cursor.Valid());
+    cursor.Next();
+  }
+  EXPECT_EQ(branch_loads.load(std::memory_order_relaxed), 0U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      SeekBranchVisitsRemainLinearInPatriciaHeight) {
   TestKeyComparator comparator;
   Arena arena;

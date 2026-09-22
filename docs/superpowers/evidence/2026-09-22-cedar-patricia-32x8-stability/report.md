@@ -1,0 +1,97 @@
+# Cedar 32x8 Stability: Failed Gate Audit
+
+Status: **not frozen**. The 32x8 byte-segment Patricia representation remains;
+the proposed 128-byte edge spacing and one compatible same-edge retry were
+reverted after failing their isolated A/B retention rules. The active goal is
+not complete. This is failed-trial evidence, not a performance acceptance.
+
+## Comparable Builds
+
+All five detached worktrees were clean. The benchmark source SHA-256 was
+`4c4ea921641adcd529a995cfb1fa0e3e9bf398e77b4134a6c65023dc6594fa53`
+for every build. All used `/usr/bin/c++`, `Release`, `-O3 -DNDEBUG`, and
+single-job named builds. Each embedded RocksDB cache was separately hashed
+and built with `CEDAR_ROCKSDB_BUILD_PARALLEL_LEVEL=1`.
+
+| Variant | Production commit | Release binary |
+| --- | --- | --- |
+| Nibble | `77593a87a64f03d7716318e3c9ce7bb672a78327` | `/Volumes/E/CedarBuild/patricia-retention-nibble-o3-20260922/cedar_radix_memtable_bench` |
+| Byte and SkipList | `76adf448257aaaa4eacac8ba5451ba38a51223f3` | `/Volumes/E/CedarBuild/patricia-retention-byte-o3-20260922/cedar_radix_memtable_bench` |
+| 32x8 baseline | `ee9a887865e9d643103758b71b7469868c758eb9` | `/Volumes/E/CedarBuild/patricia-32x8-baseline-o3-20260922/cedar_radix_memtable_bench` |
+| Edge isolation | `520a5ce9924470a619c4a0c7fe832a12833f8021` | `/Volumes/E/CedarBuild/patricia-32x8-isolation-o3-20260922/cedar_radix_memtable_bench` |
+| Edge isolation + retry | `c8082029ed8f119ab76a27b5da611116803483df` | `/Volumes/E/CedarBuild/patricia-32x8-final-o3-20260922/cedar_radix_memtable_bench` |
+
+Nine untimed `--entries 1024 --phase all` checks across baseline, isolation,
+and final at 1/4/8 writers reported 1024 operations, zero errors, and the
+same result hash `16340194407465152223`.
+
+## Isolated A/B
+
+Each A/B has five separate, interleaved processes per variant and seed at
+131072 random keys and eight writers. The first raw matrix is in
+`ab-first/matrix.csv`; the independent repeat is in `ab-repeat/matrix.csv`.
+Values below are medians in milliseconds, ordered as baseline / isolation /
+final, followed by the SkipList control.
+
+| Seed | First A/B | Repeat A/B |
+| --- | --- | --- |
+| 20260920 | 25.239 / 23.589 / 23.950; 30.089 | 24.711 / 26.842 / 28.343; 33.962 |
+| 20260921 | 23.153 / 25.549 / 27.468; 24.435 | 19.243 / 26.193 / 26.504; 30.869 |
+| 20260922 | 25.641 / 26.433 / 24.334; 26.327 | 24.698 / 25.571 / 23.007; 25.490 |
+
+Isolation regressed at two seeds in the first A/B and all three in the
+repeat. Retry regressed versus isolation at two seeds in each A/B. Neither
+change passed its retention rule. Revert commits: retry `235340a`, edge
+isolation `34b5080`. The retained production header and source match
+`ee9a887` exactly.
+
+The host reported a 128-byte cache line and eight CPUs. During the first
+A/B, a remote-desktop video-session process used about 140% CPU, and
+WindowServer about 44%; load average was about 5.4. SkipList process CV
+was 11%-19%, and one isolation process took 113.766 ms while its other
+four samples were 21.705-26.667 ms. No external process was stopped.
+These observations make causal attribution to a sub-change weak, but do not
+relax any binding gate.
+
+## Five-seed Gates
+
+The unreverted candidate trial is in `matrix-raw/matrix.csv` and
+`summary.json`; the reverted baseline audit is in
+`baseline-matrix-raw/matrix.csv` and `baseline-summary.json`. Each matrix
+contains 400 independent process rows, 131072 operations and zero errors
+per row, with expected hash `454339457082336225`. Peak RSS is present in
+each row (max 57049088 candidate, 57065472 baseline bytes).
+
+| Seed | Candidate 1 / 4 / 8 ratios, CV8 | Baseline 1 / 4 / 8 ratios, CV8 |
+| --- | --- | --- |
+| 20260920 | 1.1578 / 0.8463 / 0.8200, 13.04% | 0.9071 / 0.7417 / 0.7760, 9.41% |
+| 20260921 | 1.1160 / 0.9523 / 0.8975, 22.04% | 0.9888 / 0.6149 / 0.8177, 11.86% |
+| 20260922 | 1.2260 / 0.8293 / 0.9263, 11.02% | 0.9699 / 0.6654 / 0.8700, 13.70% |
+| 20260923 | 1.2153 / 0.9145 / 0.8389, 16.77% | 1.0457 / 0.5897 / 0.7481, 18.40% |
+| 20260924 | 1.1328 / 1.0050 / 0.9249, 10.95% | 1.0101 / 0.7484 / 0.7794, 6.73% |
+
+Limits are `<=1.05` against Byte (one writer), `<=0.80` against SkipList
+(four writers), `<=0.85` against SkipList (eight writers), and `<=5%`
+candidate eight-writer CV independently for each seed. Candidate Arena
+ratios are 1.2006-1.2061x Nibble; reverted baseline Arena ratios are
+1.0799-1.0914x. Both pass the `<=1.25x` memory limit, but neither passes
+the whole performance matrix. The baseline misses the eight-writer ratio
+at seed 20260922 and all five CV gates; the candidate misses more gates.
+
+`diagnostics.json` contains 15 untimed direct-index runs. At eight writers,
+segment CAS failures were 41-94 across 131072 insertions. Final's local
+retry succeeded 28-51 times per seed and root restarts were 8-18. The
+pre-retry revisions have `root_restarts: null` because that hook did not
+exist. These rare conflicts cannot account for the measured multi-ms
+cross-seed variation by themselves. The diagnostic uses the same 40-byte
+normalization and seed shuffle, but does not enter the timed matrix.
+
+## Next Gate
+
+The approved two sub-changes are exhausted. No third representation or
+publication mechanism was introduced. A fresh, low-contention Release
+matrix is required to separate environmental CV from the remaining baseline
+seed-20260922 ratio failure. Even if that run passes, the approved spec
+requires full `MarkReadOnly`, `PrepareForFlush`, Flush/SST, WAL/restart,
+bidirectional format compatibility, ASan, and TSan evidence before design
+freeze. None of those new full-chain gates is claimed here.

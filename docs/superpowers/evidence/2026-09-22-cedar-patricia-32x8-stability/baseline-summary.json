@@ -1,0 +1,685 @@
+{
+  "all_gates_pass": false,
+  "seeds": {
+    "20260920": {
+      "arena_ratios": {
+        "1": 1.0799514619331463,
+        "4": 1.0876540340523886,
+        "8": 1.0888056328205777
+      },
+      "candidate_cv": {
+        "1": 0.038131722885976056,
+        "4": 0.21116356014178972,
+        "8": 0.09414602444658869
+      },
+      "gates": {
+        "arena_1": true,
+        "arena_4": true,
+        "arena_8": true,
+        "eight_writer_cv": false,
+        "eight_writer_vs_skiplist": true,
+        "four_writer_vs_skiplist": true,
+        "one_writer_vs_byte": true
+      },
+      "groups": {
+        "baseline/1": {
+          "arena_bytes_median": 17678624.0,
+          "elapsed_ns_median": 44134667.0,
+          "elapsed_ns_pstdev": 2015554.3849682051,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/4": {
+          "arena_bytes_median": 18961264.0,
+          "elapsed_ns_median": 22384917.0,
+          "elapsed_ns_pstdev": 2714353.86324734,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/8": {
+          "arena_bytes_median": 19020628.0,
+          "elapsed_ns_median": 22997770.5,
+          "elapsed_ns_pstdev": 2526198.6048330185,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "byte/1": {
+          "arena_bytes_median": 50061536.0,
+          "elapsed_ns_median": 47857125.0,
+          "elapsed_ns_pstdev": 2353273.152868404,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/1": {
+          "arena_bytes_median": 17678624.0,
+          "elapsed_ns_median": 43410709.0,
+          "elapsed_ns_pstdev": 1689030.3582118824,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/4": {
+          "arena_bytes_median": 18943592.0,
+          "elapsed_ns_median": 24778833.0,
+          "elapsed_ns_pstdev": 5109690.048051189,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/8": {
+          "arena_bytes_median": 19009880.0,
+          "elapsed_ns_median": 22931666.5,
+          "elapsed_ns_pstdev": 2185602.70659147,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "nibble/1": {
+          "arena_bytes_median": 16369832.0,
+          "elapsed_ns_median": 63703083.0,
+          "elapsed_ns_pstdev": 4083143.2572420477,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/4": {
+          "arena_bytes_median": 17416928.0,
+          "elapsed_ns_median": 28466833.0,
+          "elapsed_ns_pstdev": 6466390.00738177,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/8": {
+          "arena_bytes_median": 17459388.0,
+          "elapsed_ns_median": 26630104.5,
+          "elapsed_ns_pstdev": 3757808.1539868372,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "skiplist/4": {
+          "arena_bytes_median": 8105736.0,
+          "elapsed_ns_median": 33407125.0,
+          "elapsed_ns_pstdev": 4435080.33948906,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "skiplist/8": {
+          "arena_bytes_median": 8167584.0,
+          "elapsed_ns_median": 29552229.5,
+          "elapsed_ns_pstdev": 5033656.8921233835,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        }
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.7759707774332221,
+        "four_writer_vs_skiplist": 0.7417230007071844,
+        "one_writer_vs_byte": 0.9070897802573807
+      }
+    },
+    "20260921": {
+      "arena_ratios": {
+        "1": 1.0801118323667813,
+        "4": 1.0881182607545474,
+        "8": 1.0895819036085777
+      },
+      "candidate_cv": {
+        "1": 0.034764321397404555,
+        "4": 0.16025494603360146,
+        "8": 0.11860778234564619
+      },
+      "gates": {
+        "arena_1": true,
+        "arena_4": true,
+        "arena_8": true,
+        "eight_writer_cv": false,
+        "eight_writer_vs_skiplist": true,
+        "four_writer_vs_skiplist": true,
+        "one_writer_vs_byte": true
+      },
+      "groups": {
+        "baseline/1": {
+          "arena_bytes_median": 17681664.0,
+          "elapsed_ns_median": 42205500.0,
+          "elapsed_ns_pstdev": 2014320.6963589885,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/4": {
+          "arena_bytes_median": 18979864.0,
+          "elapsed_ns_median": 22842459.0,
+          "elapsed_ns_pstdev": 38912093.74491225,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/8": {
+          "arena_bytes_median": 19018124.0,
+          "elapsed_ns_median": 23773438.0,
+          "elapsed_ns_pstdev": 2360379.684913942,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "byte/1": {
+          "arena_bytes_median": 50072616.0,
+          "elapsed_ns_median": 46085208.0,
+          "elapsed_ns_pstdev": 1315309.649208216,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/1": {
+          "arena_bytes_median": 17681664.0,
+          "elapsed_ns_median": 45568875.0,
+          "elapsed_ns_pstdev": 1599046.6623912386,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/4": {
+          "arena_bytes_median": 18953784.0,
+          "elapsed_ns_median": 20246625.0,
+          "elapsed_ns_pstdev": 3579567.9351083143,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/8": {
+          "arena_bytes_median": 19020548.0,
+          "elapsed_ns_median": 23360166.5,
+          "elapsed_ns_pstdev": 2811713.12309133,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "nibble/1": {
+          "arena_bytes_median": 16370216.0,
+          "elapsed_ns_median": 62354125.0,
+          "elapsed_ns_pstdev": 2393080.4523192276,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/4": {
+          "arena_bytes_median": 17418864.0,
+          "elapsed_ns_median": 26293250.0,
+          "elapsed_ns_pstdev": 3360679.7930410807,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/8": {
+          "arena_bytes_median": 17456740.0,
+          "elapsed_ns_median": 23929375.0,
+          "elapsed_ns_pstdev": 3741985.688882928,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "skiplist/4": {
+          "arena_bytes_median": 8102456.0,
+          "elapsed_ns_median": 32925750.0,
+          "elapsed_ns_pstdev": 2796877.457560699,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "skiplist/8": {
+          "arena_bytes_median": 8169288.0,
+          "elapsed_ns_median": 28566521.0,
+          "elapsed_ns_pstdev": 1727230.2645412858,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        }
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.8177462876911052,
+        "four_writer_vs_skiplist": 0.614917655634268,
+        "one_writer_vs_byte": 0.9887961230423437
+      }
+    },
+    "20260922": {
+      "arena_ratios": {
+        "1": 1.0800833507225016,
+        "4": 1.091429943325949,
+        "8": 1.0897296066159605
+      },
+      "candidate_cv": {
+        "1": 0.050620413509167246,
+        "4": 0.18733098475535184,
+        "8": 0.1369815395946356
+      },
+      "gates": {
+        "arena_1": true,
+        "arena_4": true,
+        "arena_8": true,
+        "eight_writer_cv": false,
+        "eight_writer_vs_skiplist": false,
+        "four_writer_vs_skiplist": true,
+        "one_writer_vs_byte": true
+      },
+      "groups": {
+        "baseline/1": {
+          "arena_bytes_median": 17681336.0,
+          "elapsed_ns_median": 42594125.0,
+          "elapsed_ns_pstdev": 1582617.5339256672,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/4": {
+          "arena_bytes_median": 18956264.0,
+          "elapsed_ns_median": 24263125.0,
+          "elapsed_ns_pstdev": 3461472.9139603795,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/8": {
+          "arena_bytes_median": 19021612.0,
+          "elapsed_ns_median": 24074667.0,
+          "elapsed_ns_pstdev": 2808653.4411537303,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "byte/1": {
+          "arena_bytes_median": 50089032.0,
+          "elapsed_ns_median": 46571875.0,
+          "elapsed_ns_pstdev": 1730532.7384771893,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/1": {
+          "arena_bytes_median": 17681336.0,
+          "elapsed_ns_median": 45168208.0,
+          "elapsed_ns_pstdev": 2222667.692077608,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/4": {
+          "arena_bytes_median": 19020760.0,
+          "elapsed_ns_median": 19511458.0,
+          "elapsed_ns_pstdev": 3848802.4529699935,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/8": {
+          "arena_bytes_median": 19023340.0,
+          "elapsed_ns_median": 25576229.0,
+          "elapsed_ns_pstdev": 3562618.7309933067,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "nibble/1": {
+          "arena_bytes_median": 16370344.0,
+          "elapsed_ns_median": 59048167.0,
+          "elapsed_ns_pstdev": 1524610.4268541522,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/4": {
+          "arena_bytes_median": 17427376.0,
+          "elapsed_ns_median": 23074542.0,
+          "elapsed_ns_pstdev": 6041908.308843059,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/8": {
+          "arena_bytes_median": 17456936.0,
+          "elapsed_ns_median": 27027083.0,
+          "elapsed_ns_pstdev": 3607218.0194610097,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "skiplist/4": {
+          "arena_bytes_median": 8167832.0,
+          "elapsed_ns_median": 29321583.0,
+          "elapsed_ns_pstdev": 2121383.015153143,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "skiplist/8": {
+          "arena_bytes_median": 8169040.0,
+          "elapsed_ns_median": 29397041.5,
+          "elapsed_ns_pstdev": 2322612.659960511,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        }
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.8700273121021379,
+        "four_writer_vs_skiplist": 0.66542989851537,
+        "one_writer_vs_byte": 0.9698601999597396
+      }
+    },
+    "20260923": {
+      "arena_ratios": {
+        "1": 1.0799424669072348,
+        "4": 1.0879730291075416,
+        "8": 1.0890845450402593
+      },
+      "candidate_cv": {
+        "1": 0.04905232566404738,
+        "4": 0.12179167123153149,
+        "8": 0.18404594347933675
+      },
+      "gates": {
+        "arena_1": true,
+        "arena_4": true,
+        "arena_8": true,
+        "eight_writer_cv": false,
+        "eight_writer_vs_skiplist": true,
+        "four_writer_vs_skiplist": true,
+        "one_writer_vs_byte": true
+      },
+      "groups": {
+        "baseline/1": {
+          "arena_bytes_median": 17683600.0,
+          "elapsed_ns_median": 43230167.0,
+          "elapsed_ns_pstdev": 4025297.773400691,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/4": {
+          "arena_bytes_median": 18955632.0,
+          "elapsed_ns_median": 22579875.0,
+          "elapsed_ns_pstdev": 4040761.2965811086,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/8": {
+          "arena_bytes_median": 19020056.0,
+          "elapsed_ns_median": 23653395.5,
+          "elapsed_ns_pstdev": 2073738.1019691085,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "byte/1": {
+          "arena_bytes_median": 50073848.0,
+          "elapsed_ns_median": 44361750.0,
+          "elapsed_ns_pstdev": 1986340.2218094058,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/1": {
+          "arena_bytes_median": 17683600.0,
+          "elapsed_ns_median": 46387417.0,
+          "elapsed_ns_pstdev": 2258788.89280717,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/4": {
+          "arena_bytes_median": 18962456.0,
+          "elapsed_ns_median": 19921584.0,
+          "elapsed_ns_pstdev": 2390838.5391025133,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/8": {
+          "arena_bytes_median": 19013556.0,
+          "elapsed_ns_median": 23552083.5,
+          "elapsed_ns_pstdev": 4436571.593947751,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "nibble/1": {
+          "arena_bytes_median": 16374576.0,
+          "elapsed_ns_median": 60057917.0,
+          "elapsed_ns_pstdev": 1580908.5031237702,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/4": {
+          "arena_bytes_median": 17429160.0,
+          "elapsed_ns_median": 25107708.0,
+          "elapsed_ns_pstdev": 5470738.24697079,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/8": {
+          "arena_bytes_median": 17458292.0,
+          "elapsed_ns_median": 28015333.5,
+          "elapsed_ns_pstdev": 3618202.777790627,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "skiplist/4": {
+          "arena_bytes_median": 8109128.0,
+          "elapsed_ns_median": 33783917.0,
+          "elapsed_ns_pstdev": 6111831.551755542,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "skiplist/8": {
+          "arena_bytes_median": 8170604.0,
+          "elapsed_ns_median": 31480833.0,
+          "elapsed_ns_pstdev": 4329156.42311347,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        }
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.7481404161065243,
+        "four_writer_vs_skiplist": 0.5896765611873839,
+        "one_writer_vs_byte": 1.0456624682299505
+      }
+    },
+    "20260924": {
+      "arena_ratios": {
+        "1": 1.0801714528384965,
+        "4": 1.088593342441362,
+        "8": 1.0894940181060666
+      },
+      "candidate_cv": {
+        "1": 0.024611909039783157,
+        "4": 0.05321992124072495,
+        "8": 0.06727616257717794
+      },
+      "gates": {
+        "arena_1": true,
+        "arena_4": true,
+        "arena_8": true,
+        "eight_writer_cv": false,
+        "eight_writer_vs_skiplist": true,
+        "four_writer_vs_skiplist": true,
+        "one_writer_vs_byte": true
+      },
+      "groups": {
+        "baseline/1": {
+          "arena_bytes_median": 17682640.0,
+          "elapsed_ns_median": 44646250.0,
+          "elapsed_ns_pstdev": 1061515.9891893102,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/4": {
+          "arena_bytes_median": 18972648.0,
+          "elapsed_ns_median": 21759208.0,
+          "elapsed_ns_pstdev": 3907178.9508385407,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "baseline/8": {
+          "arena_bytes_median": 19016268.0,
+          "elapsed_ns_median": 23023979.5,
+          "elapsed_ns_pstdev": 1963782.440700181,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "byte/1": {
+          "arena_bytes_median": 50089648.0,
+          "elapsed_ns_median": 44846958.0,
+          "elapsed_ns_pstdev": 1376655.40977408,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/1": {
+          "arena_bytes_median": 17682640.0,
+          "elapsed_ns_median": 45298166.0,
+          "elapsed_ns_pstdev": 1101211.463282398,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/4": {
+          "arena_bytes_median": 18957496.0,
+          "elapsed_ns_median": 25118709.0,
+          "elapsed_ns_pstdev": 1309532.937140017,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "candidate/8": {
+          "arena_bytes_median": 19020404.0,
+          "elapsed_ns_median": 24492604.0,
+          "elapsed_ns_pstdev": 1652665.844173407,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "nibble/1": {
+          "arena_bytes_median": 16370216.0,
+          "elapsed_ns_median": 60446833.0,
+          "elapsed_ns_pstdev": 2101605.1298847366,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/4": {
+          "arena_bytes_median": 17414672.0,
+          "elapsed_ns_median": 25801541.0,
+          "elapsed_ns_pstdev": 3665157.0923978905,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "nibble/8": {
+          "arena_bytes_median": 17458016.0,
+          "elapsed_ns_median": 26586062.5,
+          "elapsed_ns_pstdev": 3909137.744162541,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        },
+        "skiplist/4": {
+          "arena_bytes_median": 8109456.0,
+          "elapsed_ns_median": 33563583.0,
+          "elapsed_ns_pstdev": 4859845.89631766,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 5
+        },
+        "skiplist/8": {
+          "arena_bytes_median": 8162172.0,
+          "elapsed_ns_median": 31422958.5,
+          "elapsed_ns_pstdev": 6087941.416077175,
+          "result_hashes": [
+            "454339457082336225"
+          ],
+          "samples": 10
+        }
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.7794493316089254,
+        "four_writer_vs_skiplist": 0.7483917613921016,
+        "one_writer_vs_byte": 1.010061061443677
+      }
+    }
+  }
+}

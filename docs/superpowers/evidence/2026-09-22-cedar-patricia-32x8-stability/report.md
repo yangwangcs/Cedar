@@ -114,6 +114,17 @@ eight-thread processes from host scheduling. Negative nice priority was
 permission-denied and passwordless elevation was unavailable. No unrelated
 user process was changed or terminated.
 
+The highest valid task-policy setting was then tested separately. The CLI
+values `-l 1 -t 1` map to the SDK's `LATENCY_QOS_TIER_0` and
+`THROUGHPUT_QOS_TIER_0`; zero means unspecified, not the highest tier. Across
+another 20 alternating processes per implementation, Patricia measured a
+23.636 ms median, 8.99% CV, and 0.7764x SkipList ratio. SkipList CV was 17.51%.
+Patricia retired-instruction CV was only 1.19%, while wall-time CV remained
+above the binding limit. Raw rows and calculations are in
+`scheduler-tier0-probe.csv` and `scheduler-tier0-probe-summary.json`. Thus the
+highest available unprivileged latency/throughput policy improves but does not
+solve process-level scheduling variance.
+
 ## Next Gate
 
 The approved two sub-changes are exhausted. No third representation or

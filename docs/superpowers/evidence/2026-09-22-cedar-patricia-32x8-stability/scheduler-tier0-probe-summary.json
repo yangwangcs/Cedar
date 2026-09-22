@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-23",
+  "policy": "taskpolicy -a -l 1 -t 1",
+  "policy_interpretation": {
+    "latency_cli_tier": 1,
+    "latency_kernel_tier": "LATENCY_QOS_TIER_0",
+    "throughput_cli_tier": 1,
+    "throughput_kernel_tier": "THROUGHPUT_QOS_TIER_0"
+  },
+  "workload": {
+    "seed": 20260922,
+    "entries": 131072,
+    "writers": 8,
+    "processes_per_implementation": 20,
+    "order": "alternating"
+  },
+  "radix": {
+    "median_ms": 23.63605,
+    "mean_ms": 23.675875,
+    "population_cv_percent": 8.986037682659953,
+    "min_ms": 19.6703,
+    "max_ms": 27.6852,
+    "average_involuntary_context_switches": 1596.7,
+    "instruction_cv_percent": 1.1859476692787485
+  },
+  "skiplist": {
+    "median_ms": 30.44185,
+    "mean_ms": 29.860365,
+    "population_cv_percent": 17.511889551845304,
+    "min_ms": 19.8727,
+    "max_ms": 43.2493,
+    "average_involuntary_context_switches": 642.45,
+    "instruction_cv_percent": 1.757296807927892
+  },
+  "median_ratio": 0.776432772646866,
+  "gate_result": "fail_radix_cv"
+}

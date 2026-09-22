@@ -1,0 +1,48 @@
+{
+  "date": "2026-09-23",
+  "policy": "taskpolicy -a -l 1 -t 1",
+  "host": {
+    "load_average": [5.48, 4.54, 4.41],
+    "largest_competing_process_cpu_percent": 125.9,
+    "thermal_warning": false,
+    "passwordless_elevation": false
+  },
+  "workload": {
+    "seed": 20260922,
+    "entries": 131072,
+    "writers": 8,
+    "processes_per_implementation": 10,
+    "order": "alternating"
+  },
+  "radix_seconds": [
+    0.0343201,
+    0.0276792,
+    0.0286569,
+    0.0305824,
+    0.0245058,
+    0.0275057,
+    0.0228118,
+    0.0219911,
+    0.0214728,
+    0.0288223
+  ],
+  "skiplist_seconds": [
+    0.0349467,
+    0.0333774,
+    0.028754,
+    0.0324676,
+    0.0302275,
+    0.029379,
+    0.0236437,
+    0.031979,
+    0.0240168,
+    0.0268763
+  ],
+  "radix_median_ms": 27.59245,
+  "radix_population_cv_percent": 14.544288116908596,
+  "skiplist_median_ms": 29.80325,
+  "skiplist_population_cv_percent": 12.285908139834788,
+  "median_ratio": 0.9258201706189761,
+  "gate_result": "fail_ratio_and_radix_cv",
+  "blocked_audit": "same external scheduling condition repeated for three consecutive goal turns"
+}

@@ -125,6 +125,15 @@ above the binding limit. Raw rows and calculations are in
 highest available unprivileged latency/throughput policy improves but does not
 solve process-level scheduling variance.
 
+A third-turn revalidation under the same Tier 0 policy used the binding ten
+processes for seed 20260922. Patricia measured 27.592 ms median, 14.54% CV,
+and 0.9258x SkipList; both binding gates failed. SkipList CV was 12.29%.
+The host load remained 5.48 / 4.54 / 4.41 with a competing process at 125.9%
+CPU. Exact samples are in `scheduler-blocked-revalidation.json`. This is the
+third consecutive goal turn with the same external scheduling condition after
+the approved code candidates and all unprivileged policy options were
+exhausted.
+
 ## Next Gate
 
 The approved two sub-changes are exhausted. No third representation or

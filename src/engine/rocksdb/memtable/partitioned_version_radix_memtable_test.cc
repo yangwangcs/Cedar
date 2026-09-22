@@ -305,6 +305,33 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     StandaloneIndexKeepsEntryPointerAcrossInsert) {
+  Arena arena;
+  CedarPureRadixIndex index(&arena);
+  const CedarPureRadixIndex::Key key = [] {
+    CedarPureRadixIndex::Key value{};
+    value[0] = 0x21;
+    value[39] = 0x0f;
+    return value;
+  }();
+  char* entry = nullptr;
+  void* handle = index.Allocate(3, &entry);
+  ASSERT_NE(handle, nullptr);
+  ASSERT_NE(entry, nullptr);
+  entry[0] = 'c';
+  entry[1] = 'e';
+  entry[2] = 'd';
+
+  ASSERT_TRUE(index.Insert(handle, key));
+  EXPECT_EQ(index.EntryForHandle(handle), entry);
+  CedarPureRadixIndex::Cursor cursor(&index);
+  cursor.SeekToFirst();
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_EQ(cursor.entry(), entry);
+  EXPECT_EQ(std::string(cursor.entry(), 3), "ced");
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      BoundaryPublicationChecksBothCachesForSparsePathAncestors) {
   Arena arena;
   std::atomic<size_t> boundary_candidates{0};

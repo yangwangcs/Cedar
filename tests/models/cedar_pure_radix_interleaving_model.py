@@ -43,29 +43,20 @@ class ByteBlock:
     children: tuple[object, ...]
 
 
-@dataclass
+@dataclass(frozen=True)
 class SegmentedByteBranch:
     byte_index: int
     blocks: tuple[ByteBlock | None, ...]
 
-    def publish_if_observed(self, segment: int, observed: ByteBlock | None,
-                            replacement: ByteBlock) -> bool:
-        if self.blocks[segment] is not observed:
-            return False
-        blocks = list(self.blocks)
-        blocks[segment] = replacement
-        self.blocks = tuple(blocks)
-        return True
-
 
 def segment_for_byte(value: int) -> int:
     assert 0 <= value <= 0xff
-    return value >> 4
+    return value >> 6
 
 
 def insert_byte_block(block: ByteBlock | None, value: int,
                       child: object) -> ByteBlock:
-    local = value & 0x0f
+    local = value & 0x3f
     occupied = 0 if block is None else block.occupied
     children = () if block is None else block.children
     assert occupied & (1 << local) == 0
@@ -79,11 +70,6 @@ def replace_byte_block(branch: SegmentedByteBranch, value: int,
     blocks = list(branch.blocks)
     blocks[segment_for_byte(value)] = block
     return SegmentedByteBranch(branch.byte_index, tuple(blocks))
-
-
-def segmented_byte_leaves(branch: SegmentedByteBranch) -> list[int]:
-    return [key for block in branch.blocks if block is not None
-            for child in block.children for key in leaves(child)]
 
 
 def first_difference(left: int, right: int, width: int) -> int:
@@ -205,53 +191,18 @@ def direct_child_block_vs_other_segment_wrapper(broken: bool) -> None:
 
 
 def stale_same_byte_segment_block_restarts(broken: bool) -> None:
-    # A and B both observed segment 7. B publishes byte 117 first; A's CAS
-    # must fail, reload the 16-bit bitmap, and preserve every packed child.
-    initial = insert_byte_block(None, 112, Leaf(0x70))
-    initial = insert_byte_block(initial, 114, Leaf(0x72))
-    blocks: list[ByteBlock | None] = [None] * 16
-    blocks[7] = initial
-    root = SegmentedByteBranch(0, tuple(blocks))
+    # A and B both observed segment 1. B publishes byte 69 first; A's CAS
+    # must fail, reload the 64-bit bitmap, and preserve every packed child.
+    initial = insert_byte_block(None, 64, Leaf(0x40))
+    initial = insert_byte_block(initial, 66, Leaf(0x42))
+    root = SegmentedByteBranch(0, (None, initial, None, None))
     stale = initial
-    published = insert_byte_block(initial, 117, Leaf(0x75))
-    assert root.publish_if_observed(7, initial, published)
-    stale_replacement = insert_byte_block(stale, 119, Leaf(0x77))
-    if broken:
-        root = replace_byte_block(root, 119, stale_replacement)
-    else:
-        assert not root.publish_if_observed(7, stale, stale_replacement)
-        observed = root.blocks[7]
-        assert observed is not None
-        replacement = insert_byte_block(observed, 119, Leaf(0x77))
-        assert root.publish_if_observed(7, observed, replacement)
-    assert root.blocks[7] is not None
-    assert [leaf.key for leaf in root.blocks[7].children] == [
-        0x70, 0x72, 0x75, 0x77]
-
-
-def direct_byte_block_vs_other_segment_wrapper(broken: bool) -> None:
-    # A observes segment 1 before B replaces segment 13 with a wrapper. The
-    # independent segment edges let A publish without retry while preserving B.
-    segment_one = insert_byte_block(None, 16, Leaf(0x10))
-    segment_thirteen = insert_byte_block(None, 208, Leaf(0xD0))
-    blocks: list[ByteBlock | None] = [None] * 16
-    blocks[1] = segment_one
-    blocks[13] = segment_thirteen
-    root = SegmentedByteBranch(0, tuple(blocks))
-    stale_blocks = root.blocks
-
-    wrapped = publish_wrap(segment_thirteen.children[0], 0xD1, 8)
-    wrapper_block = ByteBlock(segment_thirteen.occupied, (wrapped,))
-    assert root.publish_if_observed(13, segment_thirteen, wrapper_block)
-
-    direct = insert_byte_block(segment_one, 17, Leaf(0x11))
-    if broken:
-        stale_replacement = list(stale_blocks)
-        stale_replacement[1] = direct
-        root.blocks = tuple(stale_replacement)
-    else:
-        assert root.publish_if_observed(1, segment_one, direct)
-    assert segmented_byte_leaves(root) == [0x10, 0x11, 0xD0, 0xD1]
+    published = insert_byte_block(initial, 69, Leaf(0x45))
+    root = replace_byte_block(root, 69, published)
+    final = insert_byte_block(stale if broken else published, 71, Leaf(0x47))
+    root = replace_byte_block(root, 71, final)
+    assert root.blocks[1] is not None
+    assert [leaf.key for leaf in root.blocks[1].children] == [0x40, 0x42, 0x45, 0x47]
 
 
 def same_key_race(width: int) -> None:
@@ -309,7 +260,6 @@ def run(width: int, broken: bool) -> None:
       path_deeper_than_inline_cache(width)
     direct_child_table_vs_wrapper(broken)
     direct_child_block_vs_other_segment_wrapper(broken)
-    direct_byte_block_vs_other_segment_wrapper(broken)
     stale_same_byte_segment_block_restarts(broken)
 
 

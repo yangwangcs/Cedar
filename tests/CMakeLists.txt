@@ -504,6 +504,9 @@ if(TARGET cedar_radix_memtable_bench)
   add_test(NAME PatriciaRetentionMatrixContract COMMAND ${CMAKE_COMMAND}
       -DCEDAR_RADIX_BENCHMARK=$<TARGET_FILE:cedar_radix_memtable_bench>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_patricia_retention_matrix.cmake)
+  add_test(NAME Patricia32x8StabilityContract COMMAND ${CMAKE_COMMAND}
+      -DCEDAR_RADIX_BENCHMARK=$<TARGET_FILE:cedar_radix_memtable_bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_patricia_32x8_stability.cmake)
 endif()
 
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)

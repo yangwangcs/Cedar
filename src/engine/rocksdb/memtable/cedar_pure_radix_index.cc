@@ -55,10 +55,6 @@ const char* CedarPureRadixIndex::EntryForHandle(void* opaque) const {
   return handle == nullptr ? nullptr : handle->leaf.entry;
 }
 
-size_t CedarPureRadixIndex::SegmentEdgeStrideForTesting() {
-  return sizeof(SegmentEdge);
-}
-
 uint8_t CedarPureRadixIndex::ByteAt(const Key& key, uint8_t index) {
   assert(index < kKeyBytes);
   return key[index];
@@ -124,8 +120,7 @@ const CedarPureRadixIndex::Branch* CedarPureRadixIndex::AsBranch(const Node* nod
 CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::BlockAt(
     const Branch* branch, uint8_t value) {
   assert(branch != nullptr);
-  return branch->segments[SegmentForByte(value)].block.load(
-      std::memory_order_acquire);
+  return branch->segments[SegmentForByte(value)].load(std::memory_order_acquire);
 }
 CedarPureRadixIndex::Node* CedarPureRadixIndex::ChildAt(const ChildBlock* block,
                                                          uint8_t local) {
@@ -146,8 +141,7 @@ uint16_t CedarPureRadixIndex::FirstChildAtOrAfter(const Branch* branch,
   assert(branch != nullptr);
   for (uint8_t segment = SegmentForByte(value);
        segment < kByteSegmentCount; ++segment) {
-    auto* block =
-        branch->segments[segment].block.load(std::memory_order_acquire);
+    auto* block = branch->segments[segment].load(std::memory_order_acquire);
     const uint8_t local = segment == SegmentForByte(value) ? LocalByte(value) : 0;
     const auto occupied = block == nullptr ? uint8_t{0} : block->occupied;
     const auto set = static_cast<uint8_t>(occupied & ~Below(local));
@@ -161,8 +155,7 @@ uint16_t CedarPureRadixIndex::LastChildAtOrBefore(const Branch* branch,
                                                    uint8_t value) {
   assert(branch != nullptr);
   for (int segment = SegmentForByte(value); segment >= 0; --segment) {
-    auto* block =
-        branch->segments[segment].block.load(std::memory_order_acquire);
+    auto* block = branch->segments[segment].load(std::memory_order_acquire);
     const uint8_t local = segment == SegmentForByte(value) ? LocalByte(value) : 7;
     const auto occupied = block == nullptr ? uint8_t{0} : block->occupied;
     const auto set = static_cast<uint8_t>(occupied & Through(local));
@@ -231,10 +224,9 @@ bool CedarPureRadixIndex::ReplaceBlock(Branch* branch, uint8_t segment,
   if (test_hooks_.table_snapshot_cas_for_testing) {
     test_hooks_.table_snapshot_cas_for_testing();
   }
-  const bool published =
-      branch->segments[segment].block.compare_exchange_strong(
-          observed, replacement, std::memory_order_release,
-          std::memory_order_acquire);
+  const bool published = branch->segments[segment].compare_exchange_strong(
+      observed, replacement, std::memory_order_release,
+      std::memory_order_acquire);
   if (test_hooks_.segment_cas_result_for_testing) {
     test_hooks_.segment_cas_result_for_testing(published);
   }
@@ -284,9 +276,9 @@ CedarPureRadixIndex::Branch* CedarPureRadixIndex::AllocateBranch(
   add_child(new_byte, added);
   for (uint8_t segment = 0; segment < kByteSegmentCount; ++segment) {
     if (occupied[segment] != 0)
-      branch->segments[segment].block.store(
-          AllocateChildBlock(occupied[segment], children[segment].data()),
-          std::memory_order_relaxed);
+      branch->segments[segment].store(AllocateChildBlock(occupied[segment],
+                                                          children[segment].data()),
+                                       std::memory_order_relaxed);
   }
   branch->min_leaf.store(Compare(added, old_min) < 0 ? added : old_min,
                          std::memory_order_relaxed);
@@ -455,8 +447,7 @@ CedarPureRadixIndex::GetStructureStatsForTesting() const {
     ++stats.byte_branches;
     stats.max_depth = std::max(stats.max_depth, depth);
     for (uint8_t segment = 0; segment < kByteSegmentCount; ++segment) {
-      auto* block =
-          branch->segments[segment].block.load(std::memory_order_acquire);
+      auto* block = branch->segments[segment].load(std::memory_order_acquire);
       if (block == nullptr) continue;
       ++stats.child_tables;
       ++stats.child_blocks;

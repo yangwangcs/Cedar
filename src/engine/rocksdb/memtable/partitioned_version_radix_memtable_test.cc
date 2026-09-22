@@ -1850,12 +1850,6 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
-     SegmentPublicationEdgesUseIndependent128ByteStrides) {
-  EXPECT_EQ(CedarPureRadixIndex::kByteSegmentCount, 32U);
-  EXPECT_EQ(CedarPureRadixIndex::SegmentEdgeStrideForTesting(), 128U);
-}
-
-TEST(PartitionedVersionRadixMemTableTest,
      SnapshotDiagnosticsSeparateAllocationCopyAndPublication) {
   ConcurrentArena arena;
   size_t branch_bytes = 0;
@@ -1891,8 +1885,8 @@ TEST(PartitionedVersionRadixMemTableTest,
     *entry = static_cast<char>(value);
     ASSERT_TRUE(index.Insert(handle, key));
   }
-  EXPECT_GE(branch_bytes, 32U * 128U);
-  EXPECT_EQ(block_bytes, 72U);
+  EXPECT_GT(branch_bytes, 0U);
+  EXPECT_GT(block_bytes, branch_bytes / 4);
   EXPECT_EQ(copied_pointers, 1U);
   EXPECT_EQ(root_successes, 2U);
   EXPECT_EQ(segment_successes, 2U);

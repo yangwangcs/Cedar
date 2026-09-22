@@ -1,0 +1,2 @@
+revision,workload,seed,entries,allocated_handles,writers,repeat,seconds,ops,p50_ns,p95_ns,p99_ns,peak_rss_bytes,arena_bytes,bytes_per_handle,result_hash,errors,active_scan_ns,frozen_first_scan_ns,frozen_ready_scan_ns,phase,elapsed_ns,index_insert_ns,allocate_and_insert_ns,active_scan_ns_phase,freeze_prepare_ns,first_frozen_scan_ns,ready_frozen_scan_ns
+byte,random,20260921,131072,131072,8,0,0.0431781,131072,NA,NA,NA,58572800,51355808,391,454339457082336225,0,9151958,10065583,9599625,memtable,43178084,43178084,43178084,9151958,1453041,10065583,9599625

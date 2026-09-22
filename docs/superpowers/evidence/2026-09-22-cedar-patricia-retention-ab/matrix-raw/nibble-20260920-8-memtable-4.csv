@@ -1,0 +1,2 @@
+revision,workload,seed,entries,allocated_handles,writers,repeat,seconds,ops,p50_ns,p95_ns,p99_ns,peak_rss_bytes,arena_bytes,bytes_per_handle,result_hash,errors,active_scan_ns,frozen_first_scan_ns,frozen_ready_scan_ns,phase,elapsed_ns,index_insert_ns,allocate_and_insert_ns,active_scan_ns_phase,freeze_prepare_ns,first_frozen_scan_ns,ready_frozen_scan_ns
+nibble,random,20260920,131072,131072,8,0,0.0166245,131072,NA,NA,NA,24772608,17465440,133,454339457082336225,0,10590125,10256250,8638833,memtable,16624500,16624500,16624500,10590125,2388125,10256250,8638833

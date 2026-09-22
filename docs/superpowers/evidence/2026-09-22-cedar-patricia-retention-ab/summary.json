@@ -1,0 +1,64 @@
+{
+  "all_gates_pass": false,
+  "candidate": "nibble",
+  "only_single_writer_failed": false,
+  "seeds": {
+    "20260920": {
+      "arena_ratios": {
+        "1": 1.0,
+        "4": 1.0,
+        "8": 1.0
+      },
+      "gates": {
+        "arena": true,
+        "eight_writer_vs_skiplist": true,
+        "four_writer_vs_skiplist": true,
+        "single_writer_vs_byte": false
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.8496067163118555,
+        "four_writer_vs_skiplist": 0.6036303072243965,
+        "single_writer_vs_byte": 1.2025709518224392
+      },
+      "vector_historical_gate": false
+    },
+    "20260921": {
+      "arena_ratios": {
+        "1": 1.0,
+        "4": 1.0,
+        "8": 1.0
+      },
+      "gates": {
+        "arena": true,
+        "eight_writer_vs_skiplist": true,
+        "four_writer_vs_skiplist": true,
+        "single_writer_vs_byte": false
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.8350167637570344,
+        "four_writer_vs_skiplist": 0.7844119761380062,
+        "single_writer_vs_byte": 1.2135694714221592
+      },
+      "vector_historical_gate": false
+    },
+    "20260922": {
+      "arena_ratios": {
+        "1": 1.0,
+        "4": 1.0,
+        "8": 1.0
+      },
+      "gates": {
+        "arena": true,
+        "eight_writer_vs_skiplist": false,
+        "four_writer_vs_skiplist": true,
+        "single_writer_vs_byte": false
+      },
+      "ratios": {
+        "eight_writer_vs_skiplist": 0.8989268621289351,
+        "four_writer_vs_skiplist": 0.6991507548297536,
+        "single_writer_vs_byte": 1.1932319535904672
+      },
+      "vector_historical_gate": false
+    }
+  }
+}

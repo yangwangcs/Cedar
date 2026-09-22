@@ -37,6 +37,8 @@ class CedarPureRadixIndex {
     std::function<void(size_t)> copied_child_pointers_for_testing;
     std::function<void(bool)> root_cas_result_for_testing;
     std::function<void(bool)> segment_cas_result_for_testing;
+    std::function<void(bool, bool)> local_retry_for_testing;
+    std::function<void()> root_restart_for_testing;
   };
 
   class Cursor;
@@ -137,6 +139,7 @@ class CedarPureRadixIndex {
   };
 
   enum class ChainState : uint8_t { kUnbuilt, kBuilding, kReady };
+  enum class BlockUpdateKind : uint8_t { kInsert, kReplace };
 
   static uint8_t ByteAt(const Key& key, uint8_t byte_index);
   static uint8_t ByteAt(const Leaf* leaf, uint8_t byte_index);
@@ -170,8 +173,12 @@ class CedarPureRadixIndex {
                                          uint8_t value, Node* child);
   ChildBlock* CopyBlockWithReplacedChild(const ChildBlock* old_block,
                                          uint8_t value, Node* child);
-  bool ReplaceBlock(Branch* branch, uint8_t segment, ChildBlock* observed,
+  bool ReplaceBlock(Branch* branch, uint8_t segment, ChildBlock*& observed,
                     ChildBlock* replacement) const;
+  bool PublishBlockUpdate(Branch* branch, uint8_t value,
+                          ChildBlock* observed, Node* expected_child,
+                          Node* desired_child, BlockUpdateKind kind,
+                          bool* locally_retried);
   Branch* AllocateBranch(uint8_t byte_index, Node* old_node,
                         Leaf* new_leaf);
   static Leaf* MinimumLeaf(Node* node);
@@ -179,6 +186,7 @@ class CedarPureRadixIndex {
   void PublishBoundaryUpdates(const Key& key, Leaf* leaf,
                               const TraversalFrame* path,
                               size_t depth) const;
+  void PublishCurrentBoundaryUpdates(const Key& key, Leaf* leaf) const;
   bool TryBuildFrozenChain() const;
   Leaf* FirstFrozenLeaf() const;
 

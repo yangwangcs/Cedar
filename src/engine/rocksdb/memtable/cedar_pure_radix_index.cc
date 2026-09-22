@@ -224,7 +224,7 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithReplacedChild
 }
 
 bool CedarPureRadixIndex::ReplaceBlock(Branch* branch, uint8_t segment,
-                                        ChildBlock* observed,
+                                        ChildBlock*& observed,
                                         ChildBlock* replacement) const {
   assert(branch != nullptr && segment < kByteSegmentCount &&
          replacement != nullptr);
@@ -239,6 +239,51 @@ bool CedarPureRadixIndex::ReplaceBlock(Branch* branch, uint8_t segment,
     test_hooks_.segment_cas_result_for_testing(published);
   }
   return published;
+}
+
+bool CedarPureRadixIndex::PublishBlockUpdate(
+    Branch* branch, uint8_t value, ChildBlock* observed,
+    Node* expected_child, Node* desired_child, BlockUpdateKind kind,
+    bool* locally_retried) {
+  assert(branch != nullptr && desired_child != nullptr &&
+         locally_retried != nullptr);
+  *locally_retried = false;
+  const uint8_t segment = SegmentForByte(value);
+  const auto make_replacement = [&](const ChildBlock* block) {
+    return kind == BlockUpdateKind::kInsert
+               ? CopyBlockWithInsertedChild(block, value, desired_child)
+               : CopyBlockWithReplacedChild(block, value, desired_child);
+  };
+
+  auto* replacement = make_replacement(observed);
+  if (test_hooks_.before_cas) test_hooks_.before_cas();
+  if (ReplaceBlock(branch, segment, observed, replacement)) return true;
+
+  Node* current_child = ChildAt(observed, LocalByte(value));
+  const bool compatible = kind == BlockUpdateKind::kInsert
+                              ? current_child == nullptr
+                              : current_child == expected_child;
+  if (!compatible) {
+    if (test_hooks_.root_restart_for_testing) {
+      test_hooks_.root_restart_for_testing();
+    }
+    return false;
+  }
+
+  replacement = make_replacement(observed);
+  if (test_hooks_.before_cas) test_hooks_.before_cas();
+  const bool published = ReplaceBlock(branch, segment, observed, replacement);
+  if (test_hooks_.local_retry_for_testing) {
+    test_hooks_.local_retry_for_testing(true, published);
+  }
+  if (!published) {
+    if (test_hooks_.root_restart_for_testing) {
+      test_hooks_.root_restart_for_testing();
+    }
+    return false;
+  }
+  *locally_retried = true;
+  return true;
 }
 
 CedarPureRadixIndex::Leaf* CedarPureRadixIndex::MinimumLeaf(Node* node) {
@@ -322,6 +367,25 @@ void CedarPureRadixIndex::PublishBoundaryUpdates(const Key&, Leaf* leaf,
   }
 }
 
+void CedarPureRadixIndex::PublishCurrentBoundaryUpdates(const Key& key,
+                                                         Leaf* leaf) const {
+  std::array<TraversalFrame, kKeyBytes> path;
+  size_t depth = 0;
+  Node* node = root_.load(std::memory_order_acquire);
+  while (node != nullptr && node->kind == NodeKind::kBranch) {
+    auto* branch = AsBranch(node);
+    const uint8_t value = ByteAt(key, branch->byte_index);
+    const uint8_t segment = SegmentForByte(value);
+    auto* block = BlockAt(branch, value);
+    auto* child = ChildAt(block, LocalByte(value));
+    assert(depth < path.size());
+    path[depth++] = {branch, segment, block, value, child};
+    node = child;
+  }
+  assert(node == leaf);
+  if (node == leaf) PublishBoundaryUpdates(key, leaf, path.data(), depth);
+}
+
 bool CedarPureRadixIndex::Insert(void* opaque, const Key& key) {
   auto* copied = allocator_->AllocateAligned(kKeyBytes);
   std::memcpy(copied, key.data(), kKeyBytes);
@@ -380,11 +444,14 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
         }
       } else {
         auto& parent = path[depth - 1];
-        auto* replacement = CopyBlockWithInsertedChild(parent.block, parent.byte,
-                                                        &handle->leaf);
-        if (test_hooks_.before_cas) test_hooks_.before_cas();
-        if (ReplaceBlock(parent.branch, parent.segment, parent.block, replacement)) {
+        bool locally_retried = false;
+        if (PublishBlockUpdate(parent.branch, parent.byte, parent.block,
+                               nullptr, &handle->leaf,
+                               BlockUpdateKind::kInsert, &locally_retried)) {
           PublishBoundaryUpdates(key, &handle->leaf, path.data(), depth);
+          if (locally_retried) {
+            PublishCurrentBoundaryUpdates(key, &handle->leaf);
+          }
           if (test_hooks_.after_cas) test_hooks_.after_cas();
           return true;
         }
@@ -401,10 +468,14 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
       auto& direct = path[wrapper];
       const auto value = ByteAt(key, differing);
       if (ChildAt(direct.block, LocalByte(value)) == nullptr) {
-        auto* replacement = CopyBlockWithInsertedChild(direct.block, value, &handle->leaf);
-        if (test_hooks_.before_cas) test_hooks_.before_cas();
-        if (ReplaceBlock(direct.branch, direct.segment, direct.block, replacement)) {
+        bool locally_retried = false;
+        if (PublishBlockUpdate(direct.branch, value, direct.block, nullptr,
+                               &handle->leaf, BlockUpdateKind::kInsert,
+                               &locally_retried)) {
           PublishBoundaryUpdates(key, &handle->leaf, path.data(), wrapper + 1);
+          if (locally_retried) {
+            PublishCurrentBoundaryUpdates(key, &handle->leaf);
+          }
           if (test_hooks_.after_cas) test_hooks_.after_cas();
           return true;
         }
@@ -429,11 +500,14 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
       }
     } else {
       auto& parent = path[wrapper - 1];
-      auto* block = CopyBlockWithReplacedChild(parent.block, parent.byte,
-                                                replacement);
-      if (test_hooks_.before_cas) test_hooks_.before_cas();
-      if (ReplaceBlock(parent.branch, parent.segment, parent.block, block)) {
+      bool locally_retried = false;
+      if (PublishBlockUpdate(parent.branch, parent.byte, parent.block, old,
+                             replacement, BlockUpdateKind::kReplace,
+                             &locally_retried)) {
         PublishBoundaryUpdates(key, &handle->leaf, path.data(), wrapper);
+        if (locally_retried) {
+          PublishCurrentBoundaryUpdates(key, &handle->leaf);
+        }
         if (test_hooks_.after_cas) test_hooks_.after_cas();
         return true;
       }

@@ -166,6 +166,9 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::AllocateChildBlock(
   assert(count > 0 && count <= 64);
   const auto bytes = offsetof(ChildBlock, children) + size_t{count} * sizeof(Node*);
   auto* block = reinterpret_cast<ChildBlock*>(allocator_->AllocateAligned(bytes));
+  if (test_hooks_.block_allocation_bytes_for_testing) {
+    test_hooks_.block_allocation_bytes_for_testing(bytes);
+  }
   block->occupied = occupied;
   block->child_count = count;
   for (size_t i = 0; i < count; ++i) {
@@ -183,6 +186,9 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithInsertedChild
   const auto old_occupied = old == nullptr ? uint64_t{0} : old->occupied;
   const size_t rank = std::popcount(old_occupied & Below(local));
   const size_t count = old == nullptr ? 0 : old->child_count;
+  if (test_hooks_.copied_child_pointers_for_testing) {
+    test_hooks_.copied_child_pointers_for_testing(count);
+  }
   for (size_t i = 0; i < rank; ++i) packed[i] = old->children[i];
   packed[rank] = child;
   for (size_t i = rank; i < count; ++i) packed[i + 1] = old->children[i];
@@ -194,6 +200,9 @@ CedarPureRadixIndex::ChildBlock* CedarPureRadixIndex::CopyBlockWithReplacedChild
   const uint8_t local = LocalByte(value);
   assert(ChildAt(old, local) != nullptr);
   std::array<Node*, 64> packed{};
+  if (test_hooks_.copied_child_pointers_for_testing) {
+    test_hooks_.copied_child_pointers_for_testing(old->child_count);
+  }
   for (size_t i = 0; i < old->child_count; ++i) packed[i] = old->children[i];
   packed[std::popcount(old->occupied & Below(local))] = child;
   return AllocateChildBlock(old->occupied, packed.data());
@@ -206,9 +215,13 @@ bool CedarPureRadixIndex::ReplaceBlock(Branch* branch, uint8_t segment,
   if (test_hooks_.table_snapshot_cas_for_testing) {
     test_hooks_.table_snapshot_cas_for_testing();
   }
-  return branch->segments[segment].compare_exchange_strong(
+  const bool published = branch->segments[segment].compare_exchange_strong(
       observed, replacement, std::memory_order_release,
       std::memory_order_acquire);
+  if (test_hooks_.segment_cas_result_for_testing) {
+    test_hooks_.segment_cas_result_for_testing(published);
+  }
+  return published;
 }
 
 CedarPureRadixIndex::Leaf* CedarPureRadixIndex::MinimumLeaf(Node* node) {
@@ -234,6 +247,9 @@ CedarPureRadixIndex::Branch* CedarPureRadixIndex::AllocateBranch(
   const auto new_byte = ByteAt(added, index);
   assert(index < kKeyBytes && old_byte != new_byte);
   auto* branch = new (allocator_->AllocateAligned(sizeof(Branch))) Branch();
+  if (test_hooks_.branch_allocation_bytes_for_testing) {
+    test_hooks_.branch_allocation_bytes_for_testing(sizeof(Branch));
+  }
   branch->byte_index = index;
   std::array<std::array<Node*, 2>, 4> children{};
   std::array<uint64_t, 4> occupied{};
@@ -334,8 +350,13 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
       if (depth == 0) {
         if (test_hooks_.before_cas) test_hooks_.before_cas();
         Node* expected = nullptr;
-        if (root_.compare_exchange_strong(expected, &handle->leaf, std::memory_order_release,
-                                          std::memory_order_acquire)) {
+        const bool published = root_.compare_exchange_strong(
+            expected, &handle->leaf, std::memory_order_release,
+            std::memory_order_acquire);
+        if (test_hooks_.root_cas_result_for_testing) {
+          test_hooks_.root_cas_result_for_testing(published);
+        }
+        if (published) {
           if (test_hooks_.after_cas) test_hooks_.after_cas();
           return true;
         }
@@ -378,8 +399,13 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
     if (wrapper == 0) {
       if (test_hooks_.before_cas) test_hooks_.before_cas();
       Node* expected = old;
-      if (root_.compare_exchange_strong(expected, replacement, std::memory_order_release,
-                                        std::memory_order_acquire)) {
+      const bool published = root_.compare_exchange_strong(
+          expected, replacement, std::memory_order_release,
+          std::memory_order_acquire);
+      if (test_hooks_.root_cas_result_for_testing) {
+        test_hooks_.root_cas_result_for_testing(published);
+      }
+      if (published) {
         if (test_hooks_.after_cas) test_hooks_.after_cas();
         return true;
       }

@@ -31,6 +31,11 @@ class CedarPureRadixIndex {
     std::function<void()> branch_load_for_testing;
     std::function<void()> boundary_candidate_for_testing;
     std::function<void()> table_snapshot_cas_for_testing;
+    std::function<void(size_t)> branch_allocation_bytes_for_testing;
+    std::function<void(size_t)> block_allocation_bytes_for_testing;
+    std::function<void(size_t)> copied_child_pointers_for_testing;
+    std::function<void(bool)> root_cas_result_for_testing;
+    std::function<void(bool)> segment_cas_result_for_testing;
   };
 
   class Cursor;

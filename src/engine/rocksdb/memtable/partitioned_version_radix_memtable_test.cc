@@ -1836,6 +1836,49 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     SnapshotDiagnosticsSeparateAllocationCopyAndPublication) {
+  ConcurrentArena arena;
+  size_t branch_bytes = 0;
+  size_t block_bytes = 0;
+  size_t copied_pointers = 0;
+  size_t root_successes = 0;
+  size_t segment_successes = 0;
+  CedarPureRadixIndex::TestHooks hooks;
+  hooks.branch_allocation_bytes_for_testing = [&](size_t bytes) {
+    branch_bytes += bytes;
+  };
+  hooks.block_allocation_bytes_for_testing = [&](size_t bytes) {
+    block_bytes += bytes;
+  };
+  hooks.copied_child_pointers_for_testing = [&](size_t count) {
+    copied_pointers += count;
+  };
+  hooks.root_cas_result_for_testing = [&](bool success) {
+    root_successes += success;
+  };
+  hooks.segment_cas_result_for_testing = [&](bool success) {
+    segment_successes += success;
+  };
+  CedarPureRadixIndex index(&arena, hooks);
+
+  for (uint8_t value : {0U, 128U, 64U, 1U}) {
+    CedarPureRadixIndex::Key key{};
+    key[0] = value;
+    char* entry = nullptr;
+    void* handle = index.Allocate(1, &entry);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(value);
+    ASSERT_TRUE(index.Insert(handle, key));
+  }
+  EXPECT_GT(branch_bytes, 0U);
+  EXPECT_GT(block_bytes, branch_bytes / 4);
+  EXPECT_EQ(copied_pointers, 1U);
+  EXPECT_EQ(root_successes, 2U);
+  EXPECT_EQ(segment_successes, 2U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      ByteSegmentStaleBlockRejectsAndRetries) {
   ConcurrentArena arena;
   std::mutex mutex;

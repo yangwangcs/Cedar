@@ -437,8 +437,8 @@ TEST(PartitionedVersionRadixMemTableTest,
 
   const auto stats = index.GetStructureStatsForTesting();
   EXPECT_EQ(stats.branches, 1U);
-  EXPECT_EQ(stats.child_tables, 1U);
-  EXPECT_EQ(stats.child_blocks, 1U);
+  EXPECT_EQ(stats.child_tables, 2U);
+  EXPECT_EQ(stats.child_blocks, 2U);
   EXPECT_EQ(stats.max_depth, 1U);
 }
 

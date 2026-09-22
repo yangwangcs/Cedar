@@ -443,6 +443,70 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     BytePatriciaFinalByteValuesUseFourPackedSegments) {
+  ConcurrentArena arena;
+  CedarPureRadixIndex index(&arena);
+  std::array<CedarPureRadixIndex::Key, 256> keys{};
+  std::array<void*, 256> handles{};
+
+  for (size_t value = 0; value < keys.size(); ++value) {
+    keys[value][39] = static_cast<unsigned char>(value);
+    char* entry = nullptr;
+    handles[value] = index.Allocate(1, &entry);
+    ASSERT_NE(handles[value], nullptr);
+    ASSERT_NE(entry, nullptr);
+    *entry = static_cast<char>(value);
+  }
+  for (size_t index_in_order = 0; index_in_order < keys.size(); ++index_in_order) {
+    const size_t value = (index_in_order * 73 + 19) & 0xff;
+    ASSERT_TRUE(index.Insert(handles[value], keys[value]));
+  }
+
+  for (const auto& key : keys) EXPECT_TRUE(index.Contains(key));
+  for (uint16_t value = 0; value < 256; ++value) {
+    EXPECT_EQ(CedarPureRadixIndex::SegmentForByte(
+                  static_cast<uint8_t>(value)),
+              value >> 6);
+  }
+
+  CedarPureRadixIndex::Cursor cursor(&index);
+  cursor.SeekToFirst();
+  for (uint16_t value = 0; value < 256; ++value) {
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), value);
+    cursor.Next();
+  }
+  EXPECT_FALSE(cursor.Valid());
+
+  const auto stats = index.GetStructureStatsForTesting();
+  EXPECT_EQ(stats.byte_branches, 1U);
+  for (uint8_t segment = 0; segment < 4; ++segment) {
+    EXPECT_EQ(stats.byte_segment_occupied[segment], ~uint64_t{0});
+    EXPECT_EQ(stats.byte_segment_child_counts[segment], 64U);
+  }
+
+  for (uint8_t boundary : {64U, 128U, 192U}) {
+    CedarPureRadixIndex::Key below{};
+    below[39] = static_cast<unsigned char>(boundary - 1);
+    cursor.Seek(below);
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary - 1);
+    cursor.Next();
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
+
+    CedarPureRadixIndex::Key above{};
+    above[39] = static_cast<unsigned char>(boundary + 1);
+    cursor.SeekForPrev(above);
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary + 1);
+    cursor.Prev();
+    ASSERT_TRUE(cursor.Valid());
+    EXPECT_EQ(static_cast<unsigned char>(*cursor.entry()), boundary);
+  }
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      SegmentedNibbleBlocksPackLocalRanksInGlobalOrder) {
   ConcurrentArena arena;
   CedarPureRadixIndex index(&arena);

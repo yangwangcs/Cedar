@@ -40,6 +40,11 @@ class CedarPureRadixIndex {
 
   struct StructureStatsForTesting {
     size_t branches = 0;
+    // These fields define the byte-branch representation contract. They
+    // remain zero until the implementation switches from nibble branches.
+    size_t byte_branches = 0;
+    std::array<uint64_t, 4> byte_segment_occupied{};
+    std::array<uint8_t, 4> byte_segment_child_counts{};
     size_t child_tables = 0;  // Compatibility total for all child blocks.
     size_t child_blocks = 0;
     std::array<uint8_t, 4> segment_occupied{};
@@ -49,6 +54,10 @@ class CedarPureRadixIndex {
 
   explicit CedarPureRadixIndex(Allocator* allocator,
                                TestHooks test_hooks = {});
+
+  static constexpr uint8_t SegmentForByte(uint8_t value) {
+    return value >> 6;
+  }
 
   // The opaque handle owns one leaf and one private branch candidate. The
   // returned buffer is the MemTable entry that the caller fills before Insert.

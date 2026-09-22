@@ -60,6 +60,7 @@ class CedarPureRadixIndex {
   static constexpr uint8_t SegmentForByte(uint8_t value) {
     return value >> 3;
   }
+  static size_t SegmentEdgeStrideForTesting();
 
   // The opaque handle owns one leaf and one private branch candidate. The
   // returned buffer is the MemTable entry that the caller fills before Insert.
@@ -108,10 +109,21 @@ class CedarPureRadixIndex {
     Node* children[1];
   };
 
+  static constexpr size_t kPublicationCacheLineBytes = 128;
+  struct SegmentEdge {
+    std::atomic<ChildBlock*> block{nullptr};
+    std::array<std::byte,
+               kPublicationCacheLineBytes -
+                   sizeof(std::atomic<ChildBlock*>)>
+        padding{};
+  };
+  static_assert(sizeof(SegmentEdge) == kPublicationCacheLineBytes);
+  static_assert(alignof(SegmentEdge) <= alignof(std::max_align_t));
+
   struct Branch final : Node {
     Branch() : Node(NodeKind::kBranch) {}
     uint8_t byte_index = 0;
-    std::array<std::atomic<ChildBlock*>, kByteSegmentCount> segments{};
+    std::array<SegmentEdge, kByteSegmentCount> segments{};
     // Branches are immutable after publication. These cached boundaries let
     // Seek compare against a child interval without descending to its edge
     // leaf at every ancestor.

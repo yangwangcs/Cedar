@@ -1,0 +1,44 @@
+{
+  "resource_correlation_probe": {
+    "samples_per_implementation": 30,
+    "median_seed_samples_per_implementation": 6,
+    "radix_wall_time_cv_percent": 7.391490845773912,
+    "skiplist_wall_time_cv_percent": 5.427744571265794,
+    "radix_wall_time_vs_involuntary_context_switches_correlation": 0.10652183507390274,
+    "radix_wall_time_vs_elapsed_cycles_correlation": 0.8301269696942378,
+    "radix_wall_time_vs_instructions_correlation": -0.2516050582935049,
+    "skiplist_wall_time_vs_involuntary_context_switches_correlation": 0.18468525452649642,
+    "skiplist_wall_time_vs_elapsed_cycles_correlation": 0.7137883361217418,
+    "interpretation": "wall-time variation tracks elapsed cycles/core execution rate more than instruction count or involuntary context switches; supports CPU placement/frequency variability, not a direct proof of migration"
+  },
+  "writer_scale_probe": {
+    "entries": 131072,
+    "seed": 20260922,
+    "radix_cv_percent": {
+      "1": 1.2109258108582557,
+      "4": 5.252629411262295,
+      "8": 6.296660098741054
+    },
+    "skiplist_cv_percent": {
+      "1": 3.180957852137958,
+      "4": 4.746293239582018,
+      "8": 5.891770450073276
+    },
+    "radix_median_ms": {
+      "1": 26.6416,
+      "4": 10.1005,
+      "8": 14.9623
+    },
+    "skiplist_median_ms": {
+      "1": 56.0821,
+      "4": 17.5335,
+      "8": 17.7035
+    },
+    "interpretation": "wall-time CV rises for both implementations only as writers exceed the four performance-core count; process startup alone is not the cause"
+  },
+  "macos_controls": {
+    "highest_unprivileged_qos_tested": "taskpolicy -a -l 1 -t 1",
+    "cpu_affinity": "not available via standard process API; Mach affinity tags are experimental L2-sharing hints, not CPU pinning",
+    "dtrace": "available but root tracing is unavailable without interactive sudo"
+  }
+}

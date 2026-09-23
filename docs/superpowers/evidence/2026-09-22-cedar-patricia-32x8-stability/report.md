@@ -146,6 +146,30 @@ benchmark source hashes, so changing timer placement is not a valid way to
 claim the existing gate. The three pre-existing dirty benchmark paths remain
 user-owned and untouched.
 
+## Variance Attribution
+
+An additional 30+30 process resource probe spans all five seeds. Radix wall
+time had 7.39% CV; SkipList had 5.43%. Wall time correlated weakly with
+involuntary context switches (Radix `r=0.11`) and more strongly with elapsed
+cycles (Radix `r=0.83`) while instructions stayed bounded. A 15-process-per-
+writer-count probe at seed 20260922 found Radix CV of 1.21%, 5.25%, and 6.30%
+at 1, 4, and 8 writers, respectively; SkipList showed the same trend at
+3.18%, 4.75%, and 5.89%. This supports parallel core placement/frequency
+variation as the major source, rather than a Patricia-specific increase in
+structural retries. It does not directly prove thread migration.
+
+The existing untimed publication diagnostic records just 41-76 failed
+segment CAS per 131072 successful inserts on the compact baseline across the
+five seeds. The retry candidate converts 28-51 failures but still performs
+8-18 root restarts and previously failed isolated A/B retention. The 128-byte
+spacing candidate increased Arena and failed its A/B retention. Neither
+approved candidate currently has evidence to restore it.
+
+macOS affinity tags are documented by the SDK as experimental hints to share
+an L2 cache, not CPU affinity; DTrace probing of scheduling events requires
+root, which is unavailable non-interactively. No system process or machine
+configuration was changed.
+
 A third-turn revalidation under the same Tier 0 policy used the binding ten
 processes for seed 20260922. Patricia measured 27.592 ms median, 14.54% CV,
 and 0.9258x SkipList; both binding gates failed. SkipList CV was 12.29%.

@@ -170,6 +170,25 @@ an L2 cache, not CPU affinity; DTrace probing of scheduling events requires
 root, which is unavailable non-interactively. No system process or machine
 configuration was changed.
 
+## Seed-isolated Revalidation
+
+A separate 8-writer-only matrix removed the one/four-writer runs and used ten
+interleaved processes per seed under the highest unprivileged QoS policy. The
+100 raw process rows are preserved in `seed-isolated-8writer.csv`; medians and
+population CVs were independently recomputed from those rows. Three seeds
+exceeded the 0.85x ratio limit (20260921 0.8513x, 20260922 0.8572x,
+20260923 0.8587x), and every Patricia CV remained 6.08-7.37%. The other two
+seed ratios were 0.8259x and 0.8177x.
+
+The benchmark's Fisher-Yates shuffle was then modeled with exact uint64
+overflow. Per-writer segment histograms and approximate within-batch fan-in
+were similar for all five seeds; same-segment maximum fan-in was only 4-5.
+This agrees with the existing direct-index counters: 44-76 failed segment
+CAS operations per 131072 successful inserts. These counts do not track which
+seed crosses the ratio/CV limits; key-distribution skew and publication
+collision frequency are not a supported root cause. The reproducible
+distribution summary is `workload-distribution.json`.
+
 A third-turn revalidation under the same Tier 0 policy used the binding ten
 processes for seed 20260922. Patricia measured 27.592 ms median, 14.54% CV,
 and 0.9258x SkipList; both binding gates failed. SkipList CV was 12.29%.

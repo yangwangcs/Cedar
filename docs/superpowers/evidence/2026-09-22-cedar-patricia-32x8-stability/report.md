@@ -125,6 +125,27 @@ above the binding limit. Raw rows and calculations are in
 highest available unprivileged latency/throughput policy improves but does not
 solve process-level scheduling variance.
 
+## Low-load Revalidation
+
+After the prior blocked audit, host load dropped to about 2.0. The binding
+seed 20260922 was rerun with 20 interleaved Patricia and SkipList processes.
+During samples 12-20, Spotlight metadata indexing briefly reached 339.1% CPU;
+that combined sample has Patricia CV 17.86% and ratio 0.7946x. After the
+indexer returned to 0% CPU, load was 2.01 / 2.03 / 2.01. A separate 20+20
+quiet-host run measured Patricia median 14.892 ms, CV 7.45%, and ratio
+0.7484x SkipList; SkipList CV was 7.06%. Thus throughput passes, but the
+binding CV limit still fails even with no sustained heavy background task.
+Raw process values are in `lowload-revalidation.csv` and
+`quiet-host-revalidation.csv`; calculations are in
+`lowload-revalidation-summary.json`.
+
+The unchanged benchmark starts its timer before creating writer threads and
+stops after joins. The 13-17 ms operation window is therefore comparable to
+thread launch and scheduler jitter. The spec explicitly requires unchanged
+benchmark source hashes, so changing timer placement is not a valid way to
+claim the existing gate. The three pre-existing dirty benchmark paths remain
+user-owned and untouched.
+
 A third-turn revalidation under the same Tier 0 policy used the binding ten
 processes for seed 20260922. Patricia measured 27.592 ms median, 14.54% CV,
 and 0.9258x SkipList; both binding gates failed. SkipList CV was 12.29%.

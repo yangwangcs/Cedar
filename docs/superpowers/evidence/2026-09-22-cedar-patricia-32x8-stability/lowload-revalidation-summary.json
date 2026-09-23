@@ -1,0 +1,30 @@
+{
+  "date": "2026-09-23",
+  "policy": "taskpolicy -a -l 1 -t 1",
+  "workload": {
+    "seed": 20260922,
+    "entries": 131072,
+    "writers": 8,
+    "samples_per_implementation": 20
+  },
+  "background_activity": {
+    "Spotlight_updater_cpu_percent_peak": 339.1,
+    "classification": "samples 12-20 overlap background metadata indexing; samples 1-11 precede peak"
+  },
+  "combined_samples": {
+    "radix_median_ms": 14.35085,
+    "radix_population_cv_percent": 17.859191044370288,
+    "skiplist_median_ms": 18.0594,
+    "skiplist_population_cv_percent": 8.845493469895734,
+    "median_ratio": 0.7946471089847946
+  },
+  "quiet_host_samples": {
+    "load_average": [2.01, 2.03, 2.01],
+    "radix_median_ms": 14.89185,
+    "radix_population_cv_percent": 7.448100026262685,
+    "skiplist_median_ms": 19.89725,
+    "skiplist_population_cv_percent": 7.056623005145403,
+    "median_ratio": 0.7484375981605498
+  },
+  "gate_result": "relative_gate_pass_cv_gate_fail"
+}

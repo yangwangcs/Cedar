@@ -307,19 +307,25 @@ CedarPureRadixIndex::Leaf* CedarPureRadixIndex::FindLeaf(const Key& key) const {
   return node == nullptr ? nullptr : AsLeaf(node);
 }
 
-void CedarPureRadixIndex::PublishBoundaryUpdates(const Key&, Leaf* leaf,
+void CedarPureRadixIndex::PublishBoundaryUpdates(const Key& key, Leaf* leaf,
                                                   const TraversalFrame* path,
                                                   size_t depth) const {
   for (size_t i = 0; i < depth; ++i) {
     auto* branch = path[i].branch;
+    const auto branch_byte = branch->byte_index;
+    const auto value = ByteAt(key, branch_byte);
     if (test_hooks_.boundary_candidate_for_testing) test_hooks_.boundary_candidate_for_testing();
     auto* min = branch->min_leaf.load(std::memory_order_acquire);
-    while (min != nullptr && Compare(leaf, min) < 0 &&
+    while (min != nullptr &&
+           (value < ByteAt(min, branch_byte) ||
+            (value == ByteAt(min, branch_byte) && Compare(leaf, min) < 0)) &&
            !branch->min_leaf.compare_exchange_weak(min, leaf, std::memory_order_release,
                                                     std::memory_order_acquire)) {}
     if (test_hooks_.boundary_candidate_for_testing) test_hooks_.boundary_candidate_for_testing();
     auto* max = branch->max_leaf.load(std::memory_order_acquire);
-    while (max != nullptr && Compare(leaf, max) > 0 &&
+    while (max != nullptr &&
+           (value > ByteAt(max, branch_byte) ||
+            (value == ByteAt(max, branch_byte) && Compare(leaf, max) > 0)) &&
            !branch->max_leaf.compare_exchange_weak(max, leaf, std::memory_order_release,
                                                     std::memory_order_acquire)) {}
   }

@@ -222,6 +222,11 @@ under the same strict Release build was dominated by host scheduling variance:
 CVs were 9.97%, 2.58%, 7.41%, 35.44%, and 5.19%, with seed 20260923 also at
 0.8615x. It is retained as failed evidence, not averaged away.
 
+The next strict Release matrix at `/tmp/cedar-boundary-matrix.AVKMOf` included
+the boundary-byte short circuit. All one/four-writer, ratio, and Arena gates
+passed. Eight-writer CVs were 6.57%, 6.11%, 6.71%, 5.03%, and 5.88% for the
+five seeds; the remaining CV gate is still not satisfied.
+
 The approved spacing and retry sub-changes remain reverted; no third
 representation or publication mechanism was introduced. The prefix comparison
 is a bounded implementation-level constant reduction within the fixed design.

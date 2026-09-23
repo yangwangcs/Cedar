@@ -122,7 +122,9 @@ class Parser {
 
   StatusOr<std::pair<bool, TimeScope>> ParseScope() {
     const bool valid = Match("VALID_TIME");
-    if (!valid && !Match("SYSTEM_TIME")) return Error("expected VALID_TIME or SYSTEM_TIME");
+    if (!valid && !Match("TRANSACTION_TIME") && !Match("SYSTEM_TIME")) {
+      return Error("expected VALID_TIME or TRANSACTION_TIME");
+    }
     TimeScope scope;
     if (Match("AS")) {
       if (!Match("OF")) return Error("expected OF");

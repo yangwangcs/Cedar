@@ -159,5 +159,14 @@ TEST(TCypherSemanticMatrixTest, AcceptsSystemTimeRange) {
   EXPECT_EQ(bound.ValueOrDie().system_time->to, 8U);
 }
 
+TEST(TCypherSemanticMatrixTest, AcceptsCanonicalTransactionTimeRange) {
+  const auto bound = BindText(
+      "FOR TRANSACTION_TIME BETWEEN 2 AND 8 MATCH (a) RETURN a");
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  ASSERT_TRUE(bound.ValueOrDie().system_time.has_value());
+  EXPECT_EQ(bound.ValueOrDie().system_time->from, 2U);
+  EXPECT_EQ(bound.ValueOrDie().system_time->to, 8U);
+}
+
 }  // namespace
 }  // namespace cedar::cypher

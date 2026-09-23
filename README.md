@@ -241,7 +241,8 @@ limits, see the [Cedar User Guide](docs/user-guide.md).
 
 A snapshot binds a logical commit sequence and an engine snapshot. Temporal
 resolution therefore considers both the requested valid time and the
-snapshot's system time.
+snapshot's transaction time (the logical `CommitSeq` at which facts became
+visible).
 
 ```cpp
 auto begun_snapshot = database->BeginSnapshot();
@@ -259,6 +260,11 @@ close while caller-owned snapshots are still pinned.
 ## Temporal Queries
 
 Queries are prepared once and executed against a Cedar snapshot.
+
+T-Cypher uses `VALID_TIME` for business-effective time and
+`TRANSACTION_TIME` for the database recording/commit sequence. The legacy
+`SYSTEM_TIME` spelling remains accepted as a compatibility alias; it does not
+refer to the machine wall clock.
 
 ```cpp
 #include "cedar/query.h"

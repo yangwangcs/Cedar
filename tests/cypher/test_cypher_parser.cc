@@ -25,6 +25,24 @@ TEST(CypherParserTest, ParsesScopedBoundedTrailMatch) {
   EXPECT_EQ(parsed.ValueOrDie().projections.back().function, "valid_from");
 }
 
+TEST(CypherParserTest, ParsesTransactionTimeAndKeepsSystemTimeCompatibility) {
+  const auto transaction =
+      Parse("FOR TRANSACTION_TIME BETWEEN 2 AND 8 MATCH (v) RETURN v");
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie().system_time.has_value());
+  EXPECT_EQ(transaction.ValueOrDie().system_time->from, 2U);
+  EXPECT_EQ(transaction.ValueOrDie().system_time->to, 8U);
+
+  const auto compatibility =
+      Parse("FOR SYSTEM_TIME BETWEEN 2 AND 8 MATCH (v) RETURN v");
+  ASSERT_TRUE(compatibility.ok()) << compatibility.status().ToString();
+  ASSERT_TRUE(compatibility.ValueOrDie().system_time.has_value());
+  EXPECT_EQ(transaction.ValueOrDie().system_time->from,
+            compatibility.ValueOrDie().system_time->from);
+  EXPECT_EQ(transaction.ValueOrDie().system_time->to,
+            compatibility.ValueOrDie().system_time->to);
+}
+
 TEST(CypherParserTest, ParsesChangesAndParameterizedWrite) {
   const auto changes = Parse(
       "CHANGES FOR VALID_TIME BETWEEN 1 AND 9 MATCH (v) RETURN v");

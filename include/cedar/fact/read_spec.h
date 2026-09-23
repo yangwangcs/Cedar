@@ -92,7 +92,7 @@ struct CommitSeqRange {
 
   Status Validate() const {
     if (from.value > to.value) {
-      return Status::InvalidArgument("system time range",
+      return Status::InvalidArgument("transaction time range",
                                      "from must not exceed to");
     }
     return Status::OK();

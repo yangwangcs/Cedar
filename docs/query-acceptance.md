@@ -10,7 +10,8 @@ public evidence summary, not a hardware-independent performance claim.
 
 The acceptance surface covers:
 
-- system-time snapshot isolation and valid-time state reconstruction;
+- transaction-time snapshot isolation and valid-time state reconstruction
+  (`SYSTEM_TIME` remains a compatibility spelling);
 - point, history, event, and change queries;
 - typed property filtering and columnar batches;
 - temporal expansion and k-hop traversal;

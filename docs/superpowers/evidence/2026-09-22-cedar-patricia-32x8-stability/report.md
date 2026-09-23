@@ -227,6 +227,13 @@ the boundary-byte short circuit. All one/four-writer, ratio, and Arena gates
 passed. Eight-writer CVs were 6.57%, 6.11%, 6.71%, 5.03%, and 5.88% for the
 five seeds; the remaining CV gate is still not satisfied.
 
+A low-load rerun under the highest unprivileged QoS policy is retained at
+`/tmp/cedar-boundary-tier0.OjK1JM`. It again passed every one/four-writer and
+Arena gate. Eight-writer CVs were 8.74%, 11.89%, 5.50%, 5.65%, and 5.18%;
+seed 20260920 also measured 0.8540x while the other ratios were 0.7728-0.8349x.
+This repeats the external wall-time instability after the fixed-design code
+reductions removed the earlier structural throughput deficit.
+
 The approved spacing and retry sub-changes remain reverted; no third
 representation or publication mechanism was introduced. The prefix comparison
 is a bounded implementation-level constant reduction within the fixed design.

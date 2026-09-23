@@ -154,6 +154,33 @@ struct AsyncExecutorOptions {
   uint64_t max_mailbox_bytes = 4ULL * 1024ULL * 1024ULL;
 };
 
+enum class PreparedCommitRecoveryPolicy : uint8_t {
+  kFinalizeOnOpen = 0,
+  kAwaitExternalDecision = 1,
+};
+
+struct PreparedCommitBatch {
+  TxnId txn_id;
+  uint64_t system_hlc = 0;
+  std::vector<FactEvent> events;
+};
+
+enum class PreparedCommitDecisionOutcome : uint8_t {
+  kCommit = 1,
+  kAbort = 2,
+};
+
+enum class PreparedFinalizeDurability : uint8_t {
+  kBuffered = 0,
+  kWalSync = 1,
+};
+
+struct PreparedCommitDecision {
+  PreparedCommitDecisionOutcome outcome =
+      PreparedCommitDecisionOutcome::kAbort;
+  std::string certificate;
+};
+
 struct QueryRuntimeOptions {
   uint32_t query_workers = 4;
   uint32_t reserved_interactive_workers = 1;
@@ -232,6 +259,8 @@ struct DatabaseOptions {
   uint32_t foreground_admission_concurrency = 0;
   std::function<void()> foreground_admission_observer_for_testing;
   AsyncExecutorOptions async_executor;
+  PreparedCommitRecoveryPolicy prepared_commit_recovery =
+      PreparedCommitRecoveryPolicy::kFinalizeOnOpen;
   QueryRuntimeOptions query_runtime;
 };
 
@@ -307,6 +336,8 @@ class Database {
   StatusOr<VertexId> AllocateVertexId();
   StatusOr<EdgeId> AllocateEdgeId();
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);
+  StatusOr<std::optional<PropertyDefinition>> LookupProperty(
+      PropertyId property_id, uint32_t schema_epoch = 0) const;
   StatusOr<std::unique_ptr<Transaction>> BeginTransaction(
       TransactionOptions options = {});
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
@@ -316,6 +347,16 @@ class Database {
   // The operation never runs on the commit/WAL critical path.
   StatusOr<QueryMaintenanceHandle> RefreshQueryIndexes(ValidTime valid_time);
   StatusOr<std::optional<CommitResult>> ResolveTransaction(TxnId txn_id) const;
+  Status PersistPreparedCommit(const PreparedCommitBatch& batch);
+  StatusOr<std::vector<PreparedCommitBatch>> ListPreparedCommits() const;
+  StatusOr<std::optional<PreparedCommitDecision>>
+  ResolvePreparedCommitDecision(TxnId txn_id) const;
+  StatusOr<CommitResult> FinalizePreparedCommit(
+      TxnId txn_id, std::string decision_certificate,
+      PreparedFinalizeDurability durability =
+          PreparedFinalizeDurability::kBuffered);
+  Status AbortPreparedCommit(TxnId txn_id,
+                             std::string decision_certificate);
   CommitPipelineMetrics GetCommitPipelineMetrics() const;
   StatusOr<RuntimeMetrics> SampleRuntimeMetrics() const;
   QueryMetricsSnapshot SampleQueryMetrics() const;

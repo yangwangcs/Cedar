@@ -54,6 +54,14 @@ concept HasTransactionResolution = requires(const T& value) {
 static_assert(HasTransactionResolution<Database>);
 
 template <typename T>
+concept HasPropertyLookup = requires(const T& value) {
+  { value.LookupProperty(PropertyId{1}) }
+      -> std::same_as<StatusOr<std::optional<PropertyDefinition>>>;
+};
+
+static_assert(HasPropertyLookup<Database>);
+
+template <typename T>
 concept HasStorageFileInspection = requires(T options) {
   { InspectStorageFiles(options) }
       -> std::same_as<StatusOr<std::vector<StorageFileInfo>>>;
@@ -141,6 +149,41 @@ TEST_F(KernelInterfaceTest, ResolvesNoCommittedTransactionAsAbsent) {
   const auto resolved = database.ValueOrDie()->ResolveTransaction(TxnId{1});
   ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
   EXPECT_FALSE(resolved.ValueOrDie().has_value());
+}
+
+TEST_F(KernelInterfaceTest,
+       LooksUpPropertySchemasWithoutRegisteringOrAdvancingEpochs) {
+  const auto database = Database::Open(DatabaseOptions{.path = path_});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+
+  const auto absent = database.ValueOrDie()->LookupProperty(PropertyId{41});
+  ASSERT_TRUE(absent.ok()) << absent.status().ToString();
+  EXPECT_FALSE(absent.ValueOrDie().has_value());
+
+  const PropertyDefinition requested{PropertyId{41}, 0, "name",
+                                     PropertyEntityKind::kVertex,
+                                     PhysicalType::kString, 4096};
+  const auto registered = database.ValueOrDie()->RegisterProperty(requested);
+  ASSERT_TRUE(registered.ok()) << registered.status().ToString();
+  EXPECT_EQ(registered.ValueOrDie().schema_epoch, 1U);
+
+  const auto exact = database.ValueOrDie()->LookupProperty(PropertyId{41}, 1);
+  ASSERT_TRUE(exact.ok()) << exact.status().ToString();
+  ASSERT_TRUE(exact.ValueOrDie().has_value());
+  EXPECT_EQ(*exact.ValueOrDie(), registered.ValueOrDie());
+
+  const auto future = database.ValueOrDie()->LookupProperty(PropertyId{41}, 2);
+  ASSERT_TRUE(future.ok()) << future.status().ToString();
+  EXPECT_FALSE(future.ValueOrDie().has_value());
+  const auto latest = database.ValueOrDie()->LookupProperty(PropertyId{41});
+  ASSERT_TRUE(latest.ok()) << latest.status().ToString();
+  ASSERT_TRUE(latest.ValueOrDie().has_value());
+  EXPECT_EQ(latest.ValueOrDie()->schema_epoch, 1U);
+
+  EXPECT_TRUE(database.ValueOrDie()
+                  ->LookupProperty(PropertyId{})
+                  .status()
+                  .IsInvalidArgument());
 }
 
 }  // namespace

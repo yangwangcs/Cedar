@@ -21,6 +21,12 @@ StatusOr<std::string> EncodeAsyncTerminalKey(TxnId txn_id);
 StatusOr<std::string> EncodeAsyncAbortTerminal(TxnId txn_id);
 StatusOr<TxnId> DecodeAsyncAbortTerminal(const std::string& encoded);
 
+StatusOr<std::string> EncodePreparedDecisionKey(TxnId txn_id);
+StatusOr<std::string> EncodePreparedDecision(
+    const StorePreparedDecision& decision);
+StatusOr<StorePreparedDecision> DecodePreparedDecision(
+    const std::string& encoded);
+
 }  // namespace cedar::internal
 
 #endif  // CEDAR_FACT_PREPARED_COMMIT_CODEC_H_

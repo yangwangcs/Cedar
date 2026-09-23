@@ -57,11 +57,12 @@ endif()
 
 # These inputs deliberately describe the pinned Cedar codec policy and source
 # identities. A cache built with a different policy must never be reused.
-# Native, sanitizer, and release profiles use optimized RocksDB. A Cedar Debug
-# build deliberately keeps RocksDB assertions and SyncPoints so integration
-# regressions can exercise real stall/recovery interleavings.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+# Native, sanitizer, and release profiles use optimized RocksDB unless tests
+# need assertions and SyncPoints to exercise real stall/recovery interleavings.
+set(CEDAR_ROCKSDB_SYNC_POINTS_AVAILABLE OFF)
+if(BUILD_TESTS OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CEDAR_ROCKSDB_BUILD_TYPE "Debug")
+    set(CEDAR_ROCKSDB_SYNC_POINTS_AVAILABLE ON)
 else()
     set(CEDAR_ROCKSDB_BUILD_TYPE "RelWithDebInfo")
 endif()

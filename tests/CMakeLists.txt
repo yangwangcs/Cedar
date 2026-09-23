@@ -256,24 +256,36 @@ target_link_libraries(test_rocksdb_dependency
     PRIVATE cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_rocksdb_dependency)
 
-add_executable(test_rocksdb_cedar_kernel
-    test_rocksdb_cedar_kernel.cc
-    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/test_util/sync_point.cc
-    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/test_util/sync_point_impl.cc)
-target_include_directories(test_rocksdb_cedar_kernel PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
-target_compile_definitions(test_rocksdb_cedar_kernel PRIVATE
-    ROCKSDB_PLATFORM_POSIX
-    ROCKSDB_LIB_IO_POSIX
-    OS_MACOSX
-    HAVE_FULLFSYNC
-    LZ4
-    ZSTD
-    CEDAR_ZSTD_NO_DICTIONARY_TRAINING)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_definitions(test_rocksdb_cedar_kernel PRIVATE
-        CEDAR_ROCKSDB_SYNC_POINTS=1)
-endif()
+function(configure_cedar_rocksdb_sync_point_test target)
+    target_sources(${target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/test_util/sync_point.cc
+        ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/test_util/sync_point_impl.cc)
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
+    target_compile_definitions(${target} PRIVATE
+        LZ4
+        ZSTD
+        CEDAR_ZSTD_NO_DICTIONARY_TRAINING)
+    if(NOT WIN32)
+        target_compile_definitions(${target} PRIVATE
+            ROCKSDB_PLATFORM_POSIX
+            ROCKSDB_LIB_IO_POSIX)
+    endif()
+    if(APPLE)
+        target_compile_definitions(${target} PRIVATE
+            OS_MACOSX
+            HAVE_FULLFSYNC)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        target_compile_definitions(${target} PRIVATE OS_LINUX)
+    endif()
+    if(CEDAR_ROCKSDB_SYNC_POINTS_AVAILABLE)
+        target_compile_definitions(${target} PRIVATE
+            CEDAR_ROCKSDB_SYNC_POINTS=1)
+    endif()
+endfunction()
+
+add_executable(test_rocksdb_cedar_kernel test_rocksdb_cedar_kernel.cc)
+configure_cedar_rocksdb_sync_point_test(test_rocksdb_cedar_kernel)
 target_link_libraries(test_rocksdb_cedar_kernel
     PRIVATE cedar_rocksdb ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_rocksdb_cedar_kernel)
@@ -388,6 +400,7 @@ gtest_discover_tests(test_strict_transactions)
 
 add_executable(test_kernel_commit kernel/test_kernel_commit.cc)
 target_include_directories(test_kernel_commit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+configure_cedar_rocksdb_sync_point_test(test_kernel_commit)
 target_link_libraries(test_kernel_commit
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_commit)

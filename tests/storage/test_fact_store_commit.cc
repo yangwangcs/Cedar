@@ -264,6 +264,42 @@ TEST_F(FactStoreCommitTest, PersistsPreparedCommitAcrossReopenThenFinalizesIt) {
   EXPECT_EQ(resolved.ValueOrDie()->outcome, StoreAsyncCommitOutcome::kCommitted);
 }
 
+TEST_F(FactStoreCommitTest,
+       DurablePreparedFinalizeSynchronizesAtomicPublicationAcrossReopen) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::vector<bool> commit_sync_modes;
+  FactStoreOptions options;
+  options.path = path_;
+  options.group_commit_max_batch_size = 1;
+  options.group_commit_window_us = 0;
+  options.commit_write_options_observer_for_testing =
+      [&commit_sync_modes](bool sync) { commit_sync_modes.push_back(sync); };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  const StoreCommitBatch batch = Batch(TxnId{80}, {VertexPut(10, 13)});
+  ASSERT_TRUE(store_->PersistPreparedCommit(batch).ok());
+  const auto finalized = store_->FinalizePreparedCommit(batch, true);
+  ASSERT_TRUE(finalized.ok()) << finalized.status().ToString();
+  EXPECT_EQ(finalized.ValueOrDie().commit_seq, CommitSeq{1});
+  ASSERT_EQ(commit_sync_modes.size(), 1U);
+  EXPECT_TRUE(commit_sync_modes[0]);
+
+  Reopen();
+  EXPECT_TRUE(store_->ListPreparedCommits().ValueOrDie().empty());
+  const auto resolved = store_->ResolveTransaction(batch.txn_id);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  ASSERT_TRUE(resolved.ValueOrDie().has_value());
+  EXPECT_EQ(resolved.ValueOrDie()->commit_seq, CommitSeq{1});
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto fact = store_->Read(snapshot.ValueOrDie(), batch.mutations[0].ref,
+                                 ValidTime{13});
+  ASSERT_TRUE(fact.ok()) << fact.status().ToString();
+  ASSERT_TRUE(fact.ValueOrDie().has_value());
+  EXPECT_EQ(fact.ValueOrDie()->commit_seq, CommitSeq{1});
+}
+
 TEST_F(FactStoreCommitTest, ReplacesPreparedCommitWithDurableAbortedTerminal) {
   const StoreCommitBatch batch = Batch(TxnId{79}, {VertexPut(9, 12)});
   ASSERT_TRUE(store_->PersistPreparedCommit(batch).ok());

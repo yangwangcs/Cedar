@@ -131,6 +131,8 @@ class CedarPureRadixIndex {
   static int Compare(const Key& left, const Key& right);
   static int Compare(const Leaf* left, const Key& right);
   static int Compare(const Leaf* left, const Leaf* right);
+  static bool PrefixMatches(const Leaf* left, const Key& right,
+                            uint8_t byte_count);
   static uint8_t FirstDifferingByte(const Key& left, const Key& right);
   static uint8_t FirstDifferingByte(const Leaf* left, const Key& right);
 

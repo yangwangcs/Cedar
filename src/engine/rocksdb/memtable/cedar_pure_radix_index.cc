@@ -81,6 +81,17 @@ int CedarPureRadixIndex::Compare(const Leaf* left, const Leaf* right) {
                      : prefix;
 }
 
+bool CedarPureRadixIndex::PrefixMatches(const Leaf* left, const Key& right,
+                                        uint8_t byte_count) {
+  assert(left != nullptr && byte_count <= kKeyBytes);
+  if (byte_count <= 32) {
+    return std::memcmp(left->key_prefix, right.data(), byte_count) == 0;
+  }
+  return std::memcmp(left->key_prefix, right.data(), 32) == 0 &&
+         std::memcmp(left->normalized_suffix.data(), right.data() + 32,
+                     byte_count - 32) == 0;
+}
+
 uint8_t CedarPureRadixIndex::FirstDifferingByte(const Key& left,
                                                  const Key& right) {
   for (size_t byte = 0; byte < kKeyBytes; ++byte) {
@@ -342,9 +353,8 @@ bool CedarPureRadixIndex::InsertWithBorrowedKey(void* opaque, const Key& key,
       auto* branch = AsBranch(node);
       // A branch below the first differing byte cannot receive this leaf
       // directly. Stop before it so the branch is wrapped as one old subtree.
-      if (FirstDifferingByte(
-              branch->min_leaf.load(std::memory_order_acquire), key) <
-          branch->byte_index) {
+      if (!PrefixMatches(branch->min_leaf.load(std::memory_order_acquire), key,
+                         branch->byte_index)) {
         break;
       }
       const auto value = ByteAt(key, branch->byte_index);

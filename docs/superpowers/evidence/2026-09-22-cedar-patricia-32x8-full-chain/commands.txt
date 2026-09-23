@@ -1,0 +1,60 @@
+Worktree: /Users/wangyang/Desktop/Cedar/.worktrees/pure-radix-cas-cursor
+Branch: codex/pure-radix-cas-cursor
+Production implementation freeze: b39a303 (no production radix source changed afterward)
+Fixture commit: ff3fbcfb3de9f825412eddea59261200d7a36404
+Corrected lifecycle history test commit: 6ee66d6
+Old production revision: 76adf448257aaaa4eacac8ba5451ba38a51223f3
+Fixture source SHA-256 in both trees: cd926dbc233e7dd2a2f88df167a234d9f73b9a1dad837e06ad414f30e57ebf1d
+
+Debug lifecycle and concurrency:
+cmake --build /Volumes/E/CedarBuild/pure-radix-cas-cursor-debug-20260921 --target cedar_radix_format_fixture test_partitioned_version_radix_memtable test_rocksdb_lifecycle test_recovery_crash_matrix test_recovery_format -j1
+ctest --test-dir /Volumes/E/CedarBuild/pure-radix-cas-cursor-debug-20260921 -R '^(PartitionedVersionRadixMemTableTest\.|RocksDbLifecycleTest\.|RecoveryCrashMatrixTest\.|FormatRecoveryTest\.)' --output-on-failure
+ctest --test-dir /Volumes/E/CedarBuild/pure-radix-cas-cursor-debug-20260921 -R '^CedarRadixFormatFixtureCli$' --output-on-failure
+ctest --test-dir /Volumes/E/CedarBuild/pure-radix-cas-cursor-debug-20260921 -R '^Patricia32x8StabilityContract$' --output-on-failure
+ctest --test-dir /Volumes/E/CedarBuild/pure-radix-cas-cursor-debug-20260921 -R '^(CedarRadixFormatFixtureCli|Patricia32x8StabilityContract)$' --output-on-failure
+python3 tests/models/cedar_pure_radix_model.py
+python3 tests/models/cedar_pure_radix_model.py --check-negative-control
+python3 tests/models/cedar_pure_radix_interleaving_model.py
+python3 tests/models/cedar_pure_radix_interleaving_model.py --check-negative-control
+
+ASan configuration and test:
+cmake -S . -B /Volumes/E/CedarBuild/pure-radix-32x8-asan-20260923 -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON -DCEDAR_ENABLE_ASAN=ON -DCEDAR_ROCKSDB_CACHE_ROOT=/Volumes/E/CedarRocksDBCache -DCEDAR_ROCKSDB_BUILD_PARALLEL_LEVEL=1
+cmake --build /Volumes/E/CedarBuild/pure-radix-32x8-asan-20260923 --target test_partitioned_version_radix_memtable test_rocksdb_lifecycle test_recovery_crash_matrix test_recovery_format -j1
+ASAN_OPTIONS=halt_on_error=1 ctest --test-dir /Volumes/E/CedarBuild/pure-radix-32x8-asan-20260923 -R '^(PartitionedVersionRadixMemTableTest\.|RocksDbLifecycleTest\.|RecoveryCrashMatrixTest\.|FormatRecoveryTest\.)' --output-on-failure
+
+ASan platform probe that is not counted as a test run:
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 ctest --test-dir /Volumes/E/CedarBuild/pure-radix-32x8-asan-20260923 -R '^(PartitionedVersionRadixMemTableTest\.|RocksDbLifecycleTest\.|RecoveryCrashMatrixTest\.|FormatRecoveryTest\.)' --output-on-failure
+Observed: AppleClang AddressSanitizer reports "detect_leaks is not supported on this platform" and aborts before test bodies. LeakSanitizer is therefore unavailable in this macOS runtime; AddressSanitizer proper passes with detect_leaks omitted.
+
+TSan configuration and test:
+cmake -S . -B /Volumes/E/CedarBuild/pure-radix-32x8-tsan-20260923 -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON -DCEDAR_ENABLE_TSAN=ON -DCEDAR_ROCKSDB_CACHE_ROOT=/Volumes/E/CedarRocksDBCache -DCEDAR_ROCKSDB_BUILD_PARALLEL_LEVEL=1
+cmake --build /Volumes/E/CedarBuild/pure-radix-32x8-tsan-20260923 --target test_partitioned_version_radix_memtable test_rocksdb_lifecycle test_recovery_crash_matrix test_recovery_format -j1
+TSAN_OPTIONS=halt_on_error=1:report_bugs=1 ctest --test-dir /Volumes/E/CedarBuild/pure-radix-32x8-tsan-20260923 -R '^(PartitionedVersionRadixMemTableTest\.|RocksDbLifecycleTest\.|RecoveryCrashMatrixTest\.|FormatRecoveryTest\.)' --output-on-failure
+
+Cross-version fixture construction:
+Old worktree parent: 76adf448257aaaa4eacac8ba5451ba38a51223f3
+Old worktree fixture-only commit: a16fe99dd895e944ed96a7aa57bdaa44059b75d2
+Final worktree: ff3fbcfb3de9f825412eddea59261200d7a36404
+Old fixture source SHA-256: cd926dbc233e7dd2a2f88df167a234d9f73b9a1dad837e06ad414f30e57ebf1d
+Final fixture source SHA-256: cd926dbc233e7dd2a2f88df167a234d9f73b9a1dad837e06ad414f30e57ebf1d
+Old tree diff from old production parent contains only tests/CMakeLists.txt and the two fixture files. No Patricia, WAL, or SST production source was cherry-picked.
+
+Cross-version runs (each used a fresh database directory under /tmp/cedar-cross-compat.0z44pv):
+old write-sst -> final verify
+final write-sst -> old verify
+old write-wal -> final verify
+final write-wal -> old verify
+Every invocation returned exit 0 and emitted the same JSON recorded in compatibility.json. Both SST databases had a live facts .sst beginning with hex 50415231 (PAR1). Both WAL databases had one .log and zero .sst files before the consumer opened them.
+
+Same-version fixture runs also passed in fresh directories:
+/tmp/cedar-same-sst.qDXdbz/db
+/tmp/cedar-same-wal.sD7wmF/db
+SST contained a live facts Parquet SST. WAL had one .log and zero .sst before recovery. Both emitted the same result recorded in compatibility.json.
+
+Review and final checks:
+git diff --check
+The final Debug matrix ran after commit 6ee66d6: 67/67 lifecycle/concurrency/recovery tests passed, then the fixture CLI and stability contracts passed 2/2.
+The final ASan matrix ran after rebuilding the corrected lifecycle target: 67/67 passed with ASAN_OPTIONS=halt_on_error=1.
+The final TSan matrix ran after rebuilding the corrected lifecycle target: 67/67 CTest entries succeeded, 66 passed and the explicit multi-threaded-fork test was skipped.
+The corrected SST lifecycle test negative control changed the expected forward entry count from 3 to 1; it failed with actual count 3, then the expectation was restored and all 12 lifecycle tests passed under Debug, ASan, and TSan.
+Self-review performed because this execution environment's current policy disallows subagent delegation; review scope and findings are recorded in report.md.

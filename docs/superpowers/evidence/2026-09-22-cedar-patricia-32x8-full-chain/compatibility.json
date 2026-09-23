@@ -1,0 +1,52 @@
+{
+  "fixture_source_sha256": "cd926dbc233e7dd2a2f88df167a234d9f73b9a1dad837e06ad414f30e57ebf1d",
+  "old_production_revision": "76adf448257aaaa4eacac8ba5451ba38a51223f3",
+  "old_fixture_commit": "a16fe99dd895e944ed96a7aa57bdaa44059b75d2",
+  "current_fixture_commit": "ff3fbcfb3de9f825412eddea59261200d7a36404",
+  "database_root": "/tmp/cedar-cross-compat.0z44pv",
+  "logical_result": {
+    "count": 3,
+    "commit_seq": 3,
+    "forward_order_hash": 7899729986448698037,
+    "forward_value_hash": 13091264218047945013,
+    "reverse_order_hash": 16471980483761807157,
+    "reverse_value_hash": 6628625391539774829
+  },
+  "directions": [
+    {
+      "producer": "old",
+      "format": "SST",
+      "consumer": "current",
+      "facts_sst_magic_hex": "50415231",
+      "exit_code": 0,
+      "matches_logical_result": true
+    },
+    {
+      "producer": "current",
+      "format": "SST",
+      "consumer": "old",
+      "facts_sst_magic_hex": "50415231",
+      "exit_code": 0,
+      "matches_logical_result": true
+    },
+    {
+      "producer": "old",
+      "format": "WAL",
+      "consumer": "current",
+      "pre_recovery_log_files": 1,
+      "pre_recovery_sst_files": 0,
+      "exit_code": 0,
+      "matches_logical_result": true
+    },
+    {
+      "producer": "current",
+      "format": "WAL",
+      "consumer": "old",
+      "pre_recovery_log_files": 1,
+      "pre_recovery_sst_files": 0,
+      "exit_code": 0,
+      "matches_logical_result": true
+    }
+  ],
+  "all_four_directions_match": true
+}

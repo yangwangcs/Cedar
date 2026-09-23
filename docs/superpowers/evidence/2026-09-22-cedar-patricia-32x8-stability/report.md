@@ -1,9 +1,15 @@
 # Cedar 32x8 Stability: Failed Gate Audit
 
-Status: **not frozen**. The 32x8 byte-segment Patricia representation remains;
+Status for the original performance gate: **not passed**. The 32x8
+byte-segment Patricia representation remains;
 the proposed 128-byte edge spacing and one compatible same-edge retry were
 reverted after failing their isolated A/B retention rules. The active goal is
-not complete. This is failed-trial evidence, not a performance acceptance.
+not complete at that measurement checkpoint. This is failed-trial evidence,
+not a performance acceptance. On 2026-09-23 the user explicitly accepted
+the existing Tier-0 results and ordered the 32x8 design fixed for lifecycle
+acceptance. The host-only CV miss remains a documented, accepted residual and
+is not relabeled as a pass. Final lifecycle and persistence evidence is in
+`../2026-09-22-cedar-patricia-32x8-full-chain/report.md`.
 
 ## Comparable Builds
 
@@ -237,8 +243,9 @@ reductions removed the earlier structural throughput deficit.
 The approved spacing and retry sub-changes remain reverted; no third
 representation or publication mechanism was introduced. The prefix comparison
 is a bounded implementation-level constant reduction within the fixed design.
-A fresh low-contention Release matrix is still required to clear the remaining
-seed-20260921 CV gate. Even if that run passes, the approved spec
-requires full `MarkReadOnly`, `PrepareForFlush`, Flush/SST, WAL/restart,
-bidirectional format compatibility, ASan, and TSan evidence before design
-freeze. None of those new full-chain gates is claimed here.
+The original performance-only plan required a new low-contention Release
+matrix to clear the remaining seed-20260921 CV gate. The user later accepted
+the current measurements and explicitly froze performance work, so no new
+matrix or representation experiment was authorized. Full `MarkReadOnly`,
+`PrepareForFlush`, Flush/SST, WAL/restart, bidirectional compatibility, ASan,
+and TSan results are recorded in the linked full-chain report.

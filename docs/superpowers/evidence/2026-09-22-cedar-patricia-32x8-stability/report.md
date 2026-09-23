@@ -200,10 +200,28 @@ exhausted.
 
 ## Next Gate
 
-The approved two sub-changes are exhausted. No third representation or
-publication mechanism was introduced. A fresh, low-contention Release
-matrix is required to separate environmental CV from the remaining baseline
-seed-20260922 ratio failure. Even if that run passes, the approved spec
+## Prefix-comparison optimization revalidation
+
+Commit `b050121` keeps the compact 32-by-8 representation and replaces the
+per-branch full 40-byte `FirstDifferingByte` scan used during descent with an
+exact prefix comparison limited to bytes before the current Patricia
+discriminator. It does not change key storage, byte 39, immutable ownership,
+CAS ordering, or Arena allocation. The fresh Release matrix was generated at
+`/tmp/cedar-prefix-matrix.4whK8c` with the unchanged 400-row contract.
+
+All one-writer, four-writer, eight-writer ratio, and Arena gates passed for
+all five seeds. Eight-writer ratios were 0.7407, 0.8191, 0.7995, 0.7988, and
+0.7925 for seeds 20260920-20260924. Candidate CV passed four seeds (3.75%,
+3.20%, 4.23%, and 5.00%); seed 20260921 measured 7.00%. An independent
+ten-repeat seed-20260921 run measured the same 7.00% CV and a 0.7824 ratio.
+Thus the optimization materially restores throughput and removes the prior
+ratio failures, but the binding per-seed CV gate is still not complete.
+
+The approved spacing and retry sub-changes remain reverted; no third
+representation or publication mechanism was introduced. The prefix comparison
+is a bounded implementation-level constant reduction within the fixed design.
+A fresh low-contention Release matrix is still required to clear the remaining
+seed-20260921 CV gate. Even if that run passes, the approved spec
 requires full `MarkReadOnly`, `PrepareForFlush`, Flush/SST, WAL/restart,
 bidirectional format compatibility, ASan, and TSan evidence before design
 freeze. None of those new full-chain gates is claimed here.

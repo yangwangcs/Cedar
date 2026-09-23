@@ -18,6 +18,7 @@
 #include <string>
 #include <sys/wait.h>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 
@@ -31,6 +32,7 @@
 #include <rocksdb/file_system.h>
 #include <rocksdb/metadata.h>
 #include <rocksdb/options.h>
+#include <rocksdb/write_batch.h>
 #include <rocksdb/utilities/backup_engine.h>
 #include <rocksdb/utilities/checkpoint.h>
 
@@ -126,6 +128,24 @@ void ExpectNotCedarParquetMagic(const std::filesystem::path& path) {
   input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
   ASSERT_EQ(input.gcount(), static_cast<std::streamsize>(magic.size())) << path;
   EXPECT_NE(magic, "PAR1") << path;
+}
+
+using RawEntries = std::vector<std::pair<std::string, std::string>>;
+
+RawEntries CollectRawEntries(rocksdb::DB* database,
+                             rocksdb::ColumnFamilyHandle* handle,
+                             bool reverse) {
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      database->NewIterator(rocksdb::ReadOptions(), handle));
+  RawEntries entries;
+  reverse ? iterator->SeekToLast() : iterator->SeekToFirst();
+  while (iterator->Valid()) {
+    entries.emplace_back(iterator->key().ToString(),
+                         iterator->value().ToString());
+    reverse ? iterator->Prev() : iterator->Next();
+  }
+  EXPECT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+  return entries;
 }
 
 bool IsDecimalRange(const std::string& text, size_t start, size_t end) {
@@ -520,6 +540,80 @@ TEST_F(RocksDbLifecycleTest,
     EXPECT_EQ(event.ValueOrDie()->ref, ref);
   }
   ASSERT_TRUE(restored.Close().ok());
+}
+
+TEST_F(RocksDbLifecycleTest,
+       RadixFlushSstReopenPreservesPointReadsAndBidirectionalOrder) {
+  FactStore initializer(FactStoreOptions{database_path_});
+  ASSERT_TRUE(initializer.Open().ok());
+  ASSERT_TRUE(initializer.Close().ok());
+
+  std::unique_ptr<rocksdb::DB> database;
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  ASSERT_TRUE(OpenRawCedarDatabase(database_path_, &database, &handles).ok());
+  ASSERT_EQ(handles.size(), 3U);
+
+  const FactRef deleted_ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{101}}).ref();
+  const FactRef surviving_ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{202}}).ref();
+  const std::string deleted_key =
+      EncodeFactKey(deleted_ref, ValidTime{7}, CommitSeq{9});
+  const std::string surviving_key =
+      EncodeFactKey(surviving_ref, ValidTime{8}, CommitSeq{10});
+  const auto deleted_value = EncodeFactValue(
+      FactEvent{deleted_ref, ValidTime{7}, CommitSeq{9}, FactOperation::kPut,
+                0, std::nullopt});
+  const auto surviving_value = EncodeFactValue(
+      FactEvent{surviving_ref, ValidTime{8}, CommitSeq{10},
+                FactOperation::kPut, 0, std::nullopt});
+  ASSERT_TRUE(deleted_value.ok()) << deleted_value.status().ToString();
+  ASSERT_TRUE(surviving_value.ok()) << surviving_value.status().ToString();
+
+  rocksdb::WriteBatch batch;
+  ASSERT_TRUE(batch.Put(handles[1], deleted_key,
+                        deleted_value.ValueOrDie()).ok());
+  ASSERT_TRUE(batch.Put(handles[1], deleted_key,
+                        surviving_value.ValueOrDie()).ok());
+  ASSERT_TRUE(batch.Delete(handles[1], deleted_key).ok());
+  ASSERT_TRUE(batch.Put(handles[1], surviving_key,
+                        surviving_value.ValueOrDie()).ok());
+  ASSERT_TRUE(database->Write(rocksdb::WriteOptions(), &batch).ok());
+
+  std::string value;
+  EXPECT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], deleted_key,
+                            &value).IsNotFound());
+  ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], surviving_key,
+                            &value).ok());
+  EXPECT_EQ(value, surviving_value.ValueOrDie());
+  const RawEntries active_forward =
+      CollectRawEntries(database.get(), handles[1], false);
+  const RawEntries active_reverse =
+      CollectRawEntries(database.get(), handles[1], true);
+  ASSERT_EQ(active_forward.size(), 1U);
+  ASSERT_EQ(active_reverse.size(), 1U);
+  EXPECT_EQ(active_reverse, RawEntries(active_forward.rbegin(),
+                                       active_forward.rend()));
+
+  rocksdb::FlushOptions flush_options;
+  flush_options.wait = true;
+  ASSERT_TRUE(database->Flush(flush_options, handles[1]).ok());
+  const auto facts_files = LiveFactsFiles(database.get(), database_path_);
+  ASSERT_FALSE(facts_files.empty());
+  for (const auto& file : facts_files) ExpectCedarParquetMagic(file);
+  CloseRawCedarDatabase(&database, &handles);
+
+  ASSERT_TRUE(OpenRawCedarDatabase(database_path_, &database, &handles).ok());
+  EXPECT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], deleted_key,
+                            &value).IsNotFound());
+  ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], surviving_key,
+                            &value).ok());
+  EXPECT_EQ(value, surviving_value.ValueOrDie());
+  EXPECT_EQ(CollectRawEntries(database.get(), handles[1], false),
+            active_forward);
+  EXPECT_EQ(CollectRawEntries(database.get(), handles[1], true),
+            active_reverse);
+  CloseRawCedarDatabase(&database, &handles);
 }
 
 TEST_F(RocksDbLifecycleTest,

@@ -968,6 +968,64 @@ TEST(PartitionedVersionRadixMemTableTest,
 }
 
 TEST(PartitionedVersionRadixMemTableTest,
+     RepeatedFreezePreservesAllFinalByteEntriesAndScanHashes) {
+  ConcurrentArena arena;
+  std::atomic<size_t> branch_loads{0};
+  CedarPureRadixIndex::TestHooks hooks;
+  hooks.branch_load_for_testing = [&] {
+    branch_loads.fetch_add(1, std::memory_order_relaxed);
+  };
+  CedarPureRadixIndex index(&arena, hooks);
+
+  for (uint16_t value = 0; value < 256; ++value) {
+    CedarPureRadixIndex::Key key{};
+    key[32] = static_cast<uint8_t>(value >> 1);
+    key[39] = static_cast<uint8_t>(value);
+    char* entry = nullptr;
+    void* handle = index.Allocate(3, &entry);
+    ASSERT_NE(handle, nullptr);
+    entry[0] = static_cast<char>(value);
+    entry[1] = static_cast<char>(value & 1U ? kTypeDeletion : kTypeValue);
+    entry[2] = static_cast<char>(255U - value);
+    ASSERT_TRUE(index.Insert(handle, key));
+  }
+
+  const auto scan = [&](bool reverse) {
+    uint64_t hash = 1469598103934665603ULL;
+    size_t count = 0;
+    CedarPureRadixIndex::Cursor cursor(&index);
+    reverse ? cursor.SeekToLast() : cursor.SeekToFirst();
+    while (cursor.Valid()) {
+      for (size_t byte = 0; byte < 3; ++byte) {
+        hash ^= static_cast<unsigned char>(cursor.entry()[byte]);
+        hash *= 1099511628211ULL;
+      }
+      ++count;
+      reverse ? cursor.Prev() : cursor.Next();
+    }
+    return std::pair{count, hash};
+  };
+
+  const auto active_forward = scan(false);
+  const auto active_reverse = scan(true);
+  ASSERT_EQ(active_forward.first, 256U);
+  ASSERT_EQ(active_reverse.first, 256U);
+
+  index.MarkReadOnly();
+  index.PrepareForFlush();
+  index.PrepareForFlush();
+  EXPECT_EQ(scan(false), active_forward);
+  EXPECT_EQ(scan(true), active_reverse);
+
+  CedarPureRadixIndex::Cursor cursor(&index);
+  cursor.SeekToFirst();
+  ASSERT_TRUE(cursor.Valid());
+  branch_loads.store(0, std::memory_order_relaxed);
+  while (cursor.Valid()) cursor.Next();
+  EXPECT_EQ(branch_loads.load(std::memory_order_relaxed), 0U);
+}
+
+TEST(PartitionedVersionRadixMemTableTest,
      SeekBranchVisitsRemainLinearInPatriciaHeight) {
   TestKeyComparator comparator;
   Arena arena;

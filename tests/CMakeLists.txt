@@ -532,6 +532,14 @@ target_link_libraries(test_rocksdb_lifecycle
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_rocksdb_lifecycle)
 
+add_executable(cedar_radix_format_fixture storage/cedar_radix_format_fixture.cc)
+target_include_directories(cedar_radix_format_fixture PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(cedar_radix_format_fixture PRIVATE cedar_core)
+add_test(NAME CedarRadixFormatFixtureCli
+    COMMAND ${CMAKE_COMMAND}
+        -DCEDAR_RADIX_FORMAT_FIXTURE=$<TARGET_FILE:cedar_radix_format_fixture>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/storage/test_cedar_radix_format_fixture.cmake)
+
 add_executable(test_cedar_files tools/test_cedar_files.cc)
 target_include_directories(test_cedar_files PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_cedar_files PRIVATE

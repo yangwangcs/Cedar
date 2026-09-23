@@ -557,32 +557,40 @@ TEST_F(RocksDbLifecycleTest,
       EntityFact::Vertex(VertexRef{PartId{0}, VertexId{101}}).ref();
   const FactRef surviving_ref =
       EntityFact::Vertex(VertexRef{PartId{0}, VertexId{202}}).ref();
-  const std::string deleted_key =
+  const std::string put_key =
+      EncodeFactKey(deleted_ref, ValidTime{7}, CommitSeq{8});
+  const std::string delete_key =
       EncodeFactKey(deleted_ref, ValidTime{7}, CommitSeq{9});
   const std::string surviving_key =
       EncodeFactKey(surviving_ref, ValidTime{8}, CommitSeq{10});
-  const auto deleted_value = EncodeFactValue(
-      FactEvent{deleted_ref, ValidTime{7}, CommitSeq{9}, FactOperation::kPut,
+  const auto put_value = EncodeFactValue(
+      FactEvent{deleted_ref, ValidTime{7}, CommitSeq{8}, FactOperation::kPut,
+                0, std::nullopt});
+  const auto delete_value = EncodeFactValue(
+      FactEvent{deleted_ref, ValidTime{7}, CommitSeq{9}, FactOperation::kDelete,
                 0, std::nullopt});
   const auto surviving_value = EncodeFactValue(
       FactEvent{surviving_ref, ValidTime{8}, CommitSeq{10},
                 FactOperation::kPut, 0, std::nullopt});
-  ASSERT_TRUE(deleted_value.ok()) << deleted_value.status().ToString();
+  ASSERT_TRUE(put_value.ok()) << put_value.status().ToString();
+  ASSERT_TRUE(delete_value.ok()) << delete_value.status().ToString();
   ASSERT_TRUE(surviving_value.ok()) << surviving_value.status().ToString();
 
   rocksdb::WriteBatch batch;
-  ASSERT_TRUE(batch.Put(handles[1], deleted_key,
-                        deleted_value.ValueOrDie()).ok());
-  ASSERT_TRUE(batch.Put(handles[1], deleted_key,
-                        surviving_value.ValueOrDie()).ok());
-  ASSERT_TRUE(batch.Delete(handles[1], deleted_key).ok());
+  ASSERT_TRUE(batch.Put(handles[1], put_key, put_value.ValueOrDie()).ok());
+  ASSERT_TRUE(batch.Put(handles[1], delete_key,
+                        delete_value.ValueOrDie()).ok());
   ASSERT_TRUE(batch.Put(handles[1], surviving_key,
                         surviving_value.ValueOrDie()).ok());
   ASSERT_TRUE(database->Write(rocksdb::WriteOptions(), &batch).ok());
 
   std::string value;
-  EXPECT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], deleted_key,
-                            &value).IsNotFound());
+  ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], put_key,
+                            &value).ok());
+  EXPECT_EQ(value, put_value.ValueOrDie());
+  ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], delete_key,
+                            &value).ok());
+  EXPECT_EQ(value, delete_value.ValueOrDie());
   ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], surviving_key,
                             &value).ok());
   EXPECT_EQ(value, surviving_value.ValueOrDie());
@@ -590,8 +598,8 @@ TEST_F(RocksDbLifecycleTest,
       CollectRawEntries(database.get(), handles[1], false);
   const RawEntries active_reverse =
       CollectRawEntries(database.get(), handles[1], true);
-  ASSERT_EQ(active_forward.size(), 1U);
-  ASSERT_EQ(active_reverse.size(), 1U);
+  ASSERT_EQ(active_forward.size(), 3U);
+  ASSERT_EQ(active_reverse.size(), 3U);
   EXPECT_EQ(active_reverse, RawEntries(active_forward.rbegin(),
                                        active_forward.rend()));
 
@@ -604,8 +612,12 @@ TEST_F(RocksDbLifecycleTest,
   CloseRawCedarDatabase(&database, &handles);
 
   ASSERT_TRUE(OpenRawCedarDatabase(database_path_, &database, &handles).ok());
-  EXPECT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], deleted_key,
-                            &value).IsNotFound());
+  ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], put_key,
+                            &value).ok());
+  EXPECT_EQ(value, put_value.ValueOrDie());
+  ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], delete_key,
+                            &value).ok());
+  EXPECT_EQ(value, delete_value.ValueOrDie());
   ASSERT_TRUE(database->Get(rocksdb::ReadOptions(), handles[1], surviving_key,
                             &value).ok());
   EXPECT_EQ(value, surviving_value.ValueOrDie());

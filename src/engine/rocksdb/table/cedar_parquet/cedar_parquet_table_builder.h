@@ -57,6 +57,8 @@ class CedarParquetTableBuilder final : public TableBuilder {
   IOStatus io_status_;
   std::string last_internal_key_;
   uint64_t pre_compression_size_ = 0;
+  // Conservative bound for any one column's page index in this row group.
+  uint64_t row_group_index_budget_ = 64;
   bool closed_ = false;
 };
 

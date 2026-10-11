@@ -468,3 +468,37 @@ TEST(CedarParquetTableBuilderTest,
 
 }  // namespace
 }  // namespace ROCKSDB_NAMESPACE::cedar_parquet
+
+namespace ROCKSDB_NAMESPACE::cedar_parquet {
+namespace {
+TEST(CedarParquetTableBuilderTest, WriterHonorsReaderIndexBudget) {
+  const auto path = TestPath("CedarParquetIndexBudget");
+  std::unique_ptr<WritableFileWriter> file;
+  ASSERT_TRUE(WritableFileWriter::Create(Env::Default()->GetFileSystem(), path,
+      FileOptions(), &file, nullptr).ok());
+  Options options;
+  ImmutableOptions immutable(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  CedarParquetTableOptions parquet;
+  parquet.page_max_rows = 1;
+  parquet.max_index_bytes = 1024;
+  CedarParquetTableBuilder builder(BuilderOptions(immutable, mutable_options, comparator),
+                                  parquet, file.get());
+  for (uint64_t id = 1; id <= 64; ++id) {
+    builder.Add(InternalKeyFor(id, 1), StateFactValue());
+    ASSERT_TRUE(builder.status().ok()) << builder.status().ToString();
+  }
+  ASSERT_TRUE(builder.Finish().ok()) << builder.status().ToString();
+  ASSERT_TRUE(file->Close(IOOptions()).ok());
+  CedarParquetFooter footer;
+  ASSERT_TRUE(ParseParquetFooter(ReadAll(path), &footer, nullptr).ok());
+  for (const auto& group : footer.row_groups) {
+    for (const auto& column : group.columns) {
+      EXPECT_LE(column.column_index_length, parquet.max_index_bytes) << column.path;
+      EXPECT_LE(column.offset_index_length, parquet.max_index_bytes) << column.path;
+    }
+  }
+}
+}  // namespace
+}  // namespace ROCKSDB_NAMESPACE::cedar_parquet

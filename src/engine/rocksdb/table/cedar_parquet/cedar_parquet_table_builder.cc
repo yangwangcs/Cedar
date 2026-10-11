@@ -3,6 +3,7 @@
 
 #include "table/cedar_parquet/cedar_parquet_table_builder.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -234,6 +235,27 @@ void CedarParquetTableBuilder::Add(const Slice& key, const Slice& value) {
     SetStatus(std::move(status));
     return;
   }
+  // An index may retain two full byte-array values per page. Charging every
+  // row as its own page also bounds offset-index and compact-protocol overhead,
+  // irrespective of page compression or page splitting. Never emit an SST
+  // that the reader's unchanged max_index_bytes guard will reject on reopen.
+  const uint64_t index_value_bytes =
+      std::max<uint64_t>(value.size(), kCedarParquetV2SortKeyBytes);
+  if (index_value_bytes > (std::numeric_limits<uint64_t>::max() - 128) / 2) {
+    SetStatus(Status::MemoryLimit("Cedar Parquet index charge overflow"));
+    return;
+  }
+  const uint64_t index_charge = 2 * index_value_bytes + 128;
+  if (parquet_options_.max_index_bytes < 64 ||
+      index_charge > parquet_options_.max_index_bytes - 64) {
+    SetStatus(Status::MemoryLimit("Cedar Parquet row exceeds index budget"));
+    return;
+  }
+  if (!row_group_builder_.empty() &&
+      index_charge > parquet_options_.max_index_bytes - row_group_index_budget_) {
+    FlushRowGroup();
+    if (!status_.ok()) return;
+  }
   status = row_group_builder_.Add(std::move(row));
   if (status.IsIncomplete()) {
     FlushRowGroup();
@@ -246,6 +268,8 @@ void CedarParquetTableBuilder::Add(const Slice& key, const Slice& value) {
     SetStatus(std::move(status));
     return;
   }
+
+  row_group_index_budget_ += index_charge;
 
   CedarParquetMaterializedFact materialized;
   status = DecodeCedarParquetMaterializedFact(key, value, &materialized);
@@ -437,6 +461,7 @@ void CedarParquetTableBuilder::FlushRowGroup() {
   properties_.data_size += total_compressed_page_size;
   properties_.uncompressed_data_size += total_uncompressed_page_size;
   row_group_builder_.Reset();
+  row_group_index_budget_ = 64;
 }
 
 void CedarParquetTableBuilder::WriteOffsetIndexes() {

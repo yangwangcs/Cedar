@@ -398,14 +398,15 @@ class Transaction::State {
         mutation_keys.end()) {
       return Status::InvalidArgument("transaction", "duplicate fact mutation");
     }
-    auto dependencies = DeriveSnapshotWriteDependencies(
-        database->store, *snapshot, std::vector<PendingFactMutation>{mutation});
-    if (!dependencies.ok()) return dependencies.status();
+    auto dependency = CaptureSnapshotWriteDependency(
+        database->store, *snapshot, mutation.ref, mutation.valid_from);
+    if (!dependency.ok()) return dependency.status();
     mutation_keys.push_back(key);
-    mutations.push_back(std::move(mutation));
+    const auto position = std::upper_bound(
+        mutations.begin(), mutations.end(), mutation, CanonicalMutationLess);
+    mutations.insert(position, std::move(mutation));
     snapshot_write_dependencies.push_back(
-        dependencies.ConsumeValueOrDie().front());
-    std::sort(mutations.begin(), mutations.end(), CanonicalMutationLess);
+        dependency.ConsumeValueOrDie());
     return Status::OK();
   }
 

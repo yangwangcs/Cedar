@@ -143,5 +143,32 @@ TEST(KernelMutationOrderTest, SortsValidTimeDescendingWithinOneFact) {
   EXPECT_EQ(mutations[2].valid_from, ValidTime{10});
 }
 
+TEST_F(KernelMutationTest, KeepsMixedTimeAndPartitionStagingReadable) {
+  ASSERT_TRUE(database_->RegisterProperty(Property(
+      PropertyId{7}, "value", PropertyEntityKind::kVertex,
+      PhysicalType::kInt32)).ok());
+  auto transaction = Begin();
+  const auto first = PropertyFact::Vertex({PartId{1}, VertexId{11}}, PropertyId{7});
+  const auto second = PropertyFact::Vertex({PartId{2}, VertexId{11}}, PropertyId{7});
+  ASSERT_TRUE(transaction->Set(first, ValidTime{30}, Value::Int32(30)).ok());
+  ASSERT_TRUE(transaction->Set(second, ValidTime{20}, Value::Int32(200)).ok());
+  ASSERT_TRUE(transaction->Set(first, ValidTime{10}, Value::Int32(10)).ok());
+  ASSERT_TRUE(transaction->Set(first, ValidTime{20}, Value::Int32(20)).ok());
+  EXPECT_TRUE(transaction->Set(first, ValidTime{20}, Value::Int32(999)).IsInvalidArgument());
+  const auto committed = transaction->Commit();
+  ASSERT_TRUE(committed.ok());
+  ASSERT_TRUE(committed.ValueOrDie().status.ok());
+  auto after = Begin();
+  for (const auto& [property, time, expected] :
+       std::vector<std::tuple<PropertyFact, ValidTime, int32_t>>{
+           {first, ValidTime{15}, 10}, {first, ValidTime{25}, 20},
+           {first, ValidTime{35}, 30}, {second, ValidTime{25}, 200}}) {
+    const auto value = after->Get(property, time);
+    ASSERT_TRUE(value.ok());
+    ASSERT_TRUE(value.ValueOrDie().has_value());
+    EXPECT_EQ(std::get<int32_t>(value.ValueOrDie()->data()), expected);
+  }
+}
+
 }  // namespace
 }  // namespace cedar

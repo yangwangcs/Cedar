@@ -5,6 +5,16 @@
 
 namespace cedar {
 
+StatusOr<SnapshotWriteDependency> CaptureSnapshotWriteDependency(
+    const FactStore& store, const StoreSnapshot& snapshot, const FactRef& ref,
+    ValidTime valid_time) {
+  const auto neighborhood = store.ReadTemporalNeighborhood(snapshot, ref, valid_time);
+  if (!neighborhood.ok()) return neighborhood.status();
+  return SnapshotWriteDependency{ref, valid_time,
+      neighborhood.ValueOrDie().predecessor, neighborhood.ValueOrDie().successor,
+      snapshot.commit_seq()};
+}
+
 StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
     const FactStore& store, const StoreSnapshot& snapshot,
     const std::vector<PendingFactMutation>& mutations) {
@@ -14,13 +24,10 @@ StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
     const Status valid = mutation.Validate();
     if (!valid.ok()) return valid;
 
-    const auto neighborhood = store.ReadTemporalNeighborhood(
-        snapshot, mutation.ref, mutation.valid_from);
-    if (!neighborhood.ok()) return neighborhood.status();
-    dependencies.push_back(SnapshotWriteDependency{
-        mutation.ref, mutation.valid_from, neighborhood.ValueOrDie().predecessor,
-        neighborhood.ValueOrDie().successor,
-        snapshot.commit_seq()});
+    auto dependency = CaptureSnapshotWriteDependency(
+        store, snapshot, mutation.ref, mutation.valid_from);
+    if (!dependency.ok()) return dependency.status();
+    dependencies.push_back(dependency.ConsumeValueOrDie());
   }
   return dependencies;
 }

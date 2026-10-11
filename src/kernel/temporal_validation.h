@@ -10,6 +10,10 @@
 
 namespace cedar {
 
+StatusOr<SnapshotWriteDependency> CaptureSnapshotWriteDependency(
+    const FactStore& store, const StoreSnapshot& snapshot, const FactRef& ref,
+    ValidTime valid_time);
+
 StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
     const FactStore& store, const StoreSnapshot& snapshot,
     const std::vector<PendingFactMutation>& mutations);

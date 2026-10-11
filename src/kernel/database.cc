@@ -1089,17 +1089,17 @@ Status Database::Impl::StartAppendCommitPipeline() {
                 const CommitSeq sequence =
                     requests[index]->result->ValueOrDie().commit_seq;
                 internal::QueryDeltaCommit descriptor(sequence);
-                descriptor.facts.reserve(requests[index]->batch.mutations.size() +
-                                         requests[index]->batch.edge_identities.size());
+                descriptor.facts.reserve(store_requests[index].batch.mutations.size() +
+                                         store_requests[index].batch.edge_identities.size());
                 for (const PendingFactMutation& mutation :
-                     requests[index]->batch.mutations) {
+                     store_requests[index].batch.mutations) {
                   descriptor.facts.push_back(
                       FactEvent{mutation.ref, mutation.valid_from, sequence,
                                 mutation.operation, mutation.schema_epoch,
                                 mutation.value, std::nullopt});
                 }
                 for (const EdgeIdentity& identity :
-                     requests[index]->batch.edge_identities) {
+                     store_requests[index].batch.edge_identities) {
                   const FactRef identity_ref =
                       FactRef(identity.home_part_id, FactFamily::kEdgeIdentity,
                               PropertyId{}, identity.edge_id.value);

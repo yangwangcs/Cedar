@@ -48,8 +48,13 @@ void MaintenanceController::PublishSnapshot(CedarRuntimeSnapshot snapshot) {
 }
 
 void MaintenanceController::SetWalSyncCritical(bool critical) {
-  wal_sync_critical_.store(critical, std::memory_order_release);
-  work_available_.notify_all();
+  // Synchronize the predicate change with both maintenance lanes.
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool changed = wal_sync_critical_.exchange(critical, std::memory_order_acq_rel) != critical;
+  if (changed && !critical &&
+      (LaneHasWorkLocked(Lane::kFlush) || LaneHasWorkLocked(Lane::kCompaction))) {
+    work_available_.notify_all();
+  }
 }
 
 void MaintenanceController::Stop() {

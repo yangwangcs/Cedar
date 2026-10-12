@@ -2,16 +2,100 @@
 
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <string>
 
 #include <unistd.h>
 
 #include "storage/facts/fact_store.h"
+#include "rocksdb/db.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/table.h"
 #include "storage/rocks/rocksdb_config.h"
 
 namespace cedar::internal {
 namespace {
+
+class MetaCompressionTest : public testing::TestWithParam<StorageProfile> {
+ protected:
+  void SetUp() override {
+    path_ = (std::filesystem::temp_directory_path() /
+             ("cedar-meta-compression-" + std::to_string(getpid()) + "-" +
+              std::to_string(static_cast<int>(GetParam())))).string();
+    std::filesystem::remove_all(path_);
+  }
+  void Close() {
+    for (auto* handle : handles_) db_->DestroyColumnFamilyHandle(handle);
+    handles_.clear();
+    db_.reset();
+  }
+  void TearDown() override {
+    Close();
+    std::filesystem::remove_all(path_);
+  }
+  std::string path_;
+  std::unique_ptr<rocksdb::DB> db_;
+  std::vector<rocksdb::ColumnFamilyHandle*> handles_;
+};
+
+// Catches silently inheriting kNoCompression when Snappy is not built, and
+// verifies actual compressed files rather than just the requested options.
+TEST_P(MetaCompressionTest, CompressesMetaSstAndPreservesValuesAfterReopen) {
+  FactStoreOptions store;
+  store.storage_profile = GetParam();
+  store.production.memory_budget_bytes = 1ULL << 30;
+  const auto resolved = ResolveStorageProfile(store);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  auto options = MakeRocksDbOptions(store, true, &resolved.ValueOrDie());
+  // Raw offline fixture: no live kernel grant controller is attached.
+  options.cedar_kernel_mode = false;
+  options.atomic_flush = false;
+  auto descriptors = MakeRocksDbColumnFamilyDescriptors(
+      store, options, &resolved.ValueOrDie());
+  descriptors[2].options.disable_auto_compactions = true;
+  descriptors[2].options.write_buffer_size = 4ULL << 20;
+  ASSERT_TRUE(rocksdb::DB::Open(options, path_, descriptors, &handles_, &db_).ok());
+  const std::string value(2048, 'm');
+  for (int i = 0; i < 256; ++i) {
+    ASSERT_TRUE(db_->Put(rocksdb::WriteOptions(), handles_[2],
+                        "meta-key-" + std::to_string(i), value).ok());
+  }
+  rocksdb::FlushOptions flush;
+  flush.wait = true;
+  ASSERT_TRUE(db_->Flush(flush, handles_[2]).ok());
+  auto expect_compressed = [&](const std::string& codec_hex) {
+    rocksdb::TablePropertiesCollection tables;
+    ASSERT_TRUE(db_->GetPropertiesOfAllTables(handles_[2], &tables).ok());
+    ASSERT_FALSE(tables.empty());
+    uint64_t entries = 0;
+    for (const auto& [file, props] : tables) {
+      // RocksDB format >= 7 reports actual types as hex: 04=LZ4, 07=Zstd.
+      EXPECT_NE(props->compression_name.find(";" + codec_hex + ";"),
+                std::string::npos) << props->compression_name << " " << file;
+      EXPECT_LT(props->data_size, props->raw_value_size / 4) << file;
+      entries += props->num_entries;
+    }
+    EXPECT_EQ(entries, 256U);
+  };
+  expect_compressed("04");
+  rocksdb::CompactRangeOptions compact;
+  compact.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForce;
+  ASSERT_TRUE(db_->CompactRange(compact, handles_[2], nullptr, nullptr).ok());
+  expect_compressed("07");
+  Close();
+  options.create_if_missing = false;
+  ASSERT_TRUE(rocksdb::DB::Open(options, path_, descriptors, &handles_, &db_).ok());
+  for (int i = 0; i < 256; ++i) {
+    std::string found;
+    ASSERT_TRUE(db_->Get(rocksdb::ReadOptions(), handles_[2],
+                        "meta-key-" + std::to_string(i), &found).ok());
+    EXPECT_EQ(found, value);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(AllProfiles, MetaCompressionTest,
+    testing::Values(StorageProfile::kDeveloper, StorageProfile::kProductionAppend,
+                    StorageProfile::kKernelTest, StorageProfile::kDebugSmallThresholds));
 
 TEST(RocksDbProfileTest, RejectsProductionBudgetBelowOneGiB) {
   FactStoreOptions options;

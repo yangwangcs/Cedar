@@ -182,6 +182,7 @@ QueryDelta::~QueryDelta() {
     stopping_ = true;
   }
   published_cv_.notify_all();
+  work_available_cv_.notify_all();
   if (worker_.joinable()) worker_.join();
 }
 
@@ -211,7 +212,8 @@ void AdvanceVisible(std::atomic<uint64_t>* visible, uint64_t sequence) {
   }
 }
 
-Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit) {
+Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit,
+                              QueryDeltaCommit* owned_commit) {
   const Status valid = commit.Validate();
   if (!valid.ok()) return valid;
   const uint64_t bytes = commit.EstimatedBytes();
@@ -243,43 +245,50 @@ Status QueryDelta::IndexLocked(const QueryDeltaCommit& commit) {
     SetMissingLocked(commit.commit_seq);
     return Status::ResourceExhausted("query delta", "hard memory or lag bound reached");
   }
-  QueryDeltaCommit normalized = commit;
+  const CommitSeq sequence = commit.commit_seq;
+  QueryDeltaCommit normalized(sequence);
+  if (owned_commit != nullptr) {
+    normalized = std::move(*owned_commit);
+  } else {
+    normalized = commit;
+  }
   if (!normalized.mutations.empty()) {
     normalized.facts.reserve(normalized.mutations.size());
-    for (const PendingFactMutation& mutation : normalized.mutations) {
+    for (PendingFactMutation& mutation : normalized.mutations) {
       normalized.facts.push_back(FactEvent{mutation.ref, mutation.valid_from,
                                            normalized.commit_seq,
                                            mutation.operation,
-                                           mutation.schema_epoch, mutation.value,
+                                           mutation.schema_epoch, std::move(mutation.value),
                                            std::nullopt});
     }
     normalized.mutations.clear();
   }
-  commits_.push_back(normalized);
+  commits_.push_back(std::move(normalized));
+  const QueryDeltaCommit& indexed = commits_.back();
   auto immutable_commit =
       std::make_shared<const QueryDeltaCommit>(commits_.back());
   lease_commits_.push_back(immutable_commit);
   chunks_.push_back(std::make_shared<const DeltaChunk>(
-      DeltaChunk{commit.commit_seq, commit.commit_seq, immutable_commit, bytes}));
+      DeltaChunk{sequence, sequence, immutable_commit, bytes}));
   memory_bytes_ += bytes;
-  for (const FactEvent& event : normalized.facts) {
+  for (const FactEvent& event : indexed.facts) {
     chains_[event.ref].push_back(event);
     if (event.edge_identity.has_value()) {
       edge_identities_.emplace_back(event.commit_seq, *event.edge_identity);
     }
   }
-  for (const EdgeIdentity& identity : normalized.edge_identities) {
+  for (const EdgeIdentity& identity : indexed.edge_identities) {
     const auto duplicate = std::find_if(
         edge_identities_.begin(), edge_identities_.end(),
-        [&identity, &commit](const auto& candidate) {
-          return candidate.first == commit.commit_seq && candidate.second == identity;
+        [&identity, sequence](const auto& candidate) {
+          return candidate.first == sequence && candidate.second == identity;
         });
     if (duplicate == edge_identities_.end()) {
-      edge_identities_.emplace_back(commit.commit_seq, identity);
+      edge_identities_.emplace_back(sequence, identity);
     }
   }
-  indexed_through_ = commit.commit_seq;
-  AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
+  indexed_through_ = sequence;
+  AdvanceVisible(&visible_seq_value_, sequence.value);
   if (first_missing_value_.load(std::memory_order_acquire) != 0 &&
       indexed_through_.value >= first_missing_value_.load(std::memory_order_acquire)) {
     first_missing_value_.store(0, std::memory_order_release);
@@ -309,7 +318,7 @@ Status QueryDelta::ObservePublished(const QueryDeltaCommit& commit) {
   return indexed;
 }
 
-Status QueryDelta::EnqueuePublished(const QueryDeltaCommit& commit) {
+Status QueryDelta::EnqueuePublished(QueryDeltaCommit commit) {
   const Status valid = commit.Validate();
   if (!valid.ok()) return valid;
   std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -332,17 +341,23 @@ Status QueryDelta::EnqueuePublished(const QueryDeltaCommit& commit) {
     const Status injected = options_.crash_fault_injector("delta_enqueue");
     if (!injected.ok()) return injected;
   }
-  published_queue_.push_back(commit);
-  enqueued_through_ = commit.commit_seq;
-  AdvanceVisible(&visible_seq_value_, commit.commit_seq.value);
-  published_cv_.notify_one();
+  const bool wake_worker = published_queue_.empty() && !worker_indexing_;
+  const CommitSeq sequence = commit.commit_seq;
+  published_queue_.push_back(std::move(commit));
+  enqueued_through_ = sequence;
+  AdvanceVisible(&visible_seq_value_, sequence.value);
+  // An active worker checks the queue again after indexing. Only an idle
+  // worker needs a wakeup; lifecycle waiters use a separate condition variable.
+  if (wake_worker) {
+    work_available_cv_.notify_one();
+  }
   return Status::OK();
 }
 
 void QueryDelta::WorkerMain() {
   for (;;) {
     std::unique_lock<std::mutex> queue_lock(queue_mutex_);
-    published_cv_.wait(queue_lock, [this] {
+    work_available_cv_.wait(queue_lock, [this] {
       return stopping_ || !published_queue_.empty();
     });
     if (published_queue_.empty() && stopping_) return;
@@ -361,13 +376,14 @@ void QueryDelta::WorkerMain() {
         if (options_.worker_before_index_observer_for_testing) {
           options_.worker_before_index_observer_for_testing();
         }
-        IndexLocked(commit);
+        IndexLocked(commit, &commit);
       }
     }
     queue_lock.lock();
     worker_indexing_ = false;
+    const bool wake_lifecycle = lifecycle_transition_;
     queue_lock.unlock();
-    published_cv_.notify_all();
+    if (wake_lifecycle) published_cv_.notify_all();
   }
 }
 
@@ -414,8 +430,8 @@ Status QueryDelta::RepairThrough(const FactStore& store,
     }
     repaired.push_back(std::move(descriptor));
   }
-  for (const QueryDeltaCommit& descriptor : repaired) {
-    const Status indexed = IndexLocked(descriptor);
+  for (QueryDeltaCommit& descriptor : repaired) {
+    const Status indexed = IndexLocked(descriptor, &descriptor);
     if (!indexed.ok()) {
       return indexed;
     }

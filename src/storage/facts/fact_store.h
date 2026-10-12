@@ -281,6 +281,8 @@ struct StoreCommittedGroupResult {
   uint64_t memtable_insert_us = 0;
   uint64_t wal_rotations = 0;
   bool has_kernel_stage_metrics = false;
+  // A benchmark may know sync cost without exposing RocksDB kernel stages.
+  bool has_wal_sync_cost = false;
 };
 
 enum class StoreAsyncCommitOutcome : uint8_t { kCommitted = 1, kAborted = 2 };

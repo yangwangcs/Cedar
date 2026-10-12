@@ -15,6 +15,7 @@ struct EpochObservation {
   uint64_t queue_p99_us = 0;
   uint64_t transactions = 0;
   uint64_t encoded_bytes = 0;
+  bool wal_sync_cost_known = true;
 };
 
 struct EpochQueueSnapshot {
@@ -26,6 +27,7 @@ struct EpochQueueSnapshot {
 struct EpochLimits {
   uint32_t max_transactions = 1;
   uint64_t max_encoded_bytes = 1;
+  // Remaining collection time from the oldest request's enqueue time.
   uint64_t max_age_us = 0;
 };
 
@@ -51,6 +53,8 @@ class AdaptiveEpochController {
 
   Options options_;
   uint64_t bytes_per_transaction_ewma_ = 0;
+  uint64_t wal_sync_us_ewma_ = 0;
+  bool observed_wal_sync_cost_ = false;
 };
 
 }  // namespace cedar::internal

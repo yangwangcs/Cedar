@@ -587,7 +587,7 @@ StatusOr<CommitResult> Transaction::Commit() {
                          std::move(state_->snapshot_write_dependencies),
                          std::move(state_->strict_read_dependencies), true};
   const auto committed = state_->database->SubmitSyncCommit(
-      batch, state_->options.commit_deadline_us);
+      std::move(batch), state_->options.commit_deadline_us);
   state_->Finish();
   state_->EndCommit();
   if (!committed.ok()) {
@@ -595,10 +595,10 @@ StatusOr<CommitResult> Transaction::Commit() {
     return CommitResult{status.IsIndeterminate() || status.IsRecoveryRequired()
                             ? CommitOutcome::kIndeterminate
                             : CommitOutcome::kAborted,
-                        CommitSeq{}, batch.txn_id, status};
+                        CommitSeq{}, state_->txn_id, status};
   }
   return CommitResult{CommitOutcome::kCommitted, committed.ValueOrDie().commit_seq,
-                      batch.txn_id, Status::OK()};
+                      state_->txn_id, Status::OK()};
 }
 
 StatusOr<CommitHandle> Transaction::CommitAsync() {
@@ -614,7 +614,7 @@ StatusOr<CommitHandle> Transaction::CommitAsync() {
                          std::move(state_->strict_read_dependencies), true};
   auto handle_state = std::make_shared<CommitHandle::State>(batch.txn_id);
   const Status enqueued = state_->database->SubmitAsyncCommit(
-      batch, handle_state, state_->options.commit_deadline_us);
+      std::move(batch), handle_state, state_->options.commit_deadline_us);
   state_->Finish();
   state_->EndCommit();
   if (!enqueued.ok()) return enqueued;

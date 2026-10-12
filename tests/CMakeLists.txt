@@ -22,6 +22,10 @@ else()
     set(GTEST_MAIN_TARGET gtest_main)
 endif()
 
+add_executable(test_crc32c core/test_crc32c.cc)
+target_link_libraries(test_crc32c PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_crc32c)
+
 add_executable(test_query_types query/test_query_types.cc)
 target_link_libraries(test_query_types PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_query_types)
@@ -224,9 +228,8 @@ function(configure_cedar_parquet_test target)
     target_compile_definitions(${target} PRIVATE
         ROCKSDB_PLATFORM_POSIX
         ROCKSDB_LIB_IO_POSIX
-        OS_MACOSX
+        OS_LINUX
         NDEBUG
-        HAVE_FULLFSYNC
         LZ4
         ZSTD
         CEDAR_ZSTD_NO_DICTIONARY_TRAINING)

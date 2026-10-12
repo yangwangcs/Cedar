@@ -60,11 +60,15 @@ endif()
 # Native, sanitizer, and release profiles use optimized RocksDB unless tests
 # need assertions and SyncPoints to exercise real stall/recovery interleavings.
 set(CEDAR_ROCKSDB_SYNC_POINTS_AVAILABLE OFF)
-if(BUILD_TESTS OR CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CEDAR_ROCKSDB_BUILD_TYPE "Debug")
+if(NOT DEFINED CEDAR_ROCKSDB_BUILD_TYPE OR CEDAR_ROCKSDB_BUILD_TYPE STREQUAL "")
+    if(BUILD_TESTS OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(CEDAR_ROCKSDB_BUILD_TYPE "Debug")
+    else()
+        set(CEDAR_ROCKSDB_BUILD_TYPE "RelWithDebInfo")
+    endif()
+endif()
+if(CEDAR_ROCKSDB_BUILD_TYPE STREQUAL "Debug")
     set(CEDAR_ROCKSDB_SYNC_POINTS_AVAILABLE ON)
-else()
-    set(CEDAR_ROCKSDB_BUILD_TYPE "RelWithDebInfo")
 endif()
 set(CEDAR_ROCKSDB_CODEC_FLAGS
     "WITH_LZ4=ON|WITH_ZSTD=ON|WITH_SNAPPY=OFF|WITH_ZLIB=OFF|WITH_BZ2=OFF")
@@ -94,7 +98,7 @@ endforeach()
 
 set(CEDAR_ROCKSDB_TOOLCHAIN_FLAGS "")
 string(APPEND CEDAR_ROCKSDB_TOOLCHAIN_FLAGS
-       " -DCEDAR_ZSTD_NO_DICTIONARY_TRAINING")
+       " -DCEDAR_ZSTD_NO_DICTIONARY_TRAINING -Wno-error=unused-function")
 if(APPLE)
     execute_process(COMMAND xcrun --sdk macosx --show-sdk-path
                     OUTPUT_VARIABLE CEDAR_ROCKSDB_SDK_PATH
@@ -122,7 +126,7 @@ set(CEDAR_ROCKSDB_LZ4_LIBRARY "${CEDAR_ROCKSDB_CODEC_PREFIX}/lib/liblz4.a")
 set(CEDAR_ROCKSDB_ZSTD_LIBRARY "${CEDAR_ROCKSDB_CODEC_PREFIX}/lib/libzstd.a")
 
 function(cedar_build_pinned_static_library name source_root include_root)
-    file(GLOB_RECURSE codec_c_sources "${source_root}/*.c")
+    file(GLOB_RECURSE codec_c_sources "${source_root}/*.c" "${source_root}/*.S")
     list(SORT codec_c_sources)
     if(codec_c_sources STREQUAL "")
         message(FATAL_ERROR "No C sources found for pinned ${name}")
@@ -134,6 +138,7 @@ function(cedar_build_pinned_static_library name source_root include_root)
         file(RELATIVE_PATH codec_relative "${source_root}" "${codec_source}")
         string(REPLACE "/" "_" codec_object_name "${codec_relative}")
         string(REPLACE ".c" ".o" codec_object_name "${codec_object_name}")
+        string(REPLACE ".S" ".o" codec_object_name "${codec_object_name}")
         set(codec_object "${codec_object_dir}/${codec_object_name}")
         execute_process(
             COMMAND "${CMAKE_C_COMPILER}" -O2 -fPIC
@@ -212,6 +217,7 @@ if(NOT EXISTS "${CEDAR_ROCKSDB_LIBRARY}" OR
         -DWITH_ZLIB=OFF
         -DWITH_ZSTD=ON
         -DWITH_BZ2=OFF)
+    list(APPEND CEDAR_ROCKSDB_CONFIGURE_COMMAND -DUSE_RTTI=ON)
     list(APPEND CEDAR_ROCKSDB_CONFIGURE_COMMAND
         "-Dlz4_ROOT_DIR=${CEDAR_ROCKSDB_CODEC_PREFIX}"
         "-Dzstd_ROOT_DIR=${CEDAR_ROCKSDB_CODEC_PREFIX}")

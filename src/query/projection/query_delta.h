@@ -196,7 +196,7 @@ class QueryDelta {
   Status ObservePublished(const QueryDeltaCommit& commit);
   // Publisher-thread handoff. This operation only validates and queues an
   // immutable descriptor; chain indexing runs on the Cedar delta worker.
-  Status EnqueuePublished(const QueryDeltaCommit& commit);
+  Status EnqueuePublished(QueryDeltaCommit commit);
   Status ObservePublished(CommitSeq commit) {
     return ObservePublished(QueryDeltaCommit(commit));
   }
@@ -264,7 +264,10 @@ class QueryDelta {
     size_t operator()(const FactRef& ref) const noexcept;
   };
   void SetMissingLocked(CommitSeq missing);
-  Status IndexLocked(const QueryDeltaCommit& commit);
+  // owned_commit, when supplied, aliases commit and is consumed only after
+  // validation and memory admission. Borrowed ObservePublished input is kept.
+  Status IndexLocked(const QueryDeltaCommit& commit,
+                     QueryDeltaCommit* owned_commit = nullptr);
   void WorkerMain();
 
   mutable std::mutex mutex_;
@@ -278,6 +281,7 @@ class QueryDelta {
   std::deque<QueryDeltaCommit> published_queue_;
   CommitSeq enqueued_through_;
   std::condition_variable published_cv_;
+  std::condition_variable work_available_cv_;
   bool worker_indexing_ = false;
   bool lifecycle_transition_ = false;
   std::thread worker_;

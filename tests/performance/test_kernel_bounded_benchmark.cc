@@ -154,7 +154,9 @@ TEST(KernelBoundedBenchmarkTest,
   auto database = std::move(opened).ConsumeValueOrDie();
 
   auto writers = std::async(std::launch::async, [&] {
-    return RunBoundedWriters(database.get(), 32, 2);
+    // Maintenance correctness needs enough facts to switch MemTables. A
+    // two-second workload can finish without a flush on a busy Docker host.
+    return RunFixedWriters(database.get(), 32, 64);
   });
   bool saw_orphaned_high_pressure_debt = false;
   RuntimeMetrics orphaned_metrics;
@@ -176,7 +178,9 @@ TEST(KernelBoundedBenchmarkTest,
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   const BoundedWriterResult writer_result = writers.get();
-  EXPECT_GT(writer_result.committed, 0U);
+  ASSERT_TRUE(writer_result.status.ok()) << writer_result.status.ToString();
+  EXPECT_EQ(writer_result.committed, 2048U);
+  EXPECT_EQ(writer_result.failures, 0U);
   EXPECT_FALSE(saw_orphaned_high_pressure_debt)
       << "immutable_fact_count=" << orphaned_metrics.immutable_fact_count
       << " immutable_fact_bytes=" << orphaned_metrics.immutable_fact_bytes

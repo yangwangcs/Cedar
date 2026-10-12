@@ -433,7 +433,11 @@ void Database::Impl::ObserveAppendPressure(const PressureSample& sample) {
                                              std::memory_order_acq_rel);
     pressure_last_observed_at = now;
   }
-  if (admission_changed) append_commit_cv.notify_all();
+  if (admission_changed) {
+    // Pair notification with admission waiters' predicate mutex.
+    std::lock_guard<std::mutex> lock(append_commit_mutex);
+    append_admission_changed.notify_all();
+  }
 }
 
 internal::EpochLimits Database::Impl::LimitsForQueueLocked() const {
@@ -455,9 +459,13 @@ internal::EpochLimits Database::Impl::LimitsForQueueLocked() const {
   limits.max_encoded_bytes = std::min(
       {limits.max_encoded_bytes, append_commit_max_batch_bytes,
        runtime_target_bytes.load(std::memory_order_acquire)});
-  limits.max_age_us = std::min(
-      {limits.max_age_us, append_commit_window_us,
-       runtime_collection_window_us.load(std::memory_order_acquire)});
+  const uint64_t window = std::min(append_commit_window_us,
+      runtime_collection_window_us.load(std::memory_order_acquire));
+  limits.max_age_us = limits.max_transactions == 1 &&
+          std::min(append_commit_max_batch_size,
+              runtime_target_count.load(std::memory_order_acquire)) == 1
+      ? 0 : std::min(limits.max_age_us,
+          window - std::min(window, snapshot.oldest_age_us));
   return limits;
 }
 
@@ -646,7 +654,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
       uint64_t epoch_committed_count = 0;
       {
         std::unique_lock<std::mutex> lock(append_commit_mutex);
-        const bool requested = append_commit_cv.wait_for(
+        const bool requested = append_preflight_available.wait_for(
             lock, std::chrono::milliseconds(5), [this] {
               return append_commit_stopping ||
                  (active_pending_version_overlay != nullptr &&
@@ -720,6 +728,13 @@ Status Database::Impl::StartAppendCommitPipeline() {
       std::lock_guard<std::mutex> lock(append_commit_mutex);
         if (active_pending_version_overlay == overlay &&
           active_epoch_generation == epoch_generation &&
+          append_commit_requests.size() >= planned_candidates.size() &&
+          std::equal(planned_candidates.begin(), planned_candidates.end(),
+                     append_commit_requests.begin(),
+                     [](const auto& planned, const auto& queued) {
+                       return planned == queued &&
+                           !planned->cancelled.load(std::memory_order_acquire);
+                     }) &&
           (!next_epoch_slot.has_value() ||
            next_epoch_slot->state != SlotState::kEligible)) {
           active_n_plus_one_preflight_transactions = planned_transactions;
@@ -761,7 +776,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
       const auto collection_started_at = std::chrono::steady_clock::now();
       {
         std::unique_lock<std::mutex> lock(append_commit_mutex);
-        append_commit_cv.wait(lock, [this] {
+        append_work_available.wait(lock, [this] {
           return append_commit_stopping || !append_commit_requests.empty();
         });
         if (!append_commit_stopping &&
@@ -785,31 +800,15 @@ Status Database::Impl::StartAppendCommitPipeline() {
         if (next_epoch_slot.has_value() &&
             next_epoch_slot->state == SlotState::kEligible) {
           const size_t planned_size = next_epoch_slot->requests.size();
-          const uint64_t preparation_generation =
-              next_epoch_slot->preparation_generation;
-          if (append_commit_requests.size() < planned_size &&
-              !append_commit_stopping) {
-            append_commit_cv.wait(
-                lock, [this, planned_size, preparation_generation] {
-              return append_commit_stopping ||
-                     !next_epoch_slot.has_value() ||
-                     next_epoch_slot->state != SlotState::kEligible ||
-                     next_epoch_slot->preparation_generation !=
-                         preparation_generation ||
-                     append_commit_requests.size() >= planned_size;
-            });
-          }
-          const bool same_slot =
-              next_epoch_slot.has_value() &&
-              next_epoch_slot->state == SlotState::kEligible &&
-              next_epoch_slot->preparation_generation ==
-                  preparation_generation;
-          if (same_slot && append_commit_requests.size() >= planned_size) {
+          // Prepared requests were already queued. A shorter queue cannot be
+          // repaired by future arrivals: cancellation invalidated this slot.
+          if (append_commit_requests.size() >= planned_size) {
             can_promote_slot = std::equal(
                 next_epoch_slot->requests.begin(),
                 next_epoch_slot->requests.end(), append_commit_requests.begin(),
                 [](const auto& planned, const auto& queued) {
-                  return planned == queued;
+                  return planned == queued &&
+                      !planned->cancelled.load(std::memory_order_acquire);
                 });
             if (!can_promote_slot) {
               next_epoch_slot->state = SlotState::kDiscarded;
@@ -818,10 +817,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
                   NPlusOneDiscardReason::kGenerationMismatch, planned_size);
               next_epoch_slot.reset();
             }
-          } else if (same_slot && append_commit_stopping) {
+          } else {
             next_epoch_slot->state = SlotState::kDiscarded;
             RecordNPlusOneDiscard(&append_commit_metrics,
-                                  NPlusOneDiscardReason::kShutdown,
+                                  append_commit_stopping
+                                      ? NPlusOneDiscardReason::kShutdown
+                                      : NPlusOneDiscardReason::kGenerationMismatch,
                                   planned_size);
             next_epoch_slot.reset();
           }
@@ -852,7 +853,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
           if (collection_age_us != 0 && append_commit_requests.size() < wake_at) {
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::microseconds(collection_age_us);
-            append_commit_cv.wait_until(lock, deadline, [this, wake_at] {
+            append_work_available.wait_until(lock, deadline, [this, wake_at] {
               return append_commit_stopping || append_commit_requests.size() >= wake_at;
             });
           }
@@ -880,6 +881,9 @@ Status Database::Impl::StartAppendCommitPipeline() {
             queued_append_commit_bytes -= requests.back()->estimated_bytes;
           }
         }
+        // Selection frees queue-count capacity even while the selected group
+        // still owns its reserved bytes during a slow durable write.
+        if (!requests.empty()) append_admission_changed.notify_all();
         active_append_commit_requests += requests.size();
         if (!requests.empty()) {
           RecordGroupFill(&append_commit_metrics.group_fill, requests.size());
@@ -922,7 +926,10 @@ Status Database::Impl::StartAppendCommitPipeline() {
                 ? requests.size()
                 : 0;
         ++preflight_request_generation;
-        append_commit_cv.notify_all();
+        if (active_epoch_committed_count_hint != 0 &&
+            !append_commit_requests.empty()) {
+          append_preflight_available.notify_one();
+        }
       }
 
       std::vector<StoreCommitGroupRequest> store_requests;
@@ -1032,7 +1039,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
           adaptive_epoch_controller.Observe(internal::EpochObservation{
               group_metrics.wal_sync_us,
               append_commit_metrics.latency.queue.ApproximatePercentile(99),
-              requests.size(), epoch_bytes});
+              requests.size(), epoch_bytes,
+              group_metrics.has_kernel_stage_metrics || group_metrics.has_wal_sync_cost});
         }
         if (discarded_stale_predecision) {
           RecordNPlusOneDiscard(&append_commit_metrics,
@@ -1151,14 +1159,19 @@ Status Database::Impl::StartAppendCommitPipeline() {
         }
         active_pending_version_overlay.reset();
         ++preflight_request_generation;
-        append_commit_cv.notify_all();
+        if (append_commit_requests.empty() && active_append_commit_requests == 0) {
+          append_drained.notify_all();
+        }
+      }
+      for (const auto& request : requests) {
+        if (request->handle == nullptr) request->completed.notify_one();
       }
       // QueryDelta observes only after visible publication and outside the
       // append bookkeeping lock.  It performs no exact-fact reads here; a
       // rejected descriptor is repaired later from durable sequence records.
       if (query_delta != nullptr) {
-        for (const internal::QueryDeltaCommit& descriptor : published_delta) {
-          query_delta->EnqueuePublished(descriptor).IgnoreError();
+        for (internal::QueryDeltaCommit& descriptor : published_delta) {
+          query_delta->EnqueuePublished(std::move(descriptor)).IgnoreError();
         }
       }
       if (epoch_completion != nullptr) {
@@ -1171,7 +1184,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
         reserved_append_commit_bytes -= released_bytes;
-        append_commit_cv.notify_all();
+        append_admission_changed.notify_all();
       }
     }
   });
@@ -1179,12 +1192,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
 }
 
 StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
-    const StoreCommitBatch& batch, uint64_t deadline_us) {
+    StoreCommitBatch batch, uint64_t deadline_us) {
   auto request = std::make_shared<AppendCommitRequest>();
-  request->batch = batch;
-  request->txn_id = batch.txn_id;
-  request->estimated_bytes = internal::EstimateCommitBatchBytes(batch);
-  request->preflight_footprint = internal::BuildCommitFootprint(batch);
+  request->batch = std::move(batch);
+  request->txn_id = request->batch.txn_id;
+  request->estimated_bytes = internal::EstimateCommitBatchBytes(request->batch);
+  request->preflight_footprint = internal::BuildCommitFootprint(request->batch);
   request->enqueued_at = std::chrono::steady_clock::now();
   if (request->estimated_bytes > append_commit_max_batch_bytes) {
     std::lock_guard<std::mutex> lock(append_commit_mutex);
@@ -1216,7 +1229,7 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
       }
       admission_wait_started = std::chrono::steady_clock::now();
       while (!runtime_admission_permitted.load(std::memory_order_acquire)) {
-        if (append_commit_cv.wait_until(lock, deadline) ==
+        if (append_admission_changed.wait_until(lock, deadline) ==
             std::cv_status::timeout) {
           ++append_commit_metrics.rejected;
           return Status::ResourceExhausted(
@@ -1246,7 +1259,7 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
         admission_wait_started = std::chrono::steady_clock::now();
       }
       while (!has_capacity()) {
-        if (append_commit_cv.wait_until(lock, deadline) ==
+        if (append_admission_changed.wait_until(lock, deadline) ==
             std::cv_status::timeout) {
           ++append_commit_metrics.rejected;
           return Status::ResourceExhausted(
@@ -1276,10 +1289,13 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
     if (append_commit_enqueued_observer_for_testing) {
       append_commit_enqueued_observer_for_testing();
     }
-    append_commit_cv.notify_all();
+    append_work_available.notify_one();
+    if (active_pending_version_overlay != nullptr) {
+      append_preflight_available.notify_one();
+    }
   }
   std::unique_lock<std::mutex> lock(append_commit_mutex);
-  append_commit_cv.wait(lock, [&] { return request->result.has_value(); });
+  request->completed.wait(lock, [&] { return request->result.has_value(); });
   return std::move(*request->result);
 }
 
@@ -1330,7 +1346,10 @@ Status Database::Impl::SubmitAsyncCommitToAppendPipeline(
   if (append_commit_enqueued_observer_for_testing) {
     append_commit_enqueued_observer_for_testing();
   }
-  append_commit_cv.notify_all();
+  append_work_available.notify_one();
+  if (active_pending_version_overlay != nullptr) {
+    append_preflight_available.notify_one();
+  }
   return Status::OK();
 }
 
@@ -1366,7 +1385,16 @@ void Database::Impl::CancelQueuedAsyncCommit(
         next_epoch_slot.reset();
       }
     }
-    if (removed) append_commit_cv.notify_all();
+    if (removed) {
+      ++preflight_request_generation;
+      append_preflight_available.notify_one();
+      append_admission_changed.notify_all();
+      if (append_commit_requests.empty() && active_append_commit_requests == 0) {
+        append_drained.notify_all();
+      }
+    }
+    // Cancellation can invalidate a slot independently of queue removal.
+    append_work_available.notify_one();
   }
 
   if (removed) {
@@ -1386,13 +1414,13 @@ void Database::Impl::CancelQueuedAsyncCommit(
 }
 
 Status Database::Impl::SubmitAsyncCommit(
-    const StoreCommitBatch& batch, std::shared_ptr<CommitHandle::State> handle,
+    StoreCommitBatch batch, std::shared_ptr<CommitHandle::State> handle,
     uint64_t deadline_us) {
   auto request = std::make_shared<AppendCommitRequest>();
-  request->batch = batch;
-  request->txn_id = batch.txn_id;
-  request->estimated_bytes = internal::EstimateCommitBatchBytes(batch);
-  request->preflight_footprint = internal::BuildCommitFootprint(batch);
+  request->batch = std::move(batch);
+  request->txn_id = request->batch.txn_id;
+  request->estimated_bytes = internal::EstimateCommitBatchBytes(request->batch);
+  request->preflight_footprint = internal::BuildCommitFootprint(request->batch);
   request->enqueued_at = std::chrono::steady_clock::now();
   if (request->estimated_bytes > append_commit_max_batch_bytes) {
     std::lock_guard<std::mutex> lock(append_commit_mutex);
@@ -1468,7 +1496,7 @@ Status Database::Impl::SubmitAsyncCommit(
 
 Status Database::Impl::DrainAppendCommitPipeline() {
   std::unique_lock<std::mutex> lock(append_commit_mutex);
-  append_commit_cv.wait(lock, [this] {
+  append_drained.wait(lock, [this] {
     return append_commit_requests.empty() && active_append_commit_requests == 0;
   });
   return Status::OK();
@@ -1489,7 +1517,10 @@ void Database::Impl::StopAppendCommitPipeline() {
       next_epoch_slot.reset();
     }
     append_commit_stopping = true;
-    append_commit_cv.notify_all();
+    append_work_available.notify_all();
+    append_preflight_available.notify_all();
+    append_admission_changed.notify_all();
+    append_drained.notify_all();
   }
   ObserveShutdownStage("queue_worker_stop");
   if (append_preflight_worker.joinable()) append_preflight_worker.join();

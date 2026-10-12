@@ -442,6 +442,9 @@ TEST(KernelAsyncCommitTest, UsesOneDurableWriteForIndependentAsyncCommits) {
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> final_writes = 0;
+  std::mutex enqueue_mutex;
+  std::condition_variable enqueue_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = 2,
@@ -449,6 +452,16 @@ TEST(KernelAsyncCommitTest, UsesOneDurableWriteForIndependentAsyncCommits) {
       .commit_prewrite_fault_injector_for_testing = [&final_writes] {
         ++final_writes;
         return Status::OK();
+      },
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(enqueue_mutex);
+        ++enqueued;
+        enqueue_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(enqueue_mutex);
+        EXPECT_TRUE(enqueue_cv.wait_for(lock, std::chrono::seconds(2),
+                                       [&] { return enqueued == 2; }));
       }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
@@ -526,6 +539,9 @@ TEST(KernelRuntimeSamplerTest, SamplesOnCadenceInsteadOfEveryCommitEpoch) {
   char pattern[] = "/tmp/cedar_runtime_sampler_cadence_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
   std::atomic<uint32_t> sample_count = 0;
+  std::mutex sample_mutex;
+  std::thread::id sampler_thread;
+  bool sampled_outside_sampler = false;
   std::mutex prewrite_mutex;
   std::condition_variable prewrite_cv;
   bool writer_entered = false;
@@ -541,7 +557,18 @@ TEST(KernelRuntimeSamplerTest, SamplesOnCadenceInsteadOfEveryCommitEpoch) {
         prewrite_cv.wait(lock, [&] { return release_writer; });
         return Status::OK();
       },
-      .runtime_sample_observer_for_testing = [&] { ++sample_count; }});
+      .runtime_sample_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(sample_mutex);
+        // Open performs the initial sample before starting the worker.
+        if (sample_count.fetch_add(1) != 0 &&
+            std::this_thread::get_id() != sampler_thread) {
+          sampled_outside_sampler = true;
+        }
+      },
+      .runtime_sampler_thread_started_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(sample_mutex);
+        sampler_thread = std::this_thread::get_id();
+      }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto transaction = database->BeginTransaction();
@@ -591,7 +618,12 @@ TEST(KernelRuntimeSamplerTest, SamplesOnCadenceInsteadOfEveryCommitEpoch) {
     ASSERT_TRUE(next_committed.ok()) << next_committed.status().ToString();
     EXPECT_EQ(next_committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
   }
-  EXPECT_LT(sample_count.load(), 8U);
+  EXPECT_GT(sample_count.load(), 1U);
+  {
+    std::lock_guard<std::mutex> lock(sample_mutex);
+    EXPECT_FALSE(sampled_outside_sampler);
+  }
+  // Close legitimately performs one final refresh on its calling thread.
   ASSERT_TRUE(database->Close().ok());
   std::filesystem::remove_all(pattern);
 }
@@ -1238,14 +1270,31 @@ TEST(KernelAsyncCommitTest, PersistsValidationAbortAlongsideIndependentWinner) {
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> physical_writes = 0;
-  auto opened = Database::Open(DatabaseOptions{
-      .path = path,
-      .group_commit_max_batch_size = 2,
-      .group_commit_window_us = 20'000,
-      .commit_prewrite_fault_injector_for_testing = [&physical_writes] {
-        ++physical_writes;
-        return Status::OK();
-      }});
+  std::mutex collection_mutex;
+  std::condition_variable collection_changed;
+  bool grouping = false;
+  bool release_collection = false;
+  uint32_t enqueued = 0;
+  DatabaseOptions options;
+  options.path = path;
+  options.group_commit_max_batch_size = 2;
+  options.group_commit_window_us = 20'000;
+  options.commit_prewrite_fault_injector_for_testing = [&physical_writes] {
+    ++physical_writes;
+    return Status::OK();
+  };
+  options.append_commit_enqueued_observer_for_testing = [&] {
+    std::lock_guard lock(collection_mutex);
+    if (grouping) ++enqueued;
+    collection_changed.notify_all();
+  };
+  options.append_commit_collection_observer_for_testing = [&] {
+    std::unique_lock lock(collection_mutex);
+    if (grouping) {
+      collection_changed.wait(lock, [&] { return release_collection; });
+    }
+  };
+  auto opened = Database::Open(options);
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
 
@@ -1273,12 +1322,25 @@ TEST(KernelAsyncCommitTest, PersistsValidationAbortAlongsideIndependentWinner) {
 
   std::optional<StatusOr<CommitHandle>> invalid_handle;
   std::optional<StatusOr<CommitHandle>> winner_handle;
+  {
+    std::lock_guard lock(collection_mutex);
+    grouping = true;
+  }
   std::thread invalid_thread(
       [&] { invalid_handle.emplace(invalid.ValueOrDie()->CommitAsync()); });
   std::thread winner_thread(
       [&] { winner_handle.emplace(winner.ValueOrDie()->CommitAsync()); });
+  bool both_enqueued = false;
+  {
+    std::unique_lock lock(collection_mutex);
+    both_enqueued = collection_changed.wait_for(
+        lock, std::chrono::seconds(5), [&] { return enqueued == 2; });
+    release_collection = true;
+  }
+  collection_changed.notify_all();
   invalid_thread.join();
   winner_thread.join();
+  ASSERT_TRUE(both_enqueued);
 
   ASSERT_TRUE(invalid_handle->ok()) << invalid_handle->status().ToString();
   ASSERT_TRUE(winner_handle->ok()) << winner_handle->status().ToString();
@@ -1478,6 +1540,75 @@ TEST(KernelGroupCommitTest, EnablesBoundedGroupCommitByDefault) {
   EXPECT_EQ(options.group_commit_max_queue_requests, 1024U);
   EXPECT_EQ(options.group_commit_max_queue_bytes, 16ULL * 1024ULL * 1024ULL);
   EXPECT_EQ(options.group_commit_window_us, 200U);
+}
+
+TEST(KernelGroupCommitTest, SingleTransactionCapDoesNotWaitToCollectImpossibleWork) {
+  char pattern[] = "/tmp/cedar_single_group_dispatch_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path, .group_commit_max_batch_size = 1,
+      .group_commit_window_us = 200'000});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto tx = database->BeginTransaction();
+  ASSERT_TRUE(tx.ok());
+  ASSERT_TRUE(tx.ValueOrDie()->Assert(
+      EntityFact::Vertex({PartId{0}, VertexId{9001}}), ValidTime{1}).ok());
+  auto result = tx.ValueOrDie()->Commit();
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  // Observe only queue residence, not disk-sync latency. With a group cap of
+  // one there is no possible batch benefit from a 200ms collection delay.
+  EXPECT_LT(database->GetCommitPipelineMetrics().latency.queue.max_us, 100'000U);
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, ConcurrentSyncWaitersReceiveEveryPublishedResult) {
+  char pattern[] = "/tmp/cedar_sync_result_notifications_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path, .group_commit_max_batch_size = 16,
+      .group_commit_window_us = 200});
+  ASSERT_TRUE(opened.ok());
+  auto database = std::move(opened).ConsumeValueOrDie();
+  std::barrier start(16);
+  std::atomic<uint64_t> failures{0};
+  std::vector<std::thread> workers;
+  for (uint64_t client = 0; client < 16; ++client) {
+    workers.emplace_back([&, client] {
+      start.arrive_and_wait();
+      for (uint64_t iteration = 0; iteration < 8; ++iteration) {
+        auto tx = database->BeginTransaction();
+        if (!tx.ok()) { ++failures; continue; }
+        auto status = tx.ValueOrDie()->Assert(
+            EntityFact::Vertex({PartId{0}, VertexId{10000 + client * 8 + iteration}}),
+            ValidTime{1});
+        if (!status.ok()) { ++failures; continue; }
+        auto committed = tx.ValueOrDie()->Commit();
+        if (!committed.ok() || committed.ValueOrDie().outcome != CommitOutcome::kCommitted) ++failures;
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  EXPECT_EQ(failures.load(), 0U);
+  EXPECT_EQ(database->GetCommitPipelineMetrics().published, 128U);
+  {
+    auto snapshot = database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    for (uint64_t id = 10000; id < 10128; ++id) {
+      const auto exists = snapshot.ValueOrDie().Exists(
+          EntityFact::Vertex({PartId{0}, VertexId{id}}), ValidTime{1});
+      ASSERT_TRUE(exists.ok());
+      EXPECT_TRUE(exists.ValueOrDie());
+    }
+  }
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
+  std::filesystem::remove_all(path);
 }
 
 TEST(KernelGroupCommitTest, RejectsGroupCountAboveProtocolMaximum) {
@@ -1761,6 +1892,103 @@ TEST(KernelGroupCommitTest, CountsSelectedEpochAgainstQueueByteReservation) {
   ASSERT_TRUE(first_result->ok()) << first_result->status().ToString();
   ASSERT_TRUE(first_result->ValueOrDie().Wait().ok());
   ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(pattern);
+}
+
+TEST(KernelGroupCommitTest, SelectionWakesQueueAdmissionBeforeSlowStorageCompletes) {
+  char pattern[] = "/tmp/cedar_selection_admission_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  std::mutex gate_mutex;
+  std::condition_variable gate;
+  uint32_t collections = 0, writes = 0, admissions = 0, enqueued = 0;
+  bool release_first_write = false, release_selection = false;
+  bool release_second_write = false;
+  DatabaseOptions options;
+  options.path = pattern;
+  options.group_commit_max_batch_size = 1;
+  options.group_commit_window_us = 0;
+  options.group_commit_max_queue_requests = 1;
+  options.group_commit_max_queue_bytes = 1ULL << 20;
+  options.append_commit_collection_observer_for_testing = [&] {
+    std::unique_lock lock(gate_mutex);
+    ++collections;
+    gate.notify_all();
+    if (collections == 2) gate.wait(lock, [&] { return release_selection; });
+  };
+  options.foreground_admission_observer_for_testing = [&] {
+    std::lock_guard lock(gate_mutex);
+    ++admissions;
+    gate.notify_all();
+  };
+  options.append_commit_enqueued_observer_for_testing = [&] {
+    std::lock_guard lock(gate_mutex);
+    ++enqueued;
+    gate.notify_all();
+  };
+  options.commit_prewrite_fault_injector_for_testing = [&] {
+    std::unique_lock lock(gate_mutex);
+    ++writes;
+    gate.notify_all();
+    if (writes == 1) gate.wait(lock, [&] { return release_first_write; });
+    if (writes == 2) gate.wait(lock, [&] { return release_second_write; });
+    return Status::OK();
+  };
+  auto opened = Database::Open(options);
+  ASSERT_TRUE(opened.ok());
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto first = database->BeginTransaction();
+  auto second = database->BeginTransaction();
+  auto third = database->BeginTransaction(
+      TransactionOptions{.commit_deadline_us = 2'000'000});
+  ASSERT_TRUE(first.ok()); ASSERT_TRUE(second.ok()); ASSERT_TRUE(third.ok());
+  ASSERT_TRUE(first.ValueOrDie()->Assert(
+      EntityFact::Vertex({PartId{0}, VertexId{8001}}), ValidTime{1}).ok());
+  ASSERT_TRUE(second.ValueOrDie()->Assert(
+      EntityFact::Vertex({PartId{0}, VertexId{8002}}), ValidTime{1}).ok());
+  ASSERT_TRUE(third.ValueOrDie()->Assert(
+      EntityFact::Vertex({PartId{0}, VertexId{8003}}), ValidTime{1}).ok());
+  std::optional<StatusOr<CommitResult>> results[3];
+  std::thread a([&] { results[0].emplace(first.ValueOrDie()->Commit()); });
+  {
+    std::unique_lock lock(gate_mutex);
+    gate.wait(lock, [&] { return writes == 1; });
+  }
+  std::thread b([&] { results[1].emplace(second.ValueOrDie()->Commit()); });
+  {
+    std::unique_lock lock(gate_mutex);
+    gate.wait(lock, [&] { return enqueued == 2; });
+    release_first_write = true;
+    gate.notify_all();
+    // A's reserved-byte notification has finished before B's selection gate.
+    gate.wait(lock, [&] { return collections == 2; });
+  }
+  std::thread c([&] { results[2].emplace(third.ValueOrDie()->Commit()); });
+  {
+    std::unique_lock lock(gate_mutex);
+    gate.wait(lock, [&] { return admissions == 3; });
+  }
+  // Let C sleep on the full count-limited queue while B is still queued.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  bool admitted_while_storage_blocked = false;
+  {
+    std::unique_lock lock(gate_mutex);
+    release_selection = true;
+    gate.notify_all();
+    gate.wait(lock, [&] { return writes == 2; });
+    admitted_while_storage_blocked = gate.wait_for(
+        lock, std::chrono::milliseconds(500), [&] { return enqueued == 3; });
+    release_second_write = true;
+    gate.notify_all();
+  }
+  a.join(); b.join(); c.join();
+  EXPECT_TRUE(admitted_while_storage_blocked);
+  for (const auto& result : results) {
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->ok());
+    EXPECT_EQ(result->ValueOrDie().outcome, CommitOutcome::kCommitted);
+  }
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
   std::filesystem::remove_all(pattern);
 }
 
@@ -2883,14 +3111,31 @@ TEST(KernelGroupCommitTest, GroupsDeletesAndPutsForDifferentFacts) {
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> physical_writes = 0;
-  auto opened = Database::Open(DatabaseOptions{
-      .path = path,
-      .group_commit_max_batch_size = 2,
-      .group_commit_window_us = 20'000,
-      .commit_prewrite_fault_injector_for_testing = [&physical_writes] {
-        ++physical_writes;
-        return Status::OK();
-      }});
+  std::mutex grouping_mutex;
+  std::condition_variable grouping_changed;
+  bool grouping = false;
+  uint32_t enqueued = 0;
+  DatabaseOptions options;
+  options.path = path;
+  options.group_commit_max_batch_size = 2;
+  options.group_commit_window_us = 20'000;
+  options.commit_prewrite_fault_injector_for_testing = [&physical_writes] {
+    ++physical_writes;
+    return Status::OK();
+  };
+  options.append_commit_enqueued_observer_for_testing = [&] {
+    std::lock_guard lock(grouping_mutex);
+    if (grouping) ++enqueued;
+    grouping_changed.notify_all();
+  };
+  options.append_commit_collection_observer_for_testing = [&] {
+    std::unique_lock lock(grouping_mutex);
+    if (grouping) {
+      EXPECT_TRUE(grouping_changed.wait_for(lock, std::chrono::seconds(2),
+                                           [&] { return enqueued == 2; }));
+    }
+  };
+  auto opened = Database::Open(options);
   ASSERT_TRUE(opened.ok());
   auto database = std::move(opened).ConsumeValueOrDie();
   auto seed = database->BeginTransaction();
@@ -2899,6 +3144,10 @@ TEST(KernelGroupCommitTest, GroupsDeletesAndPutsForDifferentFacts) {
   ASSERT_TRUE(seed.ValueOrDie()->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{32}}), ValidTime{10}).ok());
   ASSERT_EQ(seed.ValueOrDie()->Commit().ValueOrDie().outcome, CommitOutcome::kCommitted);
   physical_writes.store(0);
+  {
+    std::lock_guard lock(grouping_mutex);
+    grouping = true;
+  }
 
   auto first = database->BeginTransaction();
   auto second = database->BeginTransaction();

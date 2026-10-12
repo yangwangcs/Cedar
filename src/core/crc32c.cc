@@ -16,6 +16,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__)) && \
+    !defined(CEDAR_CRC32C_PORTABLE_ONLY)
+#include <nmmintrin.h>
+#define CEDAR_CRC32C_X86_DISPATCH 1
+#endif
 
 namespace cedar {
 namespace crc32c {
@@ -70,9 +78,7 @@ const uint32_t kByteExtensionTable[256] = {
 // CRCs are pre- and post- conditioned by xoring with all ones.
 static constexpr const uint32_t kCRC32Xor = static_cast<uint32_t>(0xffffffffU);
 
-}  // namespace
-
-uint32_t Extend(uint32_t crc, const char* data, size_t n) {
+uint32_t ExtendPortable(uint32_t crc, const char* data, size_t n) {
   const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
   const uint8_t* e = p + n;
   uint32_t l = crc ^ kCRC32Xor;
@@ -84,6 +90,55 @@ uint32_t Extend(uint32_t crc, const char* data, size_t n) {
   }
 
   return l ^ kCRC32Xor;
+}
+
+#if defined(CEDAR_CRC32C_X86_DISPATCH)
+// The target applies only to this function. Binaries still run on CPUs without
+// SSE4.2; no global -march=native or -msse4.2 is required.
+__attribute__((target("sse4.2")))
+uint32_t ExtendHardware(uint32_t crc, const char* data, size_t n) {
+  uint32_t value = crc ^ kCRC32Xor;
+#if defined(__x86_64__)
+  uint64_t wide = value;
+  while (n >= sizeof(uint64_t)) {
+    uint64_t word;
+    // memcpy supports unaligned input and does not read beyond its length.
+    std::memcpy(&word, data, sizeof(word));
+    wide = _mm_crc32_u64(wide, word);
+    data += sizeof(word);
+    n -= sizeof(word);
+  }
+  value = static_cast<uint32_t>(wide);
+#else
+  while (n >= sizeof(uint32_t)) {
+    uint32_t word;
+    std::memcpy(&word, data, sizeof(word));
+    value = _mm_crc32_u32(value, word);
+    data += sizeof(word);
+    n -= sizeof(word);
+  }
+#endif
+  while (n-- != 0)
+    value = _mm_crc32_u8(value, static_cast<unsigned char>(*data++));
+  return value ^ kCRC32Xor;
+}
+#endif
+
+using ExtendFunction = uint32_t (*)(uint32_t, const char*, size_t);
+ExtendFunction SelectExtension() {
+#if defined(CEDAR_CRC32C_X86_DISPATCH)
+  if (__builtin_cpu_supports("sse4.2")) return ExtendHardware;
+#endif
+  return ExtendPortable;
+}
+
+}  // namespace
+
+uint32_t Extend(uint32_t crc, const char* data, size_t n) {
+  if (n == 0) return crc;
+  // C++ local-static initialization is thread safe; dispatch is selected once.
+  static const ExtendFunction extension = SelectExtension();
+  return extension(crc, data, n);
 }
 
 }  // namespace crc32c

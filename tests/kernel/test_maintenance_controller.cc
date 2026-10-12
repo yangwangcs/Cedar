@@ -200,5 +200,19 @@ TEST(MaintenanceControllerTest, WalCriticalStatePreventsNormalSubmission) {
   controller.Stop();
 }
 
+TEST(MaintenanceControllerTest, LeavingWalCriticalStateRunsAlreadyPublishedWork) {
+  FakeMaintenanceAdapter adapter;
+  MaintenanceController controller(&adapter);
+  ASSERT_TRUE(controller.Start().ok());
+  controller.SetWalSyncCritical(true);
+  controller.PublishSnapshot(Snapshot(1, 0, 4));
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  EXPECT_EQ(adapter.compaction_started(), 0U);
+  // No new snapshot: the state transition itself must wake the sleeping lane.
+  controller.SetWalSyncCritical(false);
+  EXPECT_TRUE(adapter.WaitForCompactionStart());
+  controller.Stop();
+}
+
 }  // namespace
 }  // namespace cedar

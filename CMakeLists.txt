@@ -195,7 +195,7 @@ if(BUILD_BENCHMARKS)
     target_include_directories(cedar_radix_memtable_bench PRIVATE
         ${CEDAR_ENGINE_SOURCE_DIR})
     target_compile_definitions(cedar_radix_memtable_bench PRIVATE
-        ROCKSDB_PLATFORM_POSIX ROCKSDB_LIB_IO_POSIX OS_MACOSX HAVE_FULLFSYNC
+        ROCKSDB_PLATFORM_POSIX ROCKSDB_LIB_IO_POSIX OS_LINUX
         LZ4 ZSTD CEDAR_ZSTD_NO_DICTIONARY_TRAINING)
     target_link_libraries(cedar_radix_memtable_bench PRIVATE cedar_rocksdb)
 endif()

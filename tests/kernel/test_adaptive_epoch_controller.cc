@@ -21,6 +21,38 @@ TEST(AdaptiveEpochControllerTest, LoneRequestWaitsOnlyForTheConfiguredAge) {
   EXPECT_EQ(limits.max_age_us, 200U);
 }
 
+TEST(AdaptiveEpochControllerTest, CollectionNeverRestartsAnOldRequestsWindow) {
+  AdaptiveEpochController controller(Options());
+  EXPECT_EQ(controller.NextLimits({1, 150, PressureState::kNormal}).max_age_us, 50U);
+  EXPECT_EQ(controller.NextLimits({1, 200, PressureState::kNormal}).max_age_us, 0U);
+  EXPECT_EQ(controller.NextLimits({1, 300, PressureState::kNormal}).max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, AGroupCappedAtOneDoesNotCollectAnotherTransaction) {
+  auto options = Options();
+  options.max_transactions = 1;
+  AdaptiveEpochController controller(options);
+  EXPECT_EQ(controller.NextLimits({1, 0, PressureState::kNormal}).max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, ObservedZeroSyncCostDispatchesLoneWorkPromptly) {
+  AdaptiveEpochController controller(Options());
+  controller.Observe({0, 0, 1, 1024});
+  EXPECT_EQ(controller.NextLimits({1, 0, PressureState::kNormal}).max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, SyncCostRetainsCollectionForLoneWork) {
+  AdaptiveEpochController controller(Options());
+  controller.Observe({1000, 0, 1, 1024});
+  EXPECT_EQ(controller.NextLimits({1, 150, PressureState::kNormal}).max_age_us, 50U);
+}
+
+TEST(AdaptiveEpochControllerTest, MissingSyncMetricsDoNotMeanZeroSyncCost) {
+  AdaptiveEpochController controller({});
+  controller.Observe({0, 0, 1, 1024, false});
+  EXPECT_EQ(controller.NextLimits({1, 0, PressureState::kNormal}).max_age_us, 200U);
+}
+
 TEST(AdaptiveEpochControllerTest, DeepHealthyQueueUsesTheBoundedMaximum) {
   AdaptiveEpochController controller(Options());
   const EpochLimits limits = controller.NextLimits(
@@ -70,7 +102,67 @@ TEST(AdaptiveEpochControllerTest, SoftPressureConstrainsBytesAndAge) {
                          .pressure_state = PressureState::kSoft});
   EXPECT_EQ(limits.max_transactions, 64U);
   EXPECT_EQ(limits.max_encoded_bytes, 1ULL * 1024ULL * 1024ULL);
-  EXPECT_EQ(limits.max_age_us, 50U);
+  EXPECT_EQ(limits.max_age_us, 40U);
+}
+
+TEST(AdaptiveEpochControllerTest, SlowWalKeepsAnAgedShallowGroupIntact) {
+  AdaptiveEpochController controller(Options());
+  controller.Observe({50'000, 0, 8, 8 * 1024});
+  const auto limits = controller.NextLimits({8, 50'000, PressureState::kNormal});
+  EXPECT_EQ(limits.max_transactions, 8U);
+  EXPECT_EQ(limits.max_encoded_bytes, 8 * 1024U);
+  EXPECT_EQ(limits.max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, SlowWalKeepsAnAgedDeepGroupBounded) {
+  AdaptiveEpochController controller({32, 64 * 1024, 5'000, 200});
+  controller.Observe({5'000, 0, 8, 8 * 8192});
+  const auto limits = controller.NextLimits({256, 50'000, PressureState::kNormal});
+  EXPECT_EQ(limits.max_transactions, 32U);
+  EXPECT_EQ(limits.max_encoded_bytes, 64 * 1024U);
+  EXPECT_EQ(limits.max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, FastWalStillShrinksAnAgedGroup) {
+  AdaptiveEpochController controller(Options());
+  controller.Observe({100, 0, 8, 8 * 1024});
+  const auto limits = controller.NextLimits({8, 50'000, PressureState::kNormal});
+  EXPECT_EQ(limits.max_transactions, 4U);
+  EXPECT_EQ(limits.max_encoded_bytes, 4 * 1024U);
+  EXPECT_EQ(limits.max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, UnobservedWalStillShrinksAnAgedGroup) {
+  AdaptiveEpochController controller(Options());
+  const auto limits = controller.NextLimits({8, 50'000, PressureState::kNormal});
+  EXPECT_EQ(limits.max_transactions, 4U);
+  EXPECT_EQ(limits.max_encoded_bytes, 1ULL << 20);
+  EXPECT_EQ(limits.max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, SlowWalRetainsPressureProtection) {
+  AdaptiveEpochController controller(Options());
+  controller.Observe({50'000, 0, 8, 8 * 1024});
+  const auto soft = controller.NextLimits({256, 50'000, PressureState::kSoft});
+  EXPECT_EQ(soft.max_transactions, 64U);
+  EXPECT_EQ(soft.max_encoded_bytes, 1ULL << 20);
+  EXPECT_EQ(soft.max_age_us, 0U);
+  const auto hard = controller.NextLimits({256, 50'000, PressureState::kHard});
+  EXPECT_EQ(hard.max_transactions, 1U);
+  EXPECT_EQ(hard.max_encoded_bytes, 512ULL << 10);
+  EXPECT_EQ(hard.max_age_us, 0U);
+}
+
+TEST(AdaptiveEpochControllerTest, WalEstimateAdaptsAfterStorageRecovers) {
+  AdaptiveEpochController controller(Options());
+  controller.Observe({50'000, 0, 8, 8 * 1024});
+  EXPECT_EQ(controller.NextLimits({8, 50'000, PressureState::kNormal})
+                .max_transactions, 8U);
+  for (int i = 0; i < 32; ++i) {
+    controller.Observe({100, 0, 8, 8 * 1024});
+  }
+  EXPECT_EQ(controller.NextLimits({8, 50'000, PressureState::kNormal})
+                .max_transactions, 4U);
 }
 
 }  // namespace

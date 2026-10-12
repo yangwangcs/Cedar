@@ -692,8 +692,10 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
     return FromRocksDb(forward->status(), "iterate temporal neighborhood");
   }
 
-  std::unique_ptr<rocksdb::Iterator> backward(
-      store->db->NewIterator(options, store->facts_cf));
+  // Both scans use the same RocksDB snapshot and options. Reposition the
+  // iterator after checking the forward scan's status; no borrowed Slice is
+  // retained in the decoded neighborhood.
+  rocksdb::Iterator* backward = forward.get();
   std::optional<ValidTime> successor_boundary;
   bool successor_boundary_visible = false;
   backward->SeekForPrev(seek);

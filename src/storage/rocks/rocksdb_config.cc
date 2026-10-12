@@ -308,6 +308,13 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
   rocksdb::ColumnFamilyOptions default_options(options);
   rocksdb::ColumnFamilyOptions facts_options(options);
   rocksdb::ColumnFamilyOptions meta_options(options);
+  // Do not inherit RocksDB's Snappy-dependent default: Cedar builds LZ4 and
+  // Zstd, but not Snappy. Keep foreground flushes light and compress the
+  // bottommost metadata SSTs more densely. Existing files remain readable.
+  meta_options.compression = rocksdb::kLZ4Compression;
+  meta_options.bottommost_compression = rocksdb::kZSTD;
+  meta_options.bottommost_compression_opts.enabled = true;
+  meta_options.bottommost_compression_opts.level = 3;
   rocksdb::cedar_parquet::CedarParquetTableOptions parquet_options;
   if (resolved != nullptr) {
     parquet_options.page_compression =

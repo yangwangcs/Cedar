@@ -119,6 +119,8 @@ class Database::Impl {
     std::weak_ptr<AsyncSubmissionExecutor::Ticket> executor_ticket;
     std::atomic<bool> cancelled{false};
     bool selected = false;
+    // Protected by append_commit_mutex; only this request's sync caller waits.
+    std::condition_variable completed;
     std::optional<StatusOr<StoreCommitResult>> result;
   };
 
@@ -273,9 +275,9 @@ class Database::Impl {
   void ObserveAppendPressure(const PressureSample& sample);
   void AccountPressureTime();
   static void NotifyWalDurable(void* context) noexcept;
-  StatusOr<StoreCommitResult> SubmitSyncCommit(const StoreCommitBatch& batch,
+  StatusOr<StoreCommitResult> SubmitSyncCommit(StoreCommitBatch batch,
                                                uint64_t deadline_us = 0);
-  Status SubmitAsyncCommit(const StoreCommitBatch& batch,
+  Status SubmitAsyncCommit(StoreCommitBatch batch,
                            std::shared_ptr<CommitHandle::State> handle,
                            uint64_t deadline_us = 0);
   Status SubmitAsyncCommitToAppendPipeline(
@@ -369,7 +371,11 @@ class Database::Impl {
   bool stop_pipeline_before_drain_for_testing = false;
   bool enforce_disk_pressure = false;
   std::mutex append_commit_mutex;
-  std::condition_variable append_commit_cv;
+  // Separate waiter classes share the existing queue/predicate mutex.
+  std::condition_variable append_work_available;
+  std::condition_variable append_preflight_available;
+  std::condition_variable append_admission_changed;
+  std::condition_variable append_drained;
   std::deque<std::shared_ptr<AppendCommitRequest>> append_commit_requests;
   std::thread append_commit_worker;
   std::thread append_preflight_worker;

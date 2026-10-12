@@ -261,6 +261,26 @@ struct ValidationCacheMetrics {
   uint64_t recent_write_index_resets = 0;
   uint64_t recent_write_index_capacity = 0;
   uint64_t recent_write_index_resident_bytes = 0;
+  uint64_t canonical_page_hits = 0;
+  uint64_t canonical_page_misses = 0;
+  uint64_t canonical_page_decodes = 0;
+  uint64_t canonical_page_decoded_bytes = 0;
+  uint64_t canonical_page_resident_charge_bytes = 0;
+  uint64_t canonical_page_pinned_charge_bytes = 0;
+  uint64_t canonical_page_uncached_live_bytes = 0;
+  uint64_t canonical_page_insert_failures = 0;
+  uint64_t canonical_validation_scans = 0;
+  uint64_t canonical_validation_boundaries = 0;
+  uint64_t recent_write_exact_hits = 0;
+  uint64_t recent_write_bloom_hits = 0;
+  uint64_t recent_write_exact_absent = 0;
+  uint64_t recent_write_exact_newer = 0;
+  uint64_t recent_write_exact_evictions = 0;
+  uint64_t recent_write_exact_resets = 0;
+  uint64_t recent_write_coverage_misses = 0;
+  uint64_t recent_write_exact_capacity = 0;
+  uint64_t recent_write_exact_resident_bytes = 0;
+
 };
 
 struct StoreCommitGroupRequest {

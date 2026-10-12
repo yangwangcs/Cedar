@@ -406,6 +406,8 @@ class FactStoreImpl {
   std::atomic<uint64_t> projected_scan_pages_read{0};
   std::atomic<uint64_t> projected_scan_physical_bytes_read{0};
   std::atomic<uint64_t> canonical_scan_bytes_read{0};
+  std::atomic<uint64_t> canonical_validation_scans{0};
+  std::atomic<uint64_t> canonical_validation_boundaries{0};
   std::atomic<uint64_t> canonical_read_physical_bytes{0};
   std::atomic<uint64_t> logical_facts_bytes{0};
   IdAllocatorState vertex_allocator{IdKind::kVertex, 1};
@@ -417,6 +419,7 @@ class FactStoreImpl {
       std::make_shared<const PropertySchemas>();
   std::unique_ptr<internal::VersionValidationCache> version_validation_cache;
   std::unique_ptr<internal::RecentFactWriteIndex> recent_fact_write_index;
+  std::shared_ptr<rocksdb::cedar_parquet::CanonicalPageCacheMetrics> canonical_page_metrics;
   std::function<void()> validation_scan_observer_for_testing;
   size_t active_snapshots = 0;
   std::multiset<uint64_t> active_snapshot_sequences;
@@ -574,6 +577,7 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
   }
   const std::string prefix = EncodeFactIdentityPrefix(
       ref.part_id(), ref.family(), ref.property_id(), ref.entity_id());
+  store->canonical_validation_scans.fetch_add(1, std::memory_order_relaxed);
   if (store->validation_scan_observer_for_testing) {
     store->validation_scan_observer_for_testing();
   }
@@ -591,6 +595,7 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
         decoded.ValueOrDie().valid_from == *previous_boundary) {
       continue;
     }
+    store->canonical_validation_boundaries.fetch_add(1, std::memory_order_relaxed);
     intervals.push_back(CurrentFactInterval{decoded.ValueOrDie().valid_from,
                                              previous_boundary,
                                              decoded.ValueOrDie().commit_seq});
@@ -1265,8 +1270,10 @@ Status FactStore::Open() {
       UsesCedarKernelProfile(options_.storage_profile)
           ? &resolved_profile.ValueOrDie()
           : nullptr;
+  std::shared_ptr<rocksdb::Cache> shared_cache;
   rocksdb::Options options = internal::MakeRocksDbOptions(
-      options_, is_new_database, resolved_ptr);
+      options_, is_new_database, resolved_ptr, &shared_cache);
+  auto page_metrics = std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
 
   std::vector<std::string> existing_column_families;
   if (!is_new_database) {
@@ -1287,7 +1294,8 @@ Status FactStore::Open() {
   }
 
   std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
-      internal::MakeRocksDbColumnFamilyDescriptors(options_, options, resolved_ptr);
+      internal::MakeRocksDbColumnFamilyDescriptors(options_, options, resolved_ptr,
+          {shared_cache, page_metrics});
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   std::unique_ptr<rocksdb::DB> db;
   const rocksdb::Status opened =
@@ -1301,6 +1309,7 @@ Status FactStore::Open() {
   }
 
   auto store = std::make_shared<FactStoreImpl>();
+  store->canonical_page_metrics = std::move(page_metrics);
   store->db = std::move(db);
   store->default_cf = handles[0];
   store->facts_cf = handles[1];
@@ -4022,6 +4031,18 @@ StatusOr<ValidationCacheMetrics> FactStore::SampleValidationCacheMetrics() const
     if (!store) return Status::InvalidArgument("metrics", "store is not open");
   }
   ValidationCacheMetrics metrics;
+  if (store->canonical_page_metrics) {
+    metrics.canonical_page_hits = store->canonical_page_metrics->hits.load(std::memory_order_relaxed);
+    metrics.canonical_page_misses = store->canonical_page_metrics->misses.load(std::memory_order_relaxed);
+    metrics.canonical_page_decodes = store->canonical_page_metrics->decodes.load(std::memory_order_relaxed);
+    metrics.canonical_page_decoded_bytes = store->canonical_page_metrics->decoded_bytes.load(std::memory_order_relaxed);
+    metrics.canonical_page_resident_charge_bytes = store->canonical_page_metrics->resident_charge_bytes.load(std::memory_order_relaxed);
+    metrics.canonical_page_pinned_charge_bytes = store->canonical_page_metrics->pinned_charge_bytes.load(std::memory_order_relaxed);
+    metrics.canonical_page_uncached_live_bytes = store->canonical_page_metrics->uncached_live_bytes.load(std::memory_order_relaxed);
+    metrics.canonical_page_insert_failures = store->canonical_page_metrics->insert_failures.load(std::memory_order_relaxed);
+  }
+  metrics.canonical_validation_scans = store->canonical_validation_scans.load(std::memory_order_relaxed);
+  metrics.canonical_validation_boundaries = store->canonical_validation_boundaries.load(std::memory_order_relaxed);
   if (store->version_validation_cache == nullptr) return metrics;
   const auto cache_metrics = store->version_validation_cache->metrics();
   metrics.hits = cache_metrics.hits;
@@ -4032,6 +4053,15 @@ StatusOr<ValidationCacheMetrics> FactStore::SampleValidationCacheMetrics() const
   metrics.reserved_bytes = store->version_validation_cache->reserved_bytes();
   if (store->recent_fact_write_index != nullptr) {
     const auto index_metrics = store->recent_fact_write_index->metrics();
+    metrics.recent_write_exact_hits = index_metrics.exact_hits;
+    metrics.recent_write_bloom_hits = index_metrics.bloom_hits;
+    metrics.recent_write_exact_absent = index_metrics.exact_absent;
+    metrics.recent_write_exact_newer = index_metrics.exact_newer;
+    metrics.recent_write_exact_evictions = index_metrics.exact_evictions;
+    metrics.recent_write_exact_resets = index_metrics.exact_resets;
+    metrics.recent_write_coverage_misses = index_metrics.coverage_misses;
+    metrics.recent_write_exact_capacity = store->recent_fact_write_index->exact_capacity();
+    metrics.recent_write_exact_resident_bytes = store->recent_fact_write_index->exact_resident_bytes();
     metrics.recent_write_index_hits = index_metrics.hits;
     metrics.recent_write_index_misses = index_metrics.misses;
     metrics.recent_write_index_resets = index_metrics.resets;

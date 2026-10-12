@@ -5,12 +5,14 @@
 
 #include "rocksdb/table.h"
 #include "table/cedar_parquet/cedar_parquet_format.h"
+#include "table/cedar_parquet/cedar_parquet_read_resources.h"
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 
 class CedarParquetFactTableFactory final : public TableFactory {
  public:
-  explicit CedarParquetFactTableFactory(CedarParquetTableOptions options);
+  explicit CedarParquetFactTableFactory(CedarParquetTableOptions options,
+                                       CedarParquetReadResources resources = {});
 
   const char* Name() const override { return "CedarParquetFactTable"; }
   using TableFactory::NewTableReader;
@@ -31,6 +33,7 @@ class CedarParquetFactTableFactory final : public TableFactory {
 
  private:
   CedarParquetTableOptions options_;
+  CedarParquetReadResources read_resources_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE::cedar_parquet
@@ -39,5 +42,8 @@ namespace ROCKSDB_NAMESPACE {
 
 TableFactory* NewCedarParquetFactTableFactory(
     const cedar_parquet::CedarParquetTableOptions& table_options);
+TableFactory* NewCedarParquetFactTableFactory(
+    const cedar_parquet::CedarParquetTableOptions& table_options,
+    cedar_parquet::CedarParquetReadResources resources);
 
 }  // namespace ROCKSDB_NAMESPACE

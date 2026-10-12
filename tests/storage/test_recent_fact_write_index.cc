@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <random>
 #include <unordered_map>
+#include <limits>
 
 #include "storage/facts/recent_fact_write_index.h"
 
@@ -67,6 +68,36 @@ TEST(RecentFactWriteIndexTest, EqualSequenceAndUnexpectedOlderPublicationStaySaf
   EXPECT_FALSE(index.CanProveUnchanged(a, CommitSeq{9}));
   index.Publish(b, CommitSeq{11});
   EXPECT_TRUE(index.CanProveUnchanged(b, CommitSeq{11}));
+}
+
+TEST(RecentFactWriteIndexTest, FullIdentityAndSequenceMaximumRemainDistinct) {
+  RecentFactWriteIndex index(4096, CommitSeq{7});
+  const FactRef vertex = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{71}}).ref();
+  const FactRef property = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{71}},
+                                              PropertyId{1}).ref();
+  index.Publish(vertex, CommitSeq{8});
+  index.Publish(property, CommitSeq{9});
+  EXPECT_TRUE(index.CanProveUnchanged(vertex, CommitSeq{8}));
+  EXPECT_FALSE(index.CanProveUnchanged(property, CommitSeq{8}));
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  index.Publish(vertex, CommitSeq{maximum});
+  index.Publish(property, CommitSeq{maximum});
+  EXPECT_FALSE(index.CanProveUnchanged(vertex, CommitSeq{maximum-1}));
+  EXPECT_TRUE(index.CanProveUnchanged(vertex, CommitSeq{maximum}));
+  EXPECT_TRUE(index.CanProveUnchanged(property, CommitSeq{maximum}));
+}
+
+TEST(RecentFactWriteIndexTest, ExactSlotsEvictWithoutTreatingMissAsAbsence) {
+  RecentFactWriteIndex index(1024, CommitSeq{7});
+  ASSERT_GT(index.exact_capacity(),0U);
+  const uint64_t count=index.exact_capacity()*16;
+  for(uint64_t id=1;id<=count;++id)
+    index.Publish(EntityFact::Vertex(VertexRef{PartId{0},VertexId{id}}).ref(),CommitSeq{7+id});
+  EXPECT_GT(index.metrics().exact_evictions,0U);
+  for(uint64_t id=1;id<=count;++id)
+    EXPECT_FALSE(index.CanProveUnchanged(
+        EntityFact::Vertex(VertexRef{PartId{0},VertexId{id}}).ref(),CommitSeq{7}));
+  EXPECT_LE(index.resident_bytes(),1024U);
 }
 
 TEST(RecentFactWriteIndexTest, ProvesUnchangedOnlyAfterCoveredSnapshot) {

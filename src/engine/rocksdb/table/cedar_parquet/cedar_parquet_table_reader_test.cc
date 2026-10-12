@@ -7,6 +7,7 @@
 #include <optional>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -16,6 +17,7 @@
 #include "rocksdb/cedar_commit.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "rocksdb/cache.h"
 #include "table/cedar_parquet/cedar_parquet_table_builder.h"
 #include "table/cedar_parquet/cedar_parquet_table_reader.h"
 #include "table/cedar_parquet/parquet_plain_page.h"
@@ -120,7 +122,9 @@ std::unique_ptr<CedarParquetTableReader> BuildAndOpen(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_options,
     const InternalKeyComparator& comparator, uint32_t row_group_max_rows = 2,
-    uint32_t page_max_rows = 1, uint64_t row_group_max_bytes = 4096) {
+    uint32_t page_max_rows = 1, uint64_t row_group_max_bytes = 4096,
+    CedarParquetReadResources resources = {NewLRUCache(1<<20),
+        std::make_shared<CanonicalPageCacheMetrics>()}) {
   std::unique_ptr<WritableFileWriter> writer;
   EXPECT_TRUE(WritableFileWriter::Create(Env::Default()->GetFileSystem(), TestPath(),
                                          FileOptions(), &writer, nullptr)
@@ -146,7 +150,7 @@ std::unique_ptr<CedarParquetTableReader> BuildAndOpen(
                   .ok());
   std::unique_ptr<CedarParquetTableReader> reader;
   Status open_status = CedarParquetTableReader::Open(comparator, std::move(file), file_size,
-                                                      options, &reader);
+                                                      options, &reader, std::move(resources));
   EXPECT_TRUE(open_status.ok()) << open_status.ToString();
   return reader;
 }
@@ -909,6 +913,160 @@ TEST(CedarParquetTableReaderTest, ReusesCanonicalPageAcrossGets) {
     EXPECT_EQ(value.ToString(), values[0]);
   }
   EXPECT_EQ(reader->PageDecodeCountForTesting(), 1U);
+}
+
+TEST(CedarParquetTableReaderTest, AlternatingTenPagesReusesSharedCache) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys, values;
+  for (uint64_t id = 1; id <= 10; ++id) {
+    keys.push_back(InternalKeyFor(id, 11-id));
+    values.push_back(StateFactValue());
+  }
+  auto reader = BuildAndOpen(keys, values, immutable_options, mutable_options,
+                             comparator, 10, 1);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  for (const std::string& key : keys) {
+    iterator->Seek(key); ASSERT_TRUE(iterator->Valid());
+    ASSERT_EQ(iterator->key().ToString(), key);
+  }
+  reader->ResetPageDecodeCountForTesting();
+  for (size_t i = 0; i < 640; ++i) {
+    const size_t index = i % keys.size();
+    iterator->Seek(keys[index]); ASSERT_TRUE(iterator->Valid());
+    ASSERT_EQ(iterator->value().ToString(), values[index]);
+  }
+  EXPECT_EQ(reader->PageDecodeCountForTesting(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, PinnedPageRemainsChargedUntilIteratorRelease) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1<<20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  const std::vector<std::string> keys = {InternalKeyFor(1,4)};
+  auto reader=BuildAndOpen(keys,{StateFactValue()},immutable_options,mutable_options,
+                          comparator,2,1,4096,{cache,metrics});
+  std::unique_ptr<InternalIterator> it(reader->NewIterator(
+      ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+  it->Seek(keys[0]); ASSERT_TRUE(it->Valid());
+  const uint64_t bytes=metrics->resident_charge_bytes.load();
+  ASSERT_GT(bytes,0U); EXPECT_EQ(metrics->pinned_charge_bytes.load(),bytes);
+  cache->SetCapacity(1); cache->EraseUnRefEntries();
+  EXPECT_EQ(metrics->resident_charge_bytes.load(),bytes);
+  EXPECT_EQ(it->value().ToString(),StateFactValue());
+  it.reset(); reader.reset(); cache->EraseUnRefEntries();
+  EXPECT_EQ(metrics->resident_charge_bytes.load(),0U);
+  EXPECT_EQ(metrics->pinned_charge_bytes.load(),0U);
+  EXPECT_EQ(metrics->uncached_live_bytes.load(),0U);
+}
+
+TEST(CedarParquetTableReaderTest, OversizeAndNoCachePagesHaveBoundedLifetime) {
+  for (bool cache_enabled : {false,true}) {
+    Options options;
+    ImmutableOptions immutable_options(options);
+    MutableCFOptions mutable_options(options);
+    InternalKeyComparator comparator(BytewiseComparator());
+    auto metrics=std::make_shared<CanonicalPageCacheMetrics>();
+    auto cache=cache_enabled?NewLRUCache(1,0,true):std::shared_ptr<Cache>{};
+    const std::vector<std::string> keys={InternalKeyFor(1,4)};
+    auto reader=BuildAndOpen(keys,{StateFactValue()},immutable_options,mutable_options,
+                            comparator,2,1,4096,{cache,metrics});
+    std::unique_ptr<InternalIterator> it(reader->NewIterator(
+        ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+    it->Seek(keys[0]);ASSERT_TRUE(it->Valid());
+    EXPECT_EQ(it->value().ToString(),StateFactValue());
+    EXPECT_GT(metrics->uncached_live_bytes.load(),0U);
+    EXPECT_EQ(metrics->resident_charge_bytes.load(),0U);
+    it.reset();reader.reset();
+    EXPECT_EQ(metrics->uncached_live_bytes.load(),0U);
+  }
+}
+
+TEST(CedarParquetTableReaderTest, ReaderNamespacesDoNotMixSamePageCoordinates) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache=NewLRUCache(1<<20,0,true);
+  auto metrics=std::make_shared<CanonicalPageCacheMetrics>();
+  const std::string first_key=InternalKeyFor(1,4),second_key=InternalKeyFor(99,4);
+  auto first=BuildAndOpen({first_key},{StateFactValue()},immutable_options,mutable_options,
+                          comparator,2,1,4096,{cache,metrics});
+  std::unique_ptr<InternalIterator> a(first->NewIterator(
+      ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+  a->Seek(first_key);ASSERT_TRUE(a->Valid());
+  // Detach the first immutable inode before the fixture creates a second SST.
+  ASSERT_EQ(std::rename(TestPath().c_str(),(TestPath()+".first").c_str()),0);
+  auto second=BuildAndOpen({second_key},{StateFactValue()},immutable_options,mutable_options,
+                           comparator,2,1,4096,{cache,metrics});
+  std::unique_ptr<InternalIterator> b(second->NewIterator(
+      ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+  b->Seek(second_key);ASSERT_TRUE(b->Valid());
+  EXPECT_EQ(b->key().ToString(),second_key);
+  EXPECT_EQ(a->key().ToString(),first_key);
+  EXPECT_EQ(metrics->decodes.load(),2U);
+  a.reset();b.reset();first.reset();second.reset();cache->EraseUnRefEntries();
+  EXPECT_EQ(metrics->resident_charge_bytes.load(),0U);
+  std::remove((TestPath()+".first").c_str());
+}
+
+TEST(CedarParquetTableReaderTest, ConcurrentMissesPreserveValuesAndReleaseCharges) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache=NewLRUCache(1<<20,0,true);
+  auto metrics=std::make_shared<CanonicalPageCacheMetrics>();
+  const std::vector<std::string> keys={InternalKeyFor(1,4),InternalKeyFor(2,3)};
+  auto reader=BuildAndOpen(keys,{StateFactValue(),StateFactValue()},immutable_options,
+                          mutable_options,comparator,2,1,4096,{cache,metrics});
+  std::atomic<bool> valid{true};std::vector<std::thread> threads;
+  for (unsigned w=0;w<8;++w) threads.emplace_back([&]{
+    std::unique_ptr<InternalIterator> it(reader->NewIterator(
+        ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+    for(unsigned n=0;n<128;++n) {
+      it->Seek(keys[n%2]);
+      if(!it->Valid()||it->value().ToString()!=StateFactValue())valid=false;
+    }
+  });
+  for(auto& t:threads)t.join();EXPECT_TRUE(valid.load());
+  reader.reset();cache->EraseUnRefEntries();
+  EXPECT_EQ(metrics->resident_charge_bytes.load(),0U);
+  EXPECT_EQ(metrics->pinned_charge_bytes.load(),0U);
+  EXPECT_EQ(metrics->uncached_live_bytes.load(),0U);
+}
+
+TEST(CedarParquetTableReaderTest, FullPinnedCacheInsertFailureKeepsReadCorrect) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache=NewLRUCache(1<<20,0,true);
+  auto metrics=std::make_shared<CanonicalPageCacheMetrics>();
+  const std::vector<std::string> keys={InternalKeyFor(1,4),InternalKeyFor(2,3)};
+  auto reader=BuildAndOpen(keys,{StateFactValue(),StateFactValue()},immutable_options,
+                          mutable_options,comparator,2,1,4096,{cache,metrics});
+  std::unique_ptr<InternalIterator> a(reader->NewIterator(
+      ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+  a->Seek(keys[0]);ASSERT_TRUE(a->Valid());
+  cache->SetCapacity(cache->GetUsage()+1);
+  std::unique_ptr<InternalIterator> b(reader->NewIterator(
+      ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
+  b->Seek(keys[1]);ASSERT_TRUE(b->Valid());
+  EXPECT_EQ(b->value().ToString(),StateFactValue());
+  EXPECT_EQ(metrics->insert_failures.load(),1U);
+  EXPECT_GT(metrics->uncached_live_bytes.load(),0U);
+  b.reset();EXPECT_EQ(metrics->uncached_live_bytes.load(),0U);
+  a.reset();reader.reset();cache->EraseUnRefEntries();
+  EXPECT_EQ(metrics->resident_charge_bytes.load(),0U);
+  EXPECT_EQ(metrics->pinned_charge_bytes.load(),0U);
 }
 
 TEST(CedarParquetTableReaderTest, BloomRejectsMissingUserKeyBeforePageDecode) {

@@ -228,7 +228,8 @@ Status ValidateProductionWalPlacement(const FactStoreOptions& options) {
 
 rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
                                     bool is_new_database,
-                                    const ResolvedStorageProfile* resolved) {
+                                    const ResolvedStorageProfile* resolved,
+                                    std::shared_ptr<rocksdb::Cache>* shared_cache_out) {
   rocksdb::Options result;
   result.create_if_missing = true;
   result.create_missing_column_families = is_new_database;
@@ -239,11 +240,14 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
     result.atomic_flush = true;
     result.enable_blob_files = true;
     result.min_blob_size = options.blob_threshold_bytes;
-    result.table_factory = MakeTableFactory(MakeBlockCache(options.block_cache_bytes));
+    const auto cache = MakeBlockCache(options.block_cache_bytes);
+    result.table_factory = MakeTableFactory(cache);
+    if (shared_cache_out) *shared_cache_out = cache;
     return result;
   }
 
   const auto cache = MakeBlockCache(resolved->block_cache_bytes);
+  if (shared_cache_out) *shared_cache_out = cache;
   result.write_buffer_size = resolved->default_write_buffer_bytes;
   const uint64_t write_buffer_manager_bytes =
       options.storage_profile == StorageProfile::kKernelTest
@@ -304,7 +308,8 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
 
 std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
     const FactStoreOptions& store_options, const rocksdb::Options& options,
-    const ResolvedStorageProfile* resolved) {
+    const ResolvedStorageProfile* resolved,
+    rocksdb::cedar_parquet::CedarParquetReadResources resources) {
   rocksdb::ColumnFamilyOptions default_options(options);
   rocksdb::ColumnFamilyOptions facts_options(options);
   rocksdb::ColumnFamilyOptions meta_options(options);
@@ -321,7 +326,7 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
         rocksdb::cedar_parquet::CedarParquetCompressionCodec::kLz4Raw;
   }
   facts_options.table_factory = std::shared_ptr<rocksdb::TableFactory>(
-      rocksdb::NewCedarParquetFactTableFactory(parquet_options));
+      rocksdb::NewCedarParquetFactTableFactory(parquet_options, std::move(resources)));
   facts_options.enable_blob_files = false;
   facts_options.memtable_factory = std::make_shared<rocksdb::PartitionedVersionRadixFactory>();
   facts_options.compression = rocksdb::kNoCompression;

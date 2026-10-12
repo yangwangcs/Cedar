@@ -13,6 +13,8 @@
 #include "file/random_access_file_reader.h"
 #include "rocksdb/table_properties.h"
 #include "table/cedar_parquet/cedar_parquet_format.h"
+#include "table/cedar_parquet/cedar_parquet_read_resources.h"
+#include "rocksdb/advanced_cache.h"
 #include "table/cedar_parquet/parquet_metadata.h"
 #include "table/cedar_parquet/parquet_bloom_filter.h"
 #include "table/table_reader.h"
@@ -27,7 +29,8 @@ class CedarParquetTableReader final : public TableReader {
   static Status Open(const InternalKeyComparator& internal_comparator,
                      std::unique_ptr<RandomAccessFileReader>&& file,
                      uint64_t file_size, CedarParquetTableOptions options,
-                     std::unique_ptr<CedarParquetTableReader>* reader);
+                     std::unique_ptr<CedarParquetTableReader>* reader,
+                     CedarParquetReadResources resources = {});
 
   InternalIterator* NewIterator(const ReadOptions& read_options,
                                 const SliceTransform* prefix_extractor,
@@ -86,6 +89,23 @@ class CedarParquetTableReader final : public TableReader {
     std::vector<std::string> internal_keys;
     std::vector<std::string> values;
   };
+  struct CachePage {
+    DecodedCanonicalPage page;
+    size_t charge = 0;
+    bool cached = false;
+    std::atomic<uint32_t> pins{0};
+    std::shared_ptr<CanonicalPageCacheMetrics> metrics;
+    ~CachePage();
+  };
+  struct PageOwner {
+    std::shared_ptr<Cache> cache;
+    Cache::Handle* handle = nullptr;
+    CachePage* entry = nullptr;
+    std::unique_ptr<CachePage> transient;
+    PageOwner(std::shared_ptr<Cache> cache, Cache::Handle* handle, CachePage* entry);
+    explicit PageOwner(std::unique_ptr<CachePage> page);
+    ~PageOwner();
+  };
 
   CedarParquetTableReader(const InternalKeyComparator& internal_comparator,
                           std::unique_ptr<RandomAccessFileReader>&& file,
@@ -93,7 +113,8 @@ class CedarParquetTableReader final : public TableReader {
                           CedarParquetFooter footer,
                           std::shared_ptr<TableProperties> table_properties,
                           size_t footer_bytes,
-                          std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms);
+                          std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms,
+                          CedarParquetReadResources resources);
 
   Status DecodeRowGroup(size_t row_group_index, DecodedRowGroup* decoded) const;
   Status DecodeCanonicalPage(size_t row_group_index, size_t page_index,
@@ -120,14 +141,8 @@ class CedarParquetTableReader final : public TableReader {
   std::vector<std::optional<CedarSplitBlockBloomFilter>> user_key_blooms_;
   size_t bloom_bytes_ = 0;
   mutable std::atomic<uint64_t> page_decode_count_{0};
-  struct CachedCanonicalPage {
-    size_t row_group_index = 0;
-    size_t page_index = 0;
-    size_t bytes = 0;
-    std::shared_ptr<const DecodedCanonicalPage> decoded;
-  };
-  mutable std::mutex page_cache_mutex_;
-  mutable std::optional<CachedCanonicalPage> page_cache_;
+  CedarParquetReadResources read_resources_;
+  uint64_t page_cache_namespace_ = 0;
 };
 
 class CedarParquetProjectedCursor final {

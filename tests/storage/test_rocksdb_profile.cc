@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "rocksdb/advanced_cache.h"
 
 #include <filesystem>
 #include <limits>
@@ -105,6 +106,28 @@ TEST(RocksDbProfileTest, RejectsProductionBudgetBelowOneGiB) {
   ASSERT_FALSE(resolved.ok());
   EXPECT_TRUE(resolved.status().IsInvalidArgument())
       << resolved.status().ToString();
+}
+
+TEST(RocksDbProfileTest, ExposesExistingCacheWithoutAllocatingSecondBudget) {
+  FactStoreOptions store;
+  store.storage_profile=StorageProfile::kProductionAppend;
+  store.production.memory_budget_bytes=4ULL<<30;
+  const auto resolved=ResolveStorageProfile(store);
+  ASSERT_TRUE(resolved.ok());
+  std::shared_ptr<rocksdb::Cache> cache;
+  const auto options=MakeRocksDbOptions(store,true,&resolved.ValueOrDie(),&cache);
+  ASSERT_NE(cache,nullptr);
+  EXPECT_EQ(cache->GetCapacity(),resolved.ValueOrDie().block_cache_bytes);
+  const auto* block=options.table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+  ASSERT_NE(block,nullptr);
+  EXPECT_EQ(block->block_cache.get(),cache.get());
+  auto page_metrics=std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
+  const auto descriptors=MakeRocksDbColumnFamilyDescriptors(
+      store,options,&resolved.ValueOrDie(),{cache,page_metrics});
+  const auto* meta=descriptors[2].options.table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+  ASSERT_NE(meta,nullptr);
+  EXPECT_EQ(meta->block_cache.get(),cache.get());
+  EXPECT_EQ(cache->GetCapacity(),resolved.ValueOrDie().block_cache_bytes);
 }
 
 TEST(RocksDbProfileTest, KernelTestProfileAcceleratesMaintenanceLifecycle) {

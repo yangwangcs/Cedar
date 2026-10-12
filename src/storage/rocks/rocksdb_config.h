@@ -8,6 +8,7 @@
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "engine/rocksdb/table/cedar_parquet/cedar_parquet_read_resources.h"
 
 #include "storage/facts/fact_store.h"
 
@@ -34,12 +35,14 @@ Status ValidateProductionWalPlacement(const FactStoreOptions& options);
 
 rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
                                     bool is_new_database,
-                                    const ResolvedStorageProfile* resolved = nullptr);
+                                    const ResolvedStorageProfile* resolved = nullptr,
+                                    std::shared_ptr<rocksdb::Cache>* shared_cache_out = nullptr);
 
 std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
     const FactStoreOptions& store_options,
     const rocksdb::Options& options,
-    const ResolvedStorageProfile* resolved = nullptr);
+    const ResolvedStorageProfile* resolved = nullptr,
+    rocksdb::cedar_parquet::CedarParquetReadResources resources = {});
 
 }  // namespace cedar::internal
 

@@ -790,7 +790,8 @@ CedarParquetTableReader::CedarParquetTableReader(
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
     CedarParquetTableOptions options, CedarParquetFooter footer,
     std::shared_ptr<TableProperties> table_properties, size_t footer_bytes,
-    std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms)
+    std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms,
+    CedarParquetReadResources resources)
     : internal_comparator_(&internal_comparator),
       file_(std::move(file)),
       file_size_(file_size),
@@ -798,7 +799,11 @@ CedarParquetTableReader::CedarParquetTableReader(
       footer_(std::move(footer)),
       table_properties_(std::move(table_properties)),
       footer_bytes_(footer_bytes),
-      user_key_blooms_(std::move(blooms)) {
+      user_key_blooms_(std::move(blooms)), read_resources_(std::move(resources)) {
+  if (!read_resources_.metrics)
+    read_resources_.metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  if (read_resources_.canonical_page_cache)
+    page_cache_namespace_ = read_resources_.canonical_page_cache->NewId();
   for (const auto& bloom : user_key_blooms_) {
     if (bloom.has_value()) bloom_bytes_ += bloom->bitset_bytes();
   }
@@ -808,7 +813,8 @@ Status CedarParquetTableReader::Open(
     const InternalKeyComparator& internal_comparator,
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
     CedarParquetTableOptions options,
-    std::unique_ptr<CedarParquetTableReader>* reader) {
+    std::unique_ptr<CedarParquetTableReader>* reader,
+    CedarParquetReadResources resources) {
   Status status = options.Validate();
   if (!status.ok()) return status;
   if (file == nullptr || file_size < 12) return Status::Corruption("truncated Cedar Parquet file");
@@ -1027,7 +1033,8 @@ Status CedarParquetTableReader::Open(
   reader->reset(new CedarParquetTableReader(internal_comparator, std::move(file),
                                              file_size, std::move(options),
                                              std::move(footer), std::move(properties),
-                                             footer_bytes.size(), std::move(blooms)));
+                                             footer_bytes.size(), std::move(blooms),
+                                             std::move(resources)));
   return Status::OK();
 }
 
@@ -1242,37 +1249,89 @@ Status CedarParquetTableReader::DecodeCanonicalPage(
   return Status::OK();
 }
 
+CedarParquetTableReader::CachePage::~CachePage() {
+  if (!metrics) return;
+  if (cached) metrics->resident_charge_bytes.fetch_sub(charge, std::memory_order_relaxed);
+  else metrics->uncached_live_bytes.fetch_sub(charge, std::memory_order_relaxed);
+}
+
+CedarParquetTableReader::PageOwner::PageOwner(
+    std::shared_ptr<Cache> source, Cache::Handle* pin, CachePage* page)
+    : cache(std::move(source)), handle(pin), entry(page) {
+  if (entry->pins.fetch_add(1, std::memory_order_relaxed) == 0)
+    entry->metrics->pinned_charge_bytes.fetch_add(entry->charge, std::memory_order_relaxed);
+}
+CedarParquetTableReader::PageOwner::PageOwner(std::unique_ptr<CachePage> page)
+    : entry(page.get()), transient(std::move(page)) {}
+CedarParquetTableReader::PageOwner::~PageOwner() {
+  if (handle) {
+    if (entry->pins.fetch_sub(1, std::memory_order_relaxed) == 1)
+      entry->metrics->pinned_charge_bytes.fetch_sub(entry->charge, std::memory_order_relaxed);
+    cache->Release(handle);
+  }
+}
+
 Status CedarParquetTableReader::LoadCanonicalPage(
     size_t row_group_index, size_t page_index,
     std::shared_ptr<const DecodedCanonicalPage>* decoded) const {
   if (decoded == nullptr) {
     return Status::InvalidArgument("missing Cedar Parquet page destination");
   }
-  {
-    std::lock_guard<std::mutex> lock(page_cache_mutex_);
-    if (page_cache_.has_value() &&
-        page_cache_->row_group_index == row_group_index &&
-        page_cache_->page_index == page_index) {
-      *decoded = page_cache_->decoded;
+  const auto& cache = read_resources_.canonical_page_cache;
+  const auto& metrics = read_resources_.metrics;
+  std::string key;
+  for (uint64_t component : {page_cache_namespace_, static_cast<uint64_t>(row_group_index),
+                             static_cast<uint64_t>(page_index)})
+    for (unsigned shift = 0; shift < 64; shift += 8)
+      key.push_back(static_cast<char>(component >> shift));
+  static const Cache::CacheItemHelper helper(CacheEntryRole::kDataBlock,
+      [](Cache::ObjectPtr object, MemoryAllocator*) { delete static_cast<CachePage*>(object); });
+  if (cache) {
+    if (Cache::Handle* handle = cache->Lookup(key)) {
+      auto* entry = static_cast<CachePage*>(cache->Value(handle));
+      auto owner = std::make_shared<PageOwner>(cache, handle, entry);
+      *decoded = std::shared_ptr<const DecodedCanonicalPage>(owner, &entry->page);
+      metrics->hits.fetch_add(1, std::memory_order_relaxed);
       return Status::OK();
     }
   }
-
-  auto loaded = std::make_shared<DecodedCanonicalPage>();
-  Status status = DecodeCanonicalPage(row_group_index, page_index, loaded.get());
+  metrics->misses.fetch_add(1, std::memory_order_relaxed);
+  auto loaded = std::make_unique<CachePage>();
+  // Metrics ownership and charge are assigned only after successful decode,
+  // so a corrupt/partial page cannot decrement bytes it never acquired.
+  Status status = DecodeCanonicalPage(row_group_index, page_index, &loaded->page);
   if (!status.ok()) return status;
-  size_t bytes = 0;
+  metrics->decodes.fetch_add(1, std::memory_order_relaxed);
+  size_t bytes = sizeof(CachePage) + sizeof(PageOwner) + key.capacity();
   const auto add_column_bytes = [&bytes](const std::vector<std::string>& column) {
-    for (const std::string& value : column) bytes += value.size();
+    bytes += column.capacity() * sizeof(std::string);
+    for (const std::string& value : column) bytes += value.capacity();
   };
-  add_column_bytes(loaded->sort_keys);
-  add_column_bytes(loaded->internal_keys);
-  add_column_bytes(loaded->values);
-  if (bytes <= options_.page_max_bytes) {
-    std::lock_guard<std::mutex> lock(page_cache_mutex_);
-    page_cache_ = CachedCanonicalPage{row_group_index, page_index, bytes, loaded};
+  add_column_bytes(loaded->page.sort_keys);
+  add_column_bytes(loaded->page.internal_keys);
+  add_column_bytes(loaded->page.values);
+  metrics->decoded_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  loaded->charge = bytes;
+  loaded->metrics = metrics;
+  if (cache && bytes <= cache->GetCapacity()) {
+    loaded->cached = true;
+    metrics->resident_charge_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    Cache::Handle* handle = nullptr;
+    status = cache->Insert(key, loaded.get(), &helper, bytes, &handle);
+    if (status.ok()) {
+      CachePage* entry = loaded.release();
+      auto owner = std::make_shared<PageOwner>(cache, handle, entry);
+      *decoded = std::shared_ptr<const DecodedCanonicalPage>(owner, &entry->page);
+      return Status::OK();
+    }
+    loaded->cached = false;
+    metrics->resident_charge_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    metrics->insert_failures.fetch_add(1, std::memory_order_relaxed);
   }
-  *decoded = std::move(loaded);
+  metrics->uncached_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  CachePage* entry = loaded.get();
+  auto owner = std::make_shared<PageOwner>(std::move(loaded));
+  *decoded = std::shared_ptr<const DecodedCanonicalPage>(owner, &entry->page);
   return Status::OK();
 }
 

@@ -1159,9 +1159,47 @@ TEST(KernelSnapshotValidationTest,
   EXPECT_EQ(stale_result.ValueOrDie().outcome, CommitOutcome::kAborted);
   EXPECT_TRUE(stale_result.ValueOrDie().status.IsConflict());
   EXPECT_GT(canonical_scans.load(std::memory_order_relaxed), 0U);
+  const auto metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.canonical_validation_scans, canonical_scans.load());
+  EXPECT_GT(metrics.canonical_validation_boundaries, 0U);
 
   ASSERT_TRUE(database->Close().ok());
   std::filesystem::remove_all(path);
+}
+
+TEST(KernelSnapshotValidationTest, LongHistoryUnchangedIdentityAvoidsCanonicalScan) {
+  char pattern[] = "/tmp/cedar_long_history_exact_proof_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  std::atomic<uint64_t> scans{0};
+  DatabaseOptions options;
+  options.path = pattern;
+  options.group_commit_max_batch_size = 1;
+  options.group_commit_window_us = 0;
+  options.validation_scan_observer_for_testing = [&] { ++scans; };
+  auto opened = Database::Open(options);
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  const EntityFact target = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{971}});
+  for (uint64_t t = 1; t <= 32; ++t) {
+    auto tx = database->BeginTransaction(); ASSERT_TRUE(tx.ok());
+    ASSERT_TRUE(tx.ValueOrDie()->Assert(target, ValidTime{t}).ok());
+    auto committed = tx.ValueOrDie()->Commit(); ASSERT_TRUE(committed.ok());
+    ASSERT_TRUE(committed.ValueOrDie().status.ok());
+  }
+  auto transaction = database->BeginTransaction(); ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(target, ValidTime{33}).ok());
+  auto unrelated = database->BeginTransaction(); ASSERT_TRUE(unrelated.ok());
+  ASSERT_TRUE(unrelated.ValueOrDie()->Assert(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{972}}), ValidTime{1}).ok());
+  auto other = unrelated.ValueOrDie()->Commit(); ASSERT_TRUE(other.ok());
+  ASSERT_TRUE(other.ValueOrDie().status.ok());
+  const uint64_t before = scans.load();
+  auto committed = transaction.ValueOrDie()->Commit(); ASSERT_TRUE(committed.ok());
+  ASSERT_TRUE(committed.ValueOrDie().status.ok());
+  EXPECT_EQ(scans.load(), before);
+  EXPECT_GT(database->GetCommitPipelineMetrics().recent_write_exact_hits, 0U);
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(pattern);
 }
 
 TEST(KernelTransactionAllocationTest, AllocatesLeasedTransactionIdWhileWriterIsBlocked) {

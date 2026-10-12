@@ -27,8 +27,8 @@ const char* CompressionCodecName(CedarParquetCompressionCodec codec) {
 }  // namespace
 
 CedarParquetFactTableFactory::CedarParquetFactTableFactory(
-    CedarParquetTableOptions options)
-    : options_(std::move(options)) {}
+    CedarParquetTableOptions options, CedarParquetReadResources resources)
+    : options_(std::move(options)), read_resources_(std::move(resources)) {}
 
 Status CedarParquetFactTableFactory::NewTableReader(
     const ReadOptions& read_options, const TableReaderOptions& table_reader_options,
@@ -46,7 +46,7 @@ Status CedarParquetFactTableFactory::NewTableReader(
     std::unique_ptr<CedarParquetTableReader> cedar_reader;
     Status status = CedarParquetTableReader::Open(
         table_reader_options.internal_comparator, std::move(file), file_size,
-        options_, &cedar_reader);
+        options_, &cedar_reader, read_resources_);
     if (status.ok()) table_reader->reset(cedar_reader.release());
     return status;
   }
@@ -100,7 +100,13 @@ namespace ROCKSDB_NAMESPACE {
 
 TableFactory* NewCedarParquetFactTableFactory(
     const cedar_parquet::CedarParquetTableOptions& table_options) {
-  return new cedar_parquet::CedarParquetFactTableFactory(table_options);
+  return NewCedarParquetFactTableFactory(table_options, {});
+}
+
+TableFactory* NewCedarParquetFactTableFactory(
+    const cedar_parquet::CedarParquetTableOptions& table_options,
+    cedar_parquet::CedarParquetReadResources resources) {
+  return new cedar_parquet::CedarParquetFactTableFactory(table_options, std::move(resources));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

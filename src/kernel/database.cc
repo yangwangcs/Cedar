@@ -2349,6 +2349,25 @@ CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {
   metrics.async_mailbox_bytes_reserved = impl_->async_executor.ReservedBytes();
   const auto cache_metrics = impl_->store.SampleValidationCacheMetrics();
   if (cache_metrics.ok()) {
+    metrics.canonical_page_hits = cache_metrics.ValueOrDie().canonical_page_hits;
+    metrics.canonical_page_misses = cache_metrics.ValueOrDie().canonical_page_misses;
+    metrics.canonical_page_decodes = cache_metrics.ValueOrDie().canonical_page_decodes;
+    metrics.canonical_page_decoded_bytes = cache_metrics.ValueOrDie().canonical_page_decoded_bytes;
+    metrics.canonical_page_resident_charge_bytes = cache_metrics.ValueOrDie().canonical_page_resident_charge_bytes;
+    metrics.canonical_page_pinned_charge_bytes = cache_metrics.ValueOrDie().canonical_page_pinned_charge_bytes;
+    metrics.canonical_page_uncached_live_bytes = cache_metrics.ValueOrDie().canonical_page_uncached_live_bytes;
+    metrics.canonical_page_insert_failures = cache_metrics.ValueOrDie().canonical_page_insert_failures;
+    metrics.canonical_validation_scans = cache_metrics.ValueOrDie().canonical_validation_scans;
+    metrics.canonical_validation_boundaries = cache_metrics.ValueOrDie().canonical_validation_boundaries;
+    metrics.recent_write_exact_hits = cache_metrics.ValueOrDie().recent_write_exact_hits;
+    metrics.recent_write_bloom_hits = cache_metrics.ValueOrDie().recent_write_bloom_hits;
+    metrics.recent_write_exact_absent = cache_metrics.ValueOrDie().recent_write_exact_absent;
+    metrics.recent_write_exact_newer = cache_metrics.ValueOrDie().recent_write_exact_newer;
+    metrics.recent_write_exact_evictions = cache_metrics.ValueOrDie().recent_write_exact_evictions;
+    metrics.recent_write_exact_resets = cache_metrics.ValueOrDie().recent_write_exact_resets;
+    metrics.recent_write_coverage_misses = cache_metrics.ValueOrDie().recent_write_coverage_misses;
+    metrics.recent_write_exact_capacity = cache_metrics.ValueOrDie().recent_write_exact_capacity;
+    metrics.recent_write_exact_resident_bytes = cache_metrics.ValueOrDie().recent_write_exact_resident_bytes;
     metrics.validation_cache_hits = cache_metrics.ValueOrDie().hits;
     metrics.validation_cache_misses = cache_metrics.ValueOrDie().misses;
     metrics.validation_cache_resident_chains =

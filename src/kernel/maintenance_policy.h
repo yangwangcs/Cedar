@@ -39,6 +39,9 @@ struct CedarRuntimeSnapshot {
   PressureSample pressure;
   RocksDbRuntimeMetrics rocksdb;
   PressureState pressure_state = PressureState::kNormal;
+  uint32_t maintenance_flush_credits = 0;
+  uint32_t maintenance_emergency_flush_credits = 0;
+  uint32_t maintenance_compaction_credits = 0;
 };
 
 struct CedarMaintenanceCompletion {

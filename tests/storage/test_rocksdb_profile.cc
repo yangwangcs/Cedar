@@ -108,6 +108,59 @@ TEST(RocksDbProfileTest, RejectsProductionBudgetBelowOneGiB) {
       << resolved.status().ToString();
 }
 
+TEST(RocksDbProfileTest, AcceptsProductionBudgetAtFortyFivePercentOfHostMemory) {
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(pages, 0);
+  ASSERT_GT(page_size, 0);
+  const uint64_t host_memory =
+      static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = host_memory * 45 / 100;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  EXPECT_EQ(resolved.ValueOrDie().memory_budget_bytes,
+            options.production.memory_budget_bytes);
+}
+
+TEST(RocksDbProfileTest, DefaultsProductionBudgetToFiftyPercentOfHostMemory) {
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(pages, 0);
+  ASSERT_GT(page_size, 0);
+  const uint64_t host_memory =
+      static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  EXPECT_EQ(resolved.ValueOrDie().memory_budget_bytes,
+            host_memory * 50 / 100);
+}
+
+TEST(RocksDbProfileTest, RejectsProductionBudgetAboveFiftyPercentOfHostMemory) {
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(pages, 0);
+  ASSERT_GT(page_size, 0);
+  const uint64_t host_memory =
+      static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = host_memory * 51 / 100;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
+}
+
 TEST(RocksDbProfileTest, ExposesExistingCacheWithoutAllocatingSecondBudget) {
   FactStoreOptions store;
   store.storage_profile=StorageProfile::kProductionAppend;
@@ -214,6 +267,139 @@ TEST(RocksDbProfileTest, ResolvesProductionBudgetSplitAndBaseline) {
   EXPECT_EQ(db_options.max_subcompactions, 2U);
   EXPECT_EQ(db_options.bytes_per_sync, 1ULL << 20);
   EXPECT_EQ(db_options.wal_bytes_per_sync, 0U);
+}
+
+TEST(RocksDbProfileTest, AppliesExplicitProductionCapacityToEveryColumnFamily) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 12ULL << 30;
+  options.production.facts_memtable_bytes = 512ULL << 20;
+  options.production.meta_memtable_bytes = 128ULL << 20;
+  options.production.default_memtable_bytes = 64ULL << 20;
+  options.production.facts_memtable_count = 4;
+  options.production.meta_memtable_count = 3;
+  options.production.default_memtable_count = 3;
+  options.production.flush_worker_capacity = 2;
+  options.production.compaction_worker_capacity = 4;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  EXPECT_EQ(resolved.ValueOrDie().facts_memtable_bytes, 512ULL << 20);
+  EXPECT_EQ(resolved.ValueOrDie().meta_memtable_bytes, 128ULL << 20);
+  EXPECT_EQ(resolved.ValueOrDie().default_memtable_bytes, 64ULL << 20);
+  EXPECT_EQ(resolved.ValueOrDie().facts_write_buffer_count, 4U);
+  EXPECT_EQ(resolved.ValueOrDie().meta_write_buffer_count, 3U);
+  EXPECT_EQ(resolved.ValueOrDie().default_write_buffer_count, 3U);
+  EXPECT_EQ(resolved.ValueOrDie().flush_worker_capacity, 2U);
+  EXPECT_EQ(resolved.ValueOrDie().compaction_worker_capacity, 4U);
+  EXPECT_EQ(resolved.ValueOrDie().max_background_jobs, 6U);
+
+  const rocksdb::Options db_options =
+      MakeRocksDbOptions(options, true, &resolved.ValueOrDie());
+  EXPECT_EQ(db_options.max_background_jobs, 6);
+  EXPECT_EQ(db_options.max_background_flushes, 2);
+  EXPECT_EQ(db_options.max_background_compactions, 4);
+
+  const auto descriptors = MakeRocksDbColumnFamilyDescriptors(
+      options, db_options, &resolved.ValueOrDie());
+  ASSERT_EQ(descriptors.size(), 3U);
+  EXPECT_EQ(descriptors[0].options.write_buffer_size, 64ULL << 20);
+  EXPECT_EQ(descriptors[0].options.max_write_buffer_number, 3);
+  EXPECT_EQ(descriptors[0].options.level0_file_num_compaction_trigger, 8);
+  EXPECT_EQ(descriptors[0].options.level0_slowdown_writes_trigger, 24);
+  EXPECT_EQ(descriptors[0].options.level0_stop_writes_trigger, 36);
+  EXPECT_EQ(descriptors[1].options.write_buffer_size, 512ULL << 20);
+  EXPECT_EQ(descriptors[1].options.max_write_buffer_number, 4);
+  EXPECT_EQ(descriptors[1].options.min_write_buffer_number_to_merge, 2);
+  EXPECT_EQ(descriptors[1].options.target_file_size_base, 512ULL << 20);
+  EXPECT_EQ(descriptors[1].options.level0_file_num_compaction_trigger, 8);
+  EXPECT_EQ(descriptors[1].options.level0_slowdown_writes_trigger, 24);
+  EXPECT_EQ(descriptors[1].options.level0_stop_writes_trigger, 36);
+  EXPECT_EQ(descriptors[2].options.write_buffer_size, 128ULL << 20);
+  EXPECT_EQ(descriptors[2].options.max_write_buffer_number, 3);
+  EXPECT_EQ(descriptors[2].options.level0_file_num_compaction_trigger, 8);
+  EXPECT_EQ(descriptors[2].options.level0_slowdown_writes_trigger, 24);
+  EXPECT_EQ(descriptors[2].options.level0_stop_writes_trigger, 36);
+}
+
+TEST(RocksDbProfileTest, RejectsProductionCapacityThatExceedsItsBudget) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 4ULL << 30;
+  options.production.facts_memtable_bytes = 1ULL << 30;
+  options.production.facts_memtable_count = 4;
+  options.production.meta_memtable_bytes = 128ULL << 20;
+  options.production.meta_memtable_count = 3;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
+}
+
+TEST(RocksDbProfileTest, RejectsCombinedMetaAndDefaultCapacityAboveBudget) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 4ULL << 30;
+  options.production.meta_memtable_bytes = 64ULL << 20;
+  options.production.meta_memtable_count = 2;
+  options.production.default_memtable_bytes = 64ULL << 20;
+  options.production.default_memtable_count = 2;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
+}
+
+TEST(RocksDbProfileTest, RejectsBackgroundWorkerCapacityOverflow) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 4ULL << 30;
+  options.production.flush_worker_capacity =
+      std::numeric_limits<uint32_t>::max();
+  options.production.compaction_worker_capacity = 2;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
+}
+
+TEST(RocksDbProfileTest, RejectsMemtableCountAboveRocksDbLimit) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.facts_memtable_bytes = 1;
+  options.production.facts_memtable_count =
+      std::numeric_limits<uint32_t>::max();
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
+}
+
+TEST(RocksDbProfileTest, RejectsFactsMemtableCountBelowFlushMergeWidth) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.facts_memtable_count = 1;
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
+}
+
+TEST(RocksDbProfileTest, RejectsBackgroundJobCountAboveRocksDbLimit) {
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.max_background_jobs =
+      std::numeric_limits<uint32_t>::max();
+
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_TRUE(resolved.status().IsInvalidArgument())
+      << resolved.status().ToString();
 }
 
 TEST(RocksDbProfileTest, ProductionProfileUsesCedarWalDefaults) {

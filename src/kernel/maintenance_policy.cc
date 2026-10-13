@@ -121,10 +121,14 @@ CedarMaintenancePlan SelectCedarMaintenance(
   if (emergency_flush) {
     plan.flush = FlushDecision(CedarMaintenancePriority::kEmergency,
                                flush_budget, false);
-    plan.flush_credits = kEmergencyFlushCredits;
+    plan.flush_credits = snapshot.maintenance_emergency_flush_credits == 0
+                             ? kEmergencyFlushCredits
+                             : snapshot.maintenance_emergency_flush_credits;
   } else if (normal_flush) {
     plan.flush = FlushDecision(CedarMaintenancePriority::kNormal, flush_budget);
-    plan.flush_credits = kNormalFlushCredits;
+    plan.flush_credits = snapshot.maintenance_flush_credits == 0
+                             ? kNormalFlushCredits
+                             : snapshot.maintenance_flush_credits;
   }
 
   const bool emergency_compaction = metrics.total_l0_files >= kEmergencyL0Files ||
@@ -134,11 +138,15 @@ CedarMaintenancePlan SelectCedarMaintenance(
   if (emergency_compaction) {
     plan.compaction = CompactionDecision(CedarMaintenancePriority::kEmergency,
                                          compaction_budget);
-    plan.compaction_credits = kNormalCompactionCredits;
+    plan.compaction_credits = snapshot.maintenance_compaction_credits == 0
+                                  ? kNormalCompactionCredits
+                                  : snapshot.maintenance_compaction_credits;
   } else if (!wal_sync_critical && normal_compaction) {
     plan.compaction = CompactionDecision(CedarMaintenancePriority::kNormal,
                                          compaction_budget);
-    plan.compaction_credits = kNormalCompactionCredits;
+    plan.compaction_credits = snapshot.maintenance_compaction_credits == 0
+                                  ? kNormalCompactionCredits
+                                  : snapshot.maintenance_compaction_credits;
   }
   if (plan.flush.has_value()) plan.flush->snapshot_generation = snapshot.generation;
   if (plan.compaction.has_value()) {

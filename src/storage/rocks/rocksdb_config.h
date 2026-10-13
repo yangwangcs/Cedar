@@ -20,6 +20,17 @@ struct ResolvedStorageProfile {
   uint64_t facts_write_buffer_bytes = 0;
   uint64_t meta_write_buffer_bytes = 0;
   uint64_t default_write_buffer_bytes = 0;
+  uint64_t facts_memtable_bytes = 0;
+  uint64_t meta_memtable_bytes = 0;
+  uint64_t default_memtable_bytes = 0;
+  uint32_t facts_write_buffer_count = 0;
+  uint32_t meta_write_buffer_count = 0;
+  uint32_t default_write_buffer_count = 0;
+  uint32_t flush_worker_capacity = 0;
+  uint32_t compaction_worker_capacity = 0;
+  uint32_t normal_flush_credits = 0;
+  uint32_t emergency_flush_credits = 0;
+  uint32_t compaction_credits = 0;
   uint32_t max_background_jobs = 0;
   uint32_t max_subcompactions = 0;
   uint64_t max_total_wal_size = 0;

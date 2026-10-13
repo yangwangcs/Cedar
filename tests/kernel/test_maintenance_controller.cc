@@ -40,10 +40,10 @@ class FakeMaintenanceAdapter final : public MaintenanceAdapter {
     completed_.notify_all();
   }
 
-  bool WaitForCompactionStart() {
+  bool WaitForCompactionStart(uint64_t count = 1) {
     std::unique_lock<std::mutex> lock(mutex_);
-    return completed_.wait_for(lock, std::chrono::seconds(2), [this] {
-      return compaction_started_ != 0;
+    return completed_.wait_for(lock, std::chrono::seconds(2), [this, count] {
+      return compaction_started_ >= count;
     });
   }
 
@@ -81,6 +81,10 @@ class FakeMaintenanceAdapter final : public MaintenanceAdapter {
     std::lock_guard<std::mutex> lock(mutex_);
     return max_concurrent_flushes_;
   }
+  uint64_t max_concurrent_compactions() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return max_concurrent_compactions_;
+  }
 
   StatusOr<CedarMaintenanceCompletion> RunFlush(
       const CedarMaintenanceDecision& decision,
@@ -102,8 +106,12 @@ class FakeMaintenanceAdapter final : public MaintenanceAdapter {
       const std::atomic<bool>*) override {
     std::unique_lock<std::mutex> lock(mutex_);
     ++compaction_started_;
+    ++active_compactions_;
+    max_concurrent_compactions_ =
+        std::max(max_concurrent_compactions_, active_compactions_);
     completed_.notify_all();
     completed_.wait(lock, [this] { return !block_compaction_; });
+    --active_compactions_;
     ++compaction_completed_;
     completed_.notify_all();
     return CedarMaintenanceCompletion{.kind = decision.kind};
@@ -120,6 +128,8 @@ class FakeMaintenanceAdapter final : public MaintenanceAdapter {
   uint64_t compaction_completed_ = 0;
   uint64_t active_flushes_ = 0;
   uint64_t max_concurrent_flushes_ = 0;
+  uint64_t active_compactions_ = 0;
+  uint64_t max_concurrent_compactions_ = 0;
 };
 
 CedarRuntimeSnapshot Snapshot(uint64_t generation, uint64_t immutable,
@@ -211,6 +221,30 @@ TEST(MaintenanceControllerTest, LeavingWalCriticalStateRunsAlreadyPublishedWork)
   // No new snapshot: the state transition itself must wake the sleeping lane.
   controller.SetWalSyncCritical(false);
   EXPECT_TRUE(adapter.WaitForCompactionStart());
+  controller.Stop();
+}
+
+TEST(MaintenanceControllerTest, UsesConfiguredWorkerCapacity) {
+  FakeMaintenanceAdapter adapter;
+  adapter.BlockFlush();
+  adapter.BlockCompaction();
+  MaintenanceController controller(
+      &adapter, CedarMaintenanceWorkerLimits{.flush_workers = 2,
+                                             .compaction_workers = 4});
+  ASSERT_TRUE(controller.Start().ok());
+
+  CedarRuntimeSnapshot snapshot = Snapshot(1, 64ULL << 20, 24);
+  snapshot.maintenance_flush_credits = 2;
+  snapshot.maintenance_compaction_credits = 4;
+  controller.PublishSnapshot(std::move(snapshot));
+
+  ASSERT_TRUE(adapter.WaitForFlushStart(2));
+  ASSERT_TRUE(adapter.WaitForCompactionStart(4));
+  EXPECT_EQ(adapter.max_concurrent_flushes(), 2U);
+  EXPECT_EQ(adapter.max_concurrent_compactions(), 4U);
+
+  adapter.ReleaseFlush();
+  adapter.ReleaseCompaction();
   controller.Stop();
 }
 

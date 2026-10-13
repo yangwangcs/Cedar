@@ -44,6 +44,15 @@ constexpr uint64_t kKernelTestWriteBufferManagerBytes = 1ULL * kMiB;
 constexpr uint64_t kDebugWriteBufferManagerBytes = 256ULL * 1024ULL;
 constexpr int kCedarFlushWorkerCapacity = 1;
 constexpr int kCedarCompactionWorkerCapacity = 2;
+constexpr uint64_t kProductionMemoryPercent = 50;
+constexpr uint64_t kProductionFactsMemtableBytes = 128ULL * kMiB;
+constexpr uint64_t kProductionMetaMemtableBytes = 32ULL * kMiB;
+constexpr uint64_t kProductionDefaultMemtableBytes = 32ULL * kMiB;
+
+bool ProductFits(uint64_t value, uint32_t count, uint64_t limit) {
+  return count != 0 && value <= std::numeric_limits<uint64_t>::max() / count &&
+         value * count <= limit;
+}
 
 uint64_t HostMemoryBytes() {
 #if defined(__linux__)
@@ -99,6 +108,17 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
     result.facts_write_buffer_bytes = options.write_buffer_bytes;
     result.meta_write_buffer_bytes = options.write_buffer_bytes;
     result.default_write_buffer_bytes = options.write_buffer_bytes;
+    result.facts_memtable_bytes = options.write_buffer_bytes;
+    result.meta_memtable_bytes = options.write_buffer_bytes;
+    result.default_memtable_bytes = options.write_buffer_bytes;
+    result.facts_write_buffer_count = 2;
+    result.meta_write_buffer_count = 2;
+    result.default_write_buffer_count = 2;
+    result.flush_worker_capacity = 1;
+    result.compaction_worker_capacity = 1;
+    result.normal_flush_credits = 1;
+    result.emergency_flush_credits = 1;
+    result.compaction_credits = 1;
     return result;
   }
   if (options.production.max_commit_batch_count == 0 ||
@@ -141,6 +161,17 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
                                            : kKernelTestMetaWriteBufferBytes;
     result.default_write_buffer_bytes = debug ? kQueryDebugThresholds.memtable_bytes / 4
                                               : kKernelTestDefaultWriteBufferBytes;
+    result.facts_memtable_bytes = result.facts_write_buffer_bytes;
+    result.meta_memtable_bytes = result.meta_write_buffer_bytes;
+    result.default_memtable_bytes = result.default_write_buffer_bytes;
+    result.facts_write_buffer_count = 6;
+    result.meta_write_buffer_count = 6;
+    result.default_write_buffer_count = 2;
+    result.flush_worker_capacity = 1;
+    result.compaction_worker_capacity = 2;
+    result.normal_flush_credits = 1;
+    result.emergency_flush_credits = 1;
+    result.compaction_credits = 1;
     result.max_background_jobs = 2;
     result.max_subcompactions = 1;
     result.max_total_wal_size = 256ULL * 1024ULL;
@@ -153,15 +184,16 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
       return Status::InvalidArgument("production storage profile",
                                      "an explicit memory budget is required");
     }
-    budget = host_memory * 40 / 100;
+    budget = host_memory * kProductionMemoryPercent / 100;
   }
   if (budget < kGiB) {
     return Status::InvalidArgument("production storage profile",
                                    "memory budget must be at least 1 GiB");
   }
-  if (host_memory != 0 && budget > host_memory * 40 / 100) {
+  if (host_memory != 0 &&
+      budget > host_memory * kProductionMemoryPercent / 100) {
     return Status::InvalidArgument("production storage profile",
-                                   "memory budget exceeds the 40% process limit");
+                                   "memory budget exceeds the 50% process limit");
   }
   result.memory_budget_bytes = budget;
   result.block_cache_bytes = options.production.block_cache_bytes == 0
@@ -175,9 +207,109 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
   result.meta_write_buffer_bytes = budget * 5 / 100;
   result.default_write_buffer_bytes = std::min<uint64_t>(32 * kMiB,
                                                          result.meta_write_buffer_bytes);
+  result.facts_memtable_bytes = options.production.facts_memtable_bytes == 0
+                                     ? kProductionFactsMemtableBytes
+                                     : options.production.facts_memtable_bytes;
+  result.meta_memtable_bytes = options.production.meta_memtable_bytes == 0
+                                    ? kProductionMetaMemtableBytes
+                                    : options.production.meta_memtable_bytes;
+  result.default_memtable_bytes = options.production.default_memtable_bytes == 0
+                                       ? kProductionDefaultMemtableBytes
+                                       : options.production.default_memtable_bytes;
+  result.facts_write_buffer_count = options.production.facts_memtable_count == 0
+                                        ? 4
+                                        : options.production.facts_memtable_count;
+  result.meta_write_buffer_count = options.production.meta_memtable_count == 0
+                                       ? 3
+                                       : options.production.meta_memtable_count;
+  result.default_write_buffer_count = options.production.default_memtable_count == 0
+                                          ? 2
+                                          : options.production.default_memtable_count;
+  result.flush_worker_capacity = options.production.flush_worker_capacity == 0
+                                     ? kCedarFlushWorkerCapacity
+                                     : options.production.flush_worker_capacity;
+  result.compaction_worker_capacity =
+      options.production.compaction_worker_capacity == 0
+          ? kCedarCompactionWorkerCapacity
+          : options.production.compaction_worker_capacity;
+  result.normal_flush_credits = options.production.normal_flush_credits == 0
+                                    ? 1
+                                    : options.production.normal_flush_credits;
+  result.emergency_flush_credits = std::min<uint32_t>(
+      2, result.flush_worker_capacity);
+  result.compaction_credits = options.production.compaction_credits == 0
+                                  ? 1
+                                  : options.production.compaction_credits;
+  const bool explicit_memtable_capacity =
+      options.production.facts_memtable_bytes != 0 ||
+      options.production.meta_memtable_bytes != 0 ||
+      options.production.default_memtable_bytes != 0 ||
+      options.production.facts_memtable_count != 0 ||
+      options.production.meta_memtable_count != 0 ||
+      options.production.default_memtable_count != 0;
+  if (explicit_memtable_capacity) {
+    const uint32_t max_rocksdb_memtable_count =
+        static_cast<uint32_t>(std::numeric_limits<int>::max());
+    if (result.facts_write_buffer_count < 2 ||
+        result.facts_write_buffer_count > max_rocksdb_memtable_count ||
+        result.meta_write_buffer_count > max_rocksdb_memtable_count ||
+        result.default_write_buffer_count > max_rocksdb_memtable_count) {
+      return Status::InvalidArgument(
+          "production storage profile",
+          "memtable count is outside RocksDB limits");
+    }
+    if (!ProductFits(result.facts_memtable_bytes,
+                     result.facts_write_buffer_count,
+                     result.facts_write_buffer_bytes) ||
+        !ProductFits(result.meta_memtable_bytes,
+                     result.meta_write_buffer_count,
+                     result.meta_write_buffer_bytes) ||
+        !ProductFits(result.default_memtable_bytes,
+                     result.default_write_buffer_count,
+                     result.meta_write_buffer_bytes)) {
+      return Status::InvalidArgument(
+          "production storage profile",
+          "column-family memtable capacity exceeds its memory budget");
+    }
+    const uint64_t meta_memtable_capacity =
+        result.meta_memtable_bytes * result.meta_write_buffer_count;
+    const uint64_t default_memtable_capacity =
+        result.default_memtable_bytes * result.default_write_buffer_count;
+    if (default_memtable_capacity >
+        result.meta_write_buffer_bytes - meta_memtable_capacity) {
+      return Status::InvalidArgument(
+          "production storage profile",
+          "combined meta and default memtable capacity exceeds its memory budget");
+    }
+  }
+  const bool explicit_capacity =
+      explicit_memtable_capacity ||
+      options.production.flush_worker_capacity != 0 ||
+      options.production.compaction_worker_capacity != 0 ||
+      options.production.normal_flush_credits != 0 ||
+      options.production.compaction_credits != 0;
+  const uint32_t max_rocksdb_workers =
+      static_cast<uint32_t>(std::numeric_limits<int>::max());
+  if (result.flush_worker_capacity > max_rocksdb_workers ||
+      result.compaction_worker_capacity >
+          max_rocksdb_workers - result.flush_worker_capacity) {
+    return Status::InvalidArgument(
+        "production storage profile",
+        "background worker capacity exceeds RocksDB limits");
+  }
+  const uint32_t required_background_jobs =
+      result.flush_worker_capacity + result.compaction_worker_capacity;
   result.max_background_jobs = options.production.max_background_jobs == 0
-                                   ? 2
+                                   ? (explicit_capacity ? required_background_jobs : 2)
                                    : options.production.max_background_jobs;
+  if (result.max_background_jobs > max_rocksdb_workers ||
+      (explicit_capacity && result.max_background_jobs < required_background_jobs) ||
+      result.normal_flush_credits > result.flush_worker_capacity ||
+      result.compaction_credits > result.compaction_worker_capacity) {
+    return Status::InvalidArgument(
+        "production storage profile",
+        "maintenance credits or background jobs exceed worker capacity");
+  }
   result.max_subcompactions = std::min<uint32_t>(2, result.max_background_jobs);
   result.max_total_wal_size = std::max(kGiB,
                                        2 * (result.facts_write_buffer_bytes +
@@ -274,8 +406,10 @@ rocksdb::Options MakeRocksDbOptions(const FactStoreOptions& options,
   result.max_background_jobs = static_cast<int>(resolved->max_background_jobs);
   // Cedar grants every maintenance job. Declare fixed engine capacity rather
   // than inheriting RocksDB's max_background_jobs / 4 flush heuristic.
-  result.max_background_flushes = kCedarFlushWorkerCapacity;
-  result.max_background_compactions = kCedarCompactionWorkerCapacity;
+  result.max_background_flushes =
+      static_cast<int>(resolved->flush_worker_capacity);
+  result.max_background_compactions =
+      static_cast<int>(resolved->compaction_worker_capacity);
   result.max_subcompactions = resolved->max_subcompactions;
   result.bytes_per_sync = kMiB;
   result.wal_bytes_per_sync = 0;
@@ -332,7 +466,9 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
   facts_options.compression = rocksdb::kNoCompression;
   facts_options.bottommost_compression = rocksdb::kNoCompression;
   if (resolved != nullptr) {
-    default_options.write_buffer_size = resolved->default_write_buffer_bytes;
+    default_options.write_buffer_size = resolved->default_memtable_bytes;
+    default_options.max_write_buffer_number =
+        static_cast<int>(resolved->default_write_buffer_count);
     default_options.enable_blob_files = false;
 
     const bool kernel_test =
@@ -342,17 +478,20 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
                                          ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
                                                 ? kQueryDebugThresholds.memtable_bytes
                                                 : kKernelTestFactsWriteBufferBytes)
-                                         : 128 * kMiB;
+                                         : resolved->facts_memtable_bytes;
     // Two buffers can be draining under Cedar flush credits, while bounded
     // queued debt and one active buffer remain available for foreground work.
-    facts_options.max_write_buffer_number = kernel_test ? 6 : 4;
+    facts_options.max_write_buffer_number = kernel_test
+                                                ? 6
+                                                : static_cast<int>(
+                                                      resolved->facts_write_buffer_count);
     facts_options.min_write_buffer_number_to_merge = kernel_test ? 1 : 2;
     facts_options.level_compaction_dynamic_level_bytes = true;
     facts_options.target_file_size_base = kernel_test
                                               ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
                                                      ? kQueryDebugThresholds.memtable_bytes
                                                      : 64ULL * 1024ULL)
-                                              : 128 * kMiB;
+                                              : resolved->facts_memtable_bytes;
     facts_options.level0_file_num_compaction_trigger = kernel_test ? 2 : 8;
     facts_options.level0_slowdown_writes_trigger = kernel_test ? 12 : 24;
     facts_options.level0_stop_writes_trigger = kernel_test ? 24 : 36;
@@ -364,12 +503,27 @@ std::vector<rocksdb::ColumnFamilyDescriptor> MakeRocksDbColumnFamilyDescriptors(
                                         ? (store_options.storage_profile == StorageProfile::kDebugSmallThresholds
                                                 ? kQueryDebugThresholds.memtable_bytes / 4
                                                 : kKernelTestMetaWriteBufferBytes)
-                                        : 32 * kMiB;
-    meta_options.max_write_buffer_number = kernel_test ? 6 : 3;
+                                        : resolved->meta_memtable_bytes;
+    meta_options.max_write_buffer_number = kernel_test
+                                               ? 6
+                                               : static_cast<int>(
+                                                     resolved->meta_write_buffer_count);
     meta_options.min_write_buffer_number_to_merge = 1;
-    meta_options.level0_file_num_compaction_trigger = kernel_test ? 2 : 4;
-    meta_options.level0_slowdown_writes_trigger = 12;
-    meta_options.level0_stop_writes_trigger = kernel_test ? 24 : 20;
+    const bool explicit_production_capacity =
+        !kernel_test && (store_options.production.facts_memtable_bytes != 0 ||
+                         store_options.production.meta_memtable_bytes != 0 ||
+                         store_options.production.default_memtable_bytes != 0);
+    meta_options.level0_file_num_compaction_trigger =
+        kernel_test ? 2 : (explicit_production_capacity ? 8 : 4);
+    meta_options.level0_slowdown_writes_trigger =
+        kernel_test ? 12 : (explicit_production_capacity ? 24 : 12);
+    meta_options.level0_stop_writes_trigger =
+        kernel_test ? 24 : (explicit_production_capacity ? 36 : 20);
+    if (explicit_production_capacity) {
+      default_options.level0_file_num_compaction_trigger = 8;
+      default_options.level0_slowdown_writes_trigger = 24;
+      default_options.level0_stop_writes_trigger = 36;
+    }
     meta_options.enable_blob_files = false;
   }
   return {{rocksdb::kDefaultColumnFamilyName, std::move(default_options)},

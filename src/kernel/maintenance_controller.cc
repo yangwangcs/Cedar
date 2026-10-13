@@ -7,15 +7,9 @@
 #include <chrono>
 
 namespace cedar {
-namespace {
-
-constexpr uint32_t kCedarFlushWorkerSlots = 1;
-constexpr uint32_t kCedarCompactionWorkerSlots = 1;
-
-}  // namespace
-
-MaintenanceController::MaintenanceController(MaintenanceAdapter* adapter)
-    : adapter_(adapter) {}
+MaintenanceController::MaintenanceController(
+    MaintenanceAdapter* adapter, CedarMaintenanceWorkerLimits limits)
+    : adapter_(adapter), limits_(limits) {}
 
 MaintenanceController::~MaintenanceController() { Stop(); }
 
@@ -24,15 +18,19 @@ Status MaintenanceController::Start() {
   if (adapter_ == nullptr) {
     return Status::InvalidArgument("maintenance controller", "adapter is null");
   }
+  if (limits_.flush_workers == 0 || limits_.compaction_workers == 0) {
+    return Status::InvalidArgument("maintenance controller",
+                                   "worker capacity must be nonzero");
+  }
   if (started_) return Status::OK();
   stopping_ = false;
   started_ = true;
-  flush_workers_.reserve(kCedarFlushWorkerSlots);
-  for (uint32_t slot = 0; slot < kCedarFlushWorkerSlots; ++slot) {
+  flush_workers_.reserve(limits_.flush_workers);
+  for (uint32_t slot = 0; slot < limits_.flush_workers; ++slot) {
     flush_workers_.emplace_back([this] { RunLane(Lane::kFlush); });
   }
-  compaction_workers_.reserve(kCedarCompactionWorkerSlots);
-  for (uint32_t slot = 0; slot < kCedarCompactionWorkerSlots; ++slot) {
+  compaction_workers_.reserve(limits_.compaction_workers);
+  for (uint32_t slot = 0; slot < limits_.compaction_workers; ++slot) {
     compaction_workers_.emplace_back([this] { RunLane(Lane::kCompaction); });
   }
   return Status::OK();
@@ -111,11 +109,11 @@ MaintenanceController::NextDecisionLocked(Lane lane) const {
 }
 
 bool MaintenanceController::LaneHasWorkLocked(Lane lane) const {
-  if (lane == Lane::kFlush && flush_outstanding_ >= kCedarFlushWorkerSlots) {
+  if (lane == Lane::kFlush && flush_outstanding_ >= limits_.flush_workers) {
     return false;
   }
   if (lane == Lane::kCompaction &&
-      compaction_outstanding_ >= kCedarCompactionWorkerSlots) {
+      compaction_outstanding_ >= limits_.compaction_workers) {
     return false;
   }
   return NextDecisionLocked(lane).has_value();

@@ -27,9 +27,16 @@ class MaintenanceAdapter {
       const std::atomic<bool>* wal_sync_critical) = 0;
 };
 
+struct CedarMaintenanceWorkerLimits {
+  uint32_t flush_workers = 1;
+  uint32_t compaction_workers = 1;
+};
+
 class MaintenanceController {
  public:
-  explicit MaintenanceController(MaintenanceAdapter* adapter);
+  explicit MaintenanceController(
+      MaintenanceAdapter* adapter,
+      CedarMaintenanceWorkerLimits limits = {});
   ~MaintenanceController();
 
   MaintenanceController(const MaintenanceController&) = delete;
@@ -50,6 +57,7 @@ class MaintenanceController {
   void CompleteLocked(const CedarMaintenanceCompletion& completion);
 
   MaintenanceAdapter* adapter_ = nullptr;
+  CedarMaintenanceWorkerLimits limits_;
   mutable std::mutex mutex_;
   std::condition_variable work_available_;
   std::vector<std::thread> flush_workers_;

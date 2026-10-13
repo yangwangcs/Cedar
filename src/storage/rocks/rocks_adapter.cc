@@ -387,6 +387,11 @@ class FactStoreImpl {
   rocksdb::ColumnFamilyHandle* facts_cf = nullptr;
   rocksdb::ColumnFamilyHandle* meta_cf = nullptr;
   std::shared_ptr<rocksdb::Statistics> statistics;
+  uint32_t maintenance_flush_worker_capacity = 1;
+  uint32_t maintenance_compaction_worker_capacity = 1;
+  uint32_t maintenance_normal_flush_credits = 1;
+  uint32_t maintenance_emergency_flush_credits = 1;
+  uint32_t maintenance_compaction_credits = 1;
   mutable std::mutex pressure_sample_mutex;
   bool pressure_sample_initialized = false;
   std::chrono::steady_clock::time_point pressure_last_sample_at;
@@ -1309,6 +1314,17 @@ Status FactStore::Open() {
   }
 
   auto store = std::make_shared<FactStoreImpl>();
+  if (resolved_ptr != nullptr) {
+    store->maintenance_flush_worker_capacity =
+        resolved_ptr->flush_worker_capacity;
+    store->maintenance_compaction_worker_capacity =
+        resolved_ptr->compaction_worker_capacity;
+    store->maintenance_normal_flush_credits =
+        resolved_ptr->normal_flush_credits;
+    store->maintenance_emergency_flush_credits =
+        resolved_ptr->emergency_flush_credits;
+    store->maintenance_compaction_credits = resolved_ptr->compaction_credits;
+  }
   store->canonical_page_metrics = std::move(page_metrics);
   store->db = std::move(db);
   store->default_cf = handles[0];
@@ -3853,6 +3869,16 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
       maintenance.write_buffer_manager_limit_bytes;
   metrics.delayed_write_rate_bytes_per_sec =
       maintenance.delayed_write_rate_bytes_per_sec;
+  metrics.maintenance_flush_worker_capacity =
+      store->maintenance_flush_worker_capacity;
+  metrics.maintenance_compaction_worker_capacity =
+      store->maintenance_compaction_worker_capacity;
+  metrics.maintenance_normal_flush_credits =
+      store->maintenance_normal_flush_credits;
+  metrics.maintenance_emergency_flush_credits =
+      store->maintenance_emergency_flush_credits;
+  metrics.maintenance_compaction_credits =
+      store->maintenance_compaction_credits;
   for (const auto& debt : maintenance.column_families) {
     RocksDbRuntimeMetrics::ColumnFamilyMetrics cf_metrics;
     cf_metrics.id = debt.id;

@@ -517,6 +517,12 @@ Status Database::Impl::RefreshRuntimeSnapshot() {
     runtime_pressure_override_for_testing(&snapshot.pressure);
   }
   snapshot.rocksdb = sampled_runtime.ValueOrDie().metrics;
+  snapshot.maintenance_flush_credits =
+      snapshot.rocksdb.maintenance_normal_flush_credits;
+  snapshot.maintenance_emergency_flush_credits =
+      snapshot.rocksdb.maintenance_emergency_flush_credits;
+  snapshot.maintenance_compaction_credits =
+      snapshot.rocksdb.maintenance_compaction_credits;
   snapshot.generation = snapshot.rocksdb.maintenance_generation;
   snapshot.rocksdb.free_disk_bytes = snapshot.pressure.free_disk_bytes;
   snapshot.rocksdb.free_disk_percent = snapshot.pressure.free_disk_percent;
@@ -637,11 +643,17 @@ Status Database::Impl::StartAppendCommitPipeline() {
   if (!sampler_started.ok()) return sampler_started;
   maintenance_adapter = std::make_unique<FactStoreMaintenanceAdapter>(
       &store, &wal_sync_critical);
+  const CedarRuntimeSnapshot initial_snapshot = ReadRuntimeSnapshot();
   maintenance_controller = std::make_unique<MaintenanceController>(
-      maintenance_adapter.get());
+      maintenance_adapter.get(),
+      CedarMaintenanceWorkerLimits{
+          .flush_workers =
+              initial_snapshot.rocksdb.maintenance_flush_worker_capacity,
+          .compaction_workers =
+              initial_snapshot.rocksdb.maintenance_compaction_worker_capacity});
   const Status maintenance_started = maintenance_controller->Start();
   if (!maintenance_started.ok()) return maintenance_started;
-  maintenance_controller->PublishSnapshot(ReadRuntimeSnapshot());
+  maintenance_controller->PublishSnapshot(initial_snapshot);
   append_preflight_worker = std::thread([this] {
     for (;;) {
       std::shared_ptr<const internal::PendingVersionOverlay> overlay;

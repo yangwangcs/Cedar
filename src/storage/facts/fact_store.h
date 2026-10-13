@@ -166,6 +166,11 @@ struct RocksDbRuntimeMetrics {
   bool recovery_in_progress = false;
   bool shutting_down = false;
   uint64_t delayed_write_rate_bytes_per_sec = 0;
+  uint32_t maintenance_flush_worker_capacity = 0;
+  uint32_t maintenance_compaction_worker_capacity = 0;
+  uint32_t maintenance_normal_flush_credits = 0;
+  uint32_t maintenance_emergency_flush_credits = 0;
+  uint32_t maintenance_compaction_credits = 0;
   uint64_t retained_wal_bytes = 0;
   uint64_t maintenance_snapshot_age_us = 0;
   uint64_t background_flush_calls = 0;

@@ -243,6 +243,22 @@ TEST_F(FactStoreCommitTest,
   EXPECT_GT(epoch.ValueOrDie()->batch().GetDataSize(), 0U);
 }
 
+TEST_F(FactStoreCommitTest,
+       IndependentAppendRejectsEdgeStateWithoutAuthoritativeIdentity) {
+  StoreCommitBatch batch = Batch(
+      TxnId{73},
+      {{EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{88}}).ref(),
+        ValidTime{20}, FactOperation::kPut, 0, std::nullopt}});
+  batch.fresh_transaction_id = true;
+
+  const auto epoch = store_->DecideIndependentAppendGroup(
+      CommitSeq{0}, CommitSeq{0}, {{batch, false}});
+
+  ASSERT_FALSE(epoch.ok());
+  EXPECT_TRUE(epoch.status().IsInvalidArgument())
+      << epoch.status().ToString();
+}
+
 TEST_F(FactStoreCommitTest, PersistsPreparedCommitAcrossReopenThenFinalizesIt) {
   const StoreCommitBatch batch = Batch(TxnId{78}, {VertexPut(8, 11)});
   ASSERT_TRUE(store_->PersistPreparedCommit(batch).ok());

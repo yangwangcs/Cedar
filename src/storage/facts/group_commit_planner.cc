@@ -180,7 +180,10 @@ bool CanUseAppendFastPath(const StoreCommitBatch& batch) {
     return false;
   }
   for (const PendingFactMutation& mutation : batch.mutations) {
-    if (mutation.operation != FactOperation::kPut) return false;
+    if (mutation.operation != FactOperation::kPut ||
+        mutation.ref.family() == FactFamily::kEdgeState) {
+      return false;
+    }
   }
   for (const SnapshotWriteDependency& dependency :
        batch.snapshot_write_dependencies) {

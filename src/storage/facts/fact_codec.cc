@@ -35,6 +35,25 @@ void AppendU64(std::string* out, uint64_t value) {
   }
 }
 
+// Fixed-width big-endian writers for callers that already sized their buffer.
+void WriteU16(char** out, uint16_t value) {
+  (*out)[0] = static_cast<char>(value >> 8);
+  (*out)[1] = static_cast<char>(value);
+  *out += 2;
+}
+
+void WriteU32(char** out, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    *(*out)++ = static_cast<char>(value >> shift);
+  }
+}
+
+void WriteU64(char** out, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    *(*out)++ = static_cast<char>(value >> shift);
+  }
+}
+
 bool ReadU16(const std::string& input, size_t* offset, uint16_t* value) {
   if (input.size() - *offset < 2) return false;
   *value = (static_cast<uint16_t>(static_cast<uint8_t>(input[*offset])) << 8) |
@@ -204,15 +223,15 @@ StatusOr<EdgeIdentity> DecodeEdgeIdentityPayload(const std::string& payload) {
 std::string EncodeFactKey(const FactRef& ref, ValidTime valid_from,
                           CommitSeq commit_seq) {
   if (!ref.Validate().ok() || commit_seq.value == 0) return {};
-  std::string encoded;
-  encoded.reserve(kEncodedFactKeyBytes);
-  encoded.push_back(static_cast<char>(kFactKeyVersion));
-  AppendU32(&encoded, ref.part_id().value);
-  encoded.push_back(static_cast<char>(ref.family()));
-  AppendU16(&encoded, ref.property_id().value);
-  AppendU64(&encoded, ref.entity_id());
-  AppendU64(&encoded, ~valid_from.value);
-  AppendU64(&encoded, ~commit_seq.value);
+  std::string encoded(kEncodedFactKeyBytes, '\0');
+  char* out = encoded.data();
+  *out++ = static_cast<char>(kFactKeyVersion);
+  WriteU32(&out, ref.part_id().value);
+  *out++ = static_cast<char>(ref.family());
+  WriteU16(&out, ref.property_id().value);
+  WriteU64(&out, ref.entity_id());
+  WriteU64(&out, ~valid_from.value);
+  WriteU64(&out, ~commit_seq.value);
   return encoded;
 }
 

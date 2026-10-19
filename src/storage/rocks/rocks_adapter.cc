@@ -1208,7 +1208,9 @@ Status StoreCommitBatch::Validate() const {
   if (!txn_id.valid() || system_hlc == 0 || mutations.empty()) {
     return Status::InvalidArgument("commit batch", "missing transaction, time, or facts");
   }
-  std::set<std::string> facts;
+  // Batches can carry thousands of mutations; hash membership keeps this
+  // validation linear instead of a red-black-tree insert per fact.
+  std::unordered_set<std::string> facts;
   for (const PendingFactMutation& mutation : mutations) {
     const Status valid = mutation.Validate();
     if (!valid.ok()) return valid;
@@ -1218,7 +1220,7 @@ Status StoreCommitBatch::Validate() const {
       return Status::InvalidArgument("commit batch", "duplicate fact mutation");
     }
   }
-  std::set<std::string> dependencies;
+  std::unordered_set<std::string> dependencies;
   for (const SnapshotWriteDependency& dependency : snapshot_write_dependencies) {
     const Status dependency_valid = dependency.Validate();
     if (!dependency_valid.ok()) return dependency_valid;
@@ -1229,18 +1231,24 @@ Status StoreCommitBatch::Validate() const {
                                      "invalid snapshot write dependency");
     }
   }
-  std::set<std::pair<std::string, uint64_t>> strict_reads;
+  std::unordered_set<std::string> strict_reads;
   for (const StrictReadDependency& dependency : strict_read_dependencies) {
     const Status dependency_valid = dependency.Validate();
     if (!dependency_valid.ok()) return dependency_valid;
-    const std::string ref_key = EncodeFactKey(dependency.ref, ValidTime{0},
-                                              CommitSeq{1});
-    if (ref_key.empty() ||
-        !strict_reads.emplace(ref_key, dependency.valid_time.value).second) {
-      return Status::InvalidArgument("commit batch", "duplicate strict read dependency");
+    std::string key = EncodeFactKey(dependency.ref, ValidTime{0}, CommitSeq{1});
+    if (key.empty()) {
+      return Status::InvalidArgument("commit batch",
+                                     "duplicate strict read dependency");
+    }
+    for (int shift = 56; shift >= 0; shift -= 8) {
+      key.push_back(static_cast<char>(dependency.valid_time.value >> shift));
+    }
+    if (!strict_reads.emplace(std::move(key)).second) {
+      return Status::InvalidArgument("commit batch",
+                                     "duplicate strict read dependency");
     }
   }
-  std::set<uint64_t> edge_ids;
+  std::unordered_set<uint64_t> edge_ids;
   for (const EdgeIdentity& identity : edge_identities) {
     const Status valid = identity.Validate();
     if (!valid.ok()) return valid;
@@ -1249,18 +1257,17 @@ Status StoreCommitBatch::Validate() const {
     }
   }
   if (!edge_ids.empty()) {
-    for (uint64_t edge_id : edge_ids) {
-      bool has_state_assertion = false;
-      for (const PendingFactMutation& mutation : mutations) {
-        if (mutation.ref.family() == FactFamily::kEdgeState &&
-            mutation.ref.entity_id() == edge_id &&
-            mutation.operation == FactOperation::kPut) {
-          has_state_assertion = true;
-          break;
-        }
+    std::unordered_set<uint64_t> edge_state_assertions;
+    for (const PendingFactMutation& mutation : mutations) {
+      if (mutation.ref.family() == FactFamily::kEdgeState &&
+          mutation.operation == FactOperation::kPut) {
+        edge_state_assertions.insert(mutation.ref.entity_id());
       }
-      if (!has_state_assertion) {
-        return Status::InvalidArgument("commit batch", "edge identity lacks state assertion");
+    }
+    for (uint64_t edge_id : edge_ids) {
+      if (!edge_state_assertions.contains(edge_id)) {
+        return Status::InvalidArgument("commit batch",
+                                       "edge identity lacks state assertion");
       }
     }
   }

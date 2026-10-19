@@ -104,6 +104,7 @@ add_library(cedar_core STATIC
     src/storage/facts/fact_codec.cc
     src/storage/facts/group_commit_planner.cc
     src/storage/facts/pending_version_overlay.cc
+    src/storage/facts/fact_identity_history.cc
     src/storage/facts/recent_fact_write_index.cc
     src/storage/facts/version_validation_cache.cc
     src/storage/facts/meta_codec.cc

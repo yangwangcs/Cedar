@@ -42,6 +42,7 @@
 #include "cedar/format.h"
 #include "storage/rocks/commit_publisher.h"
 #include "storage/rocks/decided_epoch.h"
+#include "storage/facts/fact_identity_history.h"
 #include "storage/facts/group_commit_planner.h"
 #include "storage/facts/prepared_commit_codec.h"
 #include "storage/facts/recent_fact_write_index.h"
@@ -426,6 +427,7 @@ class FactStoreImpl {
       std::make_shared<const PropertySchemas>();
   std::unique_ptr<internal::VersionValidationCache> version_validation_cache;
   std::unique_ptr<internal::RecentFactWriteIndex> recent_fact_write_index;
+  std::unique_ptr<internal::FactIdentityHistory> identity_history;
   std::shared_ptr<rocksdb::cedar_parquet::CanonicalPageCacheMetrics> canonical_page_metrics;
   std::function<void()> validation_scan_observer_for_testing;
   size_t active_snapshots = 0;
@@ -653,9 +655,17 @@ void PublishValidationCache(FactStoreImpl* store,
 void PublishRecentFactWriteIndex(FactStoreImpl* store,
                                  const std::vector<PendingFactMutation>& mutations,
                                  CommitSeq commit_seq) {
-  if (store->recent_fact_write_index == nullptr) return;
+  if (store->recent_fact_write_index == nullptr &&
+      store->identity_history == nullptr) {
+    return;
+  }
   for (const PendingFactMutation& mutation : mutations) {
-    store->recent_fact_write_index->Publish(mutation.ref, commit_seq);
+    if (store->recent_fact_write_index != nullptr) {
+      store->recent_fact_write_index->Publish(mutation.ref, commit_seq);
+    }
+    if (store->identity_history != nullptr) {
+      store->identity_history->Publish(mutation.ref);
+    }
   }
 }
 
@@ -674,6 +684,12 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhoodWithIterator(
   }
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
+  if (store->identity_history != nullptr &&
+      !store->identity_history->MightContain(ref)) {
+    // No fact of this identity was ever written, so the chain is empty at every
+    // snapshot. Skip the canonical iterator setup entirely.
+    return TemporalNeighborhood{};
+  }
   store->point_read_operations.fetch_add(1, std::memory_order_relaxed);
   CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   const std::string seek = EncodeFactKey(
@@ -793,6 +809,11 @@ Status ValidateSnapshotWriteDependencies(
     if (store->recent_fact_write_index != nullptr &&
         store->recent_fact_write_index->CanProveUnchanged(
             dependency.ref, dependency.snapshot_seq)) {
+      continue;
+    }
+    if (store->identity_history != nullptr &&
+        !store->identity_history->MightContain(dependency.ref)) {
+      // The identity was never written, so no canonical event can conflict.
       continue;
     }
     pending.push_back(index);
@@ -1499,13 +1520,36 @@ Status FactStore::Open() {
         ResumeVacuum(store.get(), options_, vacuum_state.ValueOrDie());
     if (!resumed.ok()) return resumed;
   }
-  const uint64_t write_index_bytes = options_.validation_cache_bytes / 4;
+  // Split the fixed validation budget: recent-write Bloom windows, the
+  // ever-written identity Bloom, and the version validation cache.
+  const uint64_t write_index_bytes = options_.validation_cache_bytes / 8;
+  const uint64_t identity_history_bytes =
+      options_.validation_cache_bytes * 3 / 8;
+  const uint64_t validation_cache_bytes =
+      options_.validation_cache_bytes - write_index_bytes -
+      identity_history_bytes;
   store->version_validation_cache =
       std::make_unique<internal::VersionValidationCache>(
-          options_.validation_cache_bytes - write_index_bytes);
+          validation_cache_bytes);
   store->recent_fact_write_index =
       std::make_unique<internal::RecentFactWriteIndex>(
           write_index_bytes, store->visible_seq);
+  store->identity_history =
+      std::make_unique<internal::FactIdentityHistory>(
+          identity_history_bytes);
+  {
+    rocksdb::ReadOptions options;
+    std::unique_ptr<rocksdb::Iterator> iterator(
+        store->db->NewIterator(options, store->facts_cf));
+    for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+      const auto decoded = DecodeFactKey(iterator->key().ToString());
+      if (!decoded.ok()) return decoded.status();
+      store->identity_history->Publish(decoded.ValueOrDie().ref);
+    }
+    if (!iterator->status().ok()) {
+      return FromRocksDb(iterator->status(), "scan fact identities");
+    }
+  }
   impl_ = std::move(store);
   return Status::OK();
 }

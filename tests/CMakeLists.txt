@@ -533,6 +533,11 @@ if(TARGET cedar_radix_memtable_bench)
       -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_patricia_32x8_stability.cmake)
 endif()
 
+add_executable(test_fact_identity_history storage/test_fact_identity_history.cc)
+target_include_directories(test_fact_identity_history PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_fact_identity_history PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_fact_identity_history TEST_PREFIX "FactIdentityHistory.")
+
 add_executable(test_commit_publisher storage/test_commit_publisher.cc)
 target_include_directories(test_commit_publisher PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_commit_publisher

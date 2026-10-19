@@ -129,6 +129,15 @@ TEST_F(KernelMutationTest,
                   .ok());
 }
 
+TEST_F(KernelMutationTest, DuplicateAssertionFailsAtAssertTime) {
+  auto transaction = Begin();
+  const EntityFact vertex =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}});
+  ASSERT_TRUE(transaction->Assert(vertex, ValidTime{10}).ok());
+  EXPECT_TRUE(transaction->Assert(vertex, ValidTime{10}).IsInvalidArgument());
+  EXPECT_TRUE(transaction->Rollback().ok());
+}
+
 TEST(KernelMutationOrderTest, SortsValidTimeDescendingWithinOneFact) {
   const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
   std::vector<PendingFactMutation> mutations = {

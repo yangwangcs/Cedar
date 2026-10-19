@@ -10,6 +10,7 @@
 #include <set>
 #include <type_traits>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,31 @@
 namespace cedar {
 
 namespace {
+
+// Identifies one staged fact mutation for duplicate rejection without the
+// O(n) scan an ordered vector key list would require.
+struct MutationKey {
+  uint32_t part_id = 0;
+  uint8_t family = 0;
+  uint16_t property_id = 0;
+  uint64_t entity_id = 0;
+  uint64_t valid_from = 0;
+
+  bool operator==(const MutationKey&) const = default;
+};
+
+struct MutationKeyHash {
+  size_t operator()(const MutationKey& key) const noexcept {
+    uint64_t hash = static_cast<uint64_t>(key.part_id) * 0x9E3779B97F4A7C15ULL;
+    hash ^= static_cast<uint64_t>(key.family) << 56;
+    hash ^= static_cast<uint64_t>(key.property_id) << 40;
+    hash = (hash ^ (hash >> 29)) * 0xBF58476D1CE4E5B9ULL;
+    hash ^= key.entity_id * 0x94D049BB133111EBULL;
+    hash = (hash ^ (hash >> 31)) * 0xD6E8FEB86659FD93ULL;
+    hash ^= key.valid_from + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
+    return static_cast<size_t>(hash ^ (hash >> 32));
+  }
+};
 
 bool MatchesOverlaySpec(const FactReadSpec& spec, const FactEvent& event) {
   return spec.part_scope.Contains(event.ref.part_id()) &&
@@ -295,8 +321,7 @@ class Transaction::State {
   std::vector<PendingFactMutation> mutations;
   std::vector<EdgeIdentity> edge_identities;
   std::vector<StrictReadDependency> strict_read_dependencies;
-  std::vector<std::tuple<uint32_t, uint8_t, uint16_t, uint64_t, uint64_t>>
-      mutation_keys;
+  std::unordered_set<MutationKey, MutationKeyHash> mutation_keys;
   bool terminal = false;
 
   Status CheckDatabaseOpen() const {
@@ -388,19 +413,15 @@ class Transaction::State {
   Status Stage(PendingFactMutation mutation) {
     const Status valid = mutation.Validate();
     if (!valid.ok()) return valid;
-    const auto key = std::tuple{mutation.ref.part_id().value,
-                                static_cast<uint8_t>(mutation.ref.family()),
-                                mutation.ref.property_id().value,
-                                mutation.ref.entity_id(),
-                                mutation.valid_from.value};
-    if (std::find(mutation_keys.begin(), mutation_keys.end(), key) !=
-        mutation_keys.end()) {
+    const MutationKey key{mutation.ref.part_id().value,
+                          static_cast<uint8_t>(mutation.ref.family()),
+                          mutation.ref.property_id().value,
+                          mutation.ref.entity_id(),
+                          mutation.valid_from.value};
+    if (!mutation_keys.insert(key).second) {
       return Status::InvalidArgument("transaction", "duplicate fact mutation");
     }
-    mutation_keys.push_back(key);
-    const auto position = std::upper_bound(
-        mutations.begin(), mutations.end(), mutation, CanonicalMutationLess);
-    mutations.insert(position, std::move(mutation));
+    mutations.push_back(std::move(mutation));
     return Status::OK();
   }
 
@@ -574,6 +595,10 @@ StatusOr<CommitResult> Transaction::Commit() {
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
   const Status begun = state_->BeginCommit();
   if (!begun.ok()) return begun;
+  // Staging appends in staging order; commit establishes the canonical fact
+  // order once instead of shifting the vector on every assertion.
+  std::stable_sort(state_->mutations.begin(), state_->mutations.end(),
+                   CanonicalMutationLess);
   // Dependencies are derived from the transaction's pinned snapshot at commit
   // time. One batched pass replaces one iterator pair per staged fact.
   auto dependencies = DeriveSnapshotWriteDependencies(
@@ -611,6 +636,8 @@ StatusOr<CommitHandle> Transaction::CommitAsync() {
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
   const Status begun = state_->BeginCommit();
   if (!begun.ok()) return begun;
+  std::stable_sort(state_->mutations.begin(), state_->mutations.end(),
+                   CanonicalMutationLess);
   auto dependencies = DeriveSnapshotWriteDependencies(
       state_->database->store, *state_->snapshot, state_->mutations);
   if (!dependencies.ok()) {

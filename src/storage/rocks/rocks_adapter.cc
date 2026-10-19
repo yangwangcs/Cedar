@@ -774,12 +774,16 @@ StatusOr<StrictReadIdentity> CurrentStrictReadIdentity(
 Status ValidateSnapshotWriteDependencies(
     FactStoreImpl* store,
     const std::vector<SnapshotWriteDependency>& dependencies) {
-  struct DependencyGroup {
-    FactRef ref;
-    std::vector<size_t> indices;
+  const auto ref_less = [](const FactRef& left, const FactRef& right) {
+    return std::tuple{left.part_id().value,
+                      static_cast<uint8_t>(left.family()),
+                      left.property_id().value, left.entity_id()} <
+           std::tuple{right.part_id().value,
+                      static_cast<uint8_t>(right.family()),
+                      right.property_id().value, right.entity_id()};
   };
-  std::vector<DependencyGroup> groups;
-  std::map<std::string, size_t> group_index;
+  std::vector<size_t> pending;
+  pending.reserve(dependencies.size());
   for (size_t index = 0; index < dependencies.size(); ++index) {
     const SnapshotWriteDependency& dependency = dependencies[index];
     if (dependency.snapshot_seq.value > store->visible_seq.value) {
@@ -791,45 +795,35 @@ Status ValidateSnapshotWriteDependencies(
             dependency.ref, dependency.snapshot_seq)) {
       continue;
     }
-    const std::string prefix = EncodeFactIdentityPrefix(
-        dependency.ref.part_id(), dependency.ref.family(),
-        dependency.ref.property_id(), dependency.ref.entity_id());
-    const auto found = group_index.find(prefix);
-    if (found == group_index.end()) {
-      group_index.emplace(prefix, groups.size());
-      groups.push_back(DependencyGroup{dependency.ref, {index}});
-    } else {
-      groups[found->second].indices.push_back(index);
-    }
+    pending.push_back(index);
   }
-  // One iterator serves every group. Visiting groups in canonical order keeps
-  // each Seek at or after the previous prefix.
-  std::sort(groups.begin(), groups.end(),
-            [](const DependencyGroup& left, const DependencyGroup& right) {
-              return std::tuple{left.ref.part_id().value,
-                                static_cast<uint8_t>(left.ref.family()),
-                                left.ref.property_id().value,
-                                left.ref.entity_id()} <
-                     std::tuple{right.ref.part_id().value,
-                                static_cast<uint8_t>(right.ref.family()),
-                                right.ref.property_id().value,
-                                right.ref.entity_id()};
+  // Sort by fact identity and group in place. One iterator serves every group;
+  // canonical order keeps each Seek at or after the previous prefix, and no
+  // per-dependency prefix string is allocated.
+  std::sort(pending.begin(), pending.end(),
+            [&dependencies, &ref_less](size_t left, size_t right) {
+              return ref_less(dependencies[left].ref, dependencies[right].ref);
             });
   std::unique_ptr<rocksdb::Iterator> iterator;
-  for (const DependencyGroup& group : groups) {
+  for (size_t begin = 0; begin < pending.size();) {
+    const FactRef& ref = dependencies[pending[begin]].ref;
+    size_t end = begin + 1;
+    while (end < pending.size() && dependencies[pending[end]].ref == ref) {
+      ++end;
+    }
     std::optional<std::vector<CurrentFactInterval>> intervals =
-        CachedFactIntervals(store, group.ref);
+        CachedFactIntervals(store, ref);
     if (!intervals.has_value()) {
       if (iterator == nullptr) {
         iterator.reset(
             store->db->NewIterator(rocksdb::ReadOptions(), store->facts_cf));
       }
-      auto scanned = ScanCurrentFactIntervals(store, group.ref, iterator.get());
+      auto scanned = ScanCurrentFactIntervals(store, ref, iterator.get());
       if (!scanned.ok()) return scanned.status();
       intervals = scanned.ConsumeValueOrDie();
     }
-    for (size_t index : group.indices) {
-      const SnapshotWriteDependency& dependency = dependencies[index];
+    for (size_t position = begin; position < end; ++position) {
+      const SnapshotWriteDependency& dependency = dependencies[pending[position]];
       for (const CurrentFactInterval& interval : *intervals) {
         if (interval.commit_seq.value <= dependency.snapshot_seq.value) continue;
         if (IntervalsOverlap(dependency.valid_from, dependency.successor,
@@ -839,6 +833,7 @@ Status ValidateSnapshotWriteDependencies(
         }
       }
     }
+    begin = end;
   }
   return Status::OK();
 }

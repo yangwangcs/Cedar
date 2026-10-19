@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "rocksdb/advanced_cache.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -272,10 +273,23 @@ TEST(RocksDbProfileTest, ResolvesProductionBudgetSplitAndBaseline) {
 TEST(RocksDbProfileTest, AppliesExplicitProductionCapacityToEveryColumnFamily) {
   FactStoreOptions options;
   options.storage_profile = StorageProfile::kProductionAppend;
-  options.production.memory_budget_bytes = 12ULL << 30;
-  options.production.facts_memtable_bytes = 512ULL << 20;
-  options.production.meta_memtable_bytes = 128ULL << 20;
-  options.production.default_memtable_bytes = 64ULL << 20;
+  // The production profile rejects budgets above 50% of host memory. Keep the
+  // requested 12 GiB on large hosts but stay within the host limit on smaller
+  // development machines so this capacity mapping test is host-independent.
+  const uint64_t host_memory =
+      static_cast<uint64_t>(::sysconf(_SC_PHYS_PAGES)) *
+      static_cast<uint64_t>(::sysconf(_SC_PAGE_SIZE));
+  ASSERT_GT(host_memory, 2ULL << 30);
+  options.production.memory_budget_bytes = std::min<uint64_t>(
+      12ULL << 30, host_memory / 2 - (256ULL << 20));
+  ASSERT_GE(options.production.memory_budget_bytes, 1ULL << 30);
+  // Scale the explicit capacities to the resolved budget so the profile's
+  // derived allocations (25% facts, 5% meta+default) still hold on any host.
+  constexpr uint64_t kMiB = 1ULL << 20;
+  const uint64_t budget = options.production.memory_budget_bytes;
+  options.production.facts_memtable_bytes = (budget / 16) / kMiB * kMiB;
+  options.production.meta_memtable_bytes = (budget / 100) / kMiB * kMiB;
+  options.production.default_memtable_bytes = (budget / 200) / kMiB * kMiB;
   options.production.facts_memtable_count = 4;
   options.production.meta_memtable_count = 3;
   options.production.default_memtable_count = 3;
@@ -284,9 +298,12 @@ TEST(RocksDbProfileTest, AppliesExplicitProductionCapacityToEveryColumnFamily) {
 
   const auto resolved = ResolveStorageProfile(options);
   ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
-  EXPECT_EQ(resolved.ValueOrDie().facts_memtable_bytes, 512ULL << 20);
-  EXPECT_EQ(resolved.ValueOrDie().meta_memtable_bytes, 128ULL << 20);
-  EXPECT_EQ(resolved.ValueOrDie().default_memtable_bytes, 64ULL << 20);
+  EXPECT_EQ(resolved.ValueOrDie().facts_memtable_bytes,
+            options.production.facts_memtable_bytes);
+  EXPECT_EQ(resolved.ValueOrDie().meta_memtable_bytes,
+            options.production.meta_memtable_bytes);
+  EXPECT_EQ(resolved.ValueOrDie().default_memtable_bytes,
+            options.production.default_memtable_bytes);
   EXPECT_EQ(resolved.ValueOrDie().facts_write_buffer_count, 4U);
   EXPECT_EQ(resolved.ValueOrDie().meta_write_buffer_count, 3U);
   EXPECT_EQ(resolved.ValueOrDie().default_write_buffer_count, 3U);
@@ -303,19 +320,23 @@ TEST(RocksDbProfileTest, AppliesExplicitProductionCapacityToEveryColumnFamily) {
   const auto descriptors = MakeRocksDbColumnFamilyDescriptors(
       options, db_options, &resolved.ValueOrDie());
   ASSERT_EQ(descriptors.size(), 3U);
-  EXPECT_EQ(descriptors[0].options.write_buffer_size, 64ULL << 20);
+  EXPECT_EQ(descriptors[0].options.write_buffer_size,
+            options.production.default_memtable_bytes);
   EXPECT_EQ(descriptors[0].options.max_write_buffer_number, 3);
   EXPECT_EQ(descriptors[0].options.level0_file_num_compaction_trigger, 8);
   EXPECT_EQ(descriptors[0].options.level0_slowdown_writes_trigger, 24);
   EXPECT_EQ(descriptors[0].options.level0_stop_writes_trigger, 36);
-  EXPECT_EQ(descriptors[1].options.write_buffer_size, 512ULL << 20);
+  EXPECT_EQ(descriptors[1].options.write_buffer_size,
+            options.production.facts_memtable_bytes);
   EXPECT_EQ(descriptors[1].options.max_write_buffer_number, 4);
   EXPECT_EQ(descriptors[1].options.min_write_buffer_number_to_merge, 2);
-  EXPECT_EQ(descriptors[1].options.target_file_size_base, 512ULL << 20);
+  EXPECT_EQ(descriptors[1].options.target_file_size_base,
+            options.production.facts_memtable_bytes);
   EXPECT_EQ(descriptors[1].options.level0_file_num_compaction_trigger, 8);
   EXPECT_EQ(descriptors[1].options.level0_slowdown_writes_trigger, 24);
   EXPECT_EQ(descriptors[1].options.level0_stop_writes_trigger, 36);
-  EXPECT_EQ(descriptors[2].options.write_buffer_size, 128ULL << 20);
+  EXPECT_EQ(descriptors[2].options.write_buffer_size,
+            options.production.meta_memtable_bytes);
   EXPECT_EQ(descriptors[2].options.max_write_buffer_number, 3);
   EXPECT_EQ(descriptors[2].options.level0_file_num_compaction_trigger, 8);
   EXPECT_EQ(descriptors[2].options.level0_slowdown_writes_trigger, 24);

@@ -228,11 +228,19 @@ function(configure_cedar_parquet_test target)
     target_compile_definitions(${target} PRIVATE
         ROCKSDB_PLATFORM_POSIX
         ROCKSDB_LIB_IO_POSIX
-        OS_LINUX
-        NDEBUG
         LZ4
         ZSTD
         CEDAR_ZSTD_NO_DICTIONARY_TRAINING)
+    if(APPLE)
+        target_compile_definitions(${target} PRIVATE
+            OS_MACOSX
+            HAVE_FULLFSYNC)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        target_compile_definitions(${target} PRIVATE OS_LINUX)
+    endif()
+    if(NOT CEDAR_ROCKSDB_BUILD_TYPE STREQUAL "Debug")
+        target_compile_definitions(${target} PRIVATE NDEBUG)
+    endif()
     target_link_libraries(${target} PRIVATE cedar_rocksdb ${GTEST_MAIN_TARGET})
     gtest_discover_tests(${target})
 endfunction()

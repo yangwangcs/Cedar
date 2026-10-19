@@ -3,6 +3,7 @@ build/
 build-*/
 cmake-build-*/
 out/
+.engine-cache/
 
 # Agent workflow state
 .superpowers/

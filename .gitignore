@@ -9,6 +9,9 @@ out/
 .superpowers/
 .worktrees/
 
+# CI workflows stay local; they are not published to the repository.
+.github/workflows/
+
 # Public documentation is tracked; local design and execution material is not.
 docs/*
 !docs/

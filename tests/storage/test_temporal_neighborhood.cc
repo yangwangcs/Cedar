@@ -21,6 +21,12 @@ PendingFactMutation Mutation(uint64_t valid_time, FactOperation operation = Fact
           0, std::nullopt};
 }
 
+PendingFactMutation MutationFor(uint64_t vertex_id, uint64_t valid_time,
+                                FactOperation operation = FactOperation::kPut) {
+  return {EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}).ref(),
+          ValidTime{valid_time}, operation, 0, std::nullopt};
+}
+
 class TemporalNeighborhoodTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -171,6 +177,88 @@ TEST_F(TemporalNeighborhoodTest, MatchesScanBeforeAndAfterReopen) {
   for (uint64_t query : {0U, 10U, 15U, 20U, 25U, 30U, 35U}) {
     ExpectMatchesOracle(snapshot.ValueOrDie(), ValidTime{query});
   }
+}
+
+TEST_F(TemporalNeighborhoodTest, BatchMatchesSingleFactCapturePerQuery) {
+  Commit(TxnId{1}, {Mutation(10), Mutation(30)});
+  Commit(TxnId{2}, {Mutation(20, FactOperation::kDelete)});
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  const std::vector<TemporalNeighborhoodQuery> queries = {
+      {ref, ValidTime{35}}, {ref, ValidTime{0}}, {ref, ValidTime{20}},
+      {ref, ValidTime{25}}, {ref, ValidTime{10}}};
+  std::vector<TemporalNeighborhood> batch;
+  ASSERT_TRUE(store_
+                  ->ReadTemporalNeighborhoods(snapshot.ValueOrDie(), queries,
+                                              &batch)
+                  .ok());
+  ASSERT_EQ(batch.size(), queries.size());
+  for (size_t index = 0; index < queries.size(); ++index) {
+    const auto single = store_->ReadTemporalNeighborhood(
+        snapshot.ValueOrDie(), ref, queries[index].valid_time);
+    ASSERT_TRUE(single.ok()) << single.status().ToString();
+    EXPECT_EQ(batch[index].predecessor, single.ValueOrDie().predecessor);
+    EXPECT_EQ(batch[index].successor, single.ValueOrDie().successor);
+    ASSERT_EQ(batch[index].observed.has_value(),
+              single.ValueOrDie().observed.has_value());
+    if (single.ValueOrDie().observed.has_value()) {
+      EXPECT_EQ(batch[index].observed->valid_from,
+                single.ValueOrDie().observed->valid_from);
+      EXPECT_EQ(batch[index].observed->commit_seq,
+                single.ValueOrDie().observed->commit_seq);
+      EXPECT_EQ(batch[index].observed->operation,
+                single.ValueOrDie().observed->operation);
+    }
+  }
+}
+
+TEST_F(TemporalNeighborhoodTest, BatchCoversMultipleEntitiesAndEmptyQuery) {
+  Commit(TxnId{1}, {MutationFor(1, 10), MutationFor(2, 15), MutationFor(3, 5)});
+  Commit(TxnId{2}, {MutationFor(1, 30), MutationFor(2, 40)});
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  const FactRef ref1 =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  const FactRef ref2 =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{2}}).ref();
+  const FactRef ref3 =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{3}}).ref();
+  const FactRef missing =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9}}).ref();
+  const std::vector<TemporalNeighborhoodQuery> queries = {
+      {ref3, ValidTime{0}}, {ref1, ValidTime{25}}, {missing, ValidTime{10}},
+      {ref2, ValidTime{20}}, {ref1, ValidTime{100}}};
+  std::vector<TemporalNeighborhood> batch;
+  ASSERT_TRUE(store_
+                  ->ReadTemporalNeighborhoods(snapshot.ValueOrDie(), queries,
+                                              &batch)
+                  .ok());
+  ASSERT_EQ(batch.size(), queries.size());
+  for (size_t index = 0; index < queries.size(); ++index) {
+    const auto single = store_->ReadTemporalNeighborhood(
+        snapshot.ValueOrDie(), queries[index].ref, queries[index].valid_time);
+    ASSERT_TRUE(single.ok()) << single.status().ToString();
+    EXPECT_EQ(batch[index].observed.has_value(),
+              single.ValueOrDie().observed.has_value());
+    EXPECT_EQ(batch[index].predecessor, single.ValueOrDie().predecessor);
+    EXPECT_EQ(batch[index].successor, single.ValueOrDie().successor);
+  }
+  std::vector<TemporalNeighborhood> empty;
+  EXPECT_TRUE(
+      store_->ReadTemporalNeighborhoods(snapshot.ValueOrDie(), {}, &empty).ok());
+  EXPECT_TRUE(empty.empty());
+}
+
+TEST_F(TemporalNeighborhoodTest, BatchRejectsMissingOutputVector) {
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  const auto status = store_->ReadTemporalNeighborhoods(
+      snapshot.ValueOrDie(), {{ref, ValidTime{0}}}, nullptr);
+  EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
 }
 
 }  // namespace

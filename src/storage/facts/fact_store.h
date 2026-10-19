@@ -334,6 +334,14 @@ struct TemporalNeighborhood {
   std::optional<ValidTime> successor;
 };
 
+// A single point in one fact chain to resolve against a store snapshot.
+struct TemporalNeighborhoodQuery {
+  FactRef ref;
+  ValidTime valid_time;
+
+  Status Validate() const;
+};
+
 class FactPrefix {
  public:
   static FactPrefix Exact(FactRef ref);
@@ -419,6 +427,12 @@ class FactStore {
   StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
       const StoreSnapshot& snapshot, const FactRef& ref,
       ValidTime valid_time) const;
+  // Reads several fact neighborhoods against one store snapshot. Results are
+  // returned in query order; an empty query list is valid.
+  Status ReadTemporalNeighborhoods(
+      const StoreSnapshot& snapshot,
+      const std::vector<TemporalNeighborhoodQuery>& queries,
+      std::vector<TemporalNeighborhood>* neighborhoods) const;
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactVisitor& visitor) const;
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,

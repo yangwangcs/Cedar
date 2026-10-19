@@ -4,7 +4,9 @@
 #include "storage/rocks/rocks_adapter.h"
 
 #include <algorithm>
+#include <numeric>
 #include <sstream>
+#include <tuple>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -651,9 +653,13 @@ void PublishRecentFactWriteIndex(FactStoreImpl* store,
   PublishRecentFactWriteIndex(store, batch.mutations, commit_seq);
 }
 
-StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
+StatusOr<TemporalNeighborhood> ReadTemporalNeighborhoodWithIterator(
     FactStoreImpl* store, const FactRef& ref, ValidTime valid_time,
-    CommitSeq commit_limit, const rocksdb::Snapshot* rocks_snapshot) {
+    CommitSeq commit_limit, rocksdb::Iterator* iterator) {
+  if (iterator == nullptr) {
+    return Status::InvalidArgument("temporal neighborhood",
+                                   "missing fact iterator");
+  }
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
   store->point_read_operations.fetch_add(1, std::memory_order_relaxed);
@@ -664,12 +670,9 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
     return Status::InvalidArgument("temporal neighborhood", "invalid fact key");
   }
   const std::string prefix = seek.substr(0, kFactIdentityPrefixBytes);
-  rocksdb::ReadOptions options;
-  options.snapshot = rocks_snapshot;
 
   TemporalNeighborhood neighborhood;
-  std::unique_ptr<rocksdb::Iterator> forward(
-      store->db->NewIterator(options, store->facts_cf));
+  rocksdb::Iterator* forward = iterator;
   std::optional<ValidTime> current_boundary;
   bool current_boundary_visible = false;
   forward->Seek(seek);
@@ -705,7 +708,7 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
   // Both scans use the same RocksDB snapshot and options. Reposition the
   // iterator after checking the forward scan's status; no borrowed Slice is
   // retained in the decoded neighborhood.
-  rocksdb::Iterator* backward = forward.get();
+  rocksdb::Iterator* backward = forward;
   std::optional<ValidTime> successor_boundary;
   bool successor_boundary_visible = false;
   backward->SeekForPrev(seek);
@@ -732,6 +735,17 @@ StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
     return FromRocksDb(backward->status(), "iterate temporal neighborhood");
   }
   return neighborhood;
+}
+
+StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
+    FactStoreImpl* store, const FactRef& ref, ValidTime valid_time,
+    CommitSeq commit_limit, const rocksdb::Snapshot* rocks_snapshot) {
+  rocksdb::ReadOptions options;
+  options.snapshot = rocks_snapshot;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  return ReadTemporalNeighborhoodWithIterator(store, ref, valid_time,
+                                              commit_limit, iterator.get());
 }
 
 StatusOr<StrictReadIdentity> CurrentStrictReadIdentity(
@@ -1574,6 +1588,62 @@ StatusOr<TemporalNeighborhood> FactStore::ReadTemporalNeighborhood(
   return ::cedar::ReadTemporalNeighborhood(store.get(), ref, valid_time,
                                            snapshot.commit_seq(),
                                            snapshot.state_->snapshot);
+}
+
+Status TemporalNeighborhoodQuery::Validate() const { return ref.Validate(); }
+
+Status FactStore::ReadTemporalNeighborhoods(
+    const StoreSnapshot& snapshot,
+    const std::vector<TemporalNeighborhoodQuery>& queries,
+    std::vector<TemporalNeighborhood>* neighborhoods) const {
+  if (neighborhoods == nullptr) {
+    return Status::InvalidArgument("temporal neighborhood",
+                                   "missing output vector");
+  }
+  neighborhoods->clear();
+  if (queries.empty()) return Status::OK();
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store || snapshot.state_ == nullptr ||
+        snapshot.state_->store != store) {
+      return Status::InvalidArgument("temporal neighborhood",
+                                     "snapshot belongs to another store");
+    }
+  }
+  for (const TemporalNeighborhoodQuery& query : queries) {
+    const Status valid = query.Validate();
+    if (!valid.ok()) return valid;
+  }
+  rocksdb::ReadOptions options;
+  options.snapshot = snapshot.state_->snapshot;
+  // One iterator serves the whole batch. Queries are visited in canonical fact
+  // order so each Seek starts at or after the previous prefix.
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  std::vector<size_t> order(queries.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::stable_sort(order.begin(), order.end(),
+                   [&queries](size_t left, size_t right) {
+                     const FactRef& a = queries[left].ref;
+                     const FactRef& b = queries[right].ref;
+                     return std::tuple{a.part_id().value,
+                                       static_cast<uint8_t>(a.family()),
+                                       a.property_id().value, a.entity_id()} <
+                            std::tuple{b.part_id().value,
+                                       static_cast<uint8_t>(b.family()),
+                                       b.property_id().value, b.entity_id()};
+                   });
+  neighborhoods->resize(queries.size());
+  for (size_t index : order) {
+    auto neighborhood = ::cedar::ReadTemporalNeighborhoodWithIterator(
+        store.get(), queries[index].ref, queries[index].valid_time,
+        snapshot.commit_seq(), iterator.get());
+    if (!neighborhood.ok()) return neighborhood.status();
+    (*neighborhoods)[index] = neighborhood.ConsumeValueOrDie();
+  }
+  return Status::OK();
 }
 
 Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,

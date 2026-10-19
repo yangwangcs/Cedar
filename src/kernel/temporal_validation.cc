@@ -18,16 +18,26 @@ StatusOr<SnapshotWriteDependency> CaptureSnapshotWriteDependency(
 StatusOr<std::vector<SnapshotWriteDependency>> DeriveSnapshotWriteDependencies(
     const FactStore& store, const StoreSnapshot& snapshot,
     const std::vector<PendingFactMutation>& mutations) {
-  std::vector<SnapshotWriteDependency> dependencies;
-  dependencies.reserve(mutations.size());
+  std::vector<TemporalNeighborhoodQuery> queries;
+  queries.reserve(mutations.size());
   for (const PendingFactMutation& mutation : mutations) {
     const Status valid = mutation.Validate();
     if (!valid.ok()) return valid;
-
-    auto dependency = CaptureSnapshotWriteDependency(
-        store, snapshot, mutation.ref, mutation.valid_from);
-    if (!dependency.ok()) return dependency.status();
-    dependencies.push_back(dependency.ConsumeValueOrDie());
+    queries.push_back(TemporalNeighborhoodQuery{mutation.ref,
+                                                mutation.valid_from});
+  }
+  std::vector<TemporalNeighborhood> neighborhoods;
+  const Status read =
+      store.ReadTemporalNeighborhoods(snapshot, queries, &neighborhoods);
+  if (!read.ok()) return read;
+  const CommitSeq snapshot_seq = snapshot.commit_seq();
+  std::vector<SnapshotWriteDependency> dependencies;
+  dependencies.reserve(mutations.size());
+  for (size_t index = 0; index < mutations.size(); ++index) {
+    dependencies.push_back(SnapshotWriteDependency{
+        mutations[index].ref, mutations[index].valid_from,
+        neighborhoods[index].predecessor, neighborhoods[index].successor,
+        snapshot_seq});
   }
   return dependencies;
 }

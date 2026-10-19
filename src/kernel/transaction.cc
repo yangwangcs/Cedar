@@ -294,7 +294,6 @@ class Transaction::State {
   TxnId txn_id;
   std::vector<PendingFactMutation> mutations;
   std::vector<EdgeIdentity> edge_identities;
-  std::vector<SnapshotWriteDependency> snapshot_write_dependencies;
   std::vector<StrictReadDependency> strict_read_dependencies;
   std::vector<std::tuple<uint32_t, uint8_t, uint16_t, uint64_t, uint64_t>>
       mutation_keys;
@@ -398,15 +397,10 @@ class Transaction::State {
         mutation_keys.end()) {
       return Status::InvalidArgument("transaction", "duplicate fact mutation");
     }
-    auto dependency = CaptureSnapshotWriteDependency(
-        database->store, *snapshot, mutation.ref, mutation.valid_from);
-    if (!dependency.ok()) return dependency.status();
     mutation_keys.push_back(key);
     const auto position = std::upper_bound(
         mutations.begin(), mutations.end(), mutation, CanonicalMutationLess);
     mutations.insert(position, std::move(mutation));
-    snapshot_write_dependencies.push_back(
-        dependency.ConsumeValueOrDie());
     return Status::OK();
   }
 
@@ -580,11 +574,22 @@ StatusOr<CommitResult> Transaction::Commit() {
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
   const Status begun = state_->BeginCommit();
   if (!begun.ok()) return begun;
+  // Dependencies are derived from the transaction's pinned snapshot at commit
+  // time. One batched pass replaces one iterator pair per staged fact.
+  auto dependencies = DeriveSnapshotWriteDependencies(
+      state_->database->store, *state_->snapshot, state_->mutations);
+  if (!dependencies.ok()) {
+    const Status status = dependencies.status();
+    state_->Finish();
+    state_->EndCommit();
+    return CommitResult{CommitOutcome::kAborted, CommitSeq{}, state_->txn_id,
+                        status};
+  }
   StoreCommitBatch batch{state_->txn_id,
                          state_->txn_id.value,
                          std::move(state_->mutations),
                          std::move(state_->edge_identities),
-                         std::move(state_->snapshot_write_dependencies),
+                         dependencies.ConsumeValueOrDie(),
                          std::move(state_->strict_read_dependencies), true};
   const auto committed = state_->database->SubmitSyncCommit(
       std::move(batch), state_->options.commit_deadline_us);
@@ -606,11 +611,19 @@ StatusOr<CommitHandle> Transaction::CommitAsync() {
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
   const Status begun = state_->BeginCommit();
   if (!begun.ok()) return begun;
+  auto dependencies = DeriveSnapshotWriteDependencies(
+      state_->database->store, *state_->snapshot, state_->mutations);
+  if (!dependencies.ok()) {
+    const Status status = dependencies.status();
+    state_->Finish();
+    state_->EndCommit();
+    return status;
+  }
   StoreCommitBatch batch{state_->txn_id,
                          state_->txn_id.value,
                          std::move(state_->mutations),
                          std::move(state_->edge_identities),
-                         std::move(state_->snapshot_write_dependencies),
+                         dependencies.ConsumeValueOrDie(),
                          std::move(state_->strict_read_dependencies), true};
   auto handle_state = std::make_shared<CommitHandle::State>(batch.txn_id);
   const Status enqueued = state_->database->SubmitAsyncCommit(

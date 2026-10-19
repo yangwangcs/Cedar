@@ -214,6 +214,10 @@ struct DatabaseOptions {
   uint64_t blob_threshold_bytes = 4096;
   uint32_t group_commit_max_batch_size = 128;
   uint64_t group_commit_window_us = 200;
+  // Predicted (pre-encoded) epochs are only worthwhile when assembling a group
+  // costs a meaningful fraction of the WAL sync. Below this encoded size the
+  // pipeline collects a full group on the general path instead.
+  uint64_t predicted_preflight_min_bytes = 32ULL * 1024ULL;
   WalSyncMode wal_sync_mode = WalSyncMode::kFullDeviceFlush;
   std::function<Status()> async_prepare_prewrite_fault_injector_for_testing;
   std::function<Status()> commit_prewrite_fault_injector_for_testing;

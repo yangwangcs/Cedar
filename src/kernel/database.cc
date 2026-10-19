@@ -733,7 +733,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
       }
       std::unique_ptr<internal::DecidedEpoch> predecided;
       const auto preflight_started_at = std::chrono::steady_clock::now();
+      // Predicting an epoch pays off only when assembling it is expensive
+      // relative to the WAL sync. Small blind-put batches encode in
+      // microseconds and gain more from collecting a full group, so they keep
+      // the general path. This also keeps tiny-transaction group sizes intact.
       if (!planned_requests.empty() &&
+          planned_bytes >= predicted_preflight_min_bytes &&
           epoch_committed_count <=
               std::numeric_limits<uint64_t>::max() - epoch_base.value) {
         auto decided = store.DecideIndependentAppendGroup(

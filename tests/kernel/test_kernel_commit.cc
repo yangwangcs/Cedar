@@ -514,6 +514,7 @@ TEST(KernelAsyncCommitTest, AsyncCommitUsesSynchronousDurableWrite) {
       .path = path,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_write_options_observer_for_testing =
           [&final_write_was_synchronous](bool sync) {
             final_write_was_synchronous.store(sync);
@@ -550,6 +551,7 @@ TEST(KernelRuntimeSamplerTest, SamplesOnCadenceInsteadOfEveryCommitEpoch) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         writer_entered = true;
@@ -915,6 +917,7 @@ TEST(KernelRuntimeSamplerTest, PublishesWhileCommitCompletionLockIsHeld) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_result_processing_observer_for_testing = [&] {
         std::unique_lock<std::mutex> lock(completion_mutex);
         completion_entered = true;
@@ -1017,6 +1020,7 @@ TEST(KernelAdmissionControlTest, BoundsMailboxAdmissionWithoutBlockingCallers) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         entered = true;
@@ -1099,6 +1103,7 @@ TEST(KernelAsyncCommitTest, FreshTransactionDoesNotReadPersistedOutcomeBeforeWri
       .path = path,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_transaction_lookup_observer_for_testing =
           [&transaction_outcome_reads] { ++transaction_outcome_reads; }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
@@ -1214,6 +1219,7 @@ TEST(KernelTransactionAllocationTest, AllocatesLeasedTransactionIdWhileWriterIsB
       .path = path,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         writer_entered = true;
@@ -1263,6 +1269,7 @@ TEST(KernelCommitDurabilityTest, SynchronousCommitRetainsItsDurableWrite) {
       .path = path,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_write_options_observer_for_testing =
           [&commit_write_was_synchronous](bool sync) {
             commit_write_was_synchronous.store(sync);
@@ -1710,6 +1717,7 @@ TEST(KernelGroupCommitTest, RejectsAdmissionWhenPendingQueueIsFull) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -1799,6 +1807,7 @@ TEST(KernelAsyncCommitTest, RejectsWhenCedarMailboxIsFullWithoutWaiting) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -1864,6 +1873,7 @@ TEST(KernelGroupCommitTest, CountsSelectedEpochAgainstQueueByteReservation) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -2041,6 +2051,7 @@ TEST(KernelGroupCommitTest, SyncAdmissionWaitsForQueueSpaceWithinDeadline) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -2110,6 +2121,7 @@ TEST(KernelGroupCommitTest, PreflightsNextEpochAgainstImmutableOverlay) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -2198,6 +2210,7 @@ TEST(KernelGroupCommitTest, CancelsEligibleNPlusOneWhenQueuedRequestTimesOut) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -2289,6 +2302,7 @@ TEST(KernelGroupCommitTest, DeadlineDoesNotRejectAfterWriterSelection) {
       .path = pattern,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         prewrite_entered = true;
@@ -2365,6 +2379,7 @@ void ExerciseNPlusOnePredecessorDiscard(
       .path = path,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         if (!inject_first.exchange(false, std::memory_order_acq_rel)) {
           return Status::OK();
@@ -2482,6 +2497,7 @@ TEST(KernelGroupCommitTest, DiscardsEligibleNPlusOneOnShutdown) {
       .path = path,
       .group_commit_max_batch_size = 1,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -2584,6 +2600,7 @@ TEST(KernelGroupCommitTest,
       .path = path,
       .group_commit_max_batch_size = kTransactions,
       .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
       .commit_prewrite_fault_injector_for_testing = [&] {
         std::unique_lock<std::mutex> lock(prewrite_mutex);
         if (!first_prewrite_entered) {
@@ -3824,6 +3841,136 @@ TEST(KernelSnapshotValidationTest, DisjointDependenciesCommitAfterBatchScan) {
   const auto commit = transaction.ValueOrDie()->Commit();
   ASSERT_TRUE(commit.ok()) << commit.status().ToString();
   EXPECT_EQ(commit.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelConcurrentValidationTest,
+     StaleSnapshotBlindAppendsKeepOneWinner) {
+  char pattern[] = "/tmp/cedar_predicted_stale_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  constexpr uint32_t kThreads = 8;
+  constexpr uint32_t kFactsPerTransaction = 256;
+  std::barrier start(kThreads + 1);
+  std::atomic<uint32_t> committed{0};
+  std::atomic<uint32_t> conflicted{0};
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (uint32_t thread = 0; thread < kThreads; ++thread) {
+    threads.emplace_back([&, thread] {
+      auto transaction = database->BeginTransaction();
+      if (!transaction.ok()) {
+        failed.store(true);
+        start.arrive_and_wait();
+        return;
+      }
+      auto& staged = transaction.ValueOrDie();
+      for (uint32_t index = 0; index < kFactsPerTransaction; ++index) {
+        const uint64_t vertex_id = 100000 + thread * 1000 + index;
+        if (!staged
+                 ->Assert(EntityFact::Vertex(
+                              VertexRef{PartId{0}, VertexId{vertex_id}}),
+                          ValidTime{10})
+                 .ok()) {
+          failed.store(true);
+        }
+      }
+      // Every transaction also touches one shared fact. All snapshots are
+      // taken before any commit, so exactly one blind append may win.
+      if (!staged
+               ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}),
+                        ValidTime{10})
+               .ok()) {
+        failed.store(true);
+      }
+      start.arrive_and_wait();
+      const auto result = staged->Commit();
+      if (!result.ok()) {
+        failed.store(true);
+        return;
+      }
+      if (result.ValueOrDie().outcome == CommitOutcome::kCommitted) {
+        committed.fetch_add(1);
+      } else if (result.ValueOrDie().status.IsConflict()) {
+        conflicted.fetch_add(1);
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto& thread : threads) thread.join();
+
+  EXPECT_FALSE(failed.load());
+  EXPECT_EQ(committed.load(), 1U);
+  EXPECT_EQ(conflicted.load(), kThreads - 1);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelConcurrentValidationTest, PredictedBlindAppendSurvivesReopen) {
+  char pattern[] = "/tmp/cedar_predicted_reopen_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  constexpr uint32_t kThreads = 4;
+  constexpr uint32_t kFactsPerTransaction = 256;
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  for (uint32_t thread = 0; thread < kThreads; ++thread) {
+    threads.emplace_back([&, thread] {
+      auto transaction = database->BeginTransaction();
+      if (!transaction.ok()) {
+        failed.store(true);
+        return;
+      }
+      for (uint32_t index = 0; index < kFactsPerTransaction; ++index) {
+        const uint64_t vertex_id = 200000 + thread * 1000 + index;
+        if (!transaction.ValueOrDie()
+                 ->Assert(EntityFact::Vertex(
+                              VertexRef{PartId{0}, VertexId{vertex_id}}),
+                          ValidTime{10})
+                 .ok()) {
+          failed.store(true);
+        }
+      }
+      const auto result = transaction.ValueOrDie()->Commit();
+      if (!result.ok() ||
+          result.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+        failed.store(true);
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  EXPECT_FALSE(failed.load());
+  const Status closed = database->Close();
+  ASSERT_TRUE(closed.ok()) << closed.ToString();
+  database.reset();
+
+  auto reopened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database = std::move(reopened).ConsumeValueOrDie();
+  {
+    const auto snapshot = database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    for (uint32_t thread = 0; thread < kThreads; ++thread) {
+      for (uint32_t index = 0; index < kFactsPerTransaction; index += 37) {
+        const uint64_t vertex_id = 200000 + thread * 1000 + index;
+        const auto exists = snapshot.ValueOrDie().Exists(
+            EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}),
+            ValidTime{10});
+        ASSERT_TRUE(exists.ok()) << exists.status().ToString();
+        EXPECT_TRUE(exists.ValueOrDie());
+      }
+    }
+  }
   EXPECT_TRUE(database->Close().ok());
   std::filesystem::remove_all(path);
 }

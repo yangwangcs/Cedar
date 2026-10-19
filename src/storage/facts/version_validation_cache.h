@@ -5,6 +5,7 @@
 #define CEDAR_FACT_VERSION_VALIDATION_CACHE_H_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -32,14 +33,24 @@ class VersionValidationCache {
   struct Metrics {
     uint64_t hits = 0;
     uint64_t misses = 0;
+    uint64_t skipped_primes = 0;
   };
 
   explicit VersionValidationCache(size_t max_bytes);
 
   std::optional<std::vector<ValidationBoundary>> Lookup(
       const FactRef& ref) const;
-  void Prime(const FactRef& ref, std::vector<ValidationBoundary> boundaries);
+  // Publishes a canonical chain captured by a scan. The scan may miss a commit
+  // that published while it was running, so priming is skipped when the
+  // publication generation moved since observed_publish_generation.
+  void Prime(const FactRef& ref, std::vector<ValidationBoundary> boundaries,
+             uint64_t observed_publish_generation);
   void Publish(const PendingFactMutation& mutation, CommitSeq commit_seq);
+  // Monotonic count of published fact boundaries. A scan captures it before
+  // reading so Prime can detect a concurrent publication.
+  uint64_t publish_generation() const {
+    return publish_generation_.load(std::memory_order_acquire);
+  }
 
   size_t resident_chains() const;
   size_t resident_bytes() const;
@@ -82,6 +93,8 @@ class VersionValidationCache {
   mutable size_t resident_chains_ = 0;
   mutable uint64_t hits_ = 0;
   mutable uint64_t misses_ = 0;
+  mutable uint64_t skipped_primes_ = 0;
+  mutable std::atomic<uint64_t> publish_generation_{0};
 };
 
 }  // namespace cedar::internal

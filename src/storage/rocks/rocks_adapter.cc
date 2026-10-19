@@ -584,7 +584,8 @@ std::optional<std::vector<CurrentFactInterval>> CachedFactIntervals(
 }
 
 StatusOr<std::vector<CurrentFactInterval>> ScanCurrentFactIntervals(
-    FactStoreImpl* store, const FactRef& ref, rocksdb::Iterator* iterator) {
+    FactStoreImpl* store, const FactRef& ref, rocksdb::Iterator* iterator,
+    uint64_t observed_publish_generation) {
   if (iterator == nullptr) {
     return Status::InvalidArgument("validation scan", "missing fact iterator");
   }
@@ -621,7 +622,8 @@ StatusOr<std::vector<CurrentFactInterval>> ScanCurrentFactIntervals(
       boundaries.push_back(
           internal::ValidationBoundary{interval.valid_from, interval.commit_seq});
     }
-    store->version_validation_cache->Prime(ref, std::move(boundaries));
+    store->version_validation_cache->Prime(ref, std::move(boundaries),
+                                           observed_publish_generation);
   }
   return intervals;
 }
@@ -631,10 +633,15 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
   if (auto cached = CachedFactIntervals(store, ref); cached.has_value()) {
     return std::move(*cached);
   }
+  const uint64_t observed_publish_generation =
+      store->version_validation_cache != nullptr
+          ? store->version_validation_cache->publish_generation()
+          : 0;
   rocksdb::ReadOptions options;
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->facts_cf));
-  return ScanCurrentFactIntervals(store, ref, iterator.get());
+  return ScanCurrentFactIntervals(store, ref, iterator.get(),
+                                  observed_publish_generation);
 }
 
 void PublishValidationCache(FactStoreImpl* store,
@@ -825,6 +832,13 @@ Status ValidateSnapshotWriteDependencies(
             [&dependencies, &ref_less](size_t left, size_t right) {
               return ref_less(dependencies[left].ref, dependencies[right].ref);
             });
+  // Capture the publication generation before the shared scan iterator is
+  // created: a commit published after this point may be invisible to the scan,
+  // so any chain primed from it must not replace a newer canonical view.
+  const uint64_t observed_publish_generation =
+      store->version_validation_cache != nullptr
+          ? store->version_validation_cache->publish_generation()
+          : 0;
   std::unique_ptr<rocksdb::Iterator> iterator;
   for (size_t begin = 0; begin < pending.size();) {
     const FactRef& ref = dependencies[pending[begin]].ref;
@@ -839,7 +853,8 @@ Status ValidateSnapshotWriteDependencies(
         iterator.reset(
             store->db->NewIterator(rocksdb::ReadOptions(), store->facts_cf));
       }
-      auto scanned = ScanCurrentFactIntervals(store, ref, iterator.get());
+      auto scanned = ScanCurrentFactIntervals(
+          store, ref, iterator.get(), observed_publish_generation);
       if (!scanned.ok()) return scanned.status();
       intervals = scanned.ConsumeValueOrDie();
     }

@@ -109,7 +109,8 @@ VersionValidationCache::Lookup(const FactRef& ref) const {
 }
 
 void VersionValidationCache::Prime(
-    const FactRef& ref, std::vector<ValidationBoundary> boundaries) {
+    const FactRef& ref, std::vector<ValidationBoundary> boundaries,
+    uint64_t observed_publish_generation) {
   if (slots_.empty() || !ref.Validate().ok()) return;
   Chain chain;
   for (const ValidationBoundary& boundary : boundaries) {
@@ -125,6 +126,13 @@ void VersionValidationCache::Prime(
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (publish_generation_.load(std::memory_order_acquire) !=
+      observed_publish_generation) {
+    // A commit published while the scan ran, so the scanned chain may be
+    // missing a boundary. Keep the canonical path authoritative instead.
+    ++skipped_primes_;
+    return;
+  }
   const Key key = Identity(ref);
   Slot* slot = FindLocked(key);
   if (slot == nullptr) {
@@ -142,6 +150,7 @@ void VersionValidationCache::Prime(
 void VersionValidationCache::Publish(const PendingFactMutation& mutation,
                                      CommitSeq commit_seq) {
   if (commit_seq.value == 0 || !mutation.ref.Validate().ok()) return;
+  publish_generation_.fetch_add(1, std::memory_order_acq_rel);
   std::lock_guard<std::mutex> lock(mutex_);
   Slot* slot = FindLocked(Identity(mutation.ref));
   if (slot == nullptr) return;
@@ -166,7 +175,7 @@ size_t VersionValidationCache::resident_bytes() const {
 
 VersionValidationCache::Metrics VersionValidationCache::metrics() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return Metrics{hits_, misses_};
+  return Metrics{hits_, misses_, skipped_primes_};
 }
 
 }  // namespace cedar::internal

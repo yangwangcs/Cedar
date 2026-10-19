@@ -23,7 +23,8 @@ TEST(VersionValidationCacheTest, PublishesNewBoundaryIntoResidentChain) {
   VersionValidationCache cache(4096);
   const FactRef ref = PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{1}).ref();
   cache.Prime(ref, {{ValidTime{10}, CommitSeq{1}},
-                    {ValidTime{20}, CommitSeq{2}}});
+                    {ValidTime{20}, CommitSeq{2}}},
+              cache.publish_generation());
 
   const auto initial = cache.Lookup(ref);
   ASSERT_TRUE(initial.has_value());
@@ -42,7 +43,8 @@ TEST(VersionValidationCacheTest, PublishesNewBoundaryIntoResidentChain) {
 TEST(VersionValidationCacheTest, TreatsCapacityMissAsUnknownRatherThanAbsent) {
   VersionValidationCache cache(0);
   const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{8}}).ref();
-  cache.Prime(ref, {{ValidTime{10}, CommitSeq{1}}});
+  cache.Prime(ref, {{ValidTime{10}, CommitSeq{1}}},
+              cache.publish_generation());
 
   EXPECT_FALSE(cache.Lookup(ref).has_value());
   EXPECT_EQ(cache.resident_chains(), 0U);
@@ -53,7 +55,8 @@ TEST(VersionValidationCacheTest, ReportsHitsAndUnknownMisses) {
   VersionValidationCache cache(4096);
   const FactRef resident = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9}}).ref();
   const FactRef absent = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{10}}).ref();
-  cache.Prime(resident, {{ValidTime{10}, CommitSeq{1}}});
+  cache.Prime(resident, {{ValidTime{10}, CommitSeq{1}}},
+              cache.publish_generation());
 
   ASSERT_TRUE(cache.Lookup(resident).has_value());
   ASSERT_FALSE(cache.Lookup(absent).has_value());
@@ -71,7 +74,7 @@ TEST(VersionValidationCacheTest, DropsOversizedResidentChainToCanonicalFallback)
     boundaries.push_back(ValidationBoundary{ValidTime{time}, CommitSeq{time}});
   }
 
-  cache.Prime(ref, std::move(boundaries));
+  cache.Prime(ref, std::move(boundaries), cache.publish_generation());
 
   EXPECT_FALSE(cache.Lookup(ref).has_value());
   EXPECT_EQ(cache.resident_chains(), 0U);
@@ -91,7 +94,7 @@ TEST(VersionValidationCacheTest, DropsResidentChainWhenPublicationExceedsBound) 
   for (uint64_t time = 1; time != 9; ++time) {
     initial.push_back(ValidationBoundary{ValidTime{time}, CommitSeq{time}});
   }
-  cache.Prime(ref, std::move(initial));
+  cache.Prime(ref, std::move(initial), cache.publish_generation());
   ASSERT_TRUE(cache.Lookup(ref).has_value());
 
   cache.Publish(PendingFactMutation{ref, ValidTime{9}, FactOperation::kPut,
@@ -110,11 +113,43 @@ TEST(VersionValidationCacheTest, UsesAFixedAssociativeSlotBudget) {
 
   for (uint64_t id = 1; id <= cache.slot_capacity() * 4; ++id) {
     const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{100 + id}}).ref();
-    cache.Prime(ref, {{ValidTime{10}, CommitSeq{id}}});
+    cache.Prime(ref, {{ValidTime{10}, CommitSeq{id}}},
+                cache.publish_generation());
   }
 
   EXPECT_LE(cache.resident_chains(), cache.slot_capacity());
   EXPECT_LE(cache.resident_bytes(), cache.reserved_bytes());
+}
+
+TEST(VersionValidationCacheTest, IgnoresPrimeThatRacedWithAPublication) {
+  VersionValidationCache cache(4096);
+  const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{13}}).ref();
+  const uint64_t observed = cache.publish_generation();
+  cache.Publish(PendingFactMutation{ref, ValidTime{10}, FactOperation::kPut, 0,
+                                    std::nullopt},
+                CommitSeq{5});
+  cache.Prime(ref, {{ValidTime{10}, CommitSeq{1}}}, observed);
+
+  // The scan started before the publication, so its chain must not replace
+  // what the canonical path would return.
+  EXPECT_FALSE(cache.Lookup(ref).has_value());
+  EXPECT_EQ(cache.metrics().skipped_primes, 1U);
+
+  cache.Prime(ref, {{ValidTime{10}, CommitSeq{1}}}, cache.publish_generation());
+  ASSERT_TRUE(cache.Lookup(ref).has_value());
+}
+
+TEST(VersionValidationCacheTest, PublicationAfterPrimeExtendsTheChain) {
+  VersionValidationCache cache(4096);
+  const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{14}}).ref();
+  cache.Prime(ref, {{ValidTime{10}, CommitSeq{1}}}, cache.publish_generation());
+  cache.Publish(PendingFactMutation{ref, ValidTime{10}, FactOperation::kPut, 0,
+                                    std::nullopt},
+                CommitSeq{9});
+
+  const auto chain = cache.Lookup(ref);
+  ASSERT_TRUE(chain.has_value());
+  EXPECT_EQ(AsMap(*chain), (std::map<uint64_t, uint64_t>{{10, 9}}));
 }
 
 }  // namespace

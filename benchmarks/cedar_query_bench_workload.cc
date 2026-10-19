@@ -1208,7 +1208,10 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   const auto write_done = Clock::now();
   const CommitPipelineMetrics pipeline_after_write =
       database->GetCommitPipelineMetrics();
-  if (failed.load()) result.terminal_status = failure;
+  if (failed.load()) {
+    std::fprintf(stderr, "WRITE_FAILED: %s\n", failure.c_str());
+    result.terminal_status = failure;
+  }
 
   if (options.cache == QueryCacheState::kWarm) {
     auto warm_snapshot = database->BeginSnapshot();

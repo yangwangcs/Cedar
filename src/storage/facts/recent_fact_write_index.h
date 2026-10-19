@@ -72,6 +72,7 @@ class RecentFactWriteIndex {
     uint64_t first_sequence = 0;
     uint64_t last_sequence = 0;
     uint64_t published_through = 0;
+    uint64_t identities = 0;
     bool active = false;
     std::vector<uint64_t> words;
   };
@@ -85,6 +86,7 @@ class RecentFactWriteIndex {
   Filter* FindFilter(uint64_t sequence);
   const Filter* FindFilter(uint64_t sequence) const;
   Filter* ActivateFilter(uint64_t first_sequence);
+  void RollFilter(Filter* filter, uint64_t sequence);
   void Clear(Filter* filter, uint64_t first_sequence);
   bool MightContain(const Filter& filter, const FactIdentity& identity) const;
   void Add(Filter* filter, const FactIdentity& identity);
@@ -93,6 +95,7 @@ class RecentFactWriteIndex {
   void PublishExact(const FactIdentity& identity, uint64_t sequence);
 
   std::vector<Filter> filters_;
+  size_t max_identities_per_filter_ = 0;
   const uint64_t window_sequences_;
   const uint64_t window_anchor_sequence_;
   size_t resident_bytes_ = 0;

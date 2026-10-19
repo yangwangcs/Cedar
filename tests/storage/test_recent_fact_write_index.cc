@@ -127,6 +127,21 @@ TEST(RecentFactWriteIndexTest, UsesFixedBytesForArbitrarilyManyIdentities) {
   EXPECT_GT(index.metrics().resets, 0U);
 }
 
+TEST(RecentFactWriteIndexTest, DenseFactBatchesKeepAbsenceProofs) {
+  RecentFactWriteIndex index(4096, CommitSeq{3});
+  for (uint64_t offset = 0; offset < 4000; ++offset) {
+    index.Publish(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{10000 + offset}}).ref(),
+        CommitSeq{4 + offset});
+  }
+  const FactRef fresh =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{900000}}).ref();
+  EXPECT_TRUE(index.CanProveUnchanged(fresh, CommitSeq{3900}));
+  EXPECT_FALSE(index.CanProveUnchanged(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{13950}}).ref(),
+      CommitSeq{3900}));
+}
+
 TEST(RecentFactWriteIndexTest, DropsOldCoverageWhenRollingWindowIsReused) {
   RecentFactWriteIndex index(4096, CommitSeq{3}, 2);
   for (uint64_t sequence = 4; sequence != 13; ++sequence) {

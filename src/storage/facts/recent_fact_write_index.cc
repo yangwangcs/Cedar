@@ -38,6 +38,11 @@ RecentFactWriteIndex::RecentFactWriteIndex(size_t max_bytes,
   filters_.resize(kFilterCount);
   for (Filter& filter : filters_) filter.words.resize(words);
   resident_bytes_ += filter_headers + words * kFilterCount * sizeof(uint64_t);
+  // A sequence window can receive many identities per sequence (one commit
+  // sequence may cover a whole batch). Rolling by identity count keeps the
+  // Bloom load low so absence proofs stay meaningful instead of saturating
+  // after a few large batches. Target 16 bits per retained identity.
+  max_identities_per_filter_ = words * 4;
 }
 
 RecentFactWriteIndex::ExactBucket* RecentFactWriteIndex::ExactBucketFor(
@@ -120,6 +125,7 @@ bool RecentFactWriteIndex::HasActiveFilter() const {
 
 void RecentFactWriteIndex::Clear(Filter* filter, uint64_t first_sequence) {
   std::fill(filter->words.begin(), filter->words.end(), 0);
+  filter->identities = 0;
   filter->first_sequence = first_sequence;
   const uint64_t remaining =
       std::numeric_limits<uint64_t>::max() - first_sequence;
@@ -143,7 +149,9 @@ RecentFactWriteIndex::Filter* RecentFactWriteIndex::ActivateFilter(
       filters_.begin(), filters_.end(), [](const Filter& left, const Filter& right) {
         return left.first_sequence < right.first_sequence;
       });
-  coverage_start_seq_ = std::max(coverage_start_seq_, oldest->last_sequence);
+  coverage_start_seq_ =
+      std::max(coverage_start_seq_,
+               std::max(oldest->last_sequence, oldest->published_through));
   Clear(&*oldest, first_sequence);
   resets_.fetch_add(1, std::memory_order_relaxed);
   return &*oldest;
@@ -248,9 +256,29 @@ void RecentFactWriteIndex::Publish(const FactRef& ref, CommitSeq commit_seq) {
     filter = ActivateFilter(WindowStart(commit_seq.value));
   }
   Add(filter, Identity(ref));
+  ++filter->identities;
   filter->published_through =
       std::max(filter->published_through, commit_seq.value);
   latest_published_seq_ = std::max(latest_published_seq_, commit_seq.value);
+  if (max_identities_per_filter_ != 0 &&
+      filter->identities >= max_identities_per_filter_) {
+    RollFilter(filter, commit_seq.value);
+  }
+}
+
+void RecentFactWriteIndex::RollFilter(Filter* filter, uint64_t sequence) {
+  if (filter == nullptr) return;
+  if (sequence > filter->first_sequence) {
+    // Keep published_through at `sequence`: snapshots older than this batch
+    // still have to check the window that is now closed for new identities.
+    filter->last_sequence = sequence - 1;
+  } else {
+    // The whole window lived at one sequence. Retaining it is impossible, so
+    // drop proof coverage for snapshots older than this batch instead of
+    // pretending absence.
+    coverage_start_seq_ = std::max(coverage_start_seq_, sequence);
+  }
+  ActivateFilter(sequence);
 }
 
 RecentFactWriteIndexMetrics RecentFactWriteIndex::metrics() const {

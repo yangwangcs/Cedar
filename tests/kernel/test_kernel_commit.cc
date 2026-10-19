@@ -3769,5 +3769,64 @@ TEST(KernelCommitFailureTest, NeverReusesTransactionIdAfterPrewriteIndeterminate
   std::filesystem::remove_all(path);
 }
 
+TEST(KernelSnapshotValidationTest, ManyDependenciesDetectOverlappingConflict) {
+  char pattern[] = "/tmp/cedar_many_dependencies_conflict_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  auto stale = database->BeginTransaction();
+  ASSERT_TRUE(stale.ok()) << stale.status().ToString();
+  for (uint64_t index = 0; index < 64; ++index) {
+    ASSERT_TRUE(stale.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(VertexRef{PartId{0},
+                                                          VertexId{1000 + index}}),
+                             ValidTime{10})
+                    .ok());
+  }
+  auto winner = database->BeginTransaction();
+  ASSERT_TRUE(winner.ok()) << winner.status().ToString();
+  ASSERT_TRUE(winner.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1037}}),
+                           ValidTime{10})
+                  .ok());
+  const auto winner_commit = winner.ValueOrDie()->Commit();
+  ASSERT_TRUE(winner_commit.ok()) << winner_commit.status().ToString();
+  ASSERT_EQ(winner_commit.ValueOrDie().outcome, CommitOutcome::kCommitted);
+
+  const auto stale_commit = stale.ValueOrDie()->Commit();
+  ASSERT_TRUE(stale_commit.ok()) << stale_commit.status().ToString();
+  EXPECT_EQ(stale_commit.ValueOrDie().outcome, CommitOutcome::kAborted);
+  EXPECT_TRUE(stale_commit.ValueOrDie().status.IsConflict());
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelSnapshotValidationTest, DisjointDependenciesCommitAfterBatchScan) {
+  char pattern[] = "/tmp/cedar_many_dependencies_disjoint_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  for (uint64_t index = 0; index < 64; ++index) {
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(VertexRef{PartId{0},
+                                                          VertexId{2000 + index}}),
+                             ValidTime{10})
+                    .ok());
+  }
+  const auto commit = transaction.ValueOrDie()->Commit();
+  ASSERT_TRUE(commit.ok()) << commit.status().ToString();
+  EXPECT_EQ(commit.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 }  // namespace
 }  // namespace cedar

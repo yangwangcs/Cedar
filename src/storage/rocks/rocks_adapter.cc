@@ -564,23 +564,27 @@ Status ResumeVacuum(FactStoreImpl* store, const FactStoreOptions& options,
   }
 }
 
-StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
+std::optional<std::vector<CurrentFactInterval>> CachedFactIntervals(
     FactStoreImpl* store, const FactRef& ref) {
-  if (store->version_validation_cache != nullptr) {
-    const auto cached = store->version_validation_cache->Lookup(ref);
-    if (cached.has_value()) {
-      std::vector<CurrentFactInterval> intervals;
-      intervals.reserve(cached->size());
-      for (const internal::ValidationBoundary& boundary : *cached) {
-        intervals.push_back(CurrentFactInterval{boundary.valid_from,
-                                                std::nullopt,
-                                                boundary.commit_seq});
-      }
-      for (size_t index = 1; index < intervals.size(); ++index) {
-        intervals[index].valid_to = intervals[index - 1].valid_from;
-      }
-      return intervals;
-    }
+  if (store->version_validation_cache == nullptr) return std::nullopt;
+  const auto cached = store->version_validation_cache->Lookup(ref);
+  if (!cached.has_value()) return std::nullopt;
+  std::vector<CurrentFactInterval> intervals;
+  intervals.reserve(cached->size());
+  for (const internal::ValidationBoundary& boundary : *cached) {
+    intervals.push_back(CurrentFactInterval{boundary.valid_from, std::nullopt,
+                                            boundary.commit_seq});
+  }
+  for (size_t index = 1; index < intervals.size(); ++index) {
+    intervals[index].valid_to = intervals[index - 1].valid_from;
+  }
+  return intervals;
+}
+
+StatusOr<std::vector<CurrentFactInterval>> ScanCurrentFactIntervals(
+    FactStoreImpl* store, const FactRef& ref, rocksdb::Iterator* iterator) {
+  if (iterator == nullptr) {
+    return Status::InvalidArgument("validation scan", "missing fact iterator");
   }
   const std::string prefix = EncodeFactIdentityPrefix(
       ref.part_id(), ref.family(), ref.property_id(), ref.entity_id());
@@ -588,9 +592,6 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
   if (store->validation_scan_observer_for_testing) {
     store->validation_scan_observer_for_testing();
   }
-  rocksdb::ReadOptions options;
-  std::unique_ptr<rocksdb::Iterator> iterator(
-      store->db->NewIterator(options, store->facts_cf));
   std::vector<CurrentFactInterval> intervals;
   std::optional<ValidTime> previous_boundary;
   for (iterator->Seek(prefix);
@@ -621,6 +622,17 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
     store->version_validation_cache->Prime(ref, std::move(boundaries));
   }
   return intervals;
+}
+
+StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
+    FactStoreImpl* store, const FactRef& ref) {
+  if (auto cached = CachedFactIntervals(store, ref); cached.has_value()) {
+    return std::move(*cached);
+  }
+  rocksdb::ReadOptions options;
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(options, store->facts_cf));
+  return ScanCurrentFactIntervals(store, ref, iterator.get());
 }
 
 void PublishValidationCache(FactStoreImpl* store,
@@ -762,7 +774,14 @@ StatusOr<StrictReadIdentity> CurrentStrictReadIdentity(
 Status ValidateSnapshotWriteDependencies(
     FactStoreImpl* store,
     const std::vector<SnapshotWriteDependency>& dependencies) {
-  for (const SnapshotWriteDependency& dependency : dependencies) {
+  struct DependencyGroup {
+    FactRef ref;
+    std::vector<size_t> indices;
+  };
+  std::vector<DependencyGroup> groups;
+  std::map<std::string, size_t> group_index;
+  for (size_t index = 0; index < dependencies.size(); ++index) {
+    const SnapshotWriteDependency& dependency = dependencies[index];
     if (dependency.snapshot_seq.value > store->visible_seq.value) {
       return Status::InvalidArgument("commit",
                                      "snapshot dependency exceeds visible watermark");
@@ -772,14 +791,52 @@ Status ValidateSnapshotWriteDependencies(
             dependency.ref, dependency.snapshot_seq)) {
       continue;
     }
-    const auto intervals = CurrentFactIntervals(store, dependency.ref);
-    if (!intervals.ok()) return intervals.status();
-    for (const CurrentFactInterval& interval : intervals.ValueOrDie()) {
-      if (interval.commit_seq.value <= dependency.snapshot_seq.value) continue;
-      if (IntervalsOverlap(dependency.valid_from, dependency.successor,
-                           interval.valid_from, interval.valid_to)) {
-        return Status::Conflict(
-            "commit", "snapshot write conflicts with a later overlapping event");
+    const std::string prefix = EncodeFactIdentityPrefix(
+        dependency.ref.part_id(), dependency.ref.family(),
+        dependency.ref.property_id(), dependency.ref.entity_id());
+    const auto found = group_index.find(prefix);
+    if (found == group_index.end()) {
+      group_index.emplace(prefix, groups.size());
+      groups.push_back(DependencyGroup{dependency.ref, {index}});
+    } else {
+      groups[found->second].indices.push_back(index);
+    }
+  }
+  // One iterator serves every group. Visiting groups in canonical order keeps
+  // each Seek at or after the previous prefix.
+  std::sort(groups.begin(), groups.end(),
+            [](const DependencyGroup& left, const DependencyGroup& right) {
+              return std::tuple{left.ref.part_id().value,
+                                static_cast<uint8_t>(left.ref.family()),
+                                left.ref.property_id().value,
+                                left.ref.entity_id()} <
+                     std::tuple{right.ref.part_id().value,
+                                static_cast<uint8_t>(right.ref.family()),
+                                right.ref.property_id().value,
+                                right.ref.entity_id()};
+            });
+  std::unique_ptr<rocksdb::Iterator> iterator;
+  for (const DependencyGroup& group : groups) {
+    std::optional<std::vector<CurrentFactInterval>> intervals =
+        CachedFactIntervals(store, group.ref);
+    if (!intervals.has_value()) {
+      if (iterator == nullptr) {
+        iterator.reset(
+            store->db->NewIterator(rocksdb::ReadOptions(), store->facts_cf));
+      }
+      auto scanned = ScanCurrentFactIntervals(store, group.ref, iterator.get());
+      if (!scanned.ok()) return scanned.status();
+      intervals = scanned.ConsumeValueOrDie();
+    }
+    for (size_t index : group.indices) {
+      const SnapshotWriteDependency& dependency = dependencies[index];
+      for (const CurrentFactInterval& interval : *intervals) {
+        if (interval.commit_seq.value <= dependency.snapshot_seq.value) continue;
+        if (IntervalsOverlap(dependency.valid_from, dependency.successor,
+                             interval.valid_from, interval.valid_to)) {
+          return Status::Conflict(
+              "commit", "snapshot write conflicts with a later overlapping event");
+        }
       }
     }
   }

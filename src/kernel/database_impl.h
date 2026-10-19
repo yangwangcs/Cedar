@@ -228,7 +228,8 @@ class Database::Impl {
                                std::move(options.validation_scan_observer_for_testing),
                                std::move(options.runtime_sample_observer_for_testing),
                                std::move(options.snapshot_open_observer_for_testing),
-                               std::move(options.kernel_write_observer_for_testing)}),
+                               std::move(options.kernel_write_observer_for_testing),
+                               options.wal_sync_mode}),
         async_executor(ResolveAsyncExecutorOptions(options)),
         query_runtime_options(ResolveQueryRuntimeOptions(options)),
         query_database_path(options.path) {

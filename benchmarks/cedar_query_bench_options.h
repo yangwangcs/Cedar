@@ -44,6 +44,9 @@ struct QueryBenchmarkOptions {
   // Benchmark-only append admission controls. Public Database/Transaction
   // defaults remain unchanged; zero preserves immediate admission behavior.
   uint64_t commit_deadline_us = 0;
+  // Benchmark-only durability policy. Public DatabaseOptions keeps its own
+  // default (kFullDeviceFlush).
+  bool filesystem_wal_flush = false;
   uint32_t group_queue_requests = 1024;
   uint64_t group_queue_bytes = 16ULL * 1024ULL * 1024ULL;
 };

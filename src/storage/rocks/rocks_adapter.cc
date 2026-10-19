@@ -2975,6 +2975,7 @@ StatusOr<StoreCommitResult> FactStore::CommitWithWalCallbackDirect(
     }
   }
   rocksdb::CedarEpochOptions epoch_options;
+  epoch_options.full_fsync = options_.wal_sync_mode == WalSyncMode::kFullDeviceFlush;
   if (options_.commit_write_options_observer_for_testing) {
     options_.commit_write_options_observer_for_testing(epoch_options.sync);
   }
@@ -3161,6 +3162,7 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     }
   }
   rocksdb::CedarEpochOptions kernel_options;
+  kernel_options.full_fsync = options.wal_sync_mode == WalSyncMode::kFullDeviceFlush;
   if (options.commit_write_options_observer_for_testing) {
     options.commit_write_options_observer_for_testing(kernel_options.sync);
   }

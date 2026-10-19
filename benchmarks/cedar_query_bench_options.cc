@@ -108,6 +108,10 @@ StatusOr<QueryBenchmarkOptions> ParseQueryBenchmarkOptions(
       if (!ParseU(value, &options.group_queue_bytes) || options.group_queue_bytes == 0) {
         return Invalid("group-queue-bytes must be positive");
       }
+    } else if (name == "--wal-sync-mode") {
+      if (value == "full") options.filesystem_wal_flush = false;
+      else if (value == "filesystem") options.filesystem_wal_flush = true;
+      else return Invalid("wal-sync-mode must be full or filesystem");
     } else if (name == "--max-hops") { uint64_t v = 0; if (!ParseU(value, &v) || v == 0) return Invalid("max-hops must be positive"); options.max_hops = static_cast<uint32_t>(v);
     } else if (name == "--result-limit") { if (!ParseU(value, &options.result_limit) || options.result_limit == 0) return Invalid("result-limit must be positive");
     } else if (name == "--capture-profile") { if (value == "true") options.capture_profile = true; else if (value == "false") options.capture_profile = false; else return Invalid("capture-profile must be true or false");

@@ -57,6 +57,8 @@ struct FactStoreOptions {
   std::function<void()> runtime_sample_observer_for_testing;
   std::function<void()> snapshot_open_observer_for_testing;
   std::function<void(bool)> kernel_write_observer_for_testing;
+  // Kept last so positional FactStoreOptions initializers stay readable.
+  WalSyncMode wal_sync_mode = WalSyncMode::kFullDeviceFlush;
 };
 
 struct SnapshotWriteDependency {

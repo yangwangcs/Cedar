@@ -12,6 +12,15 @@ namespace cedar {
 inline constexpr uint32_t kMaximumCommitBatchCount = 512;
 inline constexpr uint64_t kMaximumCommitBatchBytes = 2ULL * 1024ULL * 1024ULL;
 
+// Selects the durability primitive used by synchronous WAL writes.
+// kFullDeviceFlush keeps the platform's strongest flush (F_FULLFSYNC on macOS).
+// kFilesystemFlush uses fdatasync/fsync: it still survives a process crash but
+// a power loss may discard commits the database already acknowledged.
+enum class WalSyncMode : uint8_t {
+  kFullDeviceFlush = 0,
+  kFilesystemFlush = 1,
+};
+
 enum class StorageProfile : uint8_t {
   kDeveloper,
   // Test-only Kernel profile with intentionally small maintenance thresholds.

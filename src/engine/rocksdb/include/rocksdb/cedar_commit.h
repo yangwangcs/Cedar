@@ -27,6 +27,9 @@ using WalDurableCallback = void (*)(void* context) noexcept;
 struct CedarEpochOptions {
   bool sync = true;
   bool disable_wal = false;
+  // Selects F_FULLFSYNC (default) or a filesystem flush (fdatasync/fsync) for
+  // this epoch's WAL durability boundary on platforms with F_FULLFSYNC.
+  bool full_fsync = true;
   uint8_t protection_bytes_per_key = 0;
   // Owned by Cedar's maintenance scheduler. RocksDB sets this only while the
   // epoch's WAL durability boundary is in progress, then clears it before the

@@ -38,6 +38,7 @@
 #include "rocksdb/slice.h"
 #include "test_util/sync_point.h"
 #include "util/autovector.h"
+#include "util/cedar_sync_mode.h"
 #include "util/coding.h"
 #include "util/string_util.h"
 
@@ -1656,8 +1657,12 @@ IOStatus PosixWritableFile::Flush(const IOOptions& /*opts*/,
 IOStatus PosixWritableFile::Sync(const IOOptions& /*opts*/,
                                  IODebugContext* /*dbg*/) {
 #ifdef HAVE_FULLFSYNC
-  if (::fcntl(fd_, F_FULLFSYNC) < 0) {
-    return IOError("while fcntl(F_FULLFSYNC)", filename_, errno);
+  if (!cedar::UseFilesystemFlush()) {
+    if (::fcntl(fd_, F_FULLFSYNC) < 0) {
+      return IOError("while fcntl(F_FULLFSYNC)", filename_, errno);
+    }
+  } else if (fdatasync(fd_) < 0) {
+    return IOError("While fdatasync", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
   if (fdatasync(fd_) < 0) {
@@ -1670,8 +1675,12 @@ IOStatus PosixWritableFile::Sync(const IOOptions& /*opts*/,
 IOStatus PosixWritableFile::Fsync(const IOOptions& /*opts*/,
                                   IODebugContext* /*dbg*/) {
 #ifdef HAVE_FULLFSYNC
-  if (::fcntl(fd_, F_FULLFSYNC) < 0) {
-    return IOError("while fcntl(F_FULLFSYNC)", filename_, errno);
+  if (!cedar::UseFilesystemFlush()) {
+    if (::fcntl(fd_, F_FULLFSYNC) < 0) {
+      return IOError("while fcntl(F_FULLFSYNC)", filename_, errno);
+    }
+  } else if (fsync(fd_) < 0) {
+    return IOError("While fsync", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
   if (fsync(fd_) < 0) {

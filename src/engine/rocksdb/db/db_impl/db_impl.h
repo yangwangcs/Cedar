@@ -1611,7 +1611,7 @@ class DBImpl : public DB {
   Status WriteCedarEpochImpl(const WriteOptions& options, WriteBatch* batch,
                              WalDurableCallback on_wal_durable,
                              void* callback_context,
-                             CedarEpochMetrics* metrics,
+                             CedarEpochMetrics* metrics, bool full_fsync,
                              std::atomic<bool>* wal_sync_critical = nullptr);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,

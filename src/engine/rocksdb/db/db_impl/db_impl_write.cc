@@ -18,6 +18,7 @@
 #include "options/options_helper.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include "util/cedar_sync_mode.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -205,7 +206,11 @@ Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
 Status DBImpl::WriteCedarEpochImpl(
     const WriteOptions& write_options, WriteBatch* batch,
     WalDurableCallback on_wal_durable, void* callback_context,
-    CedarEpochMetrics* metrics, std::atomic<bool>* wal_sync_critical) {
+    CedarEpochMetrics* metrics, bool full_fsync,
+    std::atomic<bool>* wal_sync_critical) {
+  // Applies only to syncs issued by this thread while the epoch is written;
+  // background flushes keep the platform default.
+  cedar::ScopedFilesystemFlush sync_scope(!full_fsync);
   if (!write_options.sync) {
     return Status::InvalidArgument("WriteCedarEpoch requires sync=true");
   }
@@ -264,6 +269,7 @@ Status DBImpl::WriteCedarEpoch(const CedarEpochOptions& cedar_options,
       cedar_options.protection_bytes_per_key;
   return WriteCedarEpochImpl(write_options, batch, on_wal_durable,
                              callback_context, metrics,
+                             cedar_options.full_fsync,
                              cedar_options.wal_sync_critical);
 }
 

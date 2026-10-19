@@ -842,6 +842,9 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   // 32-reader query matrix without allowing the default block cache to crowd
   // out Cedar's explicit query pool.
   db_options.production.block_cache_bytes = 128ULL << 20;
+  db_options.wal_sync_mode = options.filesystem_wal_flush
+                                 ? WalSyncMode::kFilesystemFlush
+                                 : WalSyncMode::kFullDeviceFlush;
   db_options.group_commit_max_queue_requests = options.group_queue_requests;
   db_options.group_commit_max_queue_bytes = options.group_queue_bytes;
   // The benchmark intentionally exercises the 1/8/32-reader matrix. Expand

@@ -214,6 +214,7 @@ struct DatabaseOptions {
   uint64_t blob_threshold_bytes = 4096;
   uint32_t group_commit_max_batch_size = 128;
   uint64_t group_commit_window_us = 200;
+  WalSyncMode wal_sync_mode = WalSyncMode::kFullDeviceFlush;
   std::function<Status()> async_prepare_prewrite_fault_injector_for_testing;
   std::function<Status()> commit_prewrite_fault_injector_for_testing;
   std::function<Status()> commit_fault_injector_for_testing;

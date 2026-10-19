@@ -9,6 +9,7 @@
 
 #include <unistd.h>
 
+#include "cedar/database.h"
 #include "storage/facts/fact_store.h"
 #include "rocksdb/db.h"
 #include "rocksdb/rate_limiter.h"
@@ -341,6 +342,15 @@ TEST(RocksDbProfileTest, AppliesExplicitProductionCapacityToEveryColumnFamily) {
   EXPECT_EQ(descriptors[2].options.level0_file_num_compaction_trigger, 8);
   EXPECT_EQ(descriptors[2].options.level0_slowdown_writes_trigger, 24);
   EXPECT_EQ(descriptors[2].options.level0_stop_writes_trigger, 36);
+}
+
+TEST(RocksDbProfileTest, WalSyncModeDefaultsToFullDeviceFlush) {
+  DatabaseOptions options;
+  EXPECT_EQ(options.wal_sync_mode, WalSyncMode::kFullDeviceFlush);
+  FactStoreOptions store_options;
+  EXPECT_EQ(store_options.wal_sync_mode, WalSyncMode::kFullDeviceFlush);
+  options.wal_sync_mode = WalSyncMode::kFilesystemFlush;
+  EXPECT_EQ(options.wal_sync_mode, WalSyncMode::kFilesystemFlush);
 }
 
 TEST(RocksDbProfileTest, RejectsProductionCapacityThatExceedsItsBudget) {

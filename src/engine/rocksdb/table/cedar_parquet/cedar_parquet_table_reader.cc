@@ -724,9 +724,19 @@ class CedarParquetTableIterator final : public InternalIterator {
   }
 
   Slice key() const override { return Slice(decoded_->internal_keys[row_index_]); }
-  Slice value() const override { return Slice(decoded_->values[row_index_]); }
+  Slice value() const override {
+    // DBIter keeps the value Slice across further iterator movement (for
+    // example while scanning earlier versions of the same user key), so the
+    // decoded page that produced it must outlive the repositioning. Holding the
+    // shared page here makes the "pinned value" promise real; it is replaced
+    // when a value from another page is handed out.
+    pinned_value_page_ = decoded_;
+    return Slice(decoded_->values[row_index_]);
+  }
   Status status() const override { return status_; }
-  bool IsKeyPinned() const override { return true; }
+  // Keys are slices into the decoded page, which can be replaced by a later
+  // reposition, so DBIter must copy them.
+  bool IsKeyPinned() const override { return false; }
   bool IsValuePinned() const override { return true; }
 
  private:
@@ -779,6 +789,8 @@ class CedarParquetTableIterator final : public InternalIterator {
 
   const CedarParquetTableReader* reader_;
   std::shared_ptr<const CedarParquetTableReader::DecodedCanonicalPage> decoded_;
+  mutable std::shared_ptr<const CedarParquetTableReader::DecodedCanonicalPage>
+      pinned_value_page_;
   size_t row_group_index_ = std::numeric_limits<size_t>::max();
   size_t page_index_ = 0;
   size_t row_index_ = 0;

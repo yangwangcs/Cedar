@@ -219,7 +219,9 @@ TEST(CedarParquetTableReaderTest, IteratesAndSeeksAcrossBoundedRowGroups) {
   iterator->SeekToLast();
   ASSERT_TRUE(iterator->Valid());
   EXPECT_EQ(iterator->key(), keys[3]);
-  EXPECT_TRUE(iterator->IsKeyPinned());
+  // Keys are slices into the decoded page, which a later reposition can
+  // replace, so callers must copy them. Values keep their page alive.
+  EXPECT_FALSE(iterator->IsKeyPinned());
   EXPECT_TRUE(iterator->IsValuePinned());
   iterator->Prev();
   EXPECT_EQ(iterator->key(), keys[2]);
@@ -1872,6 +1874,41 @@ TEST(CedarParquetTableReaderTest,
 
   EXPECT_TRUE(reader->VerifyChecksum(ReadOptions(), TableReaderCaller::kUserGet)
                   .IsCorruption());
+}
+
+TEST(CedarParquetTableReaderTest, ReverseIterationReturnsMatchingValues) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (uint64_t row = 0; row < 6; ++row) {
+    keys.push_back(InternalKeyFor(row + 1, 6 - row));
+    // Valid state-fact values alternate between put and delete so a value
+    // read for the wrong row is observable.
+    std::string value;
+    value.push_back(1);
+    value.push_back(row % 2 == 0 ? 1 : 2);
+    AppendBigEndian32(&value, 0);
+    value.push_back(0);
+    AppendBigEndian32(&value, 0);
+    AppendBigEndian32(&value, crc32c::Value(value.data(), value.size()));
+    values.push_back(value);
+  }
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserGet));
+  iterator->SeekToLast();
+  for (size_t index = keys.size(); index-- > 0;) {
+    ASSERT_TRUE(iterator->Valid());
+    EXPECT_EQ(iterator->key(), keys[index]) << "row " << index;
+    EXPECT_EQ(iterator->value(), values[index]) << "row " << index;
+    iterator->Prev();
+  }
+  EXPECT_FALSE(iterator->Valid());
 }
 
 }  // namespace

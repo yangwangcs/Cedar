@@ -3,8 +3,9 @@
 
 #include "storage/rocks/commit_publisher.h"
 
-#include <utility>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
 
 #include <rocksdb/write_batch.h>
 
@@ -28,22 +29,26 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
   std::vector<std::string> sequence_fact_keys = candidate.fact_keys;
   sequence_fact_keys.reserve(candidate.fact_keys.size() +
                              candidate.batch->edge_identities.size());
-  std::unordered_set<std::string> unique_fact_keys;
-  unique_fact_keys.reserve(candidate.fact_keys.size() +
-                           candidate.batch->edge_identities.size());
+  // Candidate keys were encoded when the candidate was assembled. Validate the
+  // fixed width and committed sequence without re-encoding each key, and keep
+  // duplicate detection on views instead of copying every key.
+  std::unordered_set<std::string_view> mutation_keys;
+  mutation_keys.reserve(candidate.fact_keys.size());
+  std::unordered_set<std::string> identity_keys;
+  identity_keys.reserve(candidate.batch->edge_identities.size());
   for (size_t index = 0; index < candidate.batch->mutations.size(); ++index) {
-    const PendingFactMutation& mutation = candidate.batch->mutations[index];
-    const std::string expected_key =
-        EncodeFactKey(mutation.ref, mutation.valid_from, candidate.commit_seq);
-    if (expected_key.empty() || expected_key != candidate.fact_keys[index]) {
+    const std::string& fact_key = candidate.fact_keys[index];
+    if (fact_key.size() != kEncodedFactKeyBytes) {
       return Status::InvalidArgument("commit publisher", "invalid fact key");
     }
-    if (!unique_fact_keys.insert(candidate.fact_keys[index]).second) {
-      return Status::InvalidArgument("commit publisher", "duplicate fact key");
+    const auto decoded_key = DecodeFactKey(fact_key);
+    if (!decoded_key.ok() ||
+        decoded_key.ValueOrDie().commit_seq != candidate.commit_seq) {
+      return Status::InvalidArgument("commit publisher",
+                                     "fact key commit sequence disagrees");
     }
-    const auto decoded_key = DecodeFactKey(candidate.fact_keys[index]);
-    if (!decoded_key.ok() || decoded_key.ValueOrDie().commit_seq != candidate.commit_seq) {
-      return Status::InvalidArgument("commit publisher", "fact key commit sequence disagrees");
+    if (!mutation_keys.insert(fact_key).second) {
+      return Status::InvalidArgument("commit publisher", "duplicate fact key");
     }
   }
   for (const EdgeIdentity& identity : candidate.batch->edge_identities) {
@@ -52,9 +57,11 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
     const std::string identity_key =
         EncodeFactKey(identity_ref, ValidTime{0}, candidate.commit_seq);
     if (identity_key.empty()) {
-      return Status::InvalidArgument("commit publisher", "invalid edge identity fact key");
+      return Status::InvalidArgument("commit publisher",
+                                     "invalid edge identity fact key");
     }
-    if (!unique_fact_keys.insert(identity_key).second) {
+    if (mutation_keys.contains(identity_key) ||
+        !identity_keys.insert(identity_key).second) {
       return Status::InvalidArgument("commit publisher", "duplicate fact key");
     }
   }

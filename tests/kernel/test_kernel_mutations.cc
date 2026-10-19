@@ -129,6 +129,26 @@ TEST_F(KernelMutationTest,
                   .ok());
 }
 
+TEST_F(KernelMutationTest, SetReusesSchemaWithinTransaction) {
+  ASSERT_TRUE(database_
+                  ->RegisterProperty(Property(PropertyId{7}, "score",
+                                              PropertyEntityKind::kVertex,
+                                              PhysicalType::kInt64))
+                  .ok());
+  auto transaction = Begin();
+  for (uint64_t index = 0; index < 8; ++index) {
+    ASSERT_TRUE(transaction
+                    ->Set(PropertyFact::Vertex(
+                              VertexRef{PartId{0}, VertexId{100 + index}},
+                              PropertyId{7}),
+                          ValidTime{10}, Value::Int64(static_cast<int64_t>(index)))
+                    .ok());
+  }
+  const auto committed = transaction->Commit();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+}
+
 TEST_F(KernelMutationTest, DuplicateAssertionFailsAtAssertTime) {
   auto transaction = Begin();
   const EntityFact vertex =

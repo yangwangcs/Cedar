@@ -10,6 +10,7 @@
 #include <set>
 #include <type_traits>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -322,6 +323,9 @@ class Transaction::State {
   std::vector<EdgeIdentity> edge_identities;
   std::vector<StrictReadDependency> strict_read_dependencies;
   std::unordered_set<MutationKey, MutationKeyHash> mutation_keys;
+  // Schema is stable for the transaction's pinned snapshot; cache successful
+  // lookups so a multi-fact write does not resolve the same property per fact.
+  std::unordered_map<uint16_t, PropertyDefinition> property_definitions;
   bool terminal = false;
 
   Status CheckDatabaseOpen() const {
@@ -355,21 +359,31 @@ class Transaction::State {
     }
   }
 
-  StatusOr<PropertyDefinition> ResolveProperty(PropertyFact property) const {
-    const auto schema = database->store.LookupProperty(
-        *snapshot, property.ref().property_id());
-    if (!schema.ok()) return schema.status();
-    if (!schema.ValueOrDie().has_value()) {
-      return Status::SchemaMismatch("transaction", "property is not registered");
+  StatusOr<PropertyDefinition> ResolveProperty(PropertyFact property) {
+    const uint16_t property_id = property.ref().property_id().value;
+    PropertyDefinition definition;
+    const auto cached = property_definitions.find(property_id);
+    if (cached != property_definitions.end()) {
+      definition = cached->second;
+    } else {
+      const auto schema = database->store.LookupProperty(
+          *snapshot, property.ref().property_id());
+      if (!schema.ok()) return schema.status();
+      if (!schema.ValueOrDie().has_value()) {
+        return Status::SchemaMismatch("transaction",
+                                      "property is not registered");
+      }
+      definition = *schema.ValueOrDie();
+      property_definitions.emplace(property_id, definition);
     }
     const PropertyEntityKind expected_kind =
         property.ref().family() == FactFamily::kVertexProperty
             ? PropertyEntityKind::kVertex
             : PropertyEntityKind::kEdge;
-    if (schema.ValueOrDie()->entity_kind != expected_kind) {
+    if (definition.entity_kind != expected_kind) {
       return Status::SchemaMismatch("transaction", "property entity kind differs");
     }
-    return *schema.ValueOrDie();
+    return definition;
   }
 
   Status CaptureStrictRead(const FactRef& ref, ValidTime valid_time) {

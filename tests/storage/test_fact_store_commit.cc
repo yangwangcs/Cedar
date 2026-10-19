@@ -243,6 +243,27 @@ TEST_F(FactStoreCommitTest,
   EXPECT_GT(epoch.ValueOrDie()->batch().GetDataSize(), 0U);
 }
 
+TEST_F(FactStoreCommitTest, PredictedIndependentGroupIsValidatedBeforeWrite) {
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{901}}).ref();
+  StoreCommitBatch stale = Batch(TxnId{91}, {VertexPut(901, 10)});
+  stale.fresh_transaction_id = true;
+  stale.snapshot_write_dependencies = {SnapshotWriteDependency{
+      ref, ValidTime{10}, std::nullopt, std::nullopt, CommitSeq{0}}};
+
+  // Prediction encodes a blind append without validating the snapshot; the
+  // promotion path must validate before writing.
+  const auto predicted = store_->DecideIndependentAppendGroup(
+      CommitSeq{0}, CommitSeq{0}, {{stale, true}});
+  ASSERT_TRUE(predicted.ok()) << predicted.status().ToString();
+  EXPECT_TRUE(store_->ValidatePredictedGroup({{stale, true}}).ok());
+
+  StoreCommitBatch winner = Batch(TxnId{92}, {VertexPut(901, 10)});
+  const auto committed = store_->Commit(winner);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_TRUE(store_->ValidatePredictedGroup({{stale, true}}).IsConflict());
+}
+
 TEST_F(FactStoreCommitTest,
        IndependentAppendRejectsEdgeStateWithoutAuthoritativeIdentity) {
   StoreCommitBatch batch = Batch(

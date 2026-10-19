@@ -3319,16 +3319,10 @@ FactStore::DecideIndependentAppendGroup(
           "commit",
           "independent append decision requires a fresh blind put batch");
     }
-    for (const SnapshotWriteDependency& dependency :
-         batch.snapshot_write_dependencies) {
-      if (dependency.snapshot_seq != required_snapshot_seq ||
-          dependency.predecessor.has_value() ||
-          dependency.successor.has_value()) {
-        return Status::Conflict(
-            "commit",
-            "independent append snapshot is not the stable predecessor");
-      }
-    }
+    // Snapshot-write dependencies are validated at promotion time (see
+    // ValidatePredictedGroup); this decision only encodes the predicted
+    // sequences. A stale prediction is discarded before the write.
+    (void)required_snapshot_seq;
     const Status validation = batch.Validate();
     if (!validation.ok()) return validation;
     if (internal::EstimateCommitBatchBytes(batch) >
@@ -3382,6 +3376,26 @@ FactStore::DecideIndependentAppendGroup(
       base_visible_seq,
       CommitSeq{base_visible_seq.value + committed_count}, committed_count,
       true, std::move(write_batch), std::move(group), std::move(publications));
+}
+
+Status FactStore::ValidatePredictedGroup(
+    const std::vector<StoreCommitGroupRequest>& requests) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("commit", "store is not open");
+  }
+  if (store->recovery_required.LoadFast()) {
+    return Status::RecoveryRequired("commit",
+                                    "reopen required after indeterminate write");
+  }
+  for (const StoreCommitGroupRequest& request : requests) {
+    const Status valid = ValidateSnapshotWriteDependencies(
+        store.get(), request.batch.snapshot_write_dependencies);
+    if (!valid.ok()) return valid;
+  }
+  return Status::OK();
 }
 
 StatusOr<StoreCommittedGroupResult> FactStore::WriteDecidedGroup(

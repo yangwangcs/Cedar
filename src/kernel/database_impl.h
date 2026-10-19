@@ -130,6 +130,9 @@ class Database::Impl {
     CommitSeq predecessor_base_visible_seq;
     CommitSeq successor_base_visible_seq;
     uint64_t preflight_transactions = 0;
+    // Set when the prediction encoded without matching the epoch base; the
+    // promotion path validates dependencies before writing it.
+    bool requires_validation = false;
     std::vector<std::shared_ptr<AppendCommitRequest>> requests;
     std::unique_ptr<internal::DecidedEpoch> epoch;
     SlotState state = SlotState::kEmpty;

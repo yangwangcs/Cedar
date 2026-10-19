@@ -213,17 +213,22 @@ RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   return metrics;
 }
 
-bool CanDecideIndependentAppend(const StoreCommitBatch& batch,
-                                CommitSeq required_snapshot_seq) {
-  if (!batch.fresh_transaction_id ||
-      !internal::CanUseAppendFastPath(batch)) {
-    return false;
-  }
+// Predicts that a batch commits exactly one sequence without validating its
+// snapshot dependencies. Promotion validates them before the decided sequences
+// are written; a failed validation falls back to the general path.
+bool CanPredictIndependentAppend(const StoreCommitBatch& batch) {
+  return batch.fresh_transaction_id && internal::CanUseAppendFastPath(batch);
+}
+
+// A batch whose dependencies were captured at the epoch base needs no
+// promotion-time validation: no overlapping write can exist yet.
+bool DependenciesMatchEpochBase(const StoreCommitBatch& batch,
+                                CommitSeq epoch_base) {
   return std::all_of(
       batch.snapshot_write_dependencies.begin(),
       batch.snapshot_write_dependencies.end(),
-      [required_snapshot_seq](const SnapshotWriteDependency& dependency) {
-        return dependency.snapshot_seq == required_snapshot_seq &&
+      [epoch_base](const SnapshotWriteDependency& dependency) {
+        return dependency.snapshot_seq == epoch_base &&
                !dependency.predecessor.has_value() &&
                !dependency.successor.has_value();
       });
@@ -717,7 +722,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
         }
         const internal::CommitFootprint& footprint =
             candidate->preflight_footprint;
-        if (!CanDecideIndependentAppend(candidate->batch, epoch_base)) break;
+        if (!CanPredictIndependentAppend(candidate->batch)) break;
         if (overlay->Conflicts(footprint)) break;
         if (!planned_index.Insert(footprint)) break;
         planned_bytes += candidate->estimated_bytes;
@@ -773,6 +778,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
           slot.preflight_transactions = planned_transactions;
           slot.requests = std::move(planned_candidates);
           slot.epoch = std::move(predecided);
+          slot.requires_validation = std::any_of(
+              slot.requests.begin(), slot.requests.end(),
+              [epoch_base](const auto& candidate) {
+                return !DependenciesMatchEpochBase(candidate->batch,
+                                                   epoch_base);
+              });
           slot.state = SlotState::kEligible;
           append_commit_metrics.n_plus_one_eligible += slot.requests.size();
           ++append_commit_metrics.n_plus_one_eligible_epochs;
@@ -785,6 +796,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
     for (;;) {
       std::vector<std::shared_ptr<AppendCommitRequest>> requests;
       std::unique_ptr<internal::DecidedEpoch> predecided_epoch;
+      bool promoted_requires_validation = false;
       const auto collection_started_at = std::chrono::steady_clock::now();
       {
         std::unique_lock<std::mutex> lock(append_commit_mutex);
@@ -848,6 +860,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
             runtime_queued_request_count.fetch_sub(1, std::memory_order_release);
             queued_append_commit_bytes -= requests.back()->estimated_bytes;
           }
+          promoted_requires_validation = next_epoch_slot->requires_validation;
           predecided_epoch = std::move(next_epoch_slot->epoch);
           next_epoch_slot->state = SlotState::kPromoted;
           append_commit_metrics.n_plus_one_promoted += planned_size;
@@ -931,9 +944,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
         active_epoch_base_visible_seq = store.visible_seq();
         active_epoch_committed_count_hint =
             std::all_of(requests.begin(), requests.end(),
-                        [this](const auto& request) {
-                          return CanDecideIndependentAppend(
-                              request->batch, active_epoch_base_visible_seq);
+                        [](const auto& request) {
+                          return CanPredictIndependentAppend(request->batch);
                         })
                 ? requests.size()
                 : 0;
@@ -986,8 +998,25 @@ Status Database::Impl::StartAppendCommitPipeline() {
         maintenance_controller->SetWalSyncCritical(true);
       }
       bool discarded_stale_predecision = false;
+      bool use_predecided = predecided_epoch != nullptr;
+      if (use_predecided && promoted_requires_validation) {
+        // The predecision predicted that the predecessor epoch commits every
+        // request. Verify that base and validate the snapshot dependencies now
+        // that the predecessor write has completed; a stale prediction falls
+        // back to the general path instead of writing wrong sequences.
+        const bool base_matches =
+            store.visible_seq() == predecided_epoch->base_visible_seq();
+        const Status dependencies_valid =
+            base_matches
+                ? store.ValidatePredictedGroup(store_requests)
+                : Status::Conflict("commit", "predicted base is stale");
+        if (!base_matches || !dependencies_valid.ok()) {
+          use_predecided = false;
+          discarded_stale_predecision = true;
+        }
+      }
       StatusOr<StoreCommittedGroupResult> result;
-      if (predecided_epoch != nullptr) {
+      if (use_predecided) {
         result = store.WriteDecidedGroup(predecided_epoch.get(), NotifyWalDurable,
                                          &durability, &wal_sync_critical);
         if (!result.ok() && result.status().IsConflict()) {

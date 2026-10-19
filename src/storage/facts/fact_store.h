@@ -493,6 +493,10 @@ class FactStore {
   DecideIndependentAppendGroup(
       CommitSeq base_visible_seq, CommitSeq required_snapshot_seq,
       const std::vector<StoreCommitGroupRequest>& requests);
+  // Validates snapshot-write dependencies for a predicted (predecided) group
+  // immediately before its write. Returns Conflict when a dependency changed.
+  Status ValidatePredictedGroup(
+      const std::vector<StoreCommitGroupRequest>& requests) const;
   StatusOr<StoreCommittedGroupResult> WriteDecidedGroup(
       internal::DecidedEpoch* epoch, WalDurableCallback on_wal_durable,
       void* callback_context,

@@ -222,6 +222,89 @@ TEST_F(KernelSnapshotTest, RequiresBothEndpointStatesForEdgeVisibility) {
   EXPECT_TRUE(historical_edge.ValueOrDie());
 }
 
+TEST_F(KernelSnapshotTest, GetPointAtReadsLatestValueLikeSnapshotGet) {
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(10))}),
+        Batch(TxnId{2}, {PropertyMutation(1, 7, 20, FactOperation::kPut,
+                                          Value::Int64(20))})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto expected = snapshot.ValueOrDie().Get(property, ValidTime{25});
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+
+  const auto actual = database->GetPointAt(property.ref(), ValidTime{25});
+  ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+  EXPECT_EQ(actual.ValueOrDie(), expected.ValueOrDie());
+  EXPECT_EQ(actual.ValueOrDie(), std::optional<Value>{Value::Int64(20)});
+}
+
+TEST_F(KernelSnapshotTest, GetPointAtReturnsMissingForAbsentFact) {
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut)})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact absent =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto expected = snapshot.ValueOrDie().Get(absent, ValidTime{15});
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+  EXPECT_FALSE(expected.ValueOrDie().has_value());
+
+  const auto actual = database->GetPointAt(absent.ref(), ValidTime{15});
+  ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+  EXPECT_FALSE(actual.ValueOrDie().has_value());
+  EXPECT_EQ(actual.ValueOrDie(), expected.ValueOrDie());
+}
+
+TEST_F(KernelSnapshotTest, GetPointAtReadsStagedDeleteAfterCommit) {
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(10))}),
+        Batch(TxnId{2}, {PropertyMutation(1, 7, 20, FactOperation::kDelete)})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+
+  const auto before_delete = database->GetPointAt(property.ref(), ValidTime{15});
+  ASSERT_TRUE(before_delete.ok()) << before_delete.status().ToString();
+  EXPECT_EQ(before_delete.ValueOrDie(), std::optional<Value>{Value::Int64(10)});
+
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto expected = snapshot.ValueOrDie().Get(property, ValidTime{25});
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+  EXPECT_FALSE(expected.ValueOrDie().has_value());
+
+  const auto after_delete = database->GetPointAt(property.ref(), ValidTime{25});
+  ASSERT_TRUE(after_delete.ok()) << after_delete.status().ToString();
+  EXPECT_FALSE(after_delete.ValueOrDie().has_value());
+  EXPECT_EQ(after_delete.ValueOrDie(), expected.ValueOrDie());
+}
+
+TEST_F(KernelSnapshotTest, GetPointAtRejectsInvalidRef) {
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut)})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact invalid =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{});
+  ASSERT_TRUE(invalid.ref().Validate().IsInvalidArgument());
+
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto expected = snapshot.ValueOrDie().Get(invalid, ValidTime{15});
+  ASSERT_FALSE(expected.ok());
+  EXPECT_TRUE(expected.status().IsInvalidArgument());
+
+  const auto actual = database->GetPointAt(invalid.ref(), ValidTime{15});
+  ASSERT_FALSE(actual.ok());
+  EXPECT_TRUE(actual.status().IsInvalidArgument());
+  EXPECT_EQ(actual.status().ToString(), expected.status().ToString());
+}
+
 TEST_F(KernelSnapshotTest, PreservesBitemporalReadsAfterFlushCompactionAndReopen) {
   Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
                          PropertyMutation(1, 7, 10, FactOperation::kPut,

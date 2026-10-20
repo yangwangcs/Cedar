@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "cedar/core/status.h"
@@ -374,6 +375,13 @@ class Database {
   StatusOr<std::unique_ptr<Transaction>> BeginTransaction(
       TransactionOptions options = {});
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
+  // Reads one fact point at the latest visible commit sequence without
+  // materializing a Snapshot object. Each call pins the current snapshot epoch
+  // for exactly one store read, so it observes the latest visible sequence and
+  // holds no cached handle between calls. Missing or deleted facts yield an
+  // empty optional, exactly like Snapshot::Get for a vertex property fact.
+  StatusOr<std::optional<Value>> GetPointAt(FactRef ref,
+                                            ValidTime valid_time) const;
   StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;
   StatusOr<QueryMaintenanceHandle> RefreshQueryStatistics();
   // Builds a snapshot-bound typed property index in the derived-read lane.

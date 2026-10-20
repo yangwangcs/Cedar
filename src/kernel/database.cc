@@ -2126,6 +2126,27 @@ StatusOr<std::optional<PropertyDefinition>> Database::LookupProperty(
   return impl_->store.LookupProperty(property_id, schema_epoch);
 }
 
+StatusOr<std::optional<Value>> Database::GetPointAt(FactRef ref,
+                                                    ValidTime valid_time) const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  if (impl_->closed.load(std::memory_order_acquire)) {
+    return Status::InvalidArgument("database", "database is closed");
+  }
+  if (impl_->closing) {
+    return Status::ShutdownInProgress("database", "database close is in progress");
+  }
+  // The epoch handle is scoped to this call: BeginSnapshot pins the latest
+  // visible sequence and the handle releases it when this function returns, so
+  // a concurrent commit is observed by the next call. No Snapshot object, no
+  // extra locking, and no read semantics beyond FactStore::Read.
+  auto snapshot = impl_->store.BeginSnapshot();
+  if (!snapshot.ok()) return snapshot.status();
+  auto event = impl_->store.Read(snapshot.ValueOrDie(), ref, valid_time);
+  if (!event.ok()) return event.status();
+  if (!event.ValueOrDie().has_value()) return std::optional<Value>{};
+  return event.ValueOrDie()->value;
+}
+
 Status Database::Impl::ValidatePreparedQuery(
     CommitSeq snapshot_seq,
     const std::vector<PropertyDefinition>& schema_fingerprint) const {

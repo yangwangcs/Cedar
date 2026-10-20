@@ -69,7 +69,12 @@ TEST_F(KernelMutationTest, StagesEntityStateWithoutPropertySchemaOrValue) {
   EXPECT_FALSE(still_absent.ValueOrDie());
 }
 
-TEST_F(KernelMutationTest, UsesSchemaVisibleWhenTransactionBegan) {
+TEST_F(KernelMutationTest, UsesSchemaRefreshedAfterTransactionBegan) {
+  // A transaction's snapshot epoch is shared per visible sequence and is
+  // repointed at the current catalog when a property is registered (registration
+  // does not move the visible sequence). The first lookup therefore sees the
+  // latest schema even when it was registered after BeginTransaction; that
+  // lookup is then cached for the rest of the transaction.
   ASSERT_TRUE(database_->RegisterProperty(
                         Property(PropertyId{7}, "name", PropertyEntityKind::kVertex,
                                  PhysicalType::kString))
@@ -82,14 +87,20 @@ TEST_F(KernelMutationTest, UsesSchemaVisibleWhenTransactionBegan) {
                                  PhysicalType::kString))
                   .ok());
   ASSERT_TRUE(database_->RegisterProperty(
-                        Property(PropertyId{7}, "age", PropertyEntityKind::kVertex,
+                        Property(PropertyId{8}, "age", PropertyEntityKind::kVertex,
                                  PhysicalType::kInt64))
                   .ok());
 
   EXPECT_TRUE(transaction->Set(
-                  PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7}), ValidTime{10},
-                  Value::String("Ada"))
+                  PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{8}), ValidTime{10},
+                  Value::Int64(42))
                   .ok());
+  // The resolved definition is reused within the transaction: a value of the
+  // wrong type is rejected without re-reading the catalog.
+  EXPECT_TRUE(transaction->Set(
+                  PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{2}}, PropertyId{8}), ValidTime{10},
+                  Value::String("Ada"))
+                  .IsSchemaMismatch());
 }
 
 TEST_F(KernelMutationTest, RejectsPropertyWithWrongTypeOrMissingSchema) {
@@ -147,6 +158,45 @@ TEST_F(KernelMutationTest, SetReusesSchemaWithinTransaction) {
   const auto committed = transaction->Commit();
   ASSERT_TRUE(committed.ok()) << committed.status().ToString();
   EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+}
+
+TEST_F(KernelMutationTest,
+       UsesPropertyRegisteredAfterTheLastCommitInTheNextTransaction) {
+  // Regression: BeginTransaction used to reuse the snapshot epoch created for
+  // the last commit. RegisterProperty does not advance the visible sequence, so
+  // that epoch kept the pre-registration schema catalog and the transaction
+  // failed with "property is not registered" (P0 final-acceptance regression).
+  auto seed = Begin();
+  ASSERT_TRUE(seed->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
+                           ValidTime{1})
+                  .ok());
+  const auto seeded = seed->Commit();
+  ASSERT_TRUE(seeded.ok()) << seeded.status().ToString();
+  ASSERT_EQ(seeded.ValueOrDie().outcome, CommitOutcome::kCommitted);
+
+  ASSERT_TRUE(database_
+                  ->RegisterProperty(Property(PropertyId{11}, "label",
+                                              PropertyEntityKind::kVertex,
+                                              PhysicalType::kString))
+                  .ok());
+
+  auto transaction = Begin();
+  const PropertyFact label =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{11});
+  const auto staged = transaction->Set(label, ValidTime{2}, Value::String("new"));
+  ASSERT_TRUE(staged.ok()) << staged.ToString();
+  const auto committed = transaction->Commit();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  ASSERT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  ASSERT_TRUE(committed.ValueOrDie().status.ok())
+      << committed.ValueOrDie().status.ToString();
+
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto value = snapshot.ValueOrDie().Get(label, ValidTime{2});
+  ASSERT_TRUE(value.ok()) << value.status().ToString();
+  ASSERT_TRUE(value.ValueOrDie().has_value());
+  EXPECT_EQ(std::get<std::string>(value.ValueOrDie()->data()), "new");
 }
 
 TEST_F(KernelMutationTest, DuplicateAssertionFailsAtAssertTime) {

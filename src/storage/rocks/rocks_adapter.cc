@@ -441,11 +441,26 @@ class FactStoreImpl {
 
   // Readers on the hot path load a raw pointer; retired schema versions are
   // kept alive until the store is destroyed so no refcount is touched.
+  //
+  // A property registration does not advance the visible sequence, so every
+  // snapshot epoch opened so far (the current epoch, retired epochs, and the
+  // as_of cache's retired-from-birth epochs) must be repointed at the new
+  // catalog. Otherwise a reader that reuses an epoch created before the
+  // registration would resolve properties against a stale catalog (the
+  // transaction path hit this: SnapshotEpoch::schemas was captured at epoch
+  // creation only). Lock order: retired_schemas_mutex -> epoch_mutex. No path
+  // takes them in the opposite order, and every publisher is additionally
+  // serialized by publisher_mutex at the FactStore level.
   void PublishSchemas(std::shared_ptr<const PropertySchemas> next) {
     std::lock_guard<std::mutex> lock(retired_schemas_mutex);
     if (property_schemas) retired_schemas.push_back(property_schemas);
     property_schemas = std::move(next);
-    current_schemas.store(property_schemas.get(), std::memory_order_release);
+    const PropertySchemas* published = property_schemas.get();
+    current_schemas.store(published, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> epoch_lock(epoch_mutex);
+      RefreshLiveEpochSchemasLocked(published);
+    }
   }
   std::shared_ptr<const PropertySchemas> SchemasSnapshot() const {
     std::lock_guard<std::mutex> lock(retired_schemas_mutex);
@@ -576,6 +591,12 @@ class FactStoreImpl {
   void MaybeFreeDeadEpochs();
 
  private:
+  // Repoints every live snapshot epoch (the current epoch, every retired epoch,
+  // and therefore every as_of cache epoch, which is retired from birth and
+  // registered in retired_epochs while alive) at `schemas`. Caller must hold
+  // epoch_mutex so no epoch can be created or unlinked between the scan and the
+  // store, and must keep the catalog alive (see PublishSchemas).
+  void RefreshLiveEpochSchemasLocked(const PropertySchemas* schemas);
   SnapshotEpoch* CreateEpochLocked(const std::shared_ptr<FactStoreImpl>& self,
                                    CommitSeq seq, CommitSeq oldest_readable);
   void RetireCurrentEpochLocked();
@@ -667,7 +688,11 @@ struct SnapshotEpoch {
   FactStoreImpl* store = nullptr;
   std::shared_ptr<SnapshotLease> lease;
   std::shared_ptr<FactStoreImpl> store_owner;
-  const FactStoreImpl::PropertySchemas* schemas = nullptr;
+  // The property catalog this epoch resolves against. Refreshed in place by
+  // PublishSchemas for every live epoch because property registration is not
+  // tied to a visible sequence; readers load it with acquire and old catalog
+  // versions stay alive in FactStoreImpl::retired_schemas until destruction.
+  std::atomic<const FactStoreImpl::PropertySchemas*> schemas{nullptr};
   CommitSeq seq;
   CommitSeq oldest_readable;
   std::atomic<uint32_t> refs{0};
@@ -682,6 +707,19 @@ struct SnapshotEpoch {
   // memory (the last reader, or a close that detached it into its graveyard).
   std::atomic<bool> memory_owned{false};
 };
+
+void FactStoreImpl::RefreshLiveEpochSchemasLocked(
+    const PropertySchemas* schemas) {
+  // DEAD epochs (dead_epochs_pending_free / close_graveyard) have no reader
+  // reference, so no lookup can still load their catalog pointer; leaving them
+  // alone keeps the close path's "parked memory is inert" contract unchanged.
+  if (current_epoch != nullptr) {
+    current_epoch->schemas.store(schemas, std::memory_order_release);
+  }
+  for (SnapshotEpoch* epoch : retired_epochs) {
+    epoch->schemas.store(schemas, std::memory_order_release);
+  }
+}
 
 uint32_t FactStoreImpl::EpochRefs(const SnapshotEpoch* epoch) {
   return epoch->refs.load(std::memory_order_acquire);
@@ -854,7 +892,8 @@ SnapshotEpoch* FactStoreImpl::CreateEpochLocked(
   epoch->store = this;
   epoch->lease = std::make_shared<SnapshotLease>(this, raw);
   epoch->store_owner = self;
-  epoch->schemas = current_schemas.load(std::memory_order_acquire);
+  epoch->schemas.store(current_schemas.load(std::memory_order_acquire),
+                       std::memory_order_relaxed);
   epoch->seq = seq;
   epoch->oldest_readable = oldest_readable;
   // The returned owner reference: the store's current reference, or the
@@ -4715,8 +4754,13 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
                                      "snapshot belongs to another store");
     }
   }
-  return LookupPropertyInSchemas(*snapshot.epoch_->schemas, property_id,
-                                 schema_epoch);
+  const FactStoreImpl::PropertySchemas* schemas =
+      snapshot.epoch_->schemas.load(std::memory_order_acquire);
+  if (schemas == nullptr) {
+    return Status::InvalidArgument("property definition",
+                                   "snapshot schema catalog is unavailable");
+  }
+  return LookupPropertyInSchemas(*schemas, property_id, schema_epoch);
 }
 
 StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(

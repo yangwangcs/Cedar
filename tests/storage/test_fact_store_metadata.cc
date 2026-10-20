@@ -45,6 +45,19 @@ void PutMetaRecord(const std::string& path, const std::string& key,
   }
 }
 
+StoreCommitBatch VertexStateBatch(TxnId txn_id, VertexId vertex_id,
+                                  uint64_t valid_from) {
+  return StoreCommitBatch{
+      txn_id,
+      valid_from,
+      {{EntityFact::Vertex(VertexRef{PartId{0}, vertex_id}).ref(),
+        ValidTime{valid_from}, FactOperation::kPut, 0, std::nullopt}},
+      {},
+      {},
+      {},
+      false};
+}
+
 class FactStoreMetadataTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -139,7 +152,12 @@ TEST_F(FactStoreMetadataTest, RegistersPropertiesIdempotentlyAndPreservesEpochs)
   EXPECT_EQ(reopened_old.ValueOrDie()->name, "name");
 }
 
-TEST_F(FactStoreMetadataTest, SnapshotCapturesPropertySchemaView) {
+TEST_F(FactStoreMetadataTest,
+       RefreshesLiveCurrentEpochSchemasWhenPropertyIsRegistered) {
+  // Regression: SnapshotEpoch::schemas used to be captured once at epoch
+  // creation. A runtime RegisterProperty does not advance the visible sequence,
+  // so every later snapshot at that sequence reused the stale catalog and a
+  // lookup of the new property returned nullopt ("property is not registered").
   ASSERT_TRUE(store_->RegisterProperty(
                         Property(PropertyId{9}, "name", PropertyEntityKind::kVertex,
                                  PhysicalType::kString))
@@ -148,15 +166,101 @@ TEST_F(FactStoreMetadataTest, SnapshotCapturesPropertySchemaView) {
   ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
 
   ASSERT_TRUE(store_->RegisterProperty(
-                        Property(PropertyId{9}, "display_name",
+                        Property(PropertyId{10}, "display_name",
                                  PropertyEntityKind::kVertex,
                                  PhysicalType::kString))
                   .ok());
-  const auto captured = store_->LookupProperty(snapshot.ValueOrDie(), PropertyId{9});
-  ASSERT_TRUE(captured.ok()) << captured.status().ToString();
-  ASSERT_TRUE(captured.ValueOrDie().has_value());
-  EXPECT_EQ(captured.ValueOrDie()->name, "name");
-  EXPECT_EQ(captured.ValueOrDie()->schema_epoch, 1U);
+  const auto added = store_->LookupProperty(snapshot.ValueOrDie(), PropertyId{10});
+  ASSERT_TRUE(added.ok()) << added.status().ToString();
+  ASSERT_TRUE(added.ValueOrDie().has_value());
+  EXPECT_EQ(added.ValueOrDie()->name, "display_name");
+  EXPECT_EQ(added.ValueOrDie()->schema_epoch, 1U);
+
+  // A new schema epoch of an already-known property is refreshed as well, and
+  // the previous epoch stays resolvable through the same catalog.
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{10}, "display_name_v2",
+                                 PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+  const auto latest = store_->LookupProperty(snapshot.ValueOrDie(), PropertyId{10});
+  ASSERT_TRUE(latest.ok()) << latest.status().ToString();
+  ASSERT_TRUE(latest.ValueOrDie().has_value());
+  EXPECT_EQ(latest.ValueOrDie()->schema_epoch, 2U);
+  const auto previous =
+      store_->LookupProperty(snapshot.ValueOrDie(), PropertyId{10}, 1);
+  ASSERT_TRUE(previous.ok()) << previous.status().ToString();
+  ASSERT_TRUE(previous.ValueOrDie().has_value());
+  EXPECT_EQ(previous.ValueOrDie()->name, "display_name");
+}
+
+TEST_F(FactStoreMetadataTest,
+       RefreshesRetiredAndAsOfEpochSchemasWhenPropertyIsRegistered) {
+  // As_of and retired epochs are registered in the same live-epoch registry, so
+  // a property publish must repoint them too; otherwise an as_of reader opened
+  // before the registration would keep answering from the pre-publish catalog.
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  const auto retired = store_->BeginSnapshot();
+  ASSERT_TRUE(retired.ok()) << retired.status().ToString();
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+  const auto as_of = store_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(as_of.ok()) << as_of.status().ToString();
+
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{31}, "late", PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+
+  const auto from_retired =
+      store_->LookupProperty(retired.ValueOrDie(), PropertyId{31});
+  ASSERT_TRUE(from_retired.ok()) << from_retired.status().ToString();
+  ASSERT_TRUE(from_retired.ValueOrDie().has_value());
+  EXPECT_EQ(from_retired.ValueOrDie()->name, "late");
+  const auto from_as_of = store_->LookupProperty(as_of.ValueOrDie(), PropertyId{31});
+  ASSERT_TRUE(from_as_of.ok()) << from_as_of.status().ToString();
+  ASSERT_TRUE(from_as_of.ValueOrDie().has_value());
+  EXPECT_EQ(from_as_of.ValueOrDie()->name, "late");
+}
+
+TEST_F(FactStoreMetadataTest,
+       PropertyRegistrationKeepsVisibleSequenceAndExpirySemantics) {
+  // Requirement: refreshing live epoch schemas must not change snapshot
+  // visibility. RegisterProperty writes metadata only, so the visible sequence
+  // must not move and expiry must still follow the retention boundary.
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+  {
+    const auto before = store_->BeginSnapshot();
+    ASSERT_TRUE(before.ok()) << before.status().ToString();
+    EXPECT_EQ(before.ValueOrDie().commit_seq().value, 2U);
+  }
+  {
+    const auto as_of = store_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+    ASSERT_TRUE(as_of.ok()) << as_of.status().ToString();
+    EXPECT_EQ(as_of.ValueOrDie().commit_seq().value, 1U);
+  }
+
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{21}, "kept", PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+
+  {
+    const auto after = store_->BeginSnapshot();
+    ASSERT_TRUE(after.ok()) << after.status().ToString();
+    EXPECT_EQ(after.ValueOrDie().commit_seq().value, 2U);
+  }
+  EXPECT_TRUE(store_->BeginSnapshot(SnapshotOptions{CommitSeq{3}})
+                  .status()
+                  .IsInvalidArgument());
+
+  ASSERT_TRUE(store_->Vacuum(CommitSeq{2}).ok());
+  EXPECT_TRUE(store_->BeginSnapshot(SnapshotOptions{CommitSeq{1}})
+                  .status()
+                  .IsSnapshotExpired());
+  const auto retained = store_->BeginSnapshot(SnapshotOptions{CommitSeq{2}});
+  ASSERT_TRUE(retained.ok()) << retained.status().ToString();
+  EXPECT_EQ(retained.ValueOrDie().commit_seq().value, 2U);
 }
 
 TEST_F(FactStoreMetadataTest, HidesEdgeIdentityCreatedAfterLogicalSnapshot) {

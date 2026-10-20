@@ -568,6 +568,10 @@ TEST_F(KernelSnapshotTest, GetPointAtFastPathTracksConcurrentCommits) {
   std::atomic<bool> failed{false};
   std::atomic<uint64_t> commits{0};
   std::atomic<uint64_t> reads{0};
+  // Highest value whose commit has *returned* to the writer. Values are
+  // published monotonically, so any value above this bound would be a read of an
+  // uncommitted vintage.
+  std::atomic<int64_t> committed_max{0};
   std::mutex failure_mutex;
   std::string failure;
   const auto fail = [&](const std::string& message) {
@@ -576,7 +580,7 @@ TEST_F(KernelSnapshotTest, GetPointAtFastPathTracksConcurrentCommits) {
   };
 
   std::thread writer([&] {
-    uint64_t next = 0;
+    int64_t next = 0;
     while (!done.load(std::memory_order_relaxed)) {
       const auto transaction = database->BeginTransaction();
       if (!transaction.ok()) {
@@ -589,8 +593,9 @@ TEST_F(KernelSnapshotTest, GetPointAtFastPathTracksConcurrentCommits) {
         fail("assert: " + asserted.ToString());
         return;
       }
+      const int64_t value = ++next;
       const Status set = transaction.ValueOrDie()->Set(
-          property, ValidTime{10}, Value::Int64(static_cast<int64_t>(++next)));
+          property, ValidTime{10}, Value::Int64(value));
       if (!set.ok()) {
         fail("set: " + set.ToString());
         return;
@@ -600,6 +605,7 @@ TEST_F(KernelSnapshotTest, GetPointAtFastPathTracksConcurrentCommits) {
         fail("commit: " + committed.status().ToString());
         return;
       }
+      committed_max.store(value, std::memory_order_release);
       commits.fetch_add(1, std::memory_order_relaxed);
     }
   });
@@ -608,6 +614,7 @@ TEST_F(KernelSnapshotTest, GetPointAtFastPathTracksConcurrentCommits) {
   readers.reserve(kReaders);
   for (int reader = 0; reader < kReaders; ++reader) {
     readers.emplace_back([&] {
+      int64_t last_observed = 0;
       for (int index = 0; index < kReadsPerReader; ++index) {
         const auto value = database->GetPointAt(property.ref(), ValidTime{10});
         if (!value.ok()) {
@@ -619,16 +626,26 @@ TEST_F(KernelSnapshotTest, GetPointAtFastPathTracksConcurrentCommits) {
           return;
         }
         const int64_t observed = std::get<int64_t>(value.ValueOrDie()->data());
-        // Only a committed vintage (or the seed) may be observed, and never a
-        // value from a commit that has not finished publishing.
+        // The writer is a single thread that publishes values in increasing
+        // order. A commit is published before Commit() returns, so at most one
+        // already-published value can still be missing from committed_max; any
+        // larger value would be uncommitted.
         if (observed < 0 ||
-            observed > static_cast<int64_t>(
-                            commits.load(std::memory_order_relaxed)) +
-                            1) {
+            observed > committed_max.load(std::memory_order_acquire) + 1) {
           fail("read: observed uncommitted value " +
                std::to_string(observed));
           return;
         }
+        // Successive point reads at the same valid time must be monotonic: the
+        // visible watermark only advances, so a later read can never resurrect
+        // an older revision.
+        if (observed < last_observed) {
+          fail("read: observed value went backwards " +
+               std::to_string(observed) + " after " +
+               std::to_string(last_observed));
+          return;
+        }
+        last_observed = observed;
         reads.fetch_add(1, std::memory_order_relaxed);
       }
     });
@@ -653,6 +670,18 @@ TEST_F(KernelSnapshotTest, CloseRacingFastPathLeavesNoLivePins) {
     auto opened = Database::Open(DatabaseOptions{.path = path_});
     ASSERT_TRUE(opened.ok()) << opened.status().ToString();
     std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+    // Deterministic pinned-close coverage: a live handle must make Close report
+    // SnapshotPinned (exercising the retry path) and leave the store usable.
+    {
+      auto held = database->BeginSnapshot();
+      ASSERT_TRUE(held.ok()) << held.status().ToString();
+      const Status pinned = database->Close();
+      EXPECT_TRUE(pinned.IsSnapshotPinned()) << pinned.ToString();
+      const auto still_readable =
+          database->GetPointAt(property.ref(), ValidTime{15});
+      ASSERT_TRUE(still_readable.ok()) << still_readable.status().ToString();
+      EXPECT_EQ(still_readable.ValueOrDie(), std::optional<Value>{Value::Int64(10)});
+    }
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> succeeded{0};
     std::atomic<uint64_t> rejected{0};
@@ -698,6 +727,7 @@ TEST_F(KernelSnapshotTest, CloseRacingFastPathLeavesNoLivePins) {
     stop.store(true, std::memory_order_relaxed);
     for (std::thread& reader : readers) reader.join();
     EXPECT_EQ(unexpected.load(), 0U);
+    EXPECT_GT(succeeded.load(), 0U);
     EXPECT_GT(succeeded.load() + rejected.load(), 0U);
     // Reopening proves the close handshake actually released RocksDB.
     auto reopened = Database::Open(DatabaseOptions{.path = path_});
@@ -708,6 +738,135 @@ TEST_F(KernelSnapshotTest, CloseRacingFastPathLeavesNoLivePins) {
     EXPECT_EQ(value.ValueOrDie(), std::optional<Value>{Value::Int64(10)});
     ASSERT_TRUE(reopened.ValueOrDie()->Close().ok());
   }
+}
+
+// C1 regression: a writer commits continuously while reader threads call
+// GetPointAtAt(old_seq). Every as_of read must equal the vintage of the
+// requested sequence (Snapshot::Get at that sequence) and can never observe a
+// post-old_seq value: a publish that races the pin must not move the read to a
+// newer epoch.
+TEST_F(KernelSnapshotTest,
+       GetPointAtAtNeverObservesNewerVintageUnderContinuousCommits) {
+  {
+    // Register the schema and seed the first revision in one store lifetime so
+    // the epochs created by the Database below see the property catalog.
+    FactStore store(FactStoreOptions{path_});
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.RegisterProperty(PropertyDefinition{
+                                        PropertyId{7}, 0, "value",
+                                        PropertyEntityKind::kVertex,
+                                        PhysicalType::kInt64, 4096})
+                    .ok());
+    ASSERT_TRUE(store.Commit(Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                                             PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                                              Value::Int64(0))}))
+                    .ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+  auto opened = Database::Open(DatabaseOptions{.path = path_});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+  constexpr int kReaders = 4;
+  constexpr int kIterations = 150;
+
+  std::atomic<bool> done{false};
+  std::atomic<uint64_t> committed{0};
+  std::atomic<uint64_t> as_of_reads{0};
+  std::atomic<bool> failed{false};
+  std::mutex failure_mutex;
+  std::string failure;
+  const auto fail = [&](const std::string& message) {
+    std::lock_guard<std::mutex> lock(failure_mutex);
+    if (!failed.exchange(true)) failure = message;
+  };
+
+  std::thread writer([&] {
+    int64_t next = 0;
+    while (!done.load(std::memory_order_relaxed)) {
+      const auto transaction = database->BeginTransaction();
+      if (!transaction.ok()) {
+        fail("begin: " + transaction.status().ToString());
+        return;
+      }
+      const Status asserted = transaction.ValueOrDie()->Assert(
+          EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10});
+      if (!asserted.ok()) {
+        fail("assert: " + asserted.ToString());
+        return;
+      }
+      const Status set = transaction.ValueOrDie()->Set(
+          property, ValidTime{10}, Value::Int64(++next));
+      if (!set.ok()) {
+        fail("set: " + set.ToString());
+        return;
+      }
+      const auto result = transaction.ValueOrDie()->Commit();
+      if (!result.ok()) {
+        fail("commit: " + result.status().ToString());
+        return;
+      }
+      committed.store(static_cast<uint64_t>(next),
+                      std::memory_order_release);
+    }
+  });
+
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int reader = 0; reader < kReaders; ++reader) {
+    readers.emplace_back([&] {
+      for (int iteration = 0; iteration < kIterations; ++iteration) {
+        // Capture an as_of vintage and its expected value through the snapshot
+        // API, then re-read the same vintage through the point API while the
+        // writer keeps publishing newer revisions.
+        const auto snapshot = database->BeginSnapshot();
+        if (!snapshot.ok()) {
+          fail("snapshot: " + snapshot.status().ToString());
+          return;
+        }
+        const CommitSeq vintage = snapshot.ValueOrDie().commit_seq();
+        const auto expected =
+            snapshot.ValueOrDie().Get(property, ValidTime{10});
+        if (!expected.ok() || !expected.ValueOrDie().has_value()) {
+          fail("expected: " + expected.status().ToString());
+          return;
+        }
+        const int64_t expected_value =
+            std::get<int64_t>(expected.ValueOrDie()->data());
+        const auto actual =
+            database->GetPointAtAt(vintage, property.ref(), ValidTime{10});
+        if (!actual.ok()) {
+          fail("as_of read: " + actual.status().ToString());
+          return;
+        }
+        if (!actual.ValueOrDie().has_value()) {
+          fail("as_of read at " + std::to_string(vintage.value) +
+               " returned no value");
+          return;
+        }
+        const int64_t actual_value =
+            std::get<int64_t>(actual.ValueOrDie()->data());
+        // Values increase with every commit, so inequality means the as_of read
+        // observed a vintage other than the requested one (a newer commit
+        // leaking into the read).
+        if (actual_value != expected_value) {
+          fail("as_of read at " + std::to_string(vintage.value) +
+               " returned value " + std::to_string(actual_value) +
+               " instead of " + std::to_string(expected_value));
+          return;
+        }
+        as_of_reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (std::thread& reader : readers) reader.join();
+  done.store(true, std::memory_order_relaxed);
+  writer.join();
+
+  EXPECT_FALSE(failed.load()) << failure;
+  EXPECT_EQ(as_of_reads.load(), kReaders * kIterations);
+  EXPECT_GT(committed.load(), 0U);
 }
 
 TEST_F(KernelSnapshotTest, PreservesBitemporalReadsAfterFlushCompactionAndReopen) {

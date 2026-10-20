@@ -1192,5 +1192,46 @@ TEST_F(RocksDbLifecycleTest,
   EXPECT_TRUE(store.Close().ok());
 }
 
+// C2 regression: repeated Open/Close on the same FactStore must not accumulate
+// retained closed-store shells, and every retained shell must be inert - no
+// validation caches, write index, identity history, statistics, property
+// schemas, RocksDB handle, or snapshot lease. The single retained shell exists
+// only so a lock-free pin that loaded the raw store pointer before the close
+// gate can read accepting_fast and fail safely.
+TEST_F(RocksDbLifecycleTest, RepeatedOpenCloseBoundsRetainedShells) {
+  PopulateSource();
+  FactStore store(FactStoreOptions{database_path_});
+  for (int iteration = 0; iteration < 25; ++iteration) {
+    const auto opened = store.Open();
+    ASSERT_TRUE(opened.ok()) << opened.ToString();
+    {
+      const auto snapshot = store.BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+      EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{2});
+    }
+    const Status closed = store.Close();
+    ASSERT_TRUE(closed.ok()) << closed.ToString();
+    // Bounded retention: at most the most recently closed shell is kept, and it
+    // must have released everything heavy.
+    EXPECT_LE(store.RetainedShellCountForTesting(), 1U)
+        << "iteration " << iteration;
+    EXPECT_TRUE(store.RetainedShellsAreInertForTesting())
+        << "iteration " << iteration;
+  }
+  // Reopening after the bounded-retention closes still serves reads.
+  const auto reopened = store.Open();
+  ASSERT_TRUE(reopened.ok()) << reopened.ToString();
+  const auto event = store.ReadCurrent(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{101}}).ref(),
+      ValidTime{1000});
+  ASSERT_TRUE(event.ok()) << event.status().ToString();
+  ASSERT_TRUE(event.ValueOrDie().has_value());
+  EXPECT_EQ(event.ValueOrDie()->ref.entity_id(), 101U);
+  EXPECT_EQ(event.ValueOrDie()->commit_seq, CommitSeq{1});
+  EXPECT_TRUE(store.Close().ok());
+  EXPECT_LE(store.RetainedShellCountForTesting(), 1U);
+  EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
+}
+
 }  // namespace
 }  // namespace cedar

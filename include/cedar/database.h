@@ -392,7 +392,10 @@ class Database {
   // InvalidArgument, exactly like BeginSnapshot(SnapshotOptions{as_of}) followed
   // by Snapshot::Get. Every property fact - including edge-property endpoint
   // visibility at valid_time - resolves through the same shared point-read path
-  // as GetPointAt; only the pinned commit sequence differs.
+  // as GetPointAt; only the pinned commit sequence differs. The read is pinned
+  // at exactly `sequence`: a commit that is published concurrently with the
+  // call is never observed, even when its epoch is created before this call
+  // pins one.
   StatusOr<std::optional<Value>> GetPointAtAt(CommitSeq sequence, FactRef ref,
                                               ValidTime valid_time) const;
   StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;

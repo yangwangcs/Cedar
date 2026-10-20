@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "storage/facts/fact_store.h"
@@ -666,7 +669,135 @@ TEST_F(FactStoreCommitTest, LockFreeCurrentAndCachedAsOfReads) {
   const auto future = store_->ReadCurrentAt(CommitSeq{3}, property, ValidTime{25});
   ASSERT_FALSE(future.ok());
   EXPECT_TRUE(future.status().IsInvalidArgument());
+
+  // Reading at the *current* visible sequence through the as_of entry point must
+  // return the same vintage as the lock-free current pin: the exact-sequence
+  // check must accept the current epoch when its sequence is the requested one.
+  const CommitSeq latest_visible = store_->visible_seq();
+  const auto as_of_latest =
+      store_->ReadCurrentAt(latest_visible, property, ValidTime{25});
+  ASSERT_TRUE(as_of_latest.ok()) << as_of_latest.status().ToString();
+  ASSERT_TRUE(as_of_latest.ValueOrDie().has_value());
+  EXPECT_EQ(as_of_latest.ValueOrDie()->commit_seq, latest_visible);
+  EXPECT_EQ(as_of_latest.ValueOrDie()->value,
+            latest.ValueOrDie()->value);
   EXPECT_TRUE(store_->Close().ok());
+}
+
+// C1 regression (window 1): a publish that completes between the as_of
+// watermark load and the epoch pin must not move the read to the newer epoch.
+// The observer parks the reader inside that window so the commit below is
+// guaranteed to land after the watermark load and before the pin.
+TEST_F(FactStoreCommitTest,
+       AsOfReadDoesNotAdoptEpochPublishedAfterWatermarkLoad) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::atomic<bool> window_open{false};
+  std::atomic<bool> proceed{false};
+  FactStoreOptions options;
+  options.path = path_;
+  options.current_sequence_loaded_observer_for_testing = [&] {
+    window_open.store(true, std::memory_order_release);
+    while (!proceed.load(std::memory_order_acquire)) std::this_thread::yield();
+  };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  const auto property_put = [](uint64_t valid_from, int64_t value) {
+    return PendingFactMutation{
+        PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{7})
+            .ref(),
+        ValidTime{valid_from}, FactOperation::kPut, 1, Value::Int64(value)};
+  };
+  const FactRef property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{7})
+          .ref();
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{1}, {VertexPut(7, 10),
+                                              property_put(10, 11)})).ok());
+  ASSERT_EQ(store_->visible_seq(), CommitSeq{1});
+
+  std::optional<FactEvent> observed;
+  Status observed_status;
+  std::thread reader([&] {
+    const auto event =
+        store_->ReadCurrentAt(CommitSeq{1}, property, ValidTime{25});
+    observed_status = event.status();
+    if (event.ok()) observed = event.ValueOrDie();
+  });
+  while (!window_open.load(std::memory_order_acquire)) std::this_thread::yield();
+  // New commit while the reader has loaded visible == 1 but has not pinned yet.
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{2}, {property_put(20, 22)})).ok());
+  ASSERT_EQ(store_->visible_seq(), CommitSeq{2});
+  proceed.store(true, std::memory_order_release);
+  reader.join();
+
+  ASSERT_TRUE(observed_status.ok()) << observed_status.ToString();
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->commit_seq, CommitSeq{1})
+      << "as_of read adopted the epoch published after its watermark load";
+  EXPECT_EQ(observed->value, std::optional<Value>{Value::Int64(11)});
+}
+
+// C1 regression (window 2): PublishVisible stores the new visible watermark
+// before it retires the previous epoch. An as_of read for the new sequence that
+// pins in that window sees an *older* current epoch; it must not use it. The
+// observer parks the publisher inside the window (holding epoch_mutex) so the
+// read below pins the stale current epoch deterministically.
+TEST_F(FactStoreCommitTest,
+       AsOfReadRejectsOlderEpochWhileNewerWatermarkIsPublished) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::atomic<int> publish_calls{0};
+  std::atomic<bool> window_open{false};
+  std::atomic<bool> proceed{false};
+  FactStoreOptions options;
+  options.path = path_;
+  options.publish_visible_before_retire_observer_for_testing = [&] {
+    // The seed commit is publication 0; park inside publication 1 only.
+    if (publish_calls.fetch_add(1, std::memory_order_relaxed) != 1) return;
+    window_open.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(300);
+    while (!proceed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+  };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  const auto property_put = [](uint64_t valid_from, int64_t value) {
+    return PendingFactMutation{
+        PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{7})
+            .ref(),
+        ValidTime{valid_from}, FactOperation::kPut, 1, Value::Int64(value)};
+  };
+  const FactRef property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{7})
+          .ref();
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{1}, {VertexPut(7, 10),
+                                              property_put(10, 11)})).ok());
+  ASSERT_EQ(store_->visible_seq(), CommitSeq{1});
+
+  std::optional<StoreCommitResult> writer_result;
+  Status writer_status;
+  std::thread writer([&] {
+    const auto committed =
+        store_->Commit(Batch(TxnId{2}, {property_put(20, 22)}));
+    writer_status = committed.status();
+    if (committed.ok()) writer_result = committed.ValueOrDie();
+  });
+  while (!window_open.load(std::memory_order_acquire)) std::this_thread::yield();
+  // visible == 2 here, but current_epoch_fast still points at the seq-1 epoch.
+  const auto as_of =
+      store_->ReadCurrentAt(CommitSeq{2}, property, ValidTime{25});
+  proceed.store(true, std::memory_order_release);
+  writer.join();
+
+  ASSERT_TRUE(writer_status.ok()) << writer_status.ToString();
+  ASSERT_TRUE(as_of.ok()) << as_of.status().ToString();
+  ASSERT_TRUE(as_of.ValueOrDie().has_value());
+  EXPECT_EQ(as_of.ValueOrDie()->commit_seq, CommitSeq{2})
+      << "as_of read used the older epoch that was still current";
+  EXPECT_EQ(as_of.ValueOrDie()->value, std::optional<Value>{Value::Int64(22)});
 }
 
 }  // namespace

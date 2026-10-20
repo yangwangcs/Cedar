@@ -2161,6 +2161,12 @@ StatusOr<std::optional<Value>> Database::GetPointAtAt(CommitSeq sequence,
   // Same shared point-read helper as GetPointAt, pinned at the requested seq.
   auto snapshot = impl_->store.BeginCurrentSnapshotAt(sequence);
   if (!snapshot.ok()) return snapshot.status();
+  // Explicit exact-sequence invariant: a pin at another sequence (a newer epoch
+  // created by a concurrent publish) would silently serve a future vintage.
+  if (snapshot.ValueOrDie().commit_seq() != sequence) {
+    return Status::Corruption("point read",
+                              "as_of snapshot sequence does not match request");
+  }
   return ReadPropertyPointAt(impl_->store, snapshot.ValueOrDie(), ref,
                              valid_time);
 }

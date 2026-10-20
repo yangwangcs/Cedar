@@ -4,6 +4,7 @@
 #ifndef CEDAR_STORAGE_FACTS_FACT_STORE_H_
 #define CEDAR_STORAGE_FACTS_FACT_STORE_H_
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -70,6 +71,17 @@ struct FactStoreOptions {
   // FactStore.
   std::function<void()> snapshot_epoch_created_observer_for_testing;
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
+  // Observe the two exact-sequence windows of the as_of point path.
+  // `current_sequence_loaded` fires in BeginCurrentSnapshotAt after the
+  // visible/retention watermark loads and validation but *before* the epoch pin,
+  // so a test can advance the visible sequence inside that window.
+  // `publish_visible_before_retire` fires inside PublishVisible after the new
+  // visible watermark is published but before the previous epoch is retired, so
+  // a test can pin an older epoch while the requested sequence is already
+  // visible. It runs under the store's epoch mutex; neither observer may call
+  // back into FactStore.
+  std::function<void()> current_sequence_loaded_observer_for_testing;
+  std::function<void()> publish_visible_before_retire_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {
@@ -402,8 +414,12 @@ class StoreSnapshot {
 
   // The epoch outlives every read because it owns a RocksDB snapshot lease
   // and only the last released reference reclaims it. The shared_ptr keeps the
-  // owning store (and therefore that registry) alive without a cycle, since
-  // SnapshotEpoch holds a raw store back-pointer instead.
+  // owning store (and therefore that registry) alive for the whole read. Each
+  // epoch also holds its own strong `store_owner` back-pointer so a lock-free
+  // pin can copy it after the handle is built; that does not create an
+  // ownership cycle in the close path because Close releases every epoch's
+  // owner reference before the closed shell is retained, and the retained
+  // shell (bounded to one) holds the DEAD epoch memory until it is freed.
   std::shared_ptr<FactStoreImpl> store_;
   const FactStore* owner_ = nullptr;
   SnapshotEpoch* epoch_ = nullptr;
@@ -453,9 +469,13 @@ class FactStore {
   StatusOr<StoreSnapshot> BeginCurrentSnapshot() const;
   // Historical as_of pin for point reads (GetPointAtAt). Reads at the exact
   // commit sequence with a small bounded per-sequence epoch cache (8 entries,
-  // each holding its own reference). Reports SnapshotExpired below the durable
-  // retention boundary and InvalidArgument above the visible watermark, exactly
-  // like BeginSnapshot(options.as_of).
+  // each holding its own reference). The pin is always exact: a current-epoch
+  // pin whose sequence does not equal the requested sequence is released and
+  // an epoch pinned at the requested sequence is created instead, so a commit
+  // published concurrently with this call can never leak a newer vintage into
+  // the read. Reports SnapshotExpired below the durable retention boundary and
+  // InvalidArgument above the visible watermark, exactly like
+  // BeginSnapshot(options.as_of).
   StatusOr<StoreSnapshot> BeginCurrentSnapshotAt(CommitSeq sequence) const;
   // One-shot point reads on top of the lock-free pins above. They return the
   // storage-level fact event; kernel callers that need metric/edge visibility
@@ -588,11 +608,22 @@ class FactStore {
       const FactStoreMaintenanceRequest& request,
       const std::atomic<bool>* wal_sync_critical);
   StatusOr<ValidationCacheMetrics> SampleValidationCacheMetrics() const;
+  // Test-only introspection of the closed-store shells retained for a lock-free
+  // pin that raced `Close`. The contract under test is that the retention stays
+  // bounded (at most one shell: the one closed most recently) and that every
+  // retained shell released its heavy state (validation caches, statistics,
+  // property schemas) and every RocksDB snapshot lease. Exposed for lifecycle
+  // regression tests only; no production code may depend on it.
+  size_t RetainedShellCountForTesting() const;
+  bool RetainedShellsAreInertForTesting() const;
 
  private:
   // Slow path of BeginCurrentSnapshotAt for a historical sequence whose epoch
   // is not cached: acquires the open store through the close handshake, creates
-  // the one-off epoch, and inserts it into the bounded cache.
+  // the one-off epoch, and inserts it into the bounded cache. Also used as the
+  // exact-sequence fallback for the current vintage, in which case a mismatch
+  // between the requested sequence and the pinned current epoch creates a
+  // one-off epoch at exactly the requested sequence.
   StatusOr<StoreSnapshot> BeginSnapshotAtCached(CommitSeq sequence) const;
   StatusOr<StoreCommitResult> CommitDirect(
       const StoreCommitBatch& batch,
@@ -610,14 +641,51 @@ class FactStore {
       WalDurableCallback on_wal_durable, void* callback_context,
       std::atomic<bool>* wal_sync_critical = nullptr);
 
+  // Lock-free point reads register one attempt here *before* they load
+  // fast_impl_. A successful Close clears fast_impl_ and then drains these
+  // sharded counters (seq_cst), which proves that no thread can still hold a raw
+  // pointer into any previously closed store shell. That proof is what lets
+  // Close release the previous shell instead of retaining one full store per
+  // Open->Close; the newly closed shell is the only retained one and it is made
+  // inert by releasing its heavy state.
+  static constexpr size_t kFastPinShardCount = 32;
+  struct alignas(64) FastPinAttemptCounter {
+    std::atomic<uint32_t> value{0};
+  };
+  class FastPinAttempt {
+   public:
+    explicit FastPinAttempt(const FactStore& store);
+    ~FastPinAttempt();
+    FastPinAttempt(const FastPinAttempt&) = delete;
+    FastPinAttempt& operator=(const FastPinAttempt&) = delete;
+
+   private:
+    const FactStore& store_;
+    size_t shard_ = 0;
+  };
+  uint32_t FastPinAttemptsTotal() const;
+  // Frees every retained shell from an earlier close after draining its
+  // last-reader reclaim attempts. Only a successful Close calls this: it holds
+  // lifecycle_mutex_, fast_impl_ is null, and this close already drained every
+  // fast pin attempt, so no thread can reference the older shells.
+  void FreeEarlierRetainedShells();
+
   FactStoreOptions options_;
   mutable std::mutex lifecycle_mutex_;
   std::shared_ptr<FactStoreImpl> impl_;
-  // Raw publication of impl_ for the lock-free point-read path. The pointer is
-  // stable for the lifetime of this FactStore: a closed store is moved into
-  // retained_impls_ instead of being destroyed, so a pin that raced Close can
-  // still read the gate and fail safely.
+  // Raw publication of impl_ for the lock-free point-read path. fast_impl_ is
+  // cleared at the start of a close handshake and only republished when the
+  // close reports SnapshotPinned. A thread that loaded the pointer before the
+  // clear is covered by a FastPinAttempt that it registered before the load, so
+  // the shell can be freed once close drained the attempts.
   std::atomic<FactStoreImpl*> fast_impl_{nullptr};
+  mutable std::array<FastPinAttemptCounter, kFastPinShardCount>
+      fast_pin_attempts_{};
+  // Closed shells kept for a lock-free pin that raced the close gate. Bounded
+  // to the most recently closed shell; older shells are freed by the next
+  // successful close. The shell itself is inert (no caches/statistics/schemas,
+  // no RocksDB handle), and its epoch graveyard holds at most the epochs that
+  // existed at close, with every RocksDB snapshot lease already released.
   std::vector<std::shared_ptr<FactStoreImpl>> retained_impls_;
 };
 

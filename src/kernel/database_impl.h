@@ -251,7 +251,8 @@ class Database::Impl {
                                {},
                                {},
                                {},
-                               std::move(options.non_epoch_op_observer_for_testing)}),
+                               std::move(options.non_epoch_op_observer_for_testing),
+                               std::move(options.snapshot_boundary_loaded_observer_for_testing)}),
         async_executor(ResolveAsyncExecutorOptions(options)),
         query_runtime_options(ResolveQueryRuntimeOptions(options)),
         query_database_path(options.path) {

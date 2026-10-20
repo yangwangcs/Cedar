@@ -282,6 +282,10 @@ struct DatabaseOptions {
   PreparedCommitRecoveryPolicy prepared_commit_recovery =
       PreparedCommitRecoveryPolicy::kFinalizeOnOpen;
   QueryRuntimeOptions query_runtime;
+  // Forwards FactStoreOptions::snapshot_boundary_loaded_observer_for_testing.
+  // Tests use it to park an as_of open between its retention-boundary read and
+  // its epoch registration while Vacuum advances the boundary.
+  std::function<void()> snapshot_boundary_loaded_observer_for_testing;
 };
 
 struct CommitPipelineMetrics {

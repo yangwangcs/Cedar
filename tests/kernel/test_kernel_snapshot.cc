@@ -911,6 +911,132 @@ TEST_F(KernelSnapshotTest,
   EXPECT_GT(committed.load(), 0U);
 }
 
+// F2 regression: BeginSnapshot(as_of) loads published_oldest_readable_seq and
+// validates as_of against it, then creates/registers the epoch (before the fix
+// the two steps were not atomic). A Vacuum could scan the epoch registry,
+// advance the boundary and clean the versions in that window, so the parked
+// reader pinned a sequence that was already cleaned and silently read "no fact"
+// instead of the as_of vintage. The boundary check and the epoch registration
+// now share one epoch_mutex critical section with Vacuum's scan + boundary
+// advance, so the reader must observe SnapshotExpired.
+TEST_F(KernelSnapshotTest, AsOfOpenParkedBeforeEpochPinIsExpiredByVacuum) {
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+  // Two revisions of the same (ref, valid time): Vacuum(target 2) keeps the
+  // seq-2 baseline and deletes the seq-1 version, so an epoch created at seq 1
+  // after the cleanup finds no fact at all.
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(11))}),
+        Batch(TxnId{2}, {PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(22))})});
+
+  std::atomic<bool> armed{false};
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release{false};
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path_,
+      .snapshot_boundary_loaded_observer_for_testing = [&] {
+        if (!armed.load(std::memory_order_acquire)) return;
+        parked.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  // Open itself takes recovery snapshots; arm the window only for the reader.
+  armed.store(true, std::memory_order_release);
+
+  Status read_status = Status::OK();
+  std::optional<Value> observed;
+  std::thread reader([&] {
+    auto snapshot = database->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+    read_status = snapshot.status();
+    if (!snapshot.ok()) return;
+    const auto value = snapshot.ValueOrDie().Get(property, ValidTime{10});
+    read_status = value.status();
+    if (value.ok()) observed = value.ValueOrDie();
+  });
+  const auto parked_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!parked.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < parked_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(parked.load(std::memory_order_acquire));
+
+  // The parked reader has not registered an epoch, so Vacuum is allowed to
+  // advance and clean; doing so must make the in-flight open expire.
+  const Status vacuumed = database->Vacuum(CommitSeq{2});
+  EXPECT_TRUE(vacuumed.ok()) << vacuumed.ToString();
+  release.store(true, std::memory_order_release);
+  reader.join();
+
+  EXPECT_TRUE(read_status.IsSnapshotExpired())
+      << "parked as_of open returned " << read_status.ToString()
+      << " after Vacuum advanced the boundary past its sequence";
+  if (read_status.ok()) {
+    EXPECT_EQ(observed, std::optional<Value>{Value::Int64(11)})
+        << "as_of read at a cleaned sequence did not return the seq-1 vintage";
+  }
+}
+
+// F2 regression, GetPointAtAt cache-miss path (BeginSnapshotAtCached): same
+// parked reader as above. A success is only allowed inside the boundary and must
+// return the exact seq-1 vintage; after Vacuum cleaned seq 1 the read must be
+// SnapshotExpired, exactly like BeginSnapshot(as_of).
+TEST_F(KernelSnapshotTest, GetPointAtAtParkedBeforeEpochPinIsExpiredByVacuum) {
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(11))}),
+        Batch(TxnId{2}, {PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(22))})});
+
+  std::atomic<bool> armed{false};
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release{false};
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path_,
+      .snapshot_boundary_loaded_observer_for_testing = [&] {
+        if (!armed.load(std::memory_order_acquire)) return;
+        parked.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  armed.store(true, std::memory_order_release);
+
+  Status read_status = Status::OK();
+  std::optional<Value> observed;
+  std::thread reader([&] {
+    const auto value =
+        database->GetPointAtAt(CommitSeq{1}, property.ref(), ValidTime{10});
+    read_status = value.status();
+    if (value.ok()) observed = value.ValueOrDie();
+  });
+  const auto parked_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!parked.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < parked_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(parked.load(std::memory_order_acquire));
+
+  const Status vacuumed = database->Vacuum(CommitSeq{2});
+  EXPECT_TRUE(vacuumed.ok()) << vacuumed.ToString();
+  release.store(true, std::memory_order_release);
+  reader.join();
+
+  EXPECT_TRUE(read_status.IsSnapshotExpired())
+      << "parked GetPointAtAt returned " << read_status.ToString()
+      << " after Vacuum advanced the boundary past its sequence";
+  if (read_status.ok()) {
+    EXPECT_EQ(observed, std::optional<Value>{Value::Int64(11)})
+        << "GetPointAtAt at a cleaned sequence did not return the seq-1 vintage";
+  }
+}
+
 TEST_F(KernelSnapshotTest, PreservesBitemporalReadsAfterFlushCompactionAndReopen) {
   Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
                          PropertyMutation(1, 7, 10, FactOperation::kPut,

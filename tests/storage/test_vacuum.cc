@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -419,6 +420,47 @@ TEST_F(VacuumTest, ReopenAfterFinalStateRemovalFaultResumesVacuum) {
   EXPECT_TRUE(database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}})
                   .status().IsSnapshotExpired());
   EXPECT_EQ(CountCanonicalFactsAfterClose(), 2U);
+}
+
+// The open/vacuum handshake reserves the new retention boundary in memory while
+// a Vacuum runs (readers must see SnapshotExpired before the durable boundary is
+// published). A Vacuum that fails before its boundary write did not advance the
+// durable boundary and must not leave that reservation behind: an old sequence
+// that is still on disk stays readable, and a later successful Vacuum still
+// expires it.
+TEST_F(VacuumTest, FailedBoundaryWriteDoesNotLeaveReadersExpired) {
+  EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
+  EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  std::atomic<bool> fail_once{true};
+  auto reopened = Database::Open(DatabaseOptions{
+      .path = path_,
+      .vacuum_fault_injector_for_testing =
+          [&fail_once](VacuumFaultPoint point) {
+            if (point == VacuumFaultPoint::kBeforeBoundaryWrite &&
+                fail_once.exchange(false)) {
+              return Status::IOError("test", "injected boundary write failure");
+            }
+            return Status::OK();
+          },
+  });
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database_ = std::move(reopened).ConsumeValueOrDie();
+
+  EXPECT_TRUE(database_->Vacuum(CommitSeq{2}).IsIOError());
+  // The durable boundary is still 0, so seq 1 must still open (and the handle
+  // must release its pin before the retry below).
+  {
+    const auto still_readable =
+        database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+    EXPECT_TRUE(still_readable.ok()) << still_readable.status().ToString();
+  }
+  ASSERT_TRUE(database_->Vacuum(CommitSeq{2}).ok());
+  EXPECT_TRUE(database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}})
+                  .status()
+                  .IsSnapshotExpired());
 }
 
 }  // namespace

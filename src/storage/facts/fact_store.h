@@ -89,6 +89,12 @@ struct FactStoreOptions {
   // hold such an operation in flight while a Close is attempted; it must not
   // call back into FactStore.
   std::function<void()> non_epoch_op_observer_for_testing;
+  // Fires in BeginSnapshot and BeginSnapshotAtCached after the retention
+  // watermarks have been loaded and the cheap boundary checks passed, but before
+  // the atomic boundary re-check and epoch registration. Tests use it to park a
+  // reader in exactly the window that the open/vacuum handshake closes; it must
+  // not call back into FactStore.
+  std::function<void()> snapshot_boundary_loaded_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {
@@ -505,12 +511,20 @@ class FactStore {
   // Creates a RocksDB-owned openable checkpoint without exposing RocksDB
   // handles or file-format details across the Cedar storage boundary.
   Status CreateCheckpoint(const std::string& checkpoint_path) const;
+  // Opens a snapshot at the current visible sequence, or at `options.as_of`.
+  // The retention-boundary check and the epoch registration are one atomic
+  // section with respect to Vacuum (see Vacuum's retention/open invariant): a
+  // concurrent Vacuum either cannot clean the pinned sequence or this call
+  // reports SnapshotExpired. Reports SnapshotExpired below the retention
+  // boundary and InvalidArgument above the visible watermark.
   StatusOr<StoreSnapshot> BeginSnapshot(SnapshotOptions options = {}) const;
   // Lock-free pin of the latest visible sequence for point reads. Reads no
   // mutex on the hot path; falls back to BeginSnapshot only when the current
   // epoch has not been created yet, a publication/retirement raced the pin, or
   // the store is closing. The returned handle owns one epoch reference and (like
-  // BeginSnapshot) keeps the read pinned until it is destroyed.
+  // BeginSnapshot) keeps the read pinned until it is destroyed. The lock-free
+  // path never takes epoch_mutex, so the open/vacuum handshake adds no lock to
+  // the current-vintage point-read hot path.
   StatusOr<StoreSnapshot> BeginCurrentSnapshot() const;
   // Historical as_of pin for point reads (GetPointAtAt). Reads at the exact
   // commit sequence with a small bounded per-sequence epoch cache (8 entries,
@@ -520,7 +534,10 @@ class FactStore {
   // published concurrently with this call can never leak a newer vintage into
   // the read. Reports SnapshotExpired below the durable retention boundary and
   // InvalidArgument above the visible watermark, exactly like
-  // BeginSnapshot(options.as_of).
+  // BeginSnapshot(options.as_of); the cache-miss path repeats the boundary check
+  // and registers its epoch atomically with Vacuum like BeginSnapshot, while a
+  // cache hit is already covered because Vacuum evicts the cache before it scans
+  // the live epoch registry.
   StatusOr<StoreSnapshot> BeginCurrentSnapshotAt(CommitSeq sequence) const;
   // One-shot point reads on top of the lock-free pins above. They return the
   // storage-level fact event; kernel callers that need metric/edge visibility
@@ -639,6 +656,20 @@ class FactStore {
   StatusOr<std::string> SchemaFingerprint() const;
   StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
       const StoreSnapshot& snapshot, EdgeRef edge) const;
+  // Advances the durable retention boundary to `oldest_readable` and deletes
+  // obsolete versions at or below it (one baseline per valid-time chain is
+  // kept). Unregistered operation: the caller serializes it with Close.
+  //
+  // Retention/open invariant: an as_of open validates the retention boundary and
+  // registers its epoch in one `epoch_mutex` critical section, and Vacuum scans
+  // the live epoch registry and reserves the new boundary (before publishing it
+  // durably) in one critical section of the same mutex. Therefore a concurrent
+  // Vacuum either observes the opening epoch (a live reference at or below the
+  // target makes it fail with SnapshotPinned) or the open observes the reserved
+  // boundary and fails with SnapshotExpired. A successful open at a sequence is
+  // always at or above the boundary that covers the data it can read, so a
+  // reader can never be handed an epoch over versions the Vacuum already
+  // deleted.
   Status Vacuum(CommitSeq oldest_readable);
   CommitSeq visible_seq() const;
   StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(

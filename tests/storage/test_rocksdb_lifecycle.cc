@@ -1462,5 +1462,168 @@ TEST_F(RocksDbLifecycleTest, CloseDrainsSchemaFingerprintBeforeTeardown) {
   EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
 }
 
+// F2 regression stress: as_of opens racing repeated Vacuum calls must either be
+// inside the retention boundary and read the exact vintage, or report
+// SnapshotExpired. No successful open may read a version Vacuum already cleaned,
+// and every correct-in-boundary sequence must stay readable. The epoch
+// creation/registration/release traffic runs concurrently with the retention
+// scan, the boundary publication and the cleanup pass; run it under ASan to
+// catch a use-after-free of the epoch registry.
+TEST_F(RocksDbLifecycleTest, ConcurrentAsOfOpensAndVacuumStayCorrectOrExpired) {
+  FactStore store(FactStoreOptions{database_path_});
+  ASSERT_TRUE(store.Open().ok());
+  const auto property_put = [](int64_t value) {
+    return PendingFactMutation{
+        PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7})
+            .ref(),
+        ValidTime{10}, FactOperation::kPut, 1, Value::Int64(value)};
+  };
+  const FactRef property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7}).ref();
+  ASSERT_TRUE(
+      store.Commit(StoreCommitBatch{TxnId{1}, 1, {property_put(11)}}).ok());
+  ASSERT_TRUE(
+      store.Commit(StoreCommitBatch{TxnId{2}, 2, {property_put(22)}}).ok());
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> as_of_one_successes{0};
+  std::atomic<int> as_of_one_expired{0};
+  std::mutex failure_mutex;
+  std::vector<std::string> failures;
+  const auto fail = [&](const std::string& message) {
+    std::lock_guard<std::mutex> lock(failure_mutex);
+    failures.push_back(message);
+  };
+  // Reads the property at ValidTime{10} through `snapshot` and requires exactly
+  // `expected`; a missing fact at or above the boundary is a silent data loss.
+  const auto expect_read = [&](const StoreSnapshot& snapshot, int64_t expected,
+                               const char* path) {
+    const auto event = store.Read(snapshot, property, ValidTime{10});
+    if (!event.ok()) {
+      fail(std::string(path) + " read failed: " + event.status().ToString());
+      return false;
+    }
+    if (!event.ValueOrDie().has_value() ||
+        event.ValueOrDie()->value != std::optional<Value>{Value::Int64(expected)}) {
+      fail(std::string(path) + " read did not return " +
+           std::to_string(expected) + " (missing or cleaned version)");
+      return false;
+    }
+    return true;
+  };
+
+  constexpr int kReaders = 4;
+  constexpr int kIterations = 200;
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int reader = 0; reader < kReaders; ++reader) {
+    readers.emplace_back([&] {
+      for (int iteration = 0;
+           iteration < kIterations && !stop.load(std::memory_order_acquire);
+           ++iteration) {
+        // Historical as_of: 11 before Vacuum(2) succeeds, expired after.
+        {
+          const auto snapshot =
+              store.BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+          if (snapshot.ok()) {
+            as_of_one_successes.fetch_add(1, std::memory_order_relaxed);
+            expect_read(snapshot.ValueOrDie(), 11, "as_of=1 BeginSnapshot");
+          } else if (snapshot.status().IsSnapshotExpired()) {
+            as_of_one_expired.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            fail("as_of=1 BeginSnapshot: " + snapshot.status().ToString());
+          }
+        }
+        // GetPointAtAt storage path (cache hit or miss) for the same sequence.
+        {
+          const auto event =
+              store.ReadCurrentAt(CommitSeq{1}, property, ValidTime{10});
+          if (event.ok()) {
+            if (!event.ValueOrDie().has_value() ||
+                event.ValueOrDie()->value !=
+                    std::optional<Value>{Value::Int64(11)}) {
+              fail("as_of=1 ReadCurrentAt did not return 11 (cleaned version)");
+            }
+          } else if (!event.status().IsSnapshotExpired()) {
+            fail("as_of=1 ReadCurrentAt: " + event.status().ToString());
+          }
+        }
+        // Sequence 2 is the vacuum target: always readable, always vintage 22.
+        {
+          const auto snapshot =
+              store.BeginSnapshot(SnapshotOptions{CommitSeq{2}});
+          if (!snapshot.ok()) {
+            fail("as_of=2 BeginSnapshot: " + snapshot.status().ToString());
+          } else {
+            expect_read(snapshot.ValueOrDie(), 22, "as_of=2 BeginSnapshot");
+          }
+          const auto current = store.BeginCurrentSnapshot();
+          if (!current.ok()) {
+            fail("BeginCurrentSnapshot: " + current.status().ToString());
+          } else {
+            expect_read(current.ValueOrDie(), 22, "BeginCurrentSnapshot");
+          }
+          const auto event =
+              store.ReadCurrentAt(CommitSeq{2}, property, ValidTime{10});
+          if (!event.ok()) {
+            fail("as_of=2 ReadCurrentAt: " + event.status().ToString());
+          } else if (!event.ValueOrDie().has_value() ||
+                     event.ValueOrDie()->value !=
+                         std::optional<Value>{Value::Int64(22)}) {
+            fail("as_of=2 ReadCurrentAt did not return 22");
+          }
+        }
+      }
+    });
+  }
+
+  std::atomic<bool> vacuum_succeeded{false};
+  std::thread vacuum([&] {
+    // Vacuum(2) may legitimately fail with SnapshotPinned while an as_of=1
+    // reader is live. Keep trying; after the bounded readers drain it must
+    // succeed and clean seq 1.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (int attempt = 0; attempt < 5000000; ++attempt) {
+      const Status status = store.Vacuum(CommitSeq{2});
+      if (status.ok()) {
+        vacuum_succeeded.store(true, std::memory_order_release);
+        return;
+      }
+      if (!status.IsSnapshotPinned()) {
+        fail("Vacuum: " + status.ToString());
+        return;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        // Stop the bounded readers so the vacuum can make progress if a reader
+        // happened to keep pinning the boundary at every attempt.
+        stop.store(true, std::memory_order_release);
+      }
+      std::this_thread::yield();
+    }
+    fail("Vacuum never succeeded");
+  });
+
+  vacuum.join();
+  for (std::thread& reader : readers) reader.join();
+
+  EXPECT_TRUE(vacuum_succeeded.load()) << "Vacuum did not advance the boundary";
+  EXPECT_TRUE(failures.empty()) << failures.size() << " violation(s); first: "
+                                << (failures.empty() ? "" : failures.front());
+  // Post-vacuum consistency: seq 1 is below the boundary and seq 2 is intact.
+  EXPECT_TRUE(store.BeginSnapshot(SnapshotOptions{CommitSeq{1}})
+                  .status()
+                  .IsSnapshotExpired());
+  {
+    const auto latest = store.BeginSnapshot(SnapshotOptions{CommitSeq{2}});
+    ASSERT_TRUE(latest.ok()) << latest.status().ToString();
+    expect_read(latest.ValueOrDie(), 22, "post-vacuum as_of=2");
+  }
+  EXPECT_TRUE(store.ReadCurrentAt(CommitSeq{1}, property, ValidTime{10})
+                  .status()
+                  .IsSnapshotExpired());
+  ASSERT_TRUE(store.Close().ok());
+}
+
 }  // namespace
 }  // namespace cedar

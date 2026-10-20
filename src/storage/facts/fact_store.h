@@ -35,6 +35,8 @@ class DecidedEpoch;
 }
 
 class FactStoreImpl;
+class FactStore;
+struct SnapshotEpoch;
 
 struct FactStoreOptions {
   std::string path;
@@ -60,11 +62,12 @@ struct FactStoreOptions {
   // Kept before the appended epoch observers so positional FactStoreOptions
   // initializers keep their existing meaning.
   WalSyncMode wal_sync_mode = WalSyncMode::kFullDeviceFlush;
-  // Observe shared snapshot-epoch creation. The created observer fires once
-  // for each newly constructed epoch (never for a reuse of the current one).
-  // It may run while the store's epoch mutex is held, so it must not call back
-  // into FactStore. The destroyed observer is reserved for epoch retirement;
-  // it does not fire while epochs are only cached in this implementation stage.
+  // Observe snapshot-epoch lifecycle. The created observer fires once for each
+  // newly constructed epoch (never for a reuse of the current one); the
+  // destroyed observer fires once per retired epoch when its last reader
+  // releases it. Epochs torn down with the store do not fire it. Both may run
+  // while the store's epoch mutex is held, so they must not call back into
+  // FactStore.
   std::function<void()> snapshot_epoch_created_observer_for_testing;
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
 };
@@ -389,10 +392,23 @@ class StoreSnapshot {
   CommitSeq oldest_readable_seq() const;
 
  private:
-  class State;
-  explicit StoreSnapshot(std::unique_ptr<State> state);
+  explicit StoreSnapshot(std::shared_ptr<FactStoreImpl> store,
+                         const FactStore* owner, SnapshotEpoch* epoch,
+                         size_t epoch_shard, size_t snapshot_shard);
 
-  std::unique_ptr<State> state_;
+  // Drops the one epoch reference held by this handle and unregisters it from
+  // the store's active-snapshot bookkeeping. Safe to call only once.
+  void Release();
+
+  // The epoch outlives every read because it owns a RocksDB snapshot lease
+  // and only the last released reference destroys it. The shared_ptr keeps the
+  // owning store (and therefore that registry) alive without a cycle, since
+  // SnapshotEpoch holds a raw store back-pointer instead.
+  std::shared_ptr<FactStoreImpl> store_;
+  const FactStore* owner_ = nullptr;
+  SnapshotEpoch* epoch_ = nullptr;
+  size_t epoch_shard_ = 0;
+  size_t snapshot_shard_ = 0;
 
   friend class FactStore;
 };

@@ -515,5 +515,59 @@ TEST_F(FactStoreCommitTest, SharesEpochForSameVisibleSequence) {
   EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
 }
 
+TEST_F(FactStoreCommitTest, RetiresEpochAfterLastReader) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::atomic<int> created{0};
+  std::atomic<int> destroyed{0};
+  FactStoreOptions options;
+  options.path = path_;
+  options.snapshot_epoch_created_observer_for_testing = [&created] {
+    created.fetch_add(1, std::memory_order_relaxed);
+  };
+  options.snapshot_epoch_destroyed_observer_for_testing = [&destroyed] {
+    destroyed.fetch_add(1, std::memory_order_relaxed);
+  };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref();
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{1}, {VertexPut(7, 10)})).ok());
+  {
+    auto old = store_->BeginSnapshot();
+    ASSERT_TRUE(old.ok()) << old.status().ToString();
+    EXPECT_EQ(old.ValueOrDie().commit_seq(), CommitSeq{1});
+    EXPECT_EQ(created.load(std::memory_order_relaxed), 1);
+
+    // Advancing the visible sequence retires the epoch held by `old`.
+    const auto committed = store_->Commit(Batch(TxnId{2}, {VertexPut(7, 20)}));
+    ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+    ASSERT_EQ(store_->visible_seq(), CommitSeq{2});
+
+    // Two snapshots opened at the new sequence share one new epoch.
+    auto first = store_->BeginSnapshot();
+    auto second = store_->BeginSnapshot();
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    ASSERT_TRUE(second.ok()) << second.status().ToString();
+    EXPECT_EQ(first.ValueOrDie().commit_seq(), CommitSeq{2});
+    EXPECT_EQ(second.ValueOrDie().commit_seq(), CommitSeq{2});
+    EXPECT_EQ(created.load(std::memory_order_relaxed), 2);
+    EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+
+    // The retired epoch keeps serving reads at its own sequence.
+    const auto old_value = store_->Read(old.ValueOrDie(), ref, ValidTime{10});
+    ASSERT_TRUE(old_value.ok()) << old_value.status().ToString();
+    ASSERT_TRUE(old_value.ValueOrDie().has_value());
+    EXPECT_EQ(old_value.ValueOrDie()->commit_seq, CommitSeq{1});
+    const auto new_value = store_->Read(first.ValueOrDie(), ref, ValidTime{20});
+    ASSERT_TRUE(new_value.ok()) << new_value.status().ToString();
+    ASSERT_TRUE(new_value.ValueOrDie().has_value());
+    EXPECT_EQ(new_value.ValueOrDie()->commit_seq, CommitSeq{2});
+
+    // The retired epoch is not destroyed while `old` still holds a reference.
+    EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+  }
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
+}
+
 }  // namespace
 }  // namespace cedar

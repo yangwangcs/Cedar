@@ -25,6 +25,7 @@
 #include "cedar/database.h"
 #include "storage/facts/fact_store.h"
 #include "kernel/database_impl.h"
+#include "kernel/epoch_completion.h"
 
 #if defined(CEDAR_ROCKSDB_SYNC_POINTS)
 #include "test_util/sync_point.h"
@@ -4404,6 +4405,204 @@ TEST(KernelGroupCommitTest, PipelinedReportsIndeterminateThroughWait) {
   EXPECT_TRUE(completed.ValueOrDie().status.IsIndeterminate());
   EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{});
   database.reset();
+  std::filesystem::remove_all(path);
+}
+
+// B5 regression: a WAL-less terminal outcome (pre-write error,
+// RecoveryRequired, pre-durability indeterminate) publishes its real epoch
+// result but never releases the async submission ticket (the WAL-durable
+// callback does not run). Close's executor sweep used to fail that ticket and
+// overwrite the handle with a synthetic ShutdownInProgress, masking the real
+// terminal state - including kIndeterminate, where reporting a definite abort
+// invites a retry of a write that may already be durable. The sweep must not
+// preempt an epoch-bound terminal result.
+bool IsInjectedIndeterminate(const Status& status) {
+  return status.IsIndeterminate();
+}
+
+bool IsInjectedRecoveryRequired(const Status& status) {
+  return status.IsRecoveryRequired();
+}
+
+void ExpectWalLessTerminalSurvivesClose(Status injected, bool pipelined,
+                                        CommitOutcome expected_outcome,
+                                        bool (*status_matches)(const Status&)) {
+  char pattern[] = "/tmp/cedar_kernel_walless_close_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 4,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing =
+          [injected] { return injected; }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'580}}),
+                           ValidTime{10})
+                  .ok());
+  auto submitted = pipelined ? transaction.ValueOrDie()->CommitAsyncPipelined()
+                             : transaction.ValueOrDie()->CommitAsync();
+  ASSERT_TRUE(submitted.ok()) << submitted.status().ToString();
+  CommitHandle handle = std::move(submitted).ValueOrDie();
+
+  // Close drains the (already terminal but still ticketed) request and then the
+  // executor sweep fails every remaining ticket. The real terminal outcome must
+  // survive that sweep.
+  const Status closed = database->Close();
+  ASSERT_TRUE(closed.ok()) << closed.ToString();
+  const auto completed = handle.Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, expected_outcome);
+  EXPECT_TRUE(status_matches(completed.ValueOrDie().status))
+      << completed.ValueOrDie().status.ToString();
+  EXPECT_FALSE(completed.ValueOrDie().status.IsShutdownInProgress());
+  std::filesystem::remove_all(path);
+}
+
+// Legacy (non-pipelined) variant of the same WAL-less terminal contract. The
+// public CommitAsync() reports a failed terminal as an error status instead of
+// returning a handle, so the retained kernel handle can only be observed at the
+// Database::Impl submission layer. This exercises the exact legacy submission
+// (pipelined=false), its retained ticket, and the shutdown sweep that used to
+// overwrite the epoch result with ShutdownInProgress.
+void ExpectWalLessLegacyHandleSurvivesStop(Status injected,
+                                           bool (*status_matches)(const Status&)) {
+  char pattern[] = "/tmp/cedar_kernel_walless_legacy_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::shared_ptr<CommitHandle::State> observed_handle;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 4,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing =
+          [injected] { return injected; },
+      .async_commit_handle_observer_for_testing =
+          [&observed_handle](
+              const std::shared_ptr<CommitHandle::State>& state) {
+            observed_handle = state;
+          }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'590}}),
+                           ValidTime{10})
+                  .ok());
+  // The legacy caller sees the real terminal status directly.
+  const auto submitted = transaction.ValueOrDie()->CommitAsync();
+  ASSERT_FALSE(submitted.ok());
+  EXPECT_TRUE(status_matches(submitted.status())) << submitted.status().ToString();
+  ASSERT_NE(observed_handle, nullptr)
+      << "legacy CommitAsync did not expose its terminal handle";
+
+  // Close drains the terminal (but still ticketed) request and its executor
+  // sweep fails the retained ticket. The published epoch terminal must survive.
+  const Status closed = database->Close();
+  ASSERT_TRUE(closed.ok()) << closed.ToString();
+  std::shared_ptr<internal::EpochCompletion> completion;
+  size_t ordinal = 0;
+  {
+    std::lock_guard<std::mutex> lock(observed_handle->mutex);
+    ASSERT_FALSE(observed_handle->result.has_value())
+        << "the close sweep overwrote the published epoch terminal with "
+        << observed_handle->result->status.ToString();
+    completion = observed_handle->epoch_completion;
+    ordinal = observed_handle->epoch_result_ordinal;
+  }
+  ASSERT_NE(completion, nullptr);
+  // This is exactly what CommitHandle::Wait() now returns for a bound epoch.
+  const auto terminal = completion->WaitForResult(ordinal);
+  ASSERT_TRUE(terminal.ok()) << terminal.status().ToString();
+  EXPECT_TRUE(status_matches(terminal.ValueOrDie().status))
+      << terminal.ValueOrDie().status.ToString();
+  EXPECT_FALSE(terminal.ValueOrDie().status.IsShutdownInProgress());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, WalLessIndeterminateLegacySurvivesCloseSweep) {
+  ExpectWalLessLegacyHandleSurvivesStop(
+      Status::Indeterminate("test", "injected pre-durability uncertainty"),
+      IsInjectedIndeterminate);
+}
+
+TEST(KernelGroupCommitTest, WalLessIndeterminatePipelinedSurvivesCloseSweep) {
+  ExpectWalLessTerminalSurvivesClose(
+      Status::Indeterminate("test", "injected pre-durability uncertainty"),
+      /*pipelined=*/true, CommitOutcome::kIndeterminate,
+      IsInjectedIndeterminate);
+}
+
+TEST(KernelGroupCommitTest, WalLessRecoveryRequiredLegacySurvivesCloseSweep) {
+  ExpectWalLessLegacyHandleSurvivesStop(
+      Status::RecoveryRequired("test", "injected recovery requirement"),
+      IsInjectedRecoveryRequired);
+}
+
+TEST(KernelGroupCommitTest, WalLessRecoveryRequiredPipelinedSurvivesCloseSweep) {
+  ExpectWalLessTerminalSurvivesClose(
+      Status::RecoveryRequired("test", "injected recovery requirement"),
+      /*pipelined=*/true, CommitOutcome::kIndeterminate,
+      IsInjectedRecoveryRequired);
+}
+
+// B5 ordering regression: the append worker used to signal the drained barrier
+// before it published the epoch's terminal results, so the Close sweep could
+// observe (and overwrite) a handle whose real outcome was not published yet.
+// This observer fires at the exact drained notification and records whether the
+// epoch was already published at that point; it must always have been.
+TEST(KernelGroupCommitTest, ClosePublishesEpochTerminalBeforeDrainedBarrier) {
+  char pattern[] = "/tmp/cedar_kernel_drain_publication_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex observations_mutex;
+  std::vector<bool> published_at_drain;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 4,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing = [] {
+        return Status::Indeterminate("test", "injected pre-durability uncertainty");
+      },
+      .append_drained_observer_for_testing = [&](bool epoch_published) {
+        std::lock_guard<std::mutex> lock(observations_mutex);
+        published_at_drain.push_back(epoch_published);
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'581}}),
+                           ValidTime{10})
+                  .ok());
+  auto accepted = transaction.ValueOrDie()->CommitAsyncPipelined();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  CommitHandle handle = std::move(accepted).ValueOrDie();
+
+  ASSERT_TRUE(database->Close().ok());
+  {
+    std::lock_guard<std::mutex> lock(observations_mutex);
+    ASSERT_FALSE(published_at_drain.empty())
+        << "the drained barrier was never observed";
+    for (bool epoch_published : published_at_drain) {
+      EXPECT_TRUE(epoch_published)
+          << "the drained barrier was signalled before the epoch terminal "
+             "result was published";
+    }
+  }
+  const auto completed = handle.Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kIndeterminate);
+  EXPECT_TRUE(completed.ValueOrDie().status.IsIndeterminate());
   std::filesystem::remove_all(path);
 }
 

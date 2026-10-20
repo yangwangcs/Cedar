@@ -139,6 +139,16 @@ void CompleteCommitHandle(const std::shared_ptr<CommitHandle::State>& handle,
                           CommitResult result) {
   if (!handle) return;
   std::lock_guard<std::mutex> lock(handle->mutex);
+  // Terminal state is single-assignment: the first writer wins.
+  if (handle->result.has_value()) return;
+  if (handle->epoch_completion != nullptr) {
+    // The request was selected into an ordered epoch, which owns its terminal
+    // outcome. The executor shutdown sweep must not preempt it: the epoch may
+    // still be writing (kIndeterminate/RecoveryRequired) or may already have
+    // published, and a synthetic ShutdownInProgress here would mask that real
+    // result in CommitHandle::Wait().
+    return;
+  }
   handle->result.emplace(std::move(result));
   handle->completed.notify_all();
 }
@@ -1104,6 +1114,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
       std::vector<internal::QueryDeltaCommit> published_delta;
       published_delta.reserve(requests.size());
       if (epoch_completion != nullptr) epoch_results.reserve(requests.size());
+      bool drained_barrier_notified = false;
+      bool drained_epoch_published = true;
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
         if (commit_result_processing_observer_for_testing) {
@@ -1246,6 +1258,14 @@ Status Database::Impl::StartAppendCommitPipeline() {
           }
         }
         const auto publication_observed_at = std::chrono::steady_clock::now();
+        // Publish the epoch's terminal results before the dropped-request
+        // bookkeeping and the drained barrier. The shutdown sweep (executor
+        // Stop) must never observe a WAL-less request whose real terminal -
+        // kIndeterminate/RecoveryRequired or an abort - is still unpublished;
+        // otherwise it can mask that outcome with ShutdownInProgress.
+        if (epoch_completion != nullptr) {
+          epoch_completion->Publish(std::move(epoch_results));
+        }
         active_append_commit_requests -= requests.size();
         append_commit_metrics.n_plus_one_preflight_transactions +=
             active_n_plus_one_preflight_transactions;
@@ -1265,8 +1285,15 @@ Status Database::Impl::StartAppendCommitPipeline() {
         active_pending_version_overlay.reset();
         ++preflight_request_generation;
         if (append_commit_requests.empty() && active_append_commit_requests == 0) {
+          drained_barrier_notified = true;
+          drained_epoch_published =
+              epoch_completion == nullptr || epoch_completion->IsPublished();
           append_drained.notify_all();
         }
+      }
+      if (drained_barrier_notified &&
+          append_drained_observer_for_testing) {
+        append_drained_observer_for_testing(drained_epoch_published);
       }
       for (const auto& request : requests) {
         if (request->handle == nullptr) request->completed.notify_one();
@@ -1278,9 +1305,6 @@ Status Database::Impl::StartAppendCommitPipeline() {
         for (internal::QueryDeltaCommit& descriptor : published_delta) {
           query_delta->EnqueuePublished(std::move(descriptor)).IgnoreError();
         }
-      }
-      if (epoch_completion != nullptr) {
-        epoch_completion->Publish(std::move(epoch_results));
       }
       store_requests.clear();
       uint64_t released_bytes = 0;
@@ -1610,17 +1634,33 @@ Status Database::Impl::SubmitAsyncCommit(
     // or terminal outcome instead of reporting a failure that may later commit.
     request->handle->completed.wait(lock, selected);
   }
-  if (request->handle->result.has_value()) return request->handle->result->status;
-  const std::shared_ptr<internal::EpochCompletion> completion =
-      request->handle->epoch_completion;
-  const size_t ordinal = request->handle->epoch_result_ordinal;
-  const bool waits_for_durability = request->handle->waits_for_epoch_durability;
-  lock.unlock();
-  if (waits_for_durability && completion->WaitForWalDurableOrPublication()) {
-    return Status::OK();
+  Status terminal;
+  std::shared_ptr<internal::EpochCompletion> completion;
+  size_t ordinal = 0;
+  bool waits_for_durability = false;
+  bool bound_to_epoch = false;
+  if (request->handle->result.has_value()) {
+    terminal = request->handle->result->status;
+  } else {
+    completion = request->handle->epoch_completion;
+    ordinal = request->handle->epoch_result_ordinal;
+    waits_for_durability = request->handle->waits_for_epoch_durability;
+    bound_to_epoch = true;
   }
-  const auto terminal = completion->WaitForResult(ordinal);
-  return terminal.ok() ? terminal.ValueOrDie().status : terminal.status();
+  lock.unlock();
+  if (bound_to_epoch) {
+    if (waits_for_durability && completion->WaitForWalDurableOrPublication()) {
+      terminal = Status::OK();
+    } else {
+      const auto epoch_terminal = completion->WaitForResult(ordinal);
+      terminal = epoch_terminal.ok() ? epoch_terminal.ValueOrDie().status
+                                     : epoch_terminal.status();
+    }
+  }
+  if (async_commit_handle_observer_for_testing) {
+    async_commit_handle_observer_for_testing(request->handle);
+  }
+  return terminal;
 }
 
 Status Database::Impl::DrainAppendCommitPipeline() {
@@ -2082,6 +2122,20 @@ Status Database::Close() {
     return drained;
   }
   impl_->ObserveShutdownStage("active_commit_resolution");
+  // Irreversible-decision point: confirm that the store can close (no live
+  // epoch pin) *before* stopping the commit pipeline/executor or detaching the
+  // derived query state. A pinned failure fully restores the store here and
+  // only `closing` is rolled back, so the retriable SnapshotPinned contract
+  // cannot leave an open-but-write-dead database behind. Once this succeeds no
+  // new epoch reference can be created, so the remaining teardown cannot fail.
+  lock.lock();
+  const Status prepared = impl_->store.PrepareClose();
+  if (!prepared.ok()) {
+    impl_->closing.store(false, std::memory_order_release);
+    lock.unlock();
+    return prepared;
+  }
+  lock.unlock();
   impl_->StopAppendCommitPipeline();
   impl_->RefreshRuntimeSnapshot().IgnoreError();
   impl_->ObserveShutdownStage("final_runtime_snapshot");
@@ -2106,7 +2160,9 @@ Status Database::Close() {
   if (had_active_queries) impl_->ObserveShutdownStage("scratch_cleaned");
   impl_->ObserveShutdownStage("rocksdb_close");
   lock.lock();
-  const Status closed = impl_->store.Close();
+  // The close was committed before the irreversible teardown above, so this
+  // completes it instead of deciding it; it cannot report SnapshotPinned.
+  const Status closed = impl_->store.FinishClose();
   if (!closed.ok()) {
     impl_->closing.store(false, std::memory_order_release);
     return closed;

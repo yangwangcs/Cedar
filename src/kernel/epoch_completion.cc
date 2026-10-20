@@ -50,4 +50,9 @@ uint64_t EpochCompletion::publication_barrier_count() const {
   return publication_barrier_count_;
 }
 
+bool EpochCompletion::IsPublished() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return published_;
+}
+
 }  // namespace cedar::internal

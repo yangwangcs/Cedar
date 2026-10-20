@@ -508,6 +508,27 @@ class FactStore {
   // * Open and Close are serialized by lifecycle_mutex_ only for the duration
   //   of each call; they are not themselves registered operations.
   Status Close();
+  // Two-phase close used by the kernel to keep a failed (SnapshotPinned) close
+  // non-destructive. PrepareClose performs the irreversible *decision* part of
+  // Close: it unpublishes the lock-free fast path, drains registered opens,
+  // fast pins and non-epoch users, and checks the epoch registry with the
+  // publisher/epoch locks. If an epoch is still referenced it fully restores
+  // the store and returns SnapshotPinned, so the caller can keep using it. If
+  // not, the store is committed to closing: accepting_snapshots stays false and
+  // fast_impl_ stays null, so no epoch reference can be created afterwards, but
+  // no heavy state has been released yet. The caller may then perform its own
+  // irreversible teardown (stop commit workers, detach derived state) knowing
+  // the close can no longer fail for pinning, and finally call FinishClose.
+  // A successful PrepareClose must be followed by FinishClose; Close() is the
+  // single-call composition of both under one lifecycle critical section.
+  Status PrepareClose();
+  // Completes a successful PrepareClose: drains any remaining registered
+  // operation (the caller has stopped its producers), releases the epoch
+  // leases, destroys the RocksDB handles and retains the inert shell. It cannot
+  // fail with SnapshotPinned because PrepareClose already excluded new epoch
+  // references. Calling FinishClose without a prepared close on an open store
+  // is a contract violation (InvalidArgument).
+  Status FinishClose();
   // Creates a RocksDB-owned openable checkpoint without exposing RocksDB
   // handles or file-format details across the Cedar storage boundary.
   Status CreateCheckpoint(const std::string& checkpoint_path) const;
@@ -782,10 +803,19 @@ class FactStore {
   // lifecycle_mutex_, fast_impl_ is null, and this close already drained every
   // fast pin attempt, so no thread can reference the older shells.
   void FreeEarlierRetainedShells();
+  // The following two helpers require lifecycle_mutex_ to be held.
+  Status PrepareCloseLocked();
+  Status FinishCloseLocked();
 
   FactStoreOptions options_;
   mutable std::mutex lifecycle_mutex_;
   std::shared_ptr<FactStoreImpl> impl_;
+  // Store committed by a successful PrepareClose but not yet destroyed by
+  // FinishClose. `close_prepared_` is guarded by lifecycle_mutex_; while it is
+  // set, accepting_snapshots is false and fast_impl_ is null, so no new epoch
+  // reference (and therefore no SnapshotPinned outcome) can appear.
+  std::shared_ptr<FactStoreImpl> closing_impl_;
+  bool close_prepared_ = false;
   // Storage-level non-epoch operations currently between registration and
   // teardown. They are invisible to the epoch registry, so Close drains this
   // count while holding lifecycle_mutex_ before it releases any heavy state.

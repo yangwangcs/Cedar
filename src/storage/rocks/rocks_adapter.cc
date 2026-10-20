@@ -2371,7 +2371,24 @@ Status FactStore::Open() {
 
 Status FactStore::Close() {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const Status prepared = PrepareCloseLocked();
+  if (!prepared.ok()) return prepared;
+  return FinishCloseLocked();
+}
+
+Status FactStore::PrepareClose() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  return PrepareCloseLocked();
+}
+
+Status FactStore::FinishClose() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  return FinishCloseLocked();
+}
+
+Status FactStore::PrepareCloseLocked() {
   if (!impl_) return Status::OK();
+  if (close_prepared_) return Status::OK();
   auto store = impl_;
   store->accepting_snapshots.store(false, std::memory_order_release);
   store->accepting_fast.store(false, std::memory_order_seq_cst);
@@ -2408,9 +2425,9 @@ Status FactStore::Close() {
   // store but no epoch reference, so nothing above accounts for them. They
   // register under lifecycle_mutex_ (which this close holds for the whole
   // handshake), therefore no new user can register once the count is zero here;
-  // a user that arrives later blocks on lifecycle_mutex_ and then sees impl_
-  // reset. Because the epoch side is already quiescent, these users are the last
-  // ones that can touch the heavy state torn down below.
+  // a user that arrives later blocks on lifecycle_mutex_ and then observes the
+  // prepared/closed state. Because the epoch side is already quiescent, these
+  // users are the last ones that can touch the heavy state torn down below.
   while (non_epoch_users_.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
@@ -2423,30 +2440,69 @@ Status FactStore::Close() {
     {
       std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
       pinned = store->HasActiveEpochRefsLocked();
-      if (!pinned) {
-        // Release the current/retired epoch leases before the store is closed.
-        // A successful close implies zero live references; teardown does not
-        // fire the destroyed observer, as documented in fact_store.h.
-        store->CloseEpochsLocked();
-      }
-    }
-    if (!pinned) {
-      // Destroy RocksDB resources and release every heavy member, then keep only
-      // this inert shell (bounded retention) for a pin that loaded the pointer
-      // before the unpublish and is guaranteed to fail.
-      store->DestroyDatabaseHandles();
-      store->ReleaseRetainedStateForClose();
-      FreeEarlierRetainedShells();
-      retained_impls_.push_back(std::move(store));
-      impl_.reset();
     }
   }
   if (pinned) {
     // Semantics unchanged: a failed close leaves the store open and usable.
+    // Nothing heavy has been released, so restoring the publication gates is a
+    // complete rollback of this attempt.
     fast_impl_.store(store.get(), std::memory_order_seq_cst);
     store->accepting_fast.store(true, std::memory_order_seq_cst);
     store->accepting_snapshots.store(true, std::memory_order_release);
     return Status::SnapshotPinned("fact store", "active snapshots prevent close");
+  }
+  // Irreversible decision: no epoch reference exists and none can be created
+  // because accepting_snapshots is false and fast_impl_ is null. Keep the
+  // handshake quiescent and hand the store to FinishClose, which is where the
+  // heavy state is actually released.
+  close_prepared_ = true;
+  closing_impl_ = std::move(store);
+  return Status::OK();
+}
+
+Status FactStore::FinishCloseLocked() {
+  if (!close_prepared_) {
+    // Idempotent close of an already closed store (and the tail of a
+    // single-call Close that found no open store).
+    return impl_ ? Status::InvalidArgument("fact store", "close was not prepared")
+                 : Status::OK();
+  }
+  auto store = std::move(closing_impl_);
+  close_prepared_ = false;
+  // The store is already committed to closing, so the second quiescence pass
+  // cannot spin on new arrivals: snapshot opens and fast pins are rejected
+  // before they can create an epoch reference, and new non-epoch users block on
+  // lifecycle_mutex_ until the shell is gone. The caller stops its producers
+  // (sampler, maintenance, commit workers) between PrepareClose and this call.
+  while (store->snapshot_opens_in_flight.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
+  while (FastPinAttemptsTotal() != 0) {
+    std::this_thread::yield();
+  }
+  while (store->PinAttemptsTotal() != 0) {
+    std::this_thread::yield();
+  }
+  while (non_epoch_users_.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
+  {
+    std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
+    {
+      std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
+      // Release the current/retired epoch leases before the store is closed.
+      // A successful close implies zero live references; teardown does not fire
+      // the destroyed observer, as documented in fact_store.h.
+      store->CloseEpochsLocked();
+    }
+    // Destroy RocksDB resources and release every heavy member, then keep only
+    // this inert shell (bounded retention) for a pin that loaded the pointer
+    // before the unpublish and is guaranteed to fail.
+    store->DestroyDatabaseHandles();
+    store->ReleaseRetainedStateForClose();
+    FreeEarlierRetainedShells();
+    retained_impls_.push_back(std::move(store));
+    impl_.reset();
   }
   return Status::OK();
 }

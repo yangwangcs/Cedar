@@ -31,6 +31,10 @@ class EpochCompletion {
   // Returns false when publication completed without a durable WAL callback.
   bool WaitForWalDurableOrPublication() const;
   StatusOr<CommitResult> WaitForResult(size_t ordinal) const;
+  // True once Publish installed the terminal results. A published epoch result
+  // is authoritative: the shutdown sweep must not overwrite it with a synthetic
+  // ShutdownInProgress.
+  bool IsPublished() const;
 
   uint64_t publication_barrier_count() const;
 

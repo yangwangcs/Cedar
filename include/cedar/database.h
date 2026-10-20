@@ -246,6 +246,23 @@ struct DatabaseOptions {
   // SLO. Zero keeps the production default (5 ms).
   uint64_t collection_latency_slo_us_for_testing = 0;
   std::function<void()> commit_result_processing_observer_for_testing;
+  // Test-only observer fired by the append worker immediately after it signals
+  // `append_drained` for an epoch. The boolean reports whether that epoch's
+  // terminal results were already published (EpochCompletion) when the drained
+  // barrier was notified; shutdown sweeps may only observe published outcomes,
+  // so a conforming implementation always passes true. It runs outside the
+  // append bookkeeping lock and must not call back into the database.
+  std::function<void(bool epoch_published_before_drain)>
+      append_drained_observer_for_testing;
+  // Test-only observer exposing the kernel commit handle once a legacy
+  // (non-pipelined) CommitAsync() observed its terminal state. Legacy callers
+  // receive failed terminals as an error status, so this is the only way to
+  // assert that a later close sweep does not overwrite an already published
+  // epoch-bound result with ShutdownInProgress. Runs after the handle mutex is
+  // released, on the submitting thread, and must not call back into the
+  // database.
+  std::function<void(const std::shared_ptr<CommitHandle::State>&)>
+      async_commit_handle_observer_for_testing;
   StorageProfile storage_profile = StorageProfile::kDeveloper;
   ProductionStorageOptions production;
   uint64_t validation_cache_bytes = 8ULL * 1024ULL * 1024ULL;

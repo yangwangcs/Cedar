@@ -298,9 +298,15 @@ StatusOr<CommitResult> CommitHandle::Wait() const {
   state_->completed.wait(lock, [this] {
     return state_->result.has_value() || state_->epoch_completion != nullptr;
   });
-  if (state_->result.has_value()) return *state_->result;
   const std::shared_ptr<internal::EpochCompletion> completion =
       state_->epoch_completion;
+  if (completion == nullptr) return *state_->result;
+  // A request bound to an ordered epoch gets its terminal outcome from that
+  // epoch, including WAL-less results that never invoked the WAL-durable
+  // callback (pre-write error, RecoveryRequired, pre-durability indeterminate).
+  // The epoch completion is authoritative even if a shutdown sweep raced the
+  // bind and wrote a synthetic ShutdownInProgress into `result`; repeated Wait()
+  // calls keep returning the same published epoch result.
   const size_t ordinal = state_->epoch_result_ordinal;
   lock.unlock();
   return completion->WaitForResult(ordinal);

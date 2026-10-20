@@ -240,6 +240,73 @@ TEST_F(KernelLifecycleTest, LiveSnapshotPinsCloseButReleaseAllowsRetryAndReopen)
   EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
 }
 
+// B4 regression: a SnapshotPinned close must be non-destructive. Close used to
+// stop the append pipeline and executor and detach the derived query state
+// before it asked the store whether it could close. When the store reported
+// SnapshotPinned, only `closing` was restored: `append_commit_stopping` stayed
+// sticky and the executor/workers could never restart, so the database stayed
+// open but rejected every Commit/CommitAsync with ShutdownInProgress forever.
+// The store's closeable decision must become final before any irreversible
+// teardown is performed.
+TEST_F(KernelLifecycleTest, PinnedCloseLeavesCommitPipelineAndReadsUsable) {
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  auto begun_snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(begun_snapshot.ok()) << begun_snapshot.status().ToString();
+  std::optional<Snapshot> held(std::move(begun_snapshot).ConsumeValueOrDie());
+
+  const Status pinned = database_->Close();
+  ASSERT_TRUE(pinned.IsSnapshotPinned()) << pinned.ToString();
+
+  // Synchronous commit must still be accepted, durably published and visible.
+  auto synchronous = Begin();
+  ASSERT_TRUE(synchronous);
+  ASSERT_TRUE(synchronous
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{91}}),
+                           ValidTime{1})
+                  .ok());
+  const auto committed = synchronous->Commit();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_FALSE(committed.ValueOrDie().status.IsShutdownInProgress());
+
+  // The async path (mailbox + executor) must still be running as well.
+  auto asynchronous = Begin();
+  ASSERT_TRUE(asynchronous);
+  ASSERT_TRUE(asynchronous
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{92}}),
+                           ValidTime{1})
+                  .ok());
+  auto async_handle = asynchronous->CommitAsync();
+  ASSERT_TRUE(async_handle.ok()) << async_handle.status().ToString();
+  const auto async_result = async_handle.ValueOrDie().Wait();
+  ASSERT_TRUE(async_result.ok()) << async_result.status().ToString();
+  EXPECT_EQ(async_result.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_FALSE(async_result.ValueOrDie().status.IsShutdownInProgress());
+
+  // Reads keep working and see both commits.
+  {
+    auto visible = database_->BeginSnapshot();
+    ASSERT_TRUE(visible.ok()) << visible.status().ToString();
+    const auto exists_91 = visible.ValueOrDie().Exists(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{91}}), ValidTime{1});
+    ASSERT_TRUE(exists_91.ok()) << exists_91.status().ToString();
+    EXPECT_TRUE(exists_91.ValueOrDie());
+    const auto exists_92 = visible.ValueOrDie().Exists(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{92}}), ValidTime{1});
+    ASSERT_TRUE(exists_92.ok()) << exists_92.status().ToString();
+    EXPECT_TRUE(exists_92.ValueOrDie());
+  }
+
+  // A retried close succeeds once the pin is released (and the pinned close did
+  // not silently mark the database closed or closed the store underneath it).
+  held.reset();
+  const Status closed = database_->Close();
+  ASSERT_TRUE(closed.ok()) << closed.ToString();
+  EXPECT_TRUE(database_->BeginSnapshot().status().IsInvalidArgument());
+}
+
+
 // Regression: RefreshQueryStatistics checked closed/closing under
 // Database::Impl::mutex but called FactStore::SchemaFingerprint() after
 // releasing it. A concurrent successful Close could reset the property schema

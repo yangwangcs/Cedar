@@ -2443,6 +2443,11 @@ Status Database::AbortPreparedCommit(TxnId txn_id,
 
 CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {
   if (!impl_) return {};
+  // Serialize with Database::Close (which holds impl_->mutex across
+  // FactStore::Close) before touching store metrics. Lock order is
+  // impl_->mutex -> append_commit_mutex -> FactStore lifecycle locks; no path
+  // takes append_commit_mutex before impl_->mutex.
+  std::lock_guard<std::mutex> lifecycle_lock(impl_->mutex);
   CommitPipelineMetrics metrics;
   {
     std::lock_guard<std::mutex> lock(impl_->append_commit_mutex);
@@ -2505,6 +2510,11 @@ CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {
 
 StatusOr<RuntimeMetrics> Database::SampleRuntimeMetrics() const {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  // Hold the kernel lifecycle lock across the store sample (and the maintenance
+  // controller read below) so a concurrent Close cannot stop the controller or
+  // release the store's heavy state between the two. FactStore::SampleRuntime
+  // additionally registers as a non-epoch user for storage-level close paths.
+  std::lock_guard<std::mutex> lifecycle_lock(impl_->mutex);
   const auto sampled = impl_->store.SampleRuntimeMetrics();
   if (!sampled.ok()) return sampled.status();
   RuntimeMetrics metrics = ToRuntimeMetrics(sampled.ValueOrDie());

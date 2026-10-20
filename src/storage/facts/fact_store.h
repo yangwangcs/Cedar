@@ -82,6 +82,12 @@ struct FactStoreOptions {
   // back into FactStore.
   std::function<void()> current_sequence_loaded_observer_for_testing;
   std::function<void()> publish_visible_before_retire_observer_for_testing;
+  // Fires in every storage-level non-epoch operation (checkpoint, runtime
+  // sampling, validation-cache metrics, native maintenance) after it has
+  // registered with the close drain handshake and before it touches any store
+  // state that Close releases. Tests use it to hold such an operation in flight
+  // while a Close is attempted; it must not call back into FactStore.
+  std::function<void()> non_epoch_op_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {
@@ -456,6 +462,11 @@ class FactStore {
   FactStore& operator=(const FactStore&) = delete;
 
   Status Open();
+  // Closes the store. Only epoch-pinned readers are a reason to fail
+  // (SnapshotPinned); storage-level non-epoch operations (checkpoint, runtime
+  // sampling, validation-cache metrics, native maintenance) are drained before
+  // any RocksDB handle or heavy state is released, so they may run concurrently
+  // with Close and observe either an open store or "store is not open".
   Status Close();
   // Creates a RocksDB-owned openable checkpoint without exposing RocksDB
   // handles or file-format details across the Cedar storage boundary.
@@ -616,6 +627,9 @@ class FactStore {
   // regression tests only; no production code may depend on it.
   size_t RetainedShellCountForTesting() const;
   bool RetainedShellsAreInertForTesting() const;
+  // Number of storage-level non-epoch operations currently registered with the
+  // close drain handshake. Test-only: no production code may depend on it.
+  size_t NonEpochUsersForTesting() const;
 
  private:
   // Slow path of BeginCurrentSnapshotAt for a historical sequence whose epoch
@@ -664,6 +678,35 @@ class FactStore {
     size_t shard_ = 0;
   };
   uint32_t FastPinAttemptsTotal() const;
+  // RAII marker for a storage-level non-epoch operation. Such an operation holds
+  // a shared_ptr<FactStoreImpl> but no epoch reference, so the epoch registry and
+  // the fast-pin attempts cannot make it visible to Close. Registration happens
+  // under lifecycle_mutex_, which Close holds for its whole handshake, so a Close
+  // either observes the registration (and waits for it) or starts after the
+  // operation finished; a new operation that starts after the close began blocks
+  // on lifecycle_mutex_ and then observes no open store.
+  //
+  // The guard must be destroyed before the operation's shared_ptr copy. Covered
+  // operations must not call FactStore methods that take lifecycle_mutex_ while
+  // registered (Close holds it during the drain).
+  class NonEpochUseGuard {
+   public:
+    NonEpochUseGuard() = default;
+    ~NonEpochUseGuard();
+    NonEpochUseGuard(const NonEpochUseGuard&) = delete;
+    NonEpochUseGuard& operator=(const NonEpochUseGuard&) = delete;
+    NonEpochUseGuard(NonEpochUseGuard&& other) noexcept;
+    NonEpochUseGuard& operator=(NonEpochUseGuard&& other) noexcept;
+
+   private:
+    friend class FactStore;
+    explicit NonEpochUseGuard(const FactStore* store) : store_(store) {}
+    const FactStore* store_ = nullptr;
+  };
+  // Caller must hold lifecycle_mutex_ and must already have copied impl_.
+  NonEpochUseGuard RegisterNonEpochUseLocked() const;
+  // Fires the test-only re-entrance observer for a covered non-epoch operation.
+  void RunNonEpochOpObserverForTesting() const;
   // Frees every retained shell from an earlier close after draining its
   // last-reader reclaim attempts. Only a successful Close calls this: it holds
   // lifecycle_mutex_, fast_impl_ is null, and this close already drained every
@@ -673,6 +716,10 @@ class FactStore {
   FactStoreOptions options_;
   mutable std::mutex lifecycle_mutex_;
   std::shared_ptr<FactStoreImpl> impl_;
+  // Storage-level non-epoch operations currently between registration and
+  // teardown. They are invisible to the epoch registry, so Close drains this
+  // count while holding lifecycle_mutex_ before it releases any heavy state.
+  mutable std::atomic<uint32_t> non_epoch_users_{0};
   // Raw publication of impl_ for the lock-free point-read path. fast_impl_ is
   // cleared at the start of a close handshake and only republished when the
   // close reports SnapshotPinned. A thread that loaded the pointer before the

@@ -1233,5 +1233,87 @@ TEST_F(RocksDbLifecycleTest, RepeatedOpenCloseBoundsRetainedShells) {
   EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
 }
 
+// UAF regression: Close used to destroy `db`, `statistics`,
+// `canonical_page_metrics`, and the property schema catalog as soon as the epoch
+// reference count was zero. Storage-level non-epoch users - CreateCheckpoint,
+// SampleRuntime, SampleValidationCacheMetrics, RunNativeMaintenance - hold only a
+// shared_ptr<FactStoreImpl> and are invisible to the epoch registry, so they
+// could still be reading that state when it was released (5d2a3af behavior).
+//
+// The drain handshake registers such an operation under lifecycle_mutex_, the
+// same mutex Close holds for its entire handshake. The observer below parks the
+// operation after registration; Close must therefore stay blocked until the
+// registration is dropped. No new operation can register meanwhile (it would
+// need lifecycle_mutex_), so a single zero observation is final.
+TEST_F(RocksDbLifecycleTest,
+       CloseDrainsStorageLevelMetricsSampleBeforeTeardown) {
+  FactStoreOptions options{database_path_};
+  std::atomic<bool> op_registered{false};
+  std::atomic<bool> release_op{false};
+  std::atomic<bool> close_started{false};
+  std::atomic<bool> close_finished{false};
+  options.non_epoch_op_observer_for_testing = [&] {
+    op_registered.store(true, std::memory_order_release);
+    while (!release_op.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  };
+  FactStore store(options);
+  ASSERT_TRUE(store.Open().ok());
+  ASSERT_TRUE(store.Commit(Batch(1, 101)).ok());
+
+  Status sample_status;
+  std::thread sampler([&] {
+    const auto sampled = store.SampleValidationCacheMetrics();
+    sample_status = sampled.status();
+  });
+  const auto registration_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!op_registered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < registration_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(op_registered.load(std::memory_order_acquire));
+  ASSERT_EQ(store.NonEpochUsersForTesting(), 1U);
+
+  Status close_status;
+  std::thread closer([&] {
+    close_started.store(true, std::memory_order_release);
+    close_status = store.Close();
+    close_finished.store(true, std::memory_order_release);
+  });
+  const auto close_start_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!close_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < close_start_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(close_started.load(std::memory_order_acquire));
+
+  // Bounded liveness check: a close without the drain finishes in microseconds;
+  // this close must not finish while the operation is registered. The window is
+  // only a bound against a hang, not the synchronization itself.
+  const auto drained_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!close_finished.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < drained_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_FALSE(close_finished.load(std::memory_order_acquire))
+      << "Close released store state while a non-epoch sample was in flight";
+
+  release_op.store(true, std::memory_order_release);
+  sampler.join();
+  closer.join();
+
+  EXPECT_TRUE(sample_status.ok()) << sample_status.ToString();
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  EXPECT_EQ(store.NonEpochUsersForTesting(), 0U);
+  // Once the op drained, the teardown completed normally and idempotent close
+  // still succeeds.
+  EXPECT_TRUE(store.Close().ok());
+  EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
+}
+
 }  // namespace
 }  // namespace cedar

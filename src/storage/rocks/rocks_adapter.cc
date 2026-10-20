@@ -503,7 +503,6 @@ class FactStoreImpl {
   };
 
   std::mutex epoch_mutex;
-  uint64_t next_epoch_id = 1;
   SnapshotEpoch* current_epoch = nullptr;
   std::atomic<SnapshotEpoch*> current_epoch_fast{nullptr};
   std::vector<SnapshotEpoch*> retired_epochs;
@@ -663,6 +662,43 @@ uint32_t FactStore::FastPinAttemptsTotal() const {
   return total;
 }
 
+FactStore::NonEpochUseGuard::~NonEpochUseGuard() {
+  if (store_ == nullptr) return;
+  store_->non_epoch_users_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+FactStore::NonEpochUseGuard::NonEpochUseGuard(
+    NonEpochUseGuard&& other) noexcept
+    : store_(other.store_) {
+  other.store_ = nullptr;
+}
+
+FactStore::NonEpochUseGuard& FactStore::NonEpochUseGuard::operator=(
+    NonEpochUseGuard&& other) noexcept {
+  if (this == &other) return *this;
+  if (store_ != nullptr) {
+    store_->non_epoch_users_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+  store_ = other.store_;
+  other.store_ = nullptr;
+  return *this;
+}
+
+FactStore::NonEpochUseGuard FactStore::RegisterNonEpochUseLocked() const {
+  non_epoch_users_.fetch_add(1, std::memory_order_acq_rel);
+  return NonEpochUseGuard(this);
+}
+
+void FactStore::RunNonEpochOpObserverForTesting() const {
+  if (options_.non_epoch_op_observer_for_testing) {
+    options_.non_epoch_op_observer_for_testing();
+  }
+}
+
+size_t FactStore::NonEpochUsersForTesting() const {
+  return non_epoch_users_.load(std::memory_order_acquire);
+}
+
 // One shared RocksDB snapshot per visible commit sequence. Readers opened at
 // the current visible sequence pin this epoch instead of taking their own
 // RocksDB snapshot. The reference count is a single atomic word; the highest
@@ -675,9 +711,6 @@ struct SnapshotEpoch {
   SnapshotEpoch(const SnapshotEpoch&) = delete;
   SnapshotEpoch& operator=(const SnapshotEpoch&) = delete;
 
-  // Stable identity for diagnostics and registry lookups that are only used on
-  // the serialized slow path.
-  uint64_t id = 0;
   // The owning store outlives every epoch on the slow path. `store_owner` is a
   // strong reference (not just this raw back-pointer): a lock-free pin copies it
   // into the StoreSnapshot handle, which keeps the store alive for the read even
@@ -888,7 +921,6 @@ SnapshotEpoch* FactStoreImpl::CreateEpochLocked(
   const rocksdb::Snapshot* raw = db != nullptr ? db->GetSnapshot() : nullptr;
   if (raw == nullptr) return nullptr;
   auto epoch = std::make_unique<SnapshotEpoch>();
-  epoch->id = next_epoch_id++;
   epoch->store = this;
   epoch->lease = std::make_shared<SnapshotLease>(this, raw);
   epoch->store_owner = self;
@@ -2345,6 +2377,17 @@ Status FactStore::Close() {
   while (store->PinAttemptsTotal() != 0) {
     std::this_thread::yield();
   }
+  // Drain storage-level non-epoch users: checkpoint, runtime sampling,
+  // validation-cache metrics, and native maintenance hold a shared_ptr to the
+  // store but no epoch reference, so nothing above accounts for them. They
+  // register under lifecycle_mutex_ (which this close holds for the whole
+  // handshake), therefore no new user can register once the count is zero here;
+  // a user that arrives later blocks on lifecycle_mutex_ and then sees impl_
+  // reset. Because the epoch side is already quiescent, these users are the last
+  // ones that can touch the heavy state torn down below.
+  while (non_epoch_users_.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
   bool pinned = false;
   {
     // Serialize with a publisher so no visible-sequence advance retires or
@@ -2415,13 +2458,16 @@ Status FactStore::CreateCheckpoint(const std::string& checkpoint_path) const {
                                    "checkpoint path must be absolute");
   }
   std::shared_ptr<FactStoreImpl> store;
+  NonEpochUseGuard non_epoch_use;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) {
       return Status::InvalidArgument("fact store checkpoint", "store is not open");
     }
+    non_epoch_use = RegisterNonEpochUseLocked();
   }
+  RunNonEpochOpObserverForTesting();
   std::error_code filesystem_error;
   if (std::filesystem::exists(checkpoint_path, filesystem_error)) {
     return Status::InvalidArgument("fact store checkpoint",
@@ -5004,13 +5050,16 @@ StatusOr<FactStoreMaintenanceResult> FactStore::RunNativeMaintenance(
     const FactStoreMaintenanceRequest& request,
     const std::atomic<bool>* wal_sync_critical) {
   std::shared_ptr<FactStoreImpl> store;
+  NonEpochUseGuard non_epoch_use;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) {
       return Status::ShutdownInProgress("maintenance", "store is not open");
     }
+    non_epoch_use = RegisterNonEpochUseLocked();
   }
+  RunNonEpochOpObserverForTesting();
 
   rocksdb::CedarMaintenanceGrant grant;
   grant.snapshot_generation = request.snapshot_generation;
@@ -5100,11 +5149,14 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
     options_.runtime_sample_observer_for_testing();
   }
   std::shared_ptr<FactStoreImpl> store;
+  NonEpochUseGuard non_epoch_use;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) return Status::InvalidArgument("pressure", "store is not open");
+    non_epoch_use = RegisterNonEpochUseLocked();
   }
+  RunNonEpochOpObserverForTesting();
   FactStoreRuntimeSample runtime_sample;
   PressureSample& sample = runtime_sample.pressure;
   RocksDbRuntimeMetrics& metrics = runtime_sample.metrics;
@@ -5356,11 +5408,14 @@ StatusOr<FactStoreRuntimeSample> FactStore::SampleRuntime() const {
 
 StatusOr<ValidationCacheMetrics> FactStore::SampleValidationCacheMetrics() const {
   std::shared_ptr<FactStoreImpl> store;
+  NonEpochUseGuard non_epoch_use;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) return Status::InvalidArgument("metrics", "store is not open");
+    non_epoch_use = RegisterNonEpochUseLocked();
   }
+  RunNonEpochOpObserverForTesting();
   ValidationCacheMetrics metrics;
   if (store->canonical_page_metrics) {
     metrics.canonical_page_hits = store->canonical_page_metrics->hits.load(std::memory_order_relaxed);

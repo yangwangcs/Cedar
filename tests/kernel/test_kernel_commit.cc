@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -947,7 +948,7 @@ TEST(KernelRuntimeSamplerTest, PublishesWhileCommitCompletionLockIsHeld) {
   bool entered = false;
   {
     std::unique_lock<std::mutex> lock(completion_mutex);
-    entered = completion_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+    entered = completion_cv.wait_for(lock, std::chrono::seconds(30), [&] {
       return completion_entered;
     });
   }
@@ -1456,6 +1457,9 @@ TEST(KernelGroupCommitTest, GroupsIndependentVertexAssertionsIntoOneDurableWrite
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> physical_writes = 0;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = 2,
@@ -1463,6 +1467,18 @@ TEST(KernelGroupCommitTest, GroupsIndependentVertexAssertionsIntoOneDurableWrite
       .commit_prewrite_fault_injector_for_testing = [&physical_writes] {
         ++physical_writes;
         return Status::OK();
+      },
+      // Both callers must be queued before collection so a slow sanitizer run
+      // cannot dispatch the first commit as a single-transaction group.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= 2; });
       }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
@@ -1537,10 +1553,25 @@ TEST(KernelGroupCommitTest, KernelCommitReportsGroupFill) {
   char pattern[] = "/tmp/cedar_kernel_group_fill_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = 2,
-      .group_commit_window_us = 20'000});
+      .group_commit_window_us = 20'000,
+      // Both callers must be queued before collection so a slow sanitizer run
+      // cannot dispatch the first commit as a single-transaction group.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= 2; });
+      }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
 
@@ -2981,13 +3012,31 @@ TEST(KernelGroupCommitTest, CommitsFullBatchWithoutWaitingForCollectionWindow) {
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> physical_writes = 0;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = 2,
-      .group_commit_window_us = 200'000,
+      // A full batch must not wait for the collection window. A 1 s window
+      // keeps that behaviour distinguishable from scheduler noise under
+      // parallel ctest runs.
+      .group_commit_window_us = 1'000'000,
       .commit_prewrite_fault_injector_for_testing = [&physical_writes] {
         ++physical_writes;
         return Status::OK();
+      },
+      // Wait for both callers to enqueue, then verify the full batch commits
+      // without consuming the collection window.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= 2; });
       }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
@@ -3026,7 +3075,7 @@ TEST(KernelGroupCommitTest, CommitsFullBatchWithoutWaitingForCollectionWindow) {
   EXPECT_EQ(second_result->ValueOrDie().outcome, CommitOutcome::kCommitted);
   EXPECT_EQ(physical_writes.load(), 1U);
   EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
-            100);
+            500);
   ASSERT_TRUE(database->Close().ok());
   database.reset();
   std::filesystem::remove_all(path);
@@ -3081,6 +3130,9 @@ TEST(KernelGroupCommitTest, GroupsIndependentPropertyTransactions) {
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> physical_writes = 0;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = 2,
@@ -3088,6 +3140,18 @@ TEST(KernelGroupCommitTest, GroupsIndependentPropertyTransactions) {
       .commit_prewrite_fault_injector_for_testing = [&physical_writes] {
         ++physical_writes;
         return Status::OK();
+      },
+      // Both callers must be queued before collection so a slow sanitizer run
+      // cannot dispatch the first commit as a single-transaction group.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= 2; });
       }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
@@ -3129,6 +3193,9 @@ TEST(KernelGroupCommitTest, GroupsIndependentMultiFactTransactions) {
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
   std::atomic<uint32_t> physical_writes = 0;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path,
       .group_commit_max_batch_size = 2,
@@ -3136,6 +3203,18 @@ TEST(KernelGroupCommitTest, GroupsIndependentMultiFactTransactions) {
       .commit_prewrite_fault_injector_for_testing = [&physical_writes] {
         ++physical_writes;
         return Status::OK();
+      },
+      // Both callers must be queued before collection so a slow sanitizer run
+      // cannot dispatch the first commit as a single-transaction group.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= 2; });
       }});
   ASSERT_TRUE(opened.ok());
   auto database = std::move(opened).ConsumeValueOrDie();
@@ -3186,7 +3265,7 @@ TEST(KernelGroupCommitTest, GroupsDeletesAndPutsForDifferentFacts) {
   options.append_commit_collection_observer_for_testing = [&] {
     std::unique_lock lock(grouping_mutex);
     if (grouping) {
-      EXPECT_TRUE(grouping_changed.wait_for(lock, std::chrono::seconds(2),
+      EXPECT_TRUE(grouping_changed.wait_for(lock, std::chrono::seconds(30),
                                            [&] { return enqueued == 2; }));
     }
   };
@@ -3396,11 +3475,26 @@ TEST(KernelGroupCommitFailureTest, PostwriteIndeterminateMarksEveryMemberThenReo
   char pattern[] = "/tmp/cedar_kernel_group_indeterminate_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
   auto opened = Database::Open(DatabaseOptions{
       .path = path, .group_commit_max_batch_size = 2,
       .group_commit_window_us = 20'000,
       .commit_fault_injector_for_testing = [] {
         return Status::Indeterminate("test", "injected after durable write");
+      },
+      // Both callers must be in the same group before the post-write fault is
+      // injected; otherwise a slow sanitizer run can split them.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= 2; });
       }});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
@@ -3455,6 +3549,10 @@ TEST(KernelGroupCommitFailureTest,
       .path = path,
       .group_commit_max_batch_size = kTransactions,
       .group_commit_window_us = 500'000,
+      // This test synchronizes collection through the collection observer and
+      // then expects one full group. Predicted epochs can be decided before
+      // all callers have enqueued, so disable preflight for this test.
+      .predicted_preflight_min_bytes = std::numeric_limits<uint64_t>::max(),
       .commit_fault_injector_for_testing = [] {
         return Status::Indeterminate("test", "injected after durable group write");
       },
@@ -3469,10 +3567,18 @@ TEST(KernelGroupCommitFailureTest,
       },
       .append_commit_collection_observer_for_testing = [&] {
         std::unique_lock<std::mutex> lock(enqueue_mutex);
-        enqueue_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+        // Parallel ctest jobs can delay enqueue well past a couple of seconds;
+        // the barrier guarantees all callers arrive, so wait generously
+        // instead of letting the worker collect a partial group.
+        enqueue_cv.wait_for(lock, std::chrono::seconds(30), [&] {
           return enqueued.load(std::memory_order_relaxed) == kTransactions;
         });
-      }});
+      },
+      // Parallel ctest jobs can delay callers past the production 5 ms latency
+      // SLO, which makes the adaptive controller split the queued batch. Pin
+      // the SLO so the observer-synchronized batch stays one group.
+      .collection_latency_slo_us_for_testing = std::numeric_limits<uint64_t>::max(),
+      });
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
 

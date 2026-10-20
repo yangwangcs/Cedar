@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 
@@ -11,9 +12,11 @@ namespace {
 class ProjectionStoreTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    path_ = (std::filesystem::temp_directory_path() / "cedar_projection_store_test").string();
-    std::filesystem::remove_all(path_);
-    ASSERT_TRUE(std::filesystem::create_directories(path_));
+    // ctest runs each TEST as its own process. A fixed path lets parallel jobs
+    // delete each other's directories, so use a unique directory per test.
+    char pattern[] = "/tmp/cedar_projection_store_test_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    path_ = pattern;
   }
   void TearDown() override { std::filesystem::remove_all(path_); }
   ProjectionBuild Build(uint64_t generation, const std::string& id = "seg-a",

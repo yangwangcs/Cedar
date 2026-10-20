@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 #include <rocksdb/db.h>
@@ -69,8 +70,12 @@ struct CommandResult {
 };
 
 CommandResult RunCommand(const std::string& command) {
+  // Each ctest case runs in its own process; include the pid so parallel jobs
+  // do not overwrite each other's captured output.
   const std::string output_path =
-      (std::filesystem::temp_directory_path() / "cedar_files_output.txt").string();
+      (std::filesystem::temp_directory_path() /
+       ("cedar_files_output_" + std::to_string(::getpid()) + ".txt"))
+          .string();
   const std::string command_with_redirect = command + " >'" + output_path + "' 2>&1";
   const int raw_status = std::system(command_with_redirect.c_str());
   std::ifstream input(output_path);

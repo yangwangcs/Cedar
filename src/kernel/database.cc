@@ -760,14 +760,18 @@ Status Database::Impl::StartAppendCommitPipeline() {
           (!next_epoch_slot.has_value() ||
            next_epoch_slot->state != SlotState::kEligible)) {
           active_n_plus_one_preflight_transactions = planned_transactions;
-          if (accounted_n_plus_one_preflight_generation != epoch_generation) {
-            ++append_commit_metrics.n_plus_one_preflight_epochs;
-            accounted_n_plus_one_preflight_generation = epoch_generation;
+          // An empty plan is not an N+1 preflight: no transaction was
+          // preflighted, so it must not be attributed to the epoch counters.
+          if (planned_transactions != 0) {
+            if (accounted_n_plus_one_preflight_generation != epoch_generation) {
+              ++append_commit_metrics.n_plus_one_preflight_epochs;
+              accounted_n_plus_one_preflight_generation = epoch_generation;
+            }
+            append_commit_metrics.n_plus_one_hidden_cpu_us += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - preflight_started_at)
+                    .count());
           }
-          append_commit_metrics.n_plus_one_hidden_cpu_us += static_cast<uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - preflight_started_at)
-                  .count());
           preflight_completed_generation = request_generation;
           if (predecided != nullptr && !planned_candidates.empty()) {
             active_n_plus_one_decided_transactions = planned_candidates.size();
@@ -888,6 +892,22 @@ Status Database::Impl::StartAppendCommitPipeline() {
             });
           }
           collection_limits = LimitsForQueueLocked();
+          // When WAL sync dominates, wait a bounded settle age for the batch to
+          // fill instead of dispatching a partial group immediately.
+          const uint32_t settle_target = std::min<uint32_t>(
+              append_commit_max_batch_size,
+              runtime_target_count.load(std::memory_order_acquire));
+          if (collection_limits.settle_age_us != 0 &&
+              append_commit_requests.size() < settle_target) {
+            const auto settle_deadline = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(collection_limits.settle_age_us);
+            append_work_available.wait_until(
+                lock, settle_deadline, [this, settle_target] {
+                  return append_commit_stopping ||
+                         append_commit_requests.size() >= settle_target;
+                });
+            collection_limits = LimitsForQueueLocked();
+          }
           internal::CommitConflictIndex conflict_index;
           const size_t maximum = std::min<size_t>(
               append_commit_requests.size(), collection_limits.max_transactions);
@@ -1961,7 +1981,7 @@ Status Database::Close() {
   if (impl_->closing) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
-  impl_->closing = true;
+  impl_->closing.store(true, std::memory_order_release);
   impl_->query_shutdown_stage_mode = std::any_of(
       impl_->active_query_states.begin(), impl_->active_query_states.end(),
       [](const std::shared_ptr<QueryExecutionState>& candidate) {
@@ -1989,7 +2009,7 @@ Status Database::Close() {
   const Status drained = impl_->DrainAppendCommitPipeline();
   if (!drained.ok()) {
     lock.lock();
-    impl_->closing = false;
+    impl_->closing.store(false, std::memory_order_release);
     return drained;
   }
   impl_->ObserveShutdownStage("active_commit_resolution");
@@ -2006,11 +2026,11 @@ Status Database::Close() {
   lock.lock();
   const Status closed = impl_->store.Close();
   if (!closed.ok()) {
-    impl_->closing = false;
+    impl_->closing.store(false, std::memory_order_release);
     return closed;
   }
-  impl_->closed = true;
-  impl_->closing = false;
+  impl_->closed.store(true, std::memory_order_release);
+  impl_->closing.store(false, std::memory_order_release);
   return Status::OK();
 }
 

@@ -338,6 +338,8 @@ StatusOr<std::string> MakeEntitySortBound(const FactPrefix& prefix,
 
 }  // namespace
 
+class SnapshotLease;
+
 class FactStoreImpl {
  public:
   struct RecoveryState {
@@ -379,8 +381,13 @@ class FactStoreImpl {
 
   std::mutex publisher_mutex;
   std::mutex transaction_lease_mutex;
-  std::mutex snapshot_mutex;
-  bool accepting_snapshots = true;
+  static constexpr size_t kSnapshotShards = 8;
+  std::array<std::mutex, kSnapshotShards> snapshot_shard_mutex;
+  std::array<std::multiset<uint64_t>, kSnapshotShards>
+      active_snapshot_sequences;
+  std::atomic<size_t> active_snapshots{0};
+  std::atomic<size_t> snapshot_opens_in_flight{0};
+  std::atomic<bool> accepting_snapshots{true};
   std::mutex group_commit_mutex;
   std::condition_variable group_commit_cv;
   std::deque<std::shared_ptr<GroupCommitRequest>> group_commit_requests;
@@ -425,19 +432,59 @@ class FactStoreImpl {
   std::atomic<uint64_t> transaction_lease_limit{1};
   std::shared_ptr<const PropertySchemas> property_schemas =
       std::make_shared<const PropertySchemas>();
+  std::atomic<const PropertySchemas*> current_schemas{
+      property_schemas.get()};
+  mutable std::mutex retired_schemas_mutex;
+  std::vector<std::shared_ptr<const PropertySchemas>> retired_schemas;
+
+  // Readers on the hot path load a raw pointer; retired schema versions are
+  // kept alive until the store is destroyed so no refcount is touched.
+  void PublishSchemas(std::shared_ptr<const PropertySchemas> next) {
+    std::lock_guard<std::mutex> lock(retired_schemas_mutex);
+    if (property_schemas) retired_schemas.push_back(property_schemas);
+    property_schemas = std::move(next);
+    current_schemas.store(property_schemas.get(), std::memory_order_release);
+  }
+  std::shared_ptr<const PropertySchemas> SchemasSnapshot() const {
+    std::lock_guard<std::mutex> lock(retired_schemas_mutex);
+    return property_schemas;
+  }
   std::unique_ptr<internal::VersionValidationCache> version_validation_cache;
   std::unique_ptr<internal::RecentFactWriteIndex> recent_fact_write_index;
   std::unique_ptr<internal::FactIdentityHistory> identity_history;
   std::shared_ptr<rocksdb::cedar_parquet::CanonicalPageCacheMetrics> canonical_page_metrics;
   std::function<void()> validation_scan_observer_for_testing;
-  size_t active_snapshots = 0;
-  std::multiset<uint64_t> active_snapshot_sequences;
   RecoveryState recovery_required;
+  // One shared RocksDB snapshot for reads at the current visible sequence.
+  std::mutex current_snapshot_mutex;
+  std::shared_ptr<SnapshotLease> current_snapshot;
+  CommitSeq current_snapshot_seq;
 
   void PublishVisible(CommitSeq sequence) {
     visible_seq = sequence;
     published_visible_seq.store(sequence.value, std::memory_order_release);
   }
+};
+
+// Releases the shared RocksDB snapshot when the last reader drops it. Holds a
+// raw store pointer to avoid a FactStoreImpl -> lease -> FactStoreImpl cycle;
+// every State also owns a shared_ptr to the store for lifetime.
+class SnapshotLease {
+ public:
+  SnapshotLease(FactStoreImpl* store, const rocksdb::Snapshot* snapshot)
+      : store_(store), snapshot_(snapshot) {}
+  ~SnapshotLease() {
+    if (snapshot_ != nullptr && store_ != nullptr && store_->db) {
+      store_->db->ReleaseSnapshot(snapshot_);
+    }
+  }
+  SnapshotLease(const SnapshotLease&) = delete;
+  SnapshotLease& operator=(const SnapshotLease&) = delete;
+  const rocksdb::Snapshot* get() const { return snapshot_; }
+
+ private:
+  FactStoreImpl* store_ = nullptr;
+  const rocksdb::Snapshot* snapshot_ = nullptr;
 };
 
 namespace {
@@ -1055,7 +1102,7 @@ Status LoadPropertySchemas(FactStoreImpl* store) {
   }
   std::shared_ptr<const FactStoreImpl::PropertySchemas> immutable_schemas =
       std::move(schemas);
-  std::atomic_store(&store->property_schemas, std::move(immutable_schemas));
+  store->PublishSchemas(std::move(immutable_schemas));
   return Status::OK();
 }
 
@@ -1142,35 +1189,51 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   return Status::OK();
 }
 
+// Snapshots taken at the same visible sequence would otherwise all land in
+// one registry shard. Pick a stable per-thread shard instead.
+size_t SnapshotShardIndex() {
+  static std::atomic<size_t> next{0};
+  thread_local const size_t index =
+      next.fetch_add(1, std::memory_order_relaxed) %
+      FactStoreImpl::kSnapshotShards;
+  return index;
+}
+
 class StoreSnapshot::State {
  public:
-  State(std::shared_ptr<FactStoreImpl> store, const rocksdb::Snapshot* snapshot,
+  State(std::shared_ptr<FactStoreImpl> store,
+        std::shared_ptr<SnapshotLease> snapshot_lease,
         CommitSeq commit_seq, CommitSeq oldest_readable_seq,
-        std::shared_ptr<const FactStoreImpl::PropertySchemas> property_schemas)
+        const FactStoreImpl::PropertySchemas* property_schemas,
+        const FactStore* owner, size_t shard)
       : store(std::move(store)),
-        snapshot(snapshot),
+        snapshot(snapshot_lease ? snapshot_lease->get() : nullptr),
         commit_seq(commit_seq),
         oldest_readable_seq(oldest_readable_seq),
-        property_schemas(std::move(property_schemas)) {}
+        property_schemas(property_schemas),
+        owner(owner),
+        lease(std::move(snapshot_lease)),
+        shard(shard) {}
 
   ~State() {
     if (!store) return;
-    std::lock_guard<std::mutex> lock(store->snapshot_mutex);
-    if (snapshot != nullptr && store->db) {
-      store->db->ReleaseSnapshot(snapshot);
+    {
+      std::lock_guard<std::mutex> lock(store->snapshot_shard_mutex[shard]);
+      auto& sequences = store->active_snapshot_sequences[shard];
+      const auto registered = sequences.find(commit_seq.value);
+      if (registered != sequences.end()) sequences.erase(registered);
     }
-    --store->active_snapshots;
-    const auto registered = store->active_snapshot_sequences.find(commit_seq.value);
-    if (registered != store->active_snapshot_sequences.end()) {
-      store->active_snapshot_sequences.erase(registered);
-    }
+    store->active_snapshots.fetch_sub(1, std::memory_order_acq_rel);
   }
 
   std::shared_ptr<FactStoreImpl> store;
   const rocksdb::Snapshot* snapshot = nullptr;
   CommitSeq commit_seq;
   CommitSeq oldest_readable_seq;
-  std::shared_ptr<const FactStoreImpl::PropertySchemas> property_schemas;
+  const FactStoreImpl::PropertySchemas* property_schemas = nullptr;
+  const FactStore* owner = nullptr;
+  std::shared_ptr<SnapshotLease> lease;
+  size_t shard = 0;
 };
 
 StatusOr<std::optional<PropertyDefinition>> LookupPropertyInSchemas(
@@ -1572,12 +1635,16 @@ Status FactStore::Open() {
 Status FactStore::Close() {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   if (!impl_) return Status::OK();
-  std::lock_guard<std::mutex> publisher_lock(impl_->publisher_mutex);
-  std::lock_guard<std::mutex> snapshot_lock(impl_->snapshot_mutex);
-  if (impl_->active_snapshots != 0) {
+  auto store = impl_;
+  store->accepting_snapshots.store(false, std::memory_order_release);
+  while (store->snapshot_opens_in_flight.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
+  if (store->active_snapshots.load(std::memory_order_acquire) != 0) {
+    store->accepting_snapshots.store(true, std::memory_order_release);
     return Status::SnapshotPinned("fact store", "active snapshots prevent close");
   }
-  impl_->accepting_snapshots = false;
+  std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
   impl_.reset();
   return Status::OK();
 }
@@ -1624,42 +1691,78 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
   if (options_.snapshot_open_observer_for_testing) {
     options_.snapshot_open_observer_for_testing();
   }
-  std::lock_guard<std::mutex> snapshot_lock(store->snapshot_mutex);
-  if (!store->accepting_snapshots) {
+  FactStoreImpl* raw_store = store.get();
+  store->snapshot_opens_in_flight.fetch_add(1, std::memory_order_acq_rel);
+  if (!store->accepting_snapshots.load(std::memory_order_acquire)) {
+    store->snapshot_opens_in_flight.fetch_sub(1, std::memory_order_acq_rel);
     return Status::ShutdownInProgress("snapshot", "fact store is closing");
   }
+  const auto leave_open = [raw_store] {
+    raw_store->snapshot_opens_in_flight.fetch_sub(1,
+                                                   std::memory_order_acq_rel);
+  };
   const CommitSeq visible{store->published_visible_seq.load(
       std::memory_order_acquire)};
   const CommitSeq oldest{store->published_oldest_readable_seq.load(
       std::memory_order_acquire)};
   const CommitSeq selected = options.as_of.value_or(visible);
   if (selected.value < oldest.value) {
+    leave_open();
     return Status::SnapshotExpired("snapshot", "sequence is below retention boundary");
   }
   if (selected.value > visible.value) {
+    leave_open();
     return Status::InvalidArgument("snapshot", "sequence exceeds visible watermark");
   }
-  const rocksdb::Snapshot* snapshot = store->db->GetSnapshot();
-  if (snapshot == nullptr) return Status::IOError("snapshot", "RocksDB refused snapshot");
-  const auto schemas = std::atomic_load(&store->property_schemas);
+  static thread_local CommitSeq tls_snapshot_seq;
+  static thread_local std::weak_ptr<SnapshotLease> tls_snapshot_lease;
+  std::shared_ptr<SnapshotLease> snapshot_lease;
+  if (tls_snapshot_seq.value == selected.value) {
+    snapshot_lease = tls_snapshot_lease.lock();
+  }
+  if (!snapshot_lease) {
+    std::lock_guard<std::mutex> lock(store->current_snapshot_mutex);
+    if (selected.value == visible.value && store->current_snapshot &&
+        store->current_snapshot_seq.value == selected.value) {
+      snapshot_lease = store->current_snapshot;
+    } else {
+      const rocksdb::Snapshot* raw = store->db->GetSnapshot();
+      if (raw == nullptr) {
+        leave_open();
+        return Status::IOError("snapshot", "RocksDB refused snapshot");
+      }
+      snapshot_lease = std::make_shared<SnapshotLease>(store.get(), raw);
+      if (selected.value == visible.value) {
+        store->current_snapshot = snapshot_lease;
+        store->current_snapshot_seq = selected;
+      }
+    }
+  }
+  if (snapshot_lease && selected.value == visible.value) {
+    tls_snapshot_seq = selected;
+    tls_snapshot_lease = snapshot_lease;
+  }
+  const auto* schemas = store->current_schemas.load(std::memory_order_acquire);
+  const size_t shard = SnapshotShardIndex();
   auto state = std::make_unique<StoreSnapshot::State>(
-      store, snapshot, selected, oldest, schemas);
-  ++store->active_snapshots;
-  store->active_snapshot_sequences.insert(selected.value);
+      std::move(store), std::move(snapshot_lease), selected, oldest, schemas,
+      this, shard);
+  {
+    std::lock_guard<std::mutex> lock(raw_store->snapshot_shard_mutex[shard]);
+    raw_store->active_snapshot_sequences[shard].insert(selected.value);
+  }
+  raw_store->active_snapshots.fetch_add(1, std::memory_order_acq_rel);
+  leave_open();
   return StoreSnapshot(std::move(state));
 }
 
 StatusOr<std::optional<FactEvent>> FactStore::Read(
     const StoreSnapshot& snapshot, const FactRef& ref,
     ValidTime valid_time) const {
-  std::shared_ptr<FactStoreImpl> store;
-  {
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-    store = impl_;
-    if (!store || snapshot.state_ == nullptr || snapshot.state_->store != store) {
-      return Status::InvalidArgument("fact read", "snapshot belongs to another store");
-    }
+  if (snapshot.state_ == nullptr || snapshot.state_->owner != this) {
+    return Status::InvalidArgument("fact read", "snapshot belongs to another store");
   }
+  const std::shared_ptr<FactStoreImpl>& store = snapshot.state_->store;
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
   const std::string seek = EncodeFactKey(
@@ -3572,7 +3675,7 @@ StatusOr<PropertyDefinition> FactStore::RegisterProperty(
     return Status::RecoveryRequired("property definition",
                                     "reopen required after indeterminate write");
   }
-  const auto schemas = std::atomic_load(&store->property_schemas);
+  const auto schemas = store->SchemasSnapshot();
   const auto found = schemas->find(definition.property_id.value);
   if (found != schemas->end() && !found->second.empty()) {
     const PropertyDefinition& latest = found->second.back();
@@ -3606,7 +3709,7 @@ StatusOr<PropertyDefinition> FactStore::RegisterProperty(
   (*updated_schemas)[definition.property_id.value].push_back(definition);
   std::shared_ptr<const FactStoreImpl::PropertySchemas> immutable_schemas =
       std::move(updated_schemas);
-  std::atomic_store(&store->property_schemas, std::move(immutable_schemas));
+  store->PublishSchemas(std::move(immutable_schemas));
   return definition;
 }
 
@@ -3619,7 +3722,7 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
     if (!store) return Status::InvalidArgument("property definition", "store is not open");
   }
   std::lock_guard<std::mutex> lock(store->publisher_mutex);
-  const auto schemas = std::atomic_load(&store->property_schemas);
+  const auto schemas = store->SchemasSnapshot();
   return LookupPropertyInSchemas(*schemas, property_id,
                                  schema_epoch);
 }
@@ -3631,7 +3734,7 @@ StatusOr<std::vector<PropertyDefinition>> FactStore::ListProperties() const {
     store = impl_;
     if (!store) return Status::InvalidArgument("property definition", "store is not open");
   }
-  const auto schemas = std::atomic_load(&store->property_schemas);
+  const auto schemas = store->SchemasSnapshot();
   std::vector<PropertyDefinition> result;
   result.reserve(schemas->size());
   for (const auto& [property_id, epochs] : *schemas) {
@@ -3652,7 +3755,7 @@ StatusOr<std::string> FactStore::SchemaFingerprint() const {
     store = impl_;
     if (!store) return Status::InvalidArgument("property definition", "store is not open");
   }
-  const auto schemas = std::atomic_load(&store->property_schemas);
+  const auto schemas = store->SchemasSnapshot();
   std::ostringstream canonical;
   for (const auto& [property_id, epochs] : *schemas) {
     if (epochs.empty()) continue;
@@ -3736,9 +3839,20 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
     return Status::InvalidArgument("vacuum", "target is outside readable range");
   }
   if (oldest_readable == store->oldest_readable_seq) return Status::OK();
-  std::lock_guard<std::mutex> snapshot_lock(store->snapshot_mutex);
-  if (!store->active_snapshot_sequences.empty() &&
-      *store->active_snapshot_sequences.begin() < oldest_readable.value) {
+  std::array<std::unique_lock<std::mutex>, FactStoreImpl::kSnapshotShards>
+      snapshot_locks;
+  for (size_t shard = 0; shard < FactStoreImpl::kSnapshotShards; ++shard) {
+    snapshot_locks[shard] =
+        std::unique_lock<std::mutex>(store->snapshot_shard_mutex[shard]);
+  }
+  uint64_t oldest_active_snapshot = std::numeric_limits<uint64_t>::max();
+  for (const auto& sequences : store->active_snapshot_sequences) {
+    if (!sequences.empty()) {
+      oldest_active_snapshot =
+          std::min(oldest_active_snapshot, *sequences.begin());
+    }
+  }
+  if (oldest_active_snapshot < oldest_readable.value) {
     return Status::SnapshotPinned("vacuum", "active snapshot predates target");
   }
   const Status before_boundary = RunVacuumFaultInjector(

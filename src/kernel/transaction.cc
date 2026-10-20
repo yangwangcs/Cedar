@@ -685,9 +685,10 @@ Status Transaction::Rollback() {
 StatusOr<std::unique_ptr<Transaction>> Database::BeginTransaction(
     TransactionOptions options) {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
-  if (impl_->closing) {
+  if (impl_->closed.load(std::memory_order_acquire)) {
+    return Status::InvalidArgument("database", "database is closed");
+  }
+  if (impl_->closing.load(std::memory_order_acquire)) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
   auto txn_id = impl_->store.AllocateTransactionId();

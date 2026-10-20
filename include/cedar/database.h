@@ -214,6 +214,11 @@ struct DatabaseOptions {
   uint64_t blob_threshold_bytes = 4096;
   uint32_t group_commit_max_batch_size = 128;
   uint64_t group_commit_window_us = 200;
+  // Group-commit settle: when observed WAL sync cost is at least the floor,
+  // collection waits up to this extra age to fill the batch. 0 disables.
+  uint64_t group_commit_settle_sync_floor_us = 0;
+  uint64_t group_commit_settle_max_age_us = 8'000;
+  uint32_t group_commit_settle_sync_divisor = 8;
   // Predicted (pre-encoded) epochs are only worthwhile when assembling a group
   // costs a meaningful fraction of the WAL sync. Below this encoded size the
   // pipeline collects a full group on the general path instead.
@@ -236,6 +241,9 @@ struct DatabaseOptions {
   // Test-only hook after the append worker wakes and releases its queue lock,
   // before it selects a WAL group.
   std::function<void()> append_commit_collection_observer_for_testing;
+  // Test-only override for the adaptive epoch controller's collection latency
+  // SLO. Zero keeps the production default (5 ms).
+  uint64_t collection_latency_slo_us_for_testing = 0;
   std::function<void()> commit_result_processing_observer_for_testing;
   StorageProfile storage_profile = StorageProfile::kDeveloper;
   ProductionStorageOptions production;

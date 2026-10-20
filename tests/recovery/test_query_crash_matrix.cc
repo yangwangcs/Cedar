@@ -192,11 +192,12 @@ void RunCrashChildIfRequested() {
 class QueryCrashMatrixTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    path_ = (std::filesystem::temp_directory_path() /
-             "cedar_query_crash_matrix_test")
-                .string();
-    std::filesystem::remove_all(path_);
-    ASSERT_TRUE(std::filesystem::create_directories(path_));
+    // ctest runs each TEST as its own process. A fixed path lets parallel jobs
+    // delete each other's directories (the crash child receives this path via
+    // --query-db), so use a unique directory per test.
+    char pattern[] = "/tmp/cedar_query_crash_matrix_test_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    path_ = pattern;
   }
   void TearDown() override { std::filesystem::remove_all(path_); }
   std::string path_;

@@ -88,6 +88,41 @@ TEST(AdaptiveEpochControllerTest, SlowWalWithDeepQueueKeepsAmortizingGroup) {
   EXPECT_EQ(limits.max_age_us, 0U);
 }
 
+TEST(AdaptiveEpochControllerTest, SettleAgeFollowsObservedSlowSyncCost) {
+  AdaptiveEpochController controller(
+      {128, 2ULL << 20, 5'000, 200, 2, 16, 5'000, 8'000, 8});
+  controller.Observe({60'000, 0, 1, 1024});
+  EXPECT_EQ(controller.NextLimits({2, 0, PressureState::kNormal}).settle_age_us,
+            7'500U);
+}
+
+TEST(AdaptiveEpochControllerTest, SettleAgeIsCappedAndGated) {
+  AdaptiveEpochController capped(
+      {128, 2ULL << 20, 5'000, 200, 2, 16, 5'000, 8'000, 8});
+  capped.Observe({200'000, 0, 1, 1024});
+  EXPECT_EQ(capped.NextLimits({2, 0, PressureState::kNormal}).settle_age_us,
+            8'000U);
+  AdaptiveEpochController fast(
+      {128, 2ULL << 20, 5'000, 200, 2, 16, 5'000, 8'000, 8});
+  fast.Observe({1'000, 0, 1, 1024});
+  EXPECT_EQ(fast.NextLimits({2, 0, PressureState::kNormal}).settle_age_us, 0U);
+  AdaptiveEpochController disabled(
+      {128, 2ULL << 20, 5'000, 200, 2, 16, 0, 8'000, 8});
+  disabled.Observe({60'000, 0, 1, 1024});
+  EXPECT_EQ(disabled.NextLimits({2, 0, PressureState::kNormal}).settle_age_us,
+            0U);
+}
+
+TEST(AdaptiveEpochControllerTest, SettleDoesNotApplyUnderPressure) {
+  AdaptiveEpochController controller(
+      {128, 2ULL << 20, 5'000, 200, 2, 16, 5'000, 8'000, 8});
+  controller.Observe({60'000, 0, 1, 1024});
+  EXPECT_EQ(controller.NextLimits({64, 10, PressureState::kSoft}).settle_age_us,
+            0U);
+  EXPECT_EQ(controller.NextLimits({64, 10, PressureState::kHard}).settle_age_us,
+            0U);
+}
+
 TEST(AdaptiveEpochControllerTest, ShallowQueueStillHonorsLatencyWindow) {
   AdaptiveEpochController controller(Options());
   const auto limits = controller.NextLimits({1, 100, PressureState::kNormal});

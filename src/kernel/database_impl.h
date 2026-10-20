@@ -14,6 +14,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -169,8 +170,15 @@ class Database::Impl {
         adaptive_epoch_controller(internal::AdaptiveEpochController::Options{
             options.group_commit_max_batch_size,
             options.group_commit_max_batch_bytes,
-            5'000,
-            options.group_commit_window_us}),
+            options.collection_latency_slo_us_for_testing == 0
+                ? 5'000
+                : options.collection_latency_slo_us_for_testing,
+            options.group_commit_window_us,
+            2,
+            16,
+            options.group_commit_settle_sync_floor_us,
+            options.group_commit_settle_max_age_us,
+            options.group_commit_settle_sync_divisor}),
         append_commit_enqueued_observer_for_testing(
             std::move(options.append_commit_enqueued_observer_for_testing)),
         append_commit_collection_observer_for_testing(
@@ -431,8 +439,8 @@ class Database::Impl {
   std::shared_ptr<const CedarRuntimeSnapshot> runtime_snapshot;
   std::unique_ptr<FactStoreMaintenanceAdapter> maintenance_adapter;
   std::unique_ptr<MaintenanceController> maintenance_controller;
-  bool closing = false;
-  bool closed = false;
+  std::atomic<bool> closing{false};
+  std::atomic<bool> closed{false};
   bool query_shutdown_stage_mode = false;
 };
 

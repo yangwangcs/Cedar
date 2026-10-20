@@ -29,6 +29,8 @@ struct EpochLimits {
   uint64_t max_encoded_bytes = 1;
   // Remaining collection time from the oldest request's enqueue time.
   uint64_t max_age_us = 0;
+  // Extra collection time allowed when WAL sync dominates, to fill the batch.
+  uint64_t settle_age_us = 0;
 };
 
 class AdaptiveEpochController {
@@ -40,6 +42,11 @@ class AdaptiveEpochController {
     uint64_t maximum_collection_age_us = 200;
     uint32_t min_transactions_under_load = 2;
     uint32_t deep_queue_threshold = 16;
+    // Group-commit settle: when observed WAL sync cost is at least the floor,
+    // collection waits this much extra to fill the batch. 0 disables.
+    uint64_t settle_sync_floor_us = 0;
+    uint64_t settle_max_age_us = 8'000;
+    uint32_t settle_sync_divisor = 8;
   };
 
   explicit AdaptiveEpochController(Options options);

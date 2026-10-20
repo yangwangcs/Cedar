@@ -82,6 +82,11 @@ TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {
   // N+1 preflight; the regular production batch policy would group them first.
   options.group_commit_max_batch_size = 1;
   options.group_commit_window_us = 0;
+  // This test exercises the predicted-epoch (N+1) path with small
+  // transactions; the production default intentionally skips preflight for
+  // groups below 32 KiB, so lower the threshold the same way the kernel
+  // commit tests do.
+  options.predicted_preflight_min_bytes = 0;
   std::mutex gate_mutex;
   std::condition_variable gate_cv;
   bool first_prewrite_entered = false;

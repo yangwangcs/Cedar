@@ -805,8 +805,9 @@ Status Snapshot::StateColumnarScan(
 
 StatusOr<Snapshot> Database::BeginSnapshot(SnapshotOptions options) const {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
+  if (impl_->closed.load(std::memory_order_acquire)) {
+    return Status::InvalidArgument("database", "database is closed");
+  }
   if (impl_->closing) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }

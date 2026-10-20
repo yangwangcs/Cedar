@@ -4572,11 +4572,19 @@ StatusOr<StoreCommittedGroupResult> FactStore::CommitGroupWithWalCallbackDirect(
 
 StatusOr<TxnId> FactStore::AllocateTransactionId() {
   std::shared_ptr<FactStoreImpl> store;
+  NonEpochUseGuard non_epoch_use;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) return Status::InvalidArgument("transaction", "store is not open");
+    // Transaction start reads only atomics on the common path, but the lease
+    // slow path writes allocator state through store->db. It therefore counts as
+    // a non-epoch user: registration happens under lifecycle_mutex_, which Close
+    // holds for its whole handshake, so Close either waits for this allocation
+    // or starts after it finished and sees no open store.
+    non_epoch_use = RegisterNonEpochUseLocked();
   }
+  RunNonEpochOpObserverForTesting();
   for (;;) {
     if (store->recovery_required.LoadFast()) {
       return Status::RecoveryRequired(

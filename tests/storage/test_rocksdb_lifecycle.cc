@@ -1315,5 +1315,92 @@ TEST_F(RocksDbLifecycleTest,
   EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
 }
 
+// Task 12 final re-review: Database::BeginTransaction starts with
+// FactStore::AllocateTransactionId, whose lease slow path writes allocator
+// metadata through store->db. That path was invisible to Close (no epoch
+// reference and no non-epoch registration), so a close racing a transaction
+// start could destroy db before the allocation wrote through it.
+//
+// The observer parks the allocation after its registration; with the guard,
+// Close cannot finish until the allocation drains. Disabling the drain (or the
+// registration) makes Close finish while the allocation is parked, so this
+// test fails; the resumed allocation then uses the freed RocksDB handle under
+// ASan.
+TEST_F(RocksDbLifecycleTest,
+       CloseDrainsTransactionIdAllocationBeforeTeardown) {
+  FactStoreOptions options{database_path_};
+  std::atomic<bool> op_registered{false};
+  std::atomic<bool> release_op{false};
+  std::atomic<bool> close_started{false};
+  std::atomic<bool> close_finished{false};
+  options.non_epoch_op_observer_for_testing = [&] {
+    op_registered.store(true, std::memory_order_release);
+    while (!release_op.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  };
+  FactStore store(options);
+  ASSERT_TRUE(store.Open().ok());
+
+  Status allocate_status;
+  std::optional<TxnId> allocated;
+  std::thread starter([&] {
+    auto result = store.AllocateTransactionId();
+    allocate_status = result.status();
+    if (result.ok()) allocated = std::move(result).ConsumeValueOrDie();
+  });
+  const auto registration_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!op_registered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < registration_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(op_registered.load(std::memory_order_acquire));
+  ASSERT_EQ(store.NonEpochUsersForTesting(), 1U);
+
+  Status close_status;
+  std::thread closer([&] {
+    close_started.store(true, std::memory_order_release);
+    close_status = store.Close();
+    close_finished.store(true, std::memory_order_release);
+  });
+  const auto close_start_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!close_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < close_start_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(close_started.load(std::memory_order_acquire));
+
+  // Bounded liveness check: a close without the drain finishes in
+  // microseconds; this close must not finish while the allocation is
+  // registered. The window is only a bound against a hang, not the
+  // synchronization itself.
+  const auto drained_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!close_finished.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < drained_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_FALSE(close_finished.load(std::memory_order_acquire))
+      << "Close released RocksDB state while a transaction-ID allocation was "
+         "in flight";
+
+  release_op.store(true, std::memory_order_release);
+  starter.join();
+  closer.join();
+
+  EXPECT_TRUE(allocate_status.ok()) << allocate_status.ToString();
+  ASSERT_TRUE(allocated.has_value());
+  EXPECT_NE(allocated->value, 0U);
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  EXPECT_EQ(store.NonEpochUsersForTesting(), 0U);
+  // A successful close is final: a transaction start that arrives afterwards
+  // must fail without touching store state.
+  const auto late = store.AllocateTransactionId();
+  EXPECT_TRUE(late.status().IsInvalidArgument()) << late.status().ToString();
+  EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
+}
+
 }  // namespace
 }  // namespace cedar

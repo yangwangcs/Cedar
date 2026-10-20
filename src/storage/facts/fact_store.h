@@ -82,11 +82,12 @@ struct FactStoreOptions {
   // back into FactStore.
   std::function<void()> current_sequence_loaded_observer_for_testing;
   std::function<void()> publish_visible_before_retire_observer_for_testing;
-  // Fires in every storage-level non-epoch operation (checkpoint, runtime
-  // sampling, validation-cache metrics, native maintenance) after it has
-  // registered with the close drain handshake and before it touches any store
-  // state that Close releases. Tests use it to hold such an operation in flight
-  // while a Close is attempted; it must not call back into FactStore.
+  // Fires in every registered storage-level non-epoch operation (checkpoint,
+  // transaction-ID allocation, runtime sampling, validation-cache metrics,
+  // native maintenance) after it has registered with the close drain handshake
+  // and before it touches any store state that Close releases. Tests use it to
+  // hold such an operation in flight while a Close is attempted; it must not
+  // call back into FactStore.
   std::function<void()> non_epoch_op_observer_for_testing;
 };
 
@@ -463,10 +464,43 @@ class FactStore {
 
   Status Open();
   // Closes the store. Only epoch-pinned readers are a reason to fail
-  // (SnapshotPinned); storage-level non-epoch operations (checkpoint, runtime
-  // sampling, validation-cache metrics, native maintenance) are drained before
-  // any RocksDB handle or heavy state is released, so they may run concurrently
-  // with Close and observe either an open store or "store is not open".
+  // (SnapshotPinned); Close does not wait for them. Operations that are
+  // registered with the close handshake may run concurrently with Close: they
+  // observe either an open store or "store is not open". All other public
+  // methods must be externally serialized with Close (see the concurrency
+  // contract below).
+  //
+  // Concurrency contract:
+  // * Registered epoch readers: BeginSnapshot/BeginCurrentSnapshot/
+  //   BeginCurrentSnapshotAt register their open under lifecycle_mutex_ and the
+  //   returned StoreSnapshot owns an epoch reference, so a live handle keeps
+  //   the RocksDB snapshot alive and makes Close fail with SnapshotPinned.
+  // * Registered non-epoch operations: CreateCheckpoint, SampleRuntime (and its
+  //   SampleRuntimeMetrics/SamplePressure wrappers), SampleValidationCacheMetrics,
+  //   RunNativeMaintenance and AllocateTransactionId register in the in-flight
+  //   count under lifecycle_mutex_ after copying the store. Close drains that
+  //   count after draining snapshot opens and lock-free pins and before it
+  //   releases any RocksDB handle or heavy state. Registration and the Close
+  //   handshake both need lifecycle_mutex_, so a zero observation is final: an
+  //   operation either registered before Close and is waited for, or blocks
+  //   behind Close and then sees "store is not open".
+  // * Unregistered operations: every public method that touches a RocksDB
+  //   handle or mutable store metadata is not covered by that handshake. This
+  //   includes Commit/CommitWithWalCallback/CommitGroupWithWalCallback,
+  //   DecideAndEncodeGroup/DecideIndependentAppendGroup, WriteDecidedGroup,
+  //   PersistPreparedCommit(s)/PersistPreparedDecision,
+  //   FinalizePreparedCommit/AbortPreparedCommit/ResolveTransaction/
+  //   ResolveAsyncTransaction/ResolvePreparedDecision, SynchronizeWal,
+  //   ValidatePredictedGroup, LeaseIds, RegisterProperty, Vacuum and
+  //   visible_seq. The caller must serialize these with Close (and with each
+  //   other as their own contracts require) through a higher-level lifecycle
+  //   lock; otherwise Close can free state they are still using. The kernel
+  //   satisfies this with Database::Impl::mutex, which it holds across
+  //   FactStore::Close and while issuing those calls. Read methods taking a
+  //   StoreSnapshot stay safe because the handle pins its epoch; property
+  //   catalog snapshots are returned by value/shared_ptr.
+  // * Open and Close are serialized by lifecycle_mutex_ only for the duration
+  //   of each call; they are not themselves registered operations.
   Status Close();
   // Creates a RocksDB-owned openable checkpoint without exposing RocksDB
   // handles or file-format details across the Cedar storage boundary.
@@ -585,6 +619,8 @@ class FactStore {
   Status PersistPreparedDecision(const StorePreparedDecision& decision);
   StatusOr<std::optional<StorePreparedDecision>> ResolvePreparedDecision(
       TxnId txn_id) const;
+  // Registered non-epoch operation: the lease slow path writes allocator
+  // metadata through the RocksDB handle, so Close drains it before teardown.
   StatusOr<TxnId> AllocateTransactionId();
   StatusOr<IdLease> LeaseIds(IdKind kind, uint64_t count);
   StatusOr<PropertyDefinition> RegisterProperty(PropertyDefinition definition);

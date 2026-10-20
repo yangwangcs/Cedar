@@ -339,6 +339,7 @@ StatusOr<std::string> MakeEntitySortBound(const FactPrefix& prefix,
 }  // namespace
 
 class SnapshotLease;
+struct SnapshotEpoch;
 
 class FactStoreImpl {
  public:
@@ -372,12 +373,9 @@ class FactStoreImpl {
 
   using PropertySchemas = std::map<uint16_t, std::vector<PropertyDefinition>>;
 
-  ~FactStoreImpl() {
-    if (!db) return;
-    if (default_cf != nullptr) db->DestroyColumnFamilyHandle(default_cf);
-    if (facts_cf != nullptr) db->DestroyColumnFamilyHandle(facts_cf);
-    if (meta_cf != nullptr) db->DestroyColumnFamilyHandle(meta_cf);
-  }
+  // Defined after SnapshotEpoch so owned epochs (and their snapshot leases)
+  // are released before the RocksDB handle is destroyed.
+  ~FactStoreImpl();
 
   std::mutex publisher_mutex;
   std::mutex transaction_lease_mutex;
@@ -454,11 +452,23 @@ class FactStoreImpl {
   std::unique_ptr<internal::FactIdentityHistory> identity_history;
   std::shared_ptr<rocksdb::cedar_parquet::CanonicalPageCacheMetrics> canonical_page_metrics;
   std::function<void()> validation_scan_observer_for_testing;
+  std::function<void()> snapshot_epoch_created_observer_for_testing;
+  std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
   RecoveryState recovery_required;
-  // One shared RocksDB snapshot for reads at the current visible sequence.
-  std::mutex current_snapshot_mutex;
-  std::shared_ptr<SnapshotLease> current_snapshot;
-  CommitSeq current_snapshot_seq;
+  // One SnapshotEpoch per visible sequence is shared by every reader opened at
+  // that sequence. Lookup/creation is serialized by epoch_mutex; readers only
+  // touch a sharded reference count. Epochs are cached until replaced and are
+  // owned by the store for its whole lifetime in this implementation stage;
+  // Task 2 adds retirement on the last reader.
+  static constexpr size_t kEpochRefShards = 32;
+  std::mutex epoch_mutex;
+  SnapshotEpoch* current_epoch = nullptr;
+  std::vector<SnapshotEpoch*> retired_epochs;
+
+  // Returns the epoch for the current visible sequence (creating it on first
+  // use) with one reference pinned for the caller. Returns nullptr when
+  // RocksDB refuses a snapshot. Must be paired with SnapshotEpoch::Unpin.
+  SnapshotEpoch* PinCurrentEpoch(size_t shard);
 
   void PublishVisible(CommitSeq sequence) {
     visible_seq = sequence;
@@ -486,6 +496,80 @@ class SnapshotLease {
   FactStoreImpl* store_ = nullptr;
   const rocksdb::Snapshot* snapshot_ = nullptr;
 };
+
+// One shared RocksDB snapshot per visible commit sequence. Every snapshot
+// opened at the current visible sequence pins this epoch instead of taking its
+// own RocksDB snapshot. The store owns the epoch (and keeps retired epochs
+// alive) for its whole lifetime in this stage; Task 2 adds last-reader release.
+struct SnapshotEpoch {
+  SnapshotEpoch() {
+    for (auto& ref : refs) ref.store(0, std::memory_order_relaxed);
+  }
+  SnapshotEpoch(const SnapshotEpoch&) = delete;
+  SnapshotEpoch& operator=(const SnapshotEpoch&) = delete;
+
+  void Pin(size_t shard) {
+    refs[shard % refs.size()].fetch_add(1, std::memory_order_relaxed);
+  }
+  void Unpin(size_t shard) {
+    refs[shard % refs.size()].fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  // The owning store outlives every epoch it holds, so a raw back-pointer
+  // avoids a FactStoreImpl -> epoch -> FactStoreImpl reference cycle.
+  FactStoreImpl* store = nullptr;
+  std::shared_ptr<SnapshotLease> lease;
+  const FactStoreImpl::PropertySchemas* schemas = nullptr;
+  CommitSeq seq;
+  CommitSeq oldest_readable;
+  std::array<std::atomic<uint32_t>, FactStoreImpl::kEpochRefShards> refs;
+  std::atomic<bool> retired{false};
+  SnapshotEpoch* next_active = nullptr;
+};
+
+FactStoreImpl::~FactStoreImpl() {
+  for (SnapshotEpoch* epoch : retired_epochs) delete epoch;
+  retired_epochs.clear();
+  delete current_epoch;
+  current_epoch = nullptr;
+  if (!db) return;
+  if (default_cf != nullptr) db->DestroyColumnFamilyHandle(default_cf);
+  if (facts_cf != nullptr) db->DestroyColumnFamilyHandle(facts_cf);
+  if (meta_cf != nullptr) db->DestroyColumnFamilyHandle(meta_cf);
+}
+
+SnapshotEpoch* FactStoreImpl::PinCurrentEpoch(size_t shard) {
+  std::lock_guard<std::mutex> lock(epoch_mutex);
+  // Read the watermark under the epoch lock so a concurrent publish cannot
+  // make a stale sequence look like the epoch to cache.
+  const CommitSeq current{
+      published_visible_seq.load(std::memory_order_acquire)};
+  if (current_epoch != nullptr && current_epoch->seq.value == current.value) {
+    current_epoch->Pin(shard);
+    return current_epoch;
+  }
+  const rocksdb::Snapshot* raw =
+      db != nullptr ? db->GetSnapshot() : nullptr;
+  if (raw == nullptr) return nullptr;
+  auto epoch = std::make_unique<SnapshotEpoch>();
+  epoch->store = this;
+  epoch->lease = std::make_shared<SnapshotLease>(this, raw);
+  epoch->schemas = current_schemas.load(std::memory_order_acquire);
+  epoch->seq = current;
+  epoch->oldest_readable = CommitSeq{
+      published_oldest_readable_seq.load(std::memory_order_acquire)};
+  if (current_epoch != nullptr) {
+    // Retain the old epoch (and its lease) until Task 2 introduces retirement.
+    current_epoch->retired.store(true, std::memory_order_release);
+    retired_epochs.push_back(current_epoch);
+  }
+  current_epoch = epoch.release();
+  if (snapshot_epoch_created_observer_for_testing) {
+    snapshot_epoch_created_observer_for_testing();
+  }
+  current_epoch->Pin(shard);
+  return current_epoch;
+}
 
 namespace {
 
@@ -1199,13 +1283,25 @@ size_t SnapshotShardIndex() {
   return index;
 }
 
+// Epoch references use 32 shards so the last-reader decrement (Task 2) does not
+// bounce one cache line across every worker. Like SnapshotShardIndex, pin a
+// stable shard per thread.
+size_t SnapshotEpochShardIndex() {
+  static std::atomic<size_t> next{0};
+  thread_local const size_t index =
+      next.fetch_add(1, std::memory_order_relaxed) %
+      FactStoreImpl::kEpochRefShards;
+  return index;
+}
+
 class StoreSnapshot::State {
  public:
   State(std::shared_ptr<FactStoreImpl> store,
         std::shared_ptr<SnapshotLease> snapshot_lease,
         CommitSeq commit_seq, CommitSeq oldest_readable_seq,
         const FactStoreImpl::PropertySchemas* property_schemas,
-        const FactStore* owner, size_t shard)
+        const FactStore* owner, size_t shard, SnapshotEpoch* epoch,
+        size_t epoch_shard)
       : store(std::move(store)),
         snapshot(snapshot_lease ? snapshot_lease->get() : nullptr),
         commit_seq(commit_seq),
@@ -1213,9 +1309,12 @@ class StoreSnapshot::State {
         property_schemas(property_schemas),
         owner(owner),
         lease(std::move(snapshot_lease)),
-        shard(shard) {}
+        shard(shard),
+        epoch(epoch),
+        epoch_shard(epoch_shard) {}
 
   ~State() {
+    if (epoch != nullptr) epoch->Unpin(epoch_shard);
     if (!store) return;
     {
       std::lock_guard<std::mutex> lock(store->snapshot_shard_mutex[shard]);
@@ -1234,6 +1333,8 @@ class StoreSnapshot::State {
   const FactStore* owner = nullptr;
   std::shared_ptr<SnapshotLease> lease;
   size_t shard = 0;
+  SnapshotEpoch* epoch = nullptr;
+  size_t epoch_shard = 0;
 };
 
 StatusOr<std::optional<PropertyDefinition>> LookupPropertyInSchemas(
@@ -1505,6 +1606,10 @@ Status FactStore::Open() {
   store->statistics = options.statistics;
   store->validation_scan_observer_for_testing =
       options_.validation_scan_observer_for_testing;
+  store->snapshot_epoch_created_observer_for_testing =
+      options_.snapshot_epoch_created_observer_for_testing;
+  store->snapshot_epoch_destroyed_observer_for_testing =
+      options_.snapshot_epoch_destroyed_observer_for_testing;
 
   std::string encoded_format;
   const rocksdb::Status got_format = store->db->Get(
@@ -1714,42 +1819,47 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
     leave_open();
     return Status::InvalidArgument("snapshot", "sequence exceeds visible watermark");
   }
-  static thread_local CommitSeq tls_snapshot_seq;
-  static thread_local std::weak_ptr<SnapshotLease> tls_snapshot_lease;
+  SnapshotEpoch* epoch = nullptr;
+  size_t epoch_shard = 0;
   std::shared_ptr<SnapshotLease> snapshot_lease;
-  if (tls_snapshot_seq.value == selected.value) {
-    snapshot_lease = tls_snapshot_lease.lock();
-  }
-  if (!snapshot_lease) {
-    std::lock_guard<std::mutex> lock(store->current_snapshot_mutex);
-    if (selected.value == visible.value && store->current_snapshot &&
-        store->current_snapshot_seq.value == selected.value) {
-      snapshot_lease = store->current_snapshot;
-    } else {
-      const rocksdb::Snapshot* raw = store->db->GetSnapshot();
-      if (raw == nullptr) {
-        leave_open();
-        return Status::IOError("snapshot", "RocksDB refused snapshot");
-      }
-      snapshot_lease = std::make_shared<SnapshotLease>(store.get(), raw);
-      if (selected.value == visible.value) {
-        store->current_snapshot = snapshot_lease;
-        store->current_snapshot_seq = selected;
-      }
+  CommitSeq snapshot_seq = selected;
+  CommitSeq snapshot_oldest = oldest;
+  const FactStoreImpl::PropertySchemas* schemas = nullptr;
+  if (!options.as_of.has_value() && selected.value == visible.value) {
+    // Every reader at the current visible sequence shares one epoch (and one
+    // RocksDB snapshot). A cache hit only pins a reference; the created
+    // observer fires once when the epoch is first constructed.
+    epoch_shard = SnapshotEpochShardIndex();
+    epoch = store->PinCurrentEpoch(epoch_shard);
+    if (epoch == nullptr) {
+      leave_open();
+      return Status::IOError("snapshot", "RocksDB refused snapshot");
     }
+    // These epoch fields are immutable after construction, so they can be read
+    // without epoch_mutex; the epoch itself is owned by the store until it is
+    // destroyed.
+    snapshot_lease = epoch->lease;
+    snapshot_seq = epoch->seq;
+    snapshot_oldest = epoch->oldest_readable;
+    schemas = epoch->schemas;
+  } else {
+    // Historical as_of reads retain the existing per-request snapshot lease
+    // path until Task 2 introduces uncached as_of epochs.
+    const rocksdb::Snapshot* raw = store->db->GetSnapshot();
+    if (raw == nullptr) {
+      leave_open();
+      return Status::IOError("snapshot", "RocksDB refused snapshot");
+    }
+    snapshot_lease = std::make_shared<SnapshotLease>(store.get(), raw);
+    schemas = store->current_schemas.load(std::memory_order_acquire);
   }
-  if (snapshot_lease && selected.value == visible.value) {
-    tls_snapshot_seq = selected;
-    tls_snapshot_lease = snapshot_lease;
-  }
-  const auto* schemas = store->current_schemas.load(std::memory_order_acquire);
   const size_t shard = SnapshotShardIndex();
   auto state = std::make_unique<StoreSnapshot::State>(
-      std::move(store), std::move(snapshot_lease), selected, oldest, schemas,
-      this, shard);
+      std::move(store), std::move(snapshot_lease), snapshot_seq, snapshot_oldest,
+      schemas, this, shard, epoch, epoch_shard);
   {
     std::lock_guard<std::mutex> lock(raw_store->snapshot_shard_mutex[shard]);
-    raw_store->active_snapshot_sequences[shard].insert(selected.value);
+    raw_store->active_snapshot_sequences[shard].insert(snapshot_seq.value);
   }
   raw_store->active_snapshots.fetch_add(1, std::memory_order_acq_rel);
   leave_open();

@@ -57,8 +57,16 @@ struct FactStoreOptions {
   std::function<void()> runtime_sample_observer_for_testing;
   std::function<void()> snapshot_open_observer_for_testing;
   std::function<void(bool)> kernel_write_observer_for_testing;
-  // Kept last so positional FactStoreOptions initializers stay readable.
+  // Kept before the appended epoch observers so positional FactStoreOptions
+  // initializers keep their existing meaning.
   WalSyncMode wal_sync_mode = WalSyncMode::kFullDeviceFlush;
+  // Observe shared snapshot-epoch creation. The created observer fires once
+  // for each newly constructed epoch (never for a reuse of the current one).
+  // It may run while the store's epoch mutex is held, so it must not call back
+  // into FactStore. The destroyed observer is reserved for epoch retirement;
+  // it does not fire while epochs are only cached in this implementation stage.
+  std::function<void()> snapshot_epoch_created_observer_for_testing;
+  std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {

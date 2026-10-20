@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -477,6 +478,41 @@ TEST_F(FactStoreCommitTest, RejectsReopenWithMissingSequenceRecord) {
 
   const Status opened = store_->Open();
   EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
+}
+
+TEST_F(FactStoreCommitTest, SharesEpochForSameVisibleSequence) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::atomic<int> created{0};
+  std::atomic<int> destroyed{0};
+  FactStoreOptions options;
+  options.path = path_;
+  options.snapshot_epoch_created_observer_for_testing = [&created] {
+    created.fetch_add(1, std::memory_order_relaxed);
+  };
+  options.snapshot_epoch_destroyed_observer_for_testing = [&destroyed] {
+    destroyed.fetch_add(1, std::memory_order_relaxed);
+  };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  // Every snapshot at the same visible sequence must share one epoch.
+  for (int i = 0; i < 100; ++i) {
+    const auto snapshot = store_->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), store_->visible_seq());
+  }
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 1);
+
+  const auto committed = store_->Commit(Batch(TxnId{9}, {VertexPut(7, 10)}));
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  ASSERT_EQ(store_->visible_seq(), CommitSeq{1});
+
+  const auto next = store_->BeginSnapshot();
+  ASSERT_TRUE(next.ok()) << next.status().ToString();
+  EXPECT_EQ(next.ValueOrDie().commit_seq(), CommitSeq{1});
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 2);
+  // Task 1 only creates/reuses epochs; retirement observers fire in Task 2.
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
 }
 
 }  // namespace

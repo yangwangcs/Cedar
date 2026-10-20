@@ -116,8 +116,12 @@ if (committed.ValueOrDie().outcome != cedar::CommitOutcome::kCommitted) {
 ```
 
 `Commit()` returns only after durable acceptance. `CommitAsync()` provides a
-`CommitHandle`; call `Wait()` before treating the transaction as durable. A
-transaction can also `Retract` an entity, `Unset` a property, `Scan` facts, or
+`CommitHandle`; call `Wait()` before treating the transaction as durable.
+`CommitAsyncPipelined()` is an opt-in variant that returns the same handle once
+the request is admitted into the append pipeline, without waiting for WAL
+durability or publication; `Wait()` is still the durable/terminal barrier and a
+nonzero `commit_deadline_us` is rejected in that mode. A transaction can also
+`Retract` an entity, `Unset` a property, `Scan` facts, or
 `BeginReadSnapshot(true)` to read its staged mutations.
 
 ### 3.4 Read a snapshot directly

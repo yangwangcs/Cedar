@@ -32,6 +32,10 @@ class CommitHandle::State {
   std::shared_ptr<internal::EpochCompletion> epoch_completion;
   size_t epoch_result_ordinal = 0;
   bool waits_for_epoch_durability = false;
+  // Set once a pipelined submission's request has been pushed into the append
+  // queue. Only CommitAsyncPipelined() waits on it; durable CommitAsync() never
+  // observes or sets it.
+  bool admitted = false;
 };
 
 }  // namespace cedar

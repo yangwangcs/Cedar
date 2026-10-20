@@ -339,6 +339,36 @@ if (result.outcome != cedar::CommitOutcome::kCommitted) {
 Asynchronous commit uses bounded group commit. It reduces caller wait time by
 sharing durable WAL operations, but it does not remove synchronous persistence.
 
+### Opt-in pipelined acceptance
+
+`CommitAsyncPipelined()` is an opt-in variant for callers that build several
+independent in-flight transactions (for example, one per history stream) and
+rotate their handles. It returns the same `CommitHandle` type, but returns as
+soon as the request is admitted into Cedar's append pipeline (mailbox handoff
+and append queue admission) instead of waiting for epoch selection, WAL
+durability, and publication:
+
+```cpp
+auto accepted = transaction->CommitAsyncPipelined();
+if (!accepted.ok()) return accepted.status();
+
+// ...submit other independent transactions while the group is formed...
+
+auto result = accepted.ValueOrDie().Wait().ConsumeValueOrDie();
+if (result.outcome != cedar::CommitOutcome::kCommitted) {
+  return result.status;
+}
+```
+
+The returned handle is **not** durable by itself; `Wait()` remains the barrier
+for WAL durability, publication, and the terminal result. The opt-in mode keeps
+the transaction semantics unchanged: one fsync per group, unchanged commit
+sequence assignment and visibility ordering, and the same aborted/indeterminate
+outcomes. It does not relax ordering between related transactions: a caller
+must still use one handle per stream (or wait) before submitting a transaction
+that depends on an earlier one. A nonzero `commit_deadline_us` is rejected in
+this mode; use `CommitAsync()` when queued-request cancellation is required.
+
 ## Database Format
 
 Cedar uses a versioned clean-break database format. On open, Cedar validates

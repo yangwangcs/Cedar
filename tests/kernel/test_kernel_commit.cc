@@ -4081,5 +4081,362 @@ TEST(KernelConcurrentValidationTest, PredictedBlindAppendSurvivesReopen) {
   std::filesystem::remove_all(path);
 }
 
+// Opt-in pipelined commit acceptance (Task 13). CommitAsyncPipelined returns
+// once the request is admitted into the append pipeline (mailbox handoff plus
+// append queue admission) instead of waiting for epoch selection, WAL
+// durability or publication; CommitHandle::Wait stays the barrier for the
+// durable terminal result. The tests below park the append worker at the
+// durability boundary with the existing prewrite fault injector.
+class WalDurabilityGate {
+ public:
+  Status Hook() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!armed_) return Status::OK();
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [this] { return released_; });
+    return Status::OK();
+  }
+
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+    entered_ = false;
+    released_ = false;
+  }
+
+  bool WaitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, timeout, [this] { return entered_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    changed_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool armed_ = false;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+TEST(KernelGroupCommitTest, PipelinedAcceptsBeforeWalDurabilityAndWaitIsTheBarrier) {
+  char pattern[] = "/tmp/cedar_kernel_pipelined_gate_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  WalDurabilityGate gate;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing =
+          [&gate] { return gate.Hook(); }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  auto first = database->BeginTransaction();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  ASSERT_TRUE(first.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'101}}),
+                           ValidTime{10})
+                  .ok());
+  gate.Arm();
+  auto submission = std::async(
+      std::launch::async, [&] { return first.ValueOrDie()->CommitAsyncPipelined(); });
+  const bool accepted_early =
+      submission.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  if (!accepted_early) gate.Release();
+  auto accepted = submission.get();
+  EXPECT_TRUE(accepted_early)
+      << "pipelined acceptance blocked on WAL durability";
+  gate.Release();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  EXPECT_EQ(accepted.ValueOrDie().acceptance(), CommitAcceptance::kEnqueued);
+  {
+    const auto completed = accepted.ValueOrDie().Wait();
+    ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+    EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+    EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{1});
+    EXPECT_EQ(completed.ValueOrDie().txn_id, accepted.ValueOrDie().txn_id());
+  }
+
+  // While a second accepted request is parked at the durability boundary its
+  // Wait() must not report any result; the barrier only lifts once the group
+  // has synced, published and produced the terminal outcome.
+  auto second = database->BeginTransaction();
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  ASSERT_TRUE(second.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'102}}),
+                           ValidTime{10})
+                  .ok());
+  gate.Arm();
+  auto second_submission = std::async(std::launch::async, [&] {
+    return second.ValueOrDie()->CommitAsyncPipelined();
+  });
+  const bool second_early = second_submission.wait_for(std::chrono::seconds(5)) ==
+                            std::future_status::ready;
+  if (!second_early) gate.Release();
+  auto second_accepted = second_submission.get();
+  EXPECT_TRUE(second_early)
+      << "pipelined acceptance blocked on WAL durability";
+  ASSERT_TRUE(second_accepted.ok()) << second_accepted.status().ToString();
+  const bool parked =
+      gate.WaitUntilEntered(std::chrono::milliseconds(5000));
+  if (!parked) gate.Release();
+  ASSERT_TRUE(parked) << "request never reached the durability boundary";
+  auto completion = std::async(
+      std::launch::async, [&] { return second_accepted.ValueOrDie().Wait(); });
+  EXPECT_EQ(completion.wait_for(std::chrono::milliseconds(300)),
+            std::future_status::timeout)
+      << "Wait returned before the WAL group was durable and published";
+  gate.Release();
+  ASSERT_EQ(completion.wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  const auto completed = completion.get();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{2});
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, LegacyCommitStillBlocksOnWalDurability) {
+  char pattern[] = "/tmp/cedar_kernel_legacy_durability_gate_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  WalDurabilityGate gate;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing =
+          [&gate] { return gate.Hook(); }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'201}}),
+                           ValidTime{10})
+                  .ok());
+  gate.Arm();
+  auto submission = std::async(
+      std::launch::async, [&] { return transaction.ValueOrDie()->CommitAsync(); });
+  EXPECT_TRUE(gate.WaitUntilEntered(std::chrono::milliseconds(5000)))
+      << "legacy request never reached the durability boundary";
+  const bool returned_early =
+      submission.wait_for(std::chrono::milliseconds(300)) ==
+      std::future_status::ready;
+  gate.Release();
+  auto accepted = submission.get();
+  EXPECT_FALSE(returned_early)
+      << "legacy CommitAsync must not return before WAL durability";
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  const auto completed = accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{1});
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest,
+     PipelinedGroupsMultipleRequestsFromOneCallerIntoOneWalWrite) {
+  constexpr uint32_t kRequests = 8;
+  char pattern[] = "/tmp/cedar_kernel_pipelined_group_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = kRequests,
+      .group_commit_window_us = 20'000,
+      .predicted_preflight_min_bytes = 0,
+      // Every request must be admitted before collection so one caller's
+      // pipelined submissions can form a single full group.
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= kRequests; });
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  std::vector<CommitHandle> handles;
+  handles.reserve(kRequests);
+  for (uint32_t index = 0; index < kRequests; ++index) {
+    auto transaction = database->BeginTransaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(VertexRef{
+                                  PartId{0}, VertexId{9'300 + index}}),
+                             ValidTime{index + 1})
+                    .ok());
+    auto accepted = transaction.ValueOrDie()->CommitAsyncPipelined();
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+    handles.push_back(std::move(accepted).ValueOrDie());
+  }
+
+  for (uint32_t index = 0; index < handles.size(); ++index) {
+    const auto completed = handles[index].Wait();
+    ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+    EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+    EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{index + 1});
+  }
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.submitted, kRequests);
+  EXPECT_EQ(metrics.group_fill.groups, 1U);
+  EXPECT_EQ(metrics.group_fill.total_transactions, kRequests);
+  EXPECT_EQ(metrics.latency.wal_sync.count, 1U);
+  EXPECT_EQ(metrics.durably_accepted, kRequests);
+  EXPECT_EQ(metrics.published, kRequests);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, PipelinedHandleSurvivesCloseDrain) {
+  char pattern[] = "/tmp/cedar_kernel_pipelined_close_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  WalDurabilityGate gate;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 4,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing =
+          [&gate] { return gate.Hook(); }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'401}}),
+                           ValidTime{10})
+                  .ok());
+  gate.Arm();
+  auto submission = std::async(
+      std::launch::async, [&] { return transaction.ValueOrDie()->CommitAsyncPipelined(); });
+  const bool accepted_early =
+      submission.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  if (!accepted_early) gate.Release();
+  auto accepted = submission.get();
+  EXPECT_TRUE(accepted_early);
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  const bool parked = gate.WaitUntilEntered(std::chrono::milliseconds(5000));
+  if (!parked) gate.Release();
+  ASSERT_TRUE(parked) << "request never reached the durability boundary";
+
+  // Close must drain the accepted request (its submission call already
+  // returned) instead of dropping it; it cannot finish while the WAL write is
+  // parked, and the retained handle resolves to the committed result once the
+  // drain lets the group complete.
+  std::atomic<bool> close_done{false};
+  Status close_status = Status::OK();
+  std::thread closing([&] {
+    close_status = database->Close();
+    close_done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const bool closed_while_parked = close_done.load();
+  gate.Release();
+  closing.join();
+  EXPECT_FALSE(closed_while_parked)
+      << "Close returned while an accepted write was still undurable";
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  const auto completed = accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{1});
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, PipelinedReportsIndeterminateThroughWait) {
+  char pattern[] = "/tmp/cedar_kernel_pipelined_indeterminate_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_fault_injector_for_testing = [] {
+        return Status::Indeterminate("test", "injected uncertain write");
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  auto database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'501}}),
+                           ValidTime{10})
+                  .ok());
+  auto accepted = transaction.ValueOrDie()->CommitAsyncPipelined();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  const auto completed = accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kIndeterminate);
+  EXPECT_TRUE(completed.ValueOrDie().status.IsIndeterminate());
+  EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{});
+  database.reset();
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(KernelCommitTest, PipelinedReportsValidationAbortConsistentWithLegacy) {
+  std::unique_ptr<Transaction> winner = Begin();
+  std::unique_ptr<Transaction> pipelined = Begin();
+  std::unique_ptr<Transaction> legacy = Begin();
+  const EntityFact contested =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'601}});
+  ASSERT_TRUE(winner->Assert(contested, ValidTime{10}).ok());
+  ASSERT_TRUE(pipelined->Assert(contested, ValidTime{10}).ok());
+  ASSERT_TRUE(legacy->Assert(contested, ValidTime{10}).ok());
+  const auto committed = winner->Commit();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+
+  auto pipelined_accepted = pipelined->CommitAsyncPipelined();
+  ASSERT_TRUE(pipelined_accepted.ok()) << pipelined_accepted.status().ToString();
+  const auto pipelined_result = pipelined_accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(pipelined_result.ok()) << pipelined_result.status().ToString();
+  EXPECT_EQ(pipelined_result.ValueOrDie().outcome, CommitOutcome::kAborted);
+  EXPECT_TRUE(pipelined_result.ValueOrDie().status.IsConflict());
+
+  auto legacy_accepted = legacy->CommitAsync();
+  ASSERT_TRUE(legacy_accepted.ok()) << legacy_accepted.status().ToString();
+  const auto legacy_result = legacy_accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(legacy_result.ok()) << legacy_result.status().ToString();
+  EXPECT_EQ(legacy_result.ValueOrDie().outcome,
+            pipelined_result.ValueOrDie().outcome);
+  EXPECT_TRUE(legacy_result.ValueOrDie().status.IsConflict());
+  EXPECT_EQ(legacy_result.ValueOrDie().commit_seq,
+            pipelined_result.ValueOrDie().commit_seq);
+}
+
+TEST_F(KernelCommitTest, RejectsPipelinedCommitWithNonzeroDeadline) {
+  std::unique_ptr<Transaction> transaction = Begin(TransactionOptions{
+      .isolation = IsolationLevel::kSnapshot, .commit_deadline_us = 100'000});
+  ASSERT_TRUE(transaction->Assert(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'701}}), ValidTime{10}).ok());
+  const auto accepted = transaction->CommitAsyncPipelined();
+  ASSERT_FALSE(accepted.ok());
+  EXPECT_TRUE(accepted.status().IsInvalidArgument())
+      << accepted.status().ToString();
+}
+
 }  // namespace
 }  // namespace cedar

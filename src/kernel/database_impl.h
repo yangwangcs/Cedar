@@ -292,7 +292,7 @@ class Database::Impl {
                                                uint64_t deadline_us = 0);
   Status SubmitAsyncCommit(StoreCommitBatch batch,
                            std::shared_ptr<CommitHandle::State> handle,
-                           uint64_t deadline_us = 0);
+                           uint64_t deadline_us = 0, bool pipelined = false);
   Status SubmitAsyncCommitToAppendPipeline(
       const std::shared_ptr<AppendCommitRequest>& request);
   void CancelQueuedAsyncCommit(

@@ -155,6 +155,17 @@ void BindCommitHandleToEpoch(
   handle->completed.notify_all();
 }
 
+// Releases only the opt-in pipelined submission. The request is already in the
+// append queue (or its handoff failed and completed the handle), so the caller
+// may continue building more transactions while the WAL group is formed.
+void MarkCommitHandleAdmitted(
+    const std::shared_ptr<CommitHandle::State>& handle) {
+  if (!handle) return;
+  std::lock_guard<std::mutex> lock(handle->mutex);
+  handle->admitted = true;
+  handle->completed.notify_all();
+}
+
 RuntimeMetrics ToRuntimeMetrics(const RocksDbRuntimeMetrics& source) {
   RuntimeMetrics metrics;
   metrics.retained_wal_bytes = source.retained_wal_bytes;
@@ -863,6 +874,28 @@ Status Database::Impl::StartAppendCommitPipeline() {
         }
         if (can_promote_slot) {
           const size_t planned_size = next_epoch_slot->requests.size();
+          // Pipelined admission can grow the queue past the preflight snapshot
+          // while the predecessor epoch is still writing. A decided epoch is
+          // immutable (fixed sequences and one encoded batch), so promoting
+          // exactly the predicted prefix would cap this group below what the
+          // general path can select now. Nothing has been dequeued yet:
+          // discard the prediction and let the general path include the extra
+          // accepted requests in this group. The requests themselves stay
+          // queued and are never dropped.
+          const size_t general_max = std::min<size_t>(
+              append_commit_requests.size(),
+              LimitsForQueueLocked().max_transactions);
+          if (general_max > planned_size) {
+            next_epoch_slot->state = SlotState::kDiscarded;
+            RecordNPlusOneDiscard(&append_commit_metrics,
+                                  NPlusOneDiscardReason::kGenerationMismatch,
+                                  planned_size);
+            next_epoch_slot.reset();
+            can_promote_slot = false;
+          }
+        }
+        if (can_promote_slot) {
+          const size_t planned_size = next_epoch_slot->requests.size();
           requests.reserve(planned_size);
           for (size_t index = 0; index < planned_size; ++index) {
             requests.push_back(std::move(append_commit_requests.front()));
@@ -1482,7 +1515,11 @@ void Database::Impl::CancelQueuedAsyncCommit(
 
 Status Database::Impl::SubmitAsyncCommit(
     StoreCommitBatch batch, std::shared_ptr<CommitHandle::State> handle,
-    uint64_t deadline_us) {
+    uint64_t deadline_us, bool pipelined) {
+  if (pipelined && deadline_us != 0) {
+    return Status::InvalidArgument(
+        "async commit", "pipelined commit does not support a commit deadline");
+  }
   auto request = std::make_shared<AppendCommitRequest>();
   request->batch = std::move(batch);
   request->txn_id = request->batch.txn_id;
@@ -1497,8 +1534,12 @@ Status Database::Impl::SubmitAsyncCommit(
   request->handle = std::move(handle);
   auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
   ticket->estimated_bytes = request->estimated_bytes;
-  ticket->handoff = [this, request] {
-    return SubmitAsyncCommitToAppendPipeline(request);
+  ticket->handoff = [this, request, pipelined] {
+    const Status admitted = SubmitAsyncCommitToAppendPipeline(request);
+    if (admitted.ok() && pipelined) {
+      MarkCommitHandleAdmitted(request->handle);
+    }
+    return admitted;
   };
   ticket->fail = [request](const Status& status) {
     CompleteCommitHandle(
@@ -1529,6 +1570,20 @@ Status Database::Impl::SubmitAsyncCommit(
       return submitted;
     }
     ++append_commit_metrics.async_mailbox_accepted;
+  }
+
+  if (pipelined) {
+    // The only accepted submission contract of this mode: the request left the
+    // mailbox and reached the append queue (or failed terminally). Selection,
+    // WAL durability and publication are observed exclusively through Wait().
+    std::unique_lock<std::mutex> lock(request->handle->mutex);
+    request->handle->completed.wait(lock, [&] {
+      return request->handle->admitted || request->handle->result.has_value();
+    });
+    if (request->handle->result.has_value()) {
+      return request->handle->result->status;
+    }
+    return Status::OK();
   }
 
   std::unique_lock<std::mutex> lock(request->handle->mutex);

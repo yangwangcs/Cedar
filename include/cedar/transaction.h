@@ -41,8 +41,12 @@ struct CommitResult {
 };
 
 enum class CommitAcceptance : uint8_t {
+  // The transaction crossed Cedar's durable acceptance boundary.
   kAccepted = 1,
   kIndeterminate = 2,
+  // Opt-in pipelined acceptance only: the request is in the append pipeline,
+  // not yet durable. Wait() must be called for the durable terminal result.
+  kEnqueued = 3,
 };
 
 class CommitHandle {
@@ -86,12 +90,23 @@ class Transaction {
   Status Set(PropertyFact property, ValidTime valid_time, Value value);
   Status Unset(PropertyFact property, ValidTime valid_time);
   StatusOr<CommitResult> Commit();
+  // Durable asynchronous commit: returns only after the complete transaction
+  // reaches Cedar's durable acceptance boundary.
   StatusOr<CommitHandle> CommitAsync();
+  // Opt-in pipelined commit acceptance: returns as soon as the request is
+  // admitted into the append pipeline (mailbox handoff and append queue
+  // admission) without waiting for epoch selection, WAL durability or
+  // publication. CommitHandle::Wait() remains the barrier for the durable
+  // terminal result; callers must not treat the returned handle as durable.
+  // A nonzero TransactionOptions::commit_deadline_us is rejected because the
+  // queued-request cancellation contract belongs to CommitAsync().
+  StatusOr<CommitHandle> CommitAsyncPipelined();
   Status Rollback();
 
  private:
   class State;
   explicit Transaction(std::unique_ptr<State> state);
+  StatusOr<CommitHandle> CommitAsyncImpl(bool pipelined);
 
   std::unique_ptr<State> state_;
 

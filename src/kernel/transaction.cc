@@ -650,6 +650,14 @@ StatusOr<CommitResult> Transaction::Commit() {
 }
 
 StatusOr<CommitHandle> Transaction::CommitAsync() {
+  return CommitAsyncImpl(/*pipelined=*/false);
+}
+
+StatusOr<CommitHandle> Transaction::CommitAsyncPipelined() {
+  return CommitAsyncImpl(/*pipelined=*/true);
+}
+
+StatusOr<CommitHandle> Transaction::CommitAsyncImpl(bool pipelined) {
   if (!state_) return Status::InvalidArgument("transaction", "moved-from transaction");
   if (state_->terminal) return Status::InvalidArgument("transaction", "terminal transaction");
   const Status begun = state_->BeginCommit();
@@ -670,9 +678,12 @@ StatusOr<CommitHandle> Transaction::CommitAsync() {
                          std::move(state_->edge_identities),
                          dependencies.ConsumeValueOrDie(),
                          std::move(state_->strict_read_dependencies), true};
-  auto handle_state = std::make_shared<CommitHandle::State>(batch.txn_id);
+  auto handle_state = std::make_shared<CommitHandle::State>(
+      batch.txn_id, pipelined ? CommitAcceptance::kEnqueued
+                              : CommitAcceptance::kAccepted);
   const Status enqueued = state_->database->SubmitAsyncCommit(
-      std::move(batch), handle_state, state_->options.commit_deadline_us);
+      std::move(batch), handle_state, state_->options.commit_deadline_us,
+      pipelined);
   state_->Finish();
   state_->EndCommit();
   if (!enqueued.ok()) return enqueued;

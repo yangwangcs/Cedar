@@ -394,10 +394,11 @@ class StoreSnapshot {
  private:
   explicit StoreSnapshot(std::shared_ptr<FactStoreImpl> store,
                          const FactStore* owner, SnapshotEpoch* epoch,
-                         size_t epoch_shard, size_t snapshot_shard);
+                         size_t epoch_shard);
 
-  // Drops the one epoch reference held by this handle and unregisters it from
-  // the store's active-snapshot bookkeeping. Safe to call only once.
+  // Drops the one epoch reference held by this handle. The store's epoch
+  // registry is the liveness source of truth for Close and Vacuum; there is no
+  // per-request bookkeeping to unregister. Safe to call only once.
   void Release();
 
   // The epoch outlives every read because it owns a RocksDB snapshot lease
@@ -408,7 +409,6 @@ class StoreSnapshot {
   const FactStore* owner_ = nullptr;
   SnapshotEpoch* epoch_ = nullptr;
   size_t epoch_shard_ = 0;
-  size_t snapshot_shard_ = 0;
 
   friend class FactStore;
 };

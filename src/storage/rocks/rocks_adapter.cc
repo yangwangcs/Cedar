@@ -380,11 +380,10 @@ class FactStoreImpl {
 
   std::mutex publisher_mutex;
   std::mutex transaction_lease_mutex;
-  static constexpr size_t kSnapshotShards = 8;
-  std::array<std::mutex, kSnapshotShards> snapshot_shard_mutex;
-  std::array<std::multiset<uint64_t>, kSnapshotShards>
-      active_snapshot_sequences;
-  std::atomic<size_t> active_snapshots{0};
+  // Opens that passed the lifecycle check and are still creating/registering
+  // their epoch. Close flips accepting_snapshots under the lifecycle lock and
+  // waits only for this bounded creation window before deciding whether live
+  // epoch references permit the close.
   std::atomic<size_t> snapshot_opens_in_flight{0};
   std::atomic<bool> accepting_snapshots{true};
   std::mutex group_commit_mutex;
@@ -483,6 +482,18 @@ class FactStoreImpl {
   // Publishes a new visible watermark and retires the previous current epoch.
   void PublishVisible(CommitSeq sequence);
 
+  // Reports whether any registered epoch (current or retired, including
+  // one-off as_of epochs) still has a live reader reference. Caller must hold
+  // epoch_mutex.
+  bool HasActiveEpochRefsLocked() const;
+  // Smallest sequence among epochs with a live reader reference, or nullopt
+  // when no epoch is pinned. Caller must hold epoch_mutex.
+  std::optional<uint64_t> OldestActiveEpochSeqLocked() const;
+  // Releases every registered epoch and its RocksDB snapshot without firing
+  // the destroyed observer (teardown contract). Caller must hold epoch_mutex,
+  // or have exclusive ownership (destructor), and no epoch may be referenced.
+  void ReleaseAllEpochsLocked();
+
  private:
   SnapshotEpoch* FindLiveEpochLocked(uint64_t id) const;
   void RetireCurrentEpochLocked();
@@ -541,7 +552,6 @@ struct SnapshotEpoch {
   CommitSeq oldest_readable;
   std::array<std::atomic<uint32_t>, FactStoreImpl::kEpochRefShards> refs;
   std::atomic<bool> retired{false};
-  SnapshotEpoch* next_active = nullptr;
 };
 
 namespace {
@@ -558,6 +568,44 @@ uint32_t SumEpochRefs(const SnapshotEpoch* epoch) {
 
 uint32_t FactStoreImpl::EpochRefs(const SnapshotEpoch* epoch) {
   return SumEpochRefs(epoch);
+}
+
+bool FactStoreImpl::HasActiveEpochRefsLocked() const {
+  if (current_epoch != nullptr && EpochRefs(current_epoch) != 0) return true;
+  for (const SnapshotEpoch* epoch : retired_epochs) {
+    if (EpochRefs(epoch) != 0) return true;
+  }
+  return false;
+}
+
+std::optional<uint64_t> FactStoreImpl::OldestActiveEpochSeqLocked() const {
+  std::optional<uint64_t> oldest;
+  const auto consider = [&oldest](const SnapshotEpoch* epoch) {
+    if (epoch == nullptr || EpochRefs(epoch) == 0) return;
+    if (!oldest.has_value() || epoch->seq.value < *oldest) {
+      oldest = epoch->seq.value;
+    }
+  };
+  consider(current_epoch);
+  for (const SnapshotEpoch* epoch : retired_epochs) consider(epoch);
+  return oldest;
+}
+
+void FactStoreImpl::ReleaseAllEpochsLocked() {
+  // Teardown deliberately bypasses DestroyEpochLocked: test observers may
+  // already be gone when the store is closed, so they are never fired here.
+  for (SnapshotEpoch* epoch : retired_epochs) {
+    assert(EpochRefs(epoch) == 0);
+    epoch->lease.reset();
+    delete epoch;
+  }
+  retired_epochs.clear();
+  if (current_epoch != nullptr) {
+    assert(EpochRefs(current_epoch) == 0);
+    current_epoch->lease.reset();
+    delete current_epoch;
+    current_epoch = nullptr;
+  }
 }
 
 SnapshotEpoch* FactStoreImpl::FindLiveEpochLocked(uint64_t id) const {
@@ -624,16 +672,7 @@ FactStoreImpl::~FactStoreImpl() {
   // count. Observers are not fired here: test lambdas may already be gone by
   // the time the owning FactStore is torn down. Leases are still released
   // before the RocksDB handle and column families are destroyed.
-  for (SnapshotEpoch* epoch : retired_epochs) {
-    epoch->lease.reset();
-    delete epoch;
-  }
-  retired_epochs.clear();
-  if (current_epoch != nullptr) {
-    current_epoch->lease.reset();
-    delete current_epoch;
-    current_epoch = nullptr;
-  }
+  ReleaseAllEpochsLocked();
   if (!db) return;
   if (default_cf != nullptr) db->DestroyColumnFamilyHandle(default_cf);
   if (facts_cf != nullptr) db->DestroyColumnFamilyHandle(facts_cf);
@@ -1428,19 +1467,8 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   return Status::OK();
 }
 
-// Snapshots taken at the same visible sequence would otherwise all land in
-// one registry shard. Pick a stable per-thread shard instead.
-size_t SnapshotShardIndex() {
-  static std::atomic<size_t> next{0};
-  thread_local const size_t index =
-      next.fetch_add(1, std::memory_order_relaxed) %
-      FactStoreImpl::kSnapshotShards;
-  return index;
-}
-
 // Epoch references use 32 shards so the last-reader decrement (Task 2) does not
-// bounce one cache line across every worker. Like SnapshotShardIndex, pin a
-// stable shard per thread.
+// bounce one cache line across every worker. Pin a stable shard per thread.
 size_t SnapshotEpochShardIndex() {
   static std::atomic<size_t> next{0};
   thread_local const size_t index =
@@ -1451,12 +1479,11 @@ size_t SnapshotEpochShardIndex() {
 
 StoreSnapshot::StoreSnapshot(std::shared_ptr<FactStoreImpl> store,
                              const FactStore* owner, SnapshotEpoch* epoch,
-                             size_t epoch_shard, size_t snapshot_shard)
+                             size_t epoch_shard)
     : store_(std::move(store)),
       owner_(owner),
       epoch_(epoch),
-      epoch_shard_(epoch_shard),
-      snapshot_shard_(snapshot_shard) {}
+      epoch_shard_(epoch_shard) {}
 
 StoreSnapshot::~StoreSnapshot() { Release(); }
 
@@ -1464,8 +1491,7 @@ StoreSnapshot::StoreSnapshot(StoreSnapshot&& other) noexcept
     : store_(std::move(other.store_)),
       owner_(other.owner_),
       epoch_(other.epoch_),
-      epoch_shard_(other.epoch_shard_),
-      snapshot_shard_(other.snapshot_shard_) {
+      epoch_shard_(other.epoch_shard_) {
   other.owner_ = nullptr;
   other.epoch_ = nullptr;
 }
@@ -1477,7 +1503,6 @@ StoreSnapshot& StoreSnapshot::operator=(StoreSnapshot&& other) noexcept {
     owner_ = other.owner_;
     epoch_ = other.epoch_;
     epoch_shard_ = other.epoch_shard_;
-    snapshot_shard_ = other.snapshot_shard_;
     other.owner_ = nullptr;
     other.epoch_ = nullptr;
   }
@@ -1487,16 +1512,9 @@ StoreSnapshot& StoreSnapshot::operator=(StoreSnapshot&& other) noexcept {
 void StoreSnapshot::Release() {
   if (epoch_ == nullptr) return;
   if (store_) {
-    {
-      std::lock_guard<std::mutex> lock(
-          store_->snapshot_shard_mutex[snapshot_shard_]);
-      auto& sequences = store_->active_snapshot_sequences[snapshot_shard_];
-      const auto registered = sequences.find(epoch_->seq.value);
-      if (registered != sequences.end()) sequences.erase(registered);
-    }
-    store_->active_snapshots.fetch_sub(1, std::memory_order_acq_rel);
     // This may destroy the epoch (and release its lease) when the handle was
-    // the last reader of a retired epoch.
+    // the last reader of a retired epoch. The store's epoch reference count is
+    // the only liveness registry: Close and Vacuum read it directly.
     store_->ReleaseEpochRef(epoch_, epoch_shard_);
   }
   epoch_ = nullptr;
@@ -1903,15 +1921,37 @@ Status FactStore::Close() {
   if (!impl_) return Status::OK();
   auto store = impl_;
   store->accepting_snapshots.store(false, std::memory_order_release);
+  // Wait only for opens that already registered themselves as in flight (see
+  // BeginSnapshot, which increments under lifecycle_mutex_): their remaining
+  // work is one RocksDB GetSnapshot plus registry insertion under epoch_mutex,
+  // never a user-visible read. Reader-held epochs are accounted below as
+  // references, so a close pinned by a reader is reported instead of waited
+  // for.
   while (store->snapshot_opens_in_flight.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
-  if (store->active_snapshots.load(std::memory_order_acquire) != 0) {
+  bool pinned = false;
+  {
+    // Serialize with a publisher so no visible-sequence advance retires or
+    // reaps an epoch between the reference test and the teardown.
+    std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
+    {
+      std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
+      pinned = store->HasActiveEpochRefsLocked();
+      if (!pinned) {
+        // Release the current/retired epoch leases before the store is closed.
+        // A successful close implies zero live references; teardown does not
+        // fire the destroyed observer, as documented in fact_store.h.
+        store->ReleaseAllEpochsLocked();
+      }
+    }
+    if (!pinned) impl_.reset();
+  }
+  if (pinned) {
+    // Semantics unchanged: a failed close leaves the store open and usable.
     store->accepting_snapshots.store(true, std::memory_order_release);
     return Status::SnapshotPinned("fact store", "active snapshots prevent close");
   }
-  std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
-  impl_.reset();
   return Status::OK();
 }
 
@@ -1953,16 +1993,21 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) return Status::InvalidArgument("fact store", "store is not open");
+    // Register the open while still holding the lifecycle lock that Close
+    // holds for its whole handshake. A concurrent close therefore either sees
+    // this open in flight (and waits for its bounded epoch creation) or flips
+    // accepting_snapshots before this open registers; there is no window in
+    // which a close can miss an epoch that is about to be pinned.
+    store->snapshot_opens_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    if (!store->accepting_snapshots.load(std::memory_order_acquire)) {
+      store->snapshot_opens_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+      return Status::ShutdownInProgress("snapshot", "fact store is closing");
+    }
   }
   if (options_.snapshot_open_observer_for_testing) {
     options_.snapshot_open_observer_for_testing();
   }
   FactStoreImpl* raw_store = store.get();
-  store->snapshot_opens_in_flight.fetch_add(1, std::memory_order_acq_rel);
-  if (!store->accepting_snapshots.load(std::memory_order_acquire)) {
-    store->snapshot_opens_in_flight.fetch_sub(1, std::memory_order_acq_rel);
-    return Status::ShutdownInProgress("snapshot", "fact store is closing");
-  }
   const auto leave_open = [raw_store] {
     raw_store->snapshot_opens_in_flight.fetch_sub(1,
                                                    std::memory_order_acq_rel);
@@ -1982,7 +2027,6 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
   }
   SnapshotEpoch* epoch = nullptr;
   const size_t epoch_shard = SnapshotEpochShardIndex();
-  CommitSeq snapshot_seq = selected;
   if (!options.as_of.has_value() && selected.value == visible.value) {
     // Every reader at the current visible sequence shares one epoch (and one
     // RocksDB snapshot). A cache hit only pins a reference; the created
@@ -1992,10 +2036,6 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
       leave_open();
       return Status::IOError("snapshot", "RocksDB refused snapshot");
     }
-    // These epoch fields are immutable after construction, so they can be read
-    // without epoch_mutex; the epoch itself stays alive while this handle holds
-    // its reference.
-    snapshot_seq = epoch->seq;
   } else {
     // Historical as_of reads use a one-off, uncached epoch: they must never
     // share the current epoch's lease.
@@ -2004,16 +2044,11 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
       leave_open();
       return Status::IOError("snapshot", "RocksDB refused snapshot");
     }
-    snapshot_seq = epoch->seq;
   }
-  const size_t shard = SnapshotShardIndex();
-  {
-    std::lock_guard<std::mutex> lock(raw_store->snapshot_shard_mutex[shard]);
-    raw_store->active_snapshot_sequences[shard].insert(snapshot_seq.value);
-  }
-  raw_store->active_snapshots.fetch_add(1, std::memory_order_acq_rel);
+  // The epoch reference is the only liveness registry read by Vacuum/Close:
+  // it was pinned under epoch_mutex before this open is reported finished.
   leave_open();
-  return StoreSnapshot(std::move(store), this, epoch, epoch_shard, shard);
+  return StoreSnapshot(std::move(store), this, epoch, epoch_shard);
 }
 
 StatusOr<std::optional<FactEvent>> FactStore::Read(
@@ -4109,21 +4144,18 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
     return Status::InvalidArgument("vacuum", "target is outside readable range");
   }
   if (oldest_readable == store->oldest_readable_seq) return Status::OK();
-  std::array<std::unique_lock<std::mutex>, FactStoreImpl::kSnapshotShards>
-      snapshot_locks;
-  for (size_t shard = 0; shard < FactStoreImpl::kSnapshotShards; ++shard) {
-    snapshot_locks[shard] =
-        std::unique_lock<std::mutex>(store->snapshot_shard_mutex[shard]);
-  }
-  uint64_t oldest_active_snapshot = std::numeric_limits<uint64_t>::max();
-  for (const auto& sequences : store->active_snapshot_sequences) {
-    if (!sequences.empty()) {
-      oldest_active_snapshot =
-          std::min(oldest_active_snapshot, *sequences.begin());
+  // The retention boundary is the smallest sequence among epochs that still
+  // have a live reader reference. The epoch registry (current + retired,
+  // including one-off as_of epochs) is the active list: pins, creation, and
+  // retirement all happen under epoch_mutex, so this scan cannot miss an
+  // epoch that is being opened concurrently.
+  {
+    std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
+    const std::optional<uint64_t> oldest_active =
+        store->OldestActiveEpochSeqLocked();
+    if (oldest_active.has_value() && *oldest_active < oldest_readable.value) {
+      return Status::SnapshotPinned("vacuum", "active snapshot predates target");
     }
-  }
-  if (oldest_active_snapshot < oldest_readable.value) {
-    return Status::SnapshotPinned("vacuum", "active snapshot predates target");
   }
   const Status before_boundary = RunVacuumFaultInjector(
       options_, VacuumFaultPoint::kBeforeBoundaryWrite);

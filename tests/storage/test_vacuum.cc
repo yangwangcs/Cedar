@@ -169,6 +169,45 @@ TEST_F(VacuumTest, RefusesToExpireAnActiveOlderSnapshot) {
   EXPECT_TRUE(database_->Vacuum(CommitSeq{1}).ok());
 }
 
+// Task 3: the retention boundary must come from live epoch references, not
+// from a per-request registration. A snapshot handle opened at sequence 1
+// keeps the seq-1 epoch (and its RocksDB snapshot) pinned after the visible
+// sequence advances, so vacuuming to a later sequence must fail until the
+// handle is released.
+TEST_F(VacuumTest, PinnedRetiredEpochBlocksVacuumUntilTheLastHandleIsReleased) {
+  EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
+  auto begun = database_->BeginSnapshot();
+  ASSERT_TRUE(begun.ok()) << begun.status().ToString();
+  std::optional<Snapshot> pinned(std::move(begun).ConsumeValueOrDie());
+  EXPECT_EQ(pinned->commit_seq(), CommitSeq{1});
+
+  EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});
+  EXPECT_EQ(CommitVertex(VertexId{3}, ValidTime{1}), CommitSeq{3});
+
+  EXPECT_TRUE(database_->Vacuum(CommitSeq{2}).IsSnapshotPinned());
+  pinned.reset();
+  EXPECT_TRUE(database_->Vacuum(CommitSeq{2}).ok());
+  EXPECT_TRUE(database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}})
+                  .status()
+                  .IsSnapshotExpired());
+}
+
+// The same retention rule applies to the uncached one-off epoch created for an
+// as_of read: it is not the current epoch, but its live reference still pins
+// the boundary.
+TEST_F(VacuumTest, PinnedHistoricalEpochBlocksVacuumUntilReleased) {
+  EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
+  EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});
+  auto begun = database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(begun.ok()) << begun.status().ToString();
+  std::optional<Snapshot> historical(std::move(begun).ConsumeValueOrDie());
+  EXPECT_EQ(historical->commit_seq(), CommitSeq{1});
+
+  EXPECT_TRUE(database_->Vacuum(CommitSeq{2}).IsSnapshotPinned());
+  historical.reset();
+  EXPECT_TRUE(database_->Vacuum(CommitSeq{2}).ok());
+}
+
 TEST_F(VacuumTest, TracksDuplicateSnapshotSequencesUntilEveryHandleIsReleased) {
   EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
   auto first = database_->BeginSnapshot(SnapshotOptions{CommitSeq{0}});

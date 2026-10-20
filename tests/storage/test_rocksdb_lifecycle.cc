@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <sys/wait.h>
@@ -1054,6 +1055,141 @@ TEST_F(RocksDbLifecycleTest,
     }
   }
   ASSERT_TRUE(restored.Close().ok());
+}
+
+// Task 3: Close must gate on live epoch references, including a handle whose
+// epoch was already retired by a later commit. A failed close keeps the store
+// usable (accepting snapshots again); the same handle must still read its
+// sequence and every handle must be released before close can succeed.
+TEST_F(RocksDbLifecycleTest,
+       CloseReportsRetiredEpochUntilEveryHandleIsReleased) {
+  {
+    FactStore seed(FactStoreOptions{database_path_});
+    ASSERT_TRUE(seed.Open().ok());
+    ASSERT_TRUE(seed.Commit(Batch(1, 101)).ok());
+    ASSERT_TRUE(seed.Close().ok());
+  }
+  FactStore store(FactStoreOptions{database_path_});
+  ASSERT_TRUE(store.Open().ok());
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{101}}).ref();
+
+  auto begun = store.BeginSnapshot();
+  ASSERT_TRUE(begun.ok()) << begun.status().ToString();
+  std::optional<StoreSnapshot> retired_epoch(
+      std::move(begun).ConsumeValueOrDie());
+  EXPECT_EQ(retired_epoch->commit_seq(), CommitSeq{1});
+  ASSERT_TRUE(store.Commit(Batch(2, 202)).ok());
+
+  EXPECT_TRUE(store.Close().IsSnapshotPinned());
+  // A failed close must leave the store open for new snapshots.
+  auto current = store.BeginSnapshot();
+  ASSERT_TRUE(current.ok()) << current.status().ToString();
+  std::optional<StoreSnapshot> current_epoch(
+      std::move(current).ConsumeValueOrDie());
+  EXPECT_EQ(current_epoch->commit_seq(), CommitSeq{2});
+
+  // The still-live retired epoch keeps serving its own sequence.
+  const auto event = store.Read(*retired_epoch, ref, ValidTime{1});
+  ASSERT_TRUE(event.ok()) << event.status().ToString();
+  ASSERT_TRUE(event.ValueOrDie().has_value());
+  EXPECT_EQ(event.ValueOrDie()->commit_seq, CommitSeq{1});
+
+  retired_epoch.reset();
+  EXPECT_TRUE(store.Close().IsSnapshotPinned());
+  current_epoch.reset();
+  EXPECT_TRUE(store.Close().ok());
+}
+
+// Task 3 stress: snapshot opens race Close. Every successful open owns a live
+// epoch reference until its handle is destroyed, so Close may only report
+// success when no handle is outstanding; rejected opens must fail with the
+// documented transient/invalid statuses. Bounded: readers exit after a fixed
+// number of iterations and close is only retried while handles drain.
+TEST_F(RocksDbLifecycleTest,
+       ConcurrentSnapshotOpenAndCloseKeepsEpochAccountingConsistent) {
+  {
+    FactStore seed(FactStoreOptions{database_path_});
+    ASSERT_TRUE(seed.Open().ok());
+    ASSERT_TRUE(seed.Commit(Batch(1, 101)).ok());
+    ASSERT_TRUE(seed.Close().ok());
+  }
+  FactStore store(FactStoreOptions{database_path_});
+  ASSERT_TRUE(store.Open().ok());
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{101}}).ref();
+
+  constexpr int kReaders = 4;
+  constexpr int kIterations = 2000;
+  std::atomic<int> started{0};
+  std::atomic<bool> close_succeeded{false};
+  std::atomic<uint64_t> opened{0};
+  std::atomic<uint64_t> unexpected{0};
+  std::atomic<uint64_t> live_handles{0};
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int reader = 0; reader < kReaders; ++reader) {
+    readers.emplace_back([&] {
+      started.fetch_add(1, std::memory_order_release);
+      while (started.load(std::memory_order_acquire) != kReaders) {
+        std::this_thread::yield();
+      }
+      for (int iteration = 0; iteration < kIterations; ++iteration) {
+        if (close_succeeded.load(std::memory_order_acquire)) break;
+        auto begun = store.BeginSnapshot();
+        if (!begun.ok()) {
+          if (!begun.status().IsShutdownInProgress() &&
+              !begun.status().IsInvalidArgument()) {
+            unexpected.fetch_add(1, std::memory_order_relaxed);
+          }
+          continue;
+        }
+        StoreSnapshot snapshot = std::move(begun).ConsumeValueOrDie();
+        live_handles.fetch_add(1, std::memory_order_acq_rel);
+        const auto event = store.Read(snapshot, ref, ValidTime{1});
+        if (!event.ok() || !event.ValueOrDie().has_value()) {
+          unexpected.fetch_add(1, std::memory_order_relaxed);
+        }
+        live_handles.fetch_sub(1, std::memory_order_acq_rel);
+        opened.fetch_add(1, std::memory_order_relaxed);
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // Wait (bounded) until every reader has opened at least one snapshot so the
+  // close attempt is guaranteed to race real epoch references.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (opened.load(std::memory_order_acquire) <
+             static_cast<uint64_t>(kReaders) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+
+  Status closed;
+  const auto close_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < close_deadline) {
+    closed = store.Close();
+    if (closed.ok()) break;
+    if (!closed.IsSnapshotPinned()) break;
+    std::this_thread::yield();
+  }
+  // A successful close must not have raced a live handle into the teardown:
+  // any handle alive at that moment would still own an epoch reference.
+  if (closed.ok()) {
+    EXPECT_EQ(live_handles.load(std::memory_order_acquire), 0U);
+  }
+  close_succeeded.store(true, std::memory_order_release);
+  for (std::thread& reader : readers) reader.join();
+
+  EXPECT_TRUE(closed.ok()) << closed.ToString();
+  EXPECT_EQ(unexpected.load(std::memory_order_acquire), 0U);
+  EXPECT_GT(opened.load(std::memory_order_acquire), 0U);
+  EXPECT_EQ(live_handles.load(std::memory_order_acquire), 0U);
+  // Idempotent close on an already-closed store.
+  EXPECT_TRUE(store.Close().ok());
 }
 
 }  // namespace

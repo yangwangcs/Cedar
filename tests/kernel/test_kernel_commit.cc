@@ -4087,6 +4087,14 @@ TEST(KernelConcurrentValidationTest, PredictedBlindAppendSurvivesReopen) {
 // durability or publication; CommitHandle::Wait stays the barrier for the
 // durable terminal result. The tests below park the append worker at the
 // durability boundary with the existing prewrite fault injector.
+// Group-formation tests pin a healthy pressure sample (background maintenance
+// must not change batch limits) and a latency SLO far above the test's queueing
+// delay. Without the latter, requests that wait while the caller submits the
+// rest of the burst can age past the 5 ms SLO, which makes the adaptive
+// controller halve the batch and split an otherwise full group (reproduced
+// under ASan). The tests below exercise grouping, not adaptive adaptation.
+void PinHealthyPressure(PressureSample* sample) { *sample = PressureSample{}; }
+
 class WalDurabilityGate {
  public:
   Status Hook() {
@@ -4273,7 +4281,9 @@ TEST(KernelGroupCommitTest,
         std::unique_lock<std::mutex> lock(gate_mutex);
         gate_cv.wait_for(lock, std::chrono::seconds(30),
                          [&] { return enqueued >= kRequests; });
-      }});
+      },
+      .collection_latency_slo_us_for_testing = 60'000'000,
+      .runtime_pressure_override_for_testing = PinHealthyPressure});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
 
@@ -4436,6 +4446,342 @@ TEST_F(KernelCommitTest, RejectsPipelinedCommitWithNonzeroDeadline) {
   ASSERT_FALSE(accepted.ok());
   EXPECT_TRUE(accepted.status().IsInvalidArgument())
       << accepted.status().ToString();
+}
+
+// Pins the predecided-slot growth fallback: the predecessor write is parked,
+// preflight decides a one-request slot from the first pipeline admission, and
+// the queue then grows past that snapshot. Pipelined mode must discard the
+// prediction, select the enlarged group through the general path, and keep
+// every accepted request with one WAL sync per group. In legacy mode the same
+// growth must NOT discard the slot (the default CommitAsync path is unchanged).
+enum class SlotGrowthMode { kPipelined, kLegacy };
+
+void ExercisePredecidedSlotGrowth(SlotGrowthMode mode,
+                                  CommitPipelineMetrics* metrics,
+                                  std::vector<CommitSeq>* sequences) {
+  constexpr size_t kTransactions = 5;
+  char pattern[] = "/tmp/cedar_kernel_slot_growth_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex prewrite_mutex;
+  std::condition_variable prewrite_cv;
+  bool first_prewrite_entered = false;
+  bool release_first_prewrite = false;
+  std::atomic<bool> inject_first{true};
+  std::mutex enqueue_mutex;
+  std::condition_variable enqueue_cv;
+  uint32_t enqueued = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0,
+      .commit_prewrite_fault_injector_for_testing =
+          [&] {
+            if (!inject_first.exchange(false, std::memory_order_acq_rel)) {
+              return Status::OK();
+            }
+            std::unique_lock<std::mutex> lock(prewrite_mutex);
+            first_prewrite_entered = true;
+            prewrite_cv.notify_all();
+            prewrite_cv.wait(lock, [&] { return release_first_prewrite; });
+            return Status::OK();
+          },
+      .group_commit_max_queue_requests = 16,
+      .group_commit_max_queue_bytes = 1ULL << 20,
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(enqueue_mutex);
+        ++enqueued;
+        enqueue_cv.notify_all();
+      },
+      .collection_latency_slo_us_for_testing = 60'000'000,
+      .runtime_pressure_override_for_testing = PinHealthyPressure});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  std::vector<std::unique_ptr<Transaction>> transactions;
+  transactions.reserve(kTransactions);
+  for (size_t index = 0; index < kTransactions; ++index) {
+    auto transaction = database->BeginTransaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+    ASSERT_TRUE(transaction.ValueOrDie()
+                    ->Assert(EntityFact::Vertex(VertexRef{
+                                  PartId{0}, VertexId{9'810 + index}}),
+                             ValidTime{static_cast<uint64_t>(index + 1)})
+                    .ok());
+    transactions.push_back(std::move(transaction).ConsumeValueOrDie());
+  }
+
+  std::vector<std::optional<StatusOr<CommitHandle>>> accepted(kTransactions);
+  std::vector<std::thread> threads;
+  threads.emplace_back([&] { accepted[0].emplace(transactions[0]->CommitAsync()); });
+  {
+    std::unique_lock<std::mutex> lock(prewrite_mutex);
+    ASSERT_TRUE(prewrite_cv.wait_for(
+        lock, std::chrono::seconds(2), [&] { return first_prewrite_entered; }));
+  }
+  {
+    std::unique_lock<std::mutex> lock(enqueue_mutex);
+    ASSERT_TRUE(enqueue_cv.wait_for(lock, std::chrono::seconds(2),
+                                    [&] { return enqueued == 1; }));
+  }
+  for (size_t index = 1; index < kTransactions; ++index) {
+    if (mode == SlotGrowthMode::kPipelined) {
+      accepted[index].emplace(transactions[index]->CommitAsyncPipelined());
+    } else {
+      threads.emplace_back([&, index] {
+        accepted[index].emplace(transactions[index]->CommitAsync());
+      });
+    }
+    {
+      std::unique_lock<std::mutex> lock(enqueue_mutex);
+      ASSERT_TRUE(enqueue_cv.wait_for(
+          lock, std::chrono::seconds(2),
+          [&] { return enqueued == index + 1; }));
+    }
+    if (index == 1) {
+      // Let preflight decide the one-request slot from this first pipeline
+      // admission before growing the queue with the remaining submissions.
+      const auto eligible_deadline = std::chrono::steady_clock::now() +
+                                     std::chrono::seconds(2);
+      while (std::chrono::steady_clock::now() < eligible_deadline &&
+             database->GetCommitPipelineMetrics().n_plus_one_eligible == 0) {
+        std::this_thread::yield();
+      }
+      ASSERT_GE(database->GetCommitPipelineMetrics().n_plus_one_eligible, 1U);
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(prewrite_mutex);
+    release_first_prewrite = true;
+  }
+  prewrite_cv.notify_all();
+  for (auto& thread : threads) thread.join();
+
+  sequences->clear();
+  for (auto& result : accepted) {
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->ok()) << result->status().ToString();
+    const auto completed = result->ValueOrDie().Wait();
+    ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+    EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+    sequences->push_back(completed.ValueOrDie().commit_seq);
+  }
+  *metrics = database->GetCommitPipelineMetrics();
+  ASSERT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest,
+     PipelinedDiscardsPredecidedSlotWhenQueueGrowsPastPrediction) {
+  CommitPipelineMetrics metrics;
+  std::vector<CommitSeq> sequences;
+  ExercisePredecidedSlotGrowth(SlotGrowthMode::kPipelined, &metrics, &sequences);
+  ASSERT_EQ(sequences.size(), 5U);
+  for (size_t index = 0; index < sequences.size(); ++index) {
+    EXPECT_EQ(sequences[index], CommitSeq{index + 1});
+  }
+  const size_t reason_index =
+      static_cast<size_t>(NPlusOneDiscardReason::kGenerationMismatch);
+  ASSERT_LT(reason_index, metrics.n_plus_one_discarded_by_reason.size());
+  EXPECT_GE(metrics.n_plus_one_discarded_by_reason[reason_index], 1U);
+  EXPECT_GE(metrics.n_plus_one_discards, 1U);
+  EXPECT_EQ(metrics.n_plus_one_promoted_epochs, 0U);
+  // One group per WAL sync, every accepted request accounted for exactly once.
+  EXPECT_EQ(metrics.group_fill.groups, 2U);
+  EXPECT_EQ(metrics.epochs, metrics.group_fill.groups);
+  EXPECT_EQ(metrics.latency.wal_sync.count, metrics.group_fill.groups);
+  EXPECT_EQ(metrics.group_fill.total_transactions, 5U);
+  EXPECT_EQ(metrics.submitted, 5U);
+  EXPECT_EQ(metrics.published, 5U);
+  EXPECT_EQ(metrics.durably_accepted, 5U);
+  EXPECT_EQ(metrics.rejected, 0U);
+}
+
+TEST(KernelGroupCommitTest,
+     LegacyOnlyDatabasePromotesPredecidedSlotPrefixOnQueueGrowth) {
+  CommitPipelineMetrics metrics;
+  std::vector<CommitSeq> sequences;
+  ExercisePredecidedSlotGrowth(SlotGrowthMode::kLegacy, &metrics, &sequences);
+  ASSERT_EQ(sequences.size(), 5U);
+  for (size_t index = 0; index < sequences.size(); ++index) {
+    EXPECT_EQ(sequences[index], CommitSeq{index + 1});
+  }
+  const size_t reason_index =
+      static_cast<size_t>(NPlusOneDiscardReason::kGenerationMismatch);
+  ASSERT_LT(reason_index, metrics.n_plus_one_discarded_by_reason.size());
+  // No pipelined admission ever happened, so the growth fallback must stay
+  // disabled and the predicted prefix must be promoted as before Task 13.
+  EXPECT_EQ(metrics.n_plus_one_discarded_by_reason[reason_index], 0U);
+  EXPECT_EQ(metrics.n_plus_one_discards, 0U);
+  EXPECT_EQ(metrics.n_plus_one_discarded_epochs, 0U);
+  EXPECT_GE(metrics.n_plus_one_promoted, 1U);
+  // The promoted prefix is one request; the other queued requests cannot join
+  // it, so the remaining groups are at least two.
+  EXPECT_GE(metrics.group_fill.groups, 3U);
+  EXPECT_EQ(metrics.epochs, metrics.group_fill.groups);
+  EXPECT_EQ(metrics.latency.wal_sync.count, metrics.group_fill.groups);
+  EXPECT_EQ(metrics.group_fill.total_transactions, 5U);
+  EXPECT_EQ(metrics.submitted, 5U);
+  EXPECT_EQ(metrics.published, 5U);
+  EXPECT_EQ(metrics.durably_accepted, 5U);
+  EXPECT_EQ(metrics.rejected, 0U);
+}
+
+TEST(KernelGroupCommitTest, PipelinedGroupsMultipleCallersIntoOneWalWrite) {
+  constexpr uint32_t kCallers = 2;
+  constexpr uint32_t kPerCaller = 2;
+  constexpr uint32_t kRequests = kCallers * kPerCaller;
+  char pattern[] = "/tmp/cedar_kernel_pipelined_multicaller_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  uint32_t enqueued = 0;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 20'000,
+      .predicted_preflight_min_bytes = 0,
+      .append_commit_enqueued_observer_for_testing = [&] {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++enqueued;
+        gate_cv.notify_all();
+      },
+      .append_commit_collection_observer_for_testing = [&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait_for(lock, std::chrono::seconds(30),
+                         [&] { return enqueued >= kRequests; });
+      },
+      .collection_latency_slo_us_for_testing = 60'000'000,
+      .runtime_pressure_override_for_testing = PinHealthyPressure});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  std::vector<std::vector<StatusOr<CommitHandle>>> accepted(kCallers);
+  std::vector<std::thread> callers;
+  for (uint32_t caller = 0; caller < kCallers; ++caller) {
+    callers.emplace_back([&database, &accepted, caller] {
+      for (uint32_t index = 0; index < kPerCaller; ++index) {
+        auto transaction = database->BeginTransaction();
+        if (!transaction.ok()) return;
+        if (!transaction.ValueOrDie()
+                 ->Assert(EntityFact::Vertex(VertexRef{
+                               PartId{0},
+                               VertexId{9'900 + caller * 10 + index}}),
+                          ValidTime{10})
+                 .ok()) {
+          return;
+        }
+        accepted[caller].push_back(
+            transaction.ValueOrDie()->CommitAsyncPipelined());
+      }
+    });
+  }
+  for (auto& caller : callers) caller.join();
+
+  std::vector<CommitSeq> sequences;
+  sequences.reserve(kRequests);
+  for (auto& caller : accepted) {
+    ASSERT_EQ(caller.size(), kPerCaller);
+    for (auto& handle : caller) {
+      ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+      const auto completed = handle.ValueOrDie().Wait();
+      ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+      EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+      sequences.push_back(completed.ValueOrDie().commit_seq);
+    }
+  }
+  std::sort(sequences.begin(), sequences.end(),
+            [](CommitSeq left, CommitSeq right) {
+              return left.value < right.value;
+            });
+  ASSERT_EQ(sequences.size(), kRequests);
+  for (size_t index = 0; index < sequences.size(); ++index) {
+    EXPECT_EQ(sequences[index], CommitSeq{index + 1});
+  }
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.submitted, kRequests);
+  EXPECT_EQ(metrics.group_fill.groups, 1U);
+  EXPECT_EQ(metrics.group_fill.total_transactions, kRequests);
+  EXPECT_EQ(metrics.epochs, 1U);
+  EXPECT_EQ(metrics.latency.wal_sync.count, 1U);
+  EXPECT_EQ(metrics.durably_accepted, kRequests);
+  EXPECT_EQ(metrics.published, kRequests);
+  EXPECT_EQ(metrics.rejected, 0U);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest, PipelinedWaitIsIdempotentAndAcceptanceIsSticky) {
+  char pattern[] = "/tmp/cedar_kernel_pipelined_idempotent_wait_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'950}}),
+                           ValidTime{10})
+                  .ok());
+  auto accepted = transaction.ValueOrDie()->CommitAsyncPipelined();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  CommitHandle handle = std::move(accepted).ValueOrDie();
+  EXPECT_EQ(handle.acceptance(), CommitAcceptance::kEnqueued);
+
+  const auto first = handle.Wait();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  EXPECT_EQ(first.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(first.ValueOrDie().commit_seq, CommitSeq{1});
+  // acceptance() records the creation-time value and Wait() is repeatable.
+  EXPECT_EQ(handle.acceptance(), CommitAcceptance::kEnqueued);
+  const auto second = handle.Wait();
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  EXPECT_EQ(second.ValueOrDie().outcome, first.ValueOrDie().outcome);
+  EXPECT_EQ(second.ValueOrDie().commit_seq, first.ValueOrDie().commit_seq);
+  EXPECT_EQ(second.ValueOrDie().txn_id, first.ValueOrDie().txn_id);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelGroupCommitTest,
+     PipelinedHandleWaitIsSafeAfterDatabaseDestruction) {
+  char pattern[] = "/tmp/cedar_kernel_pipelined_handle_lifetime_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'960}}),
+                           ValidTime{10})
+                  .ok());
+  auto accepted = transaction.ValueOrDie()->CommitAsyncPipelined();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  CommitHandle handle = std::move(accepted).ValueOrDie();
+  ASSERT_TRUE(database->Close().ok());
+  database.reset();
+  // The handle retains the terminal state (shared EpochCompletion); Wait() is
+  // safe after the Database object is gone.
+  const auto completed = handle.Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{1});
+  EXPECT_EQ(handle.acceptance(), CommitAcceptance::kEnqueued);
+  std::filesystem::remove_all(path);
 }
 
 }  // namespace

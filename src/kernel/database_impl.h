@@ -119,6 +119,11 @@ class Database::Impl {
     // after terminal completion.
     std::weak_ptr<AsyncSubmissionExecutor::Ticket> executor_ticket;
     std::atomic<bool> cancelled{false};
+    // True for requests admitted through CommitAsyncPipelined(). The
+    // predecided-slot growth fallback is enabled only by this mode so a
+    // database that only uses CommitAsync() keeps its pre-Task-13 promotion
+    // behavior.
+    bool pipelined = false;
     bool selected = false;
     // Protected by append_commit_mutex; only this request's sync caller waits.
     std::condition_variable completed;
@@ -412,6 +417,10 @@ class Database::Impl {
   std::optional<DecidedEpochSlot> next_epoch_slot;
   uint64_t preflight_request_generation = 0;
   uint64_t preflight_completed_generation = 0;
+  // Sticky for the lifetime of the database: set under append_commit_mutex when
+  // the first CommitAsyncPipelined() request reaches the append queue. The
+  // predecided-slot growth fallback is gated on it.
+  bool append_commit_pipelined_admission = false;
   // The sampler owns the mutable controller. The commit path consumes only
   // these atomically published admission limits and never blocks publication.
   std::mutex runtime_pressure_mutex;

@@ -24,6 +24,9 @@ enum class IsolationLevel : uint8_t { kSnapshot = 1, kStrict = 2 };
 
 struct TransactionOptions {
   IsolationLevel isolation = IsolationLevel::kSnapshot;
+  // Queued-request cancellation deadline for Commit() and CommitAsync(). A
+  // nonzero value is rejected by CommitAsyncPipelined() with InvalidArgument;
+  // that mode has no deadline path and does not fall back to CommitAsync().
   uint64_t commit_deadline_us = 0;
 };
 
@@ -46,6 +49,8 @@ enum class CommitAcceptance : uint8_t {
   kIndeterminate = 2,
   // Opt-in pipelined acceptance only: the request is in the append pipeline,
   // not yet durable. Wait() must be called for the durable terminal result.
+  // The value is recorded when the handle is created and does not change; a
+  // pipelined handle remains kEnqueued after Wait() succeeds.
   kEnqueued = 3,
 };
 
@@ -58,6 +63,10 @@ class CommitHandle {
   CommitHandle& operator=(const CommitHandle&) = default;
 
   TxnId txn_id() const;
+  // Returns the acceptance recorded when the handle was created; it does not
+  // change after Wait(). In particular a pipelined handle stays kEnqueued once
+  // the transaction becomes durable, so Wait()'s result is the durability
+  // barrier and the acceptance value must not be used to infer it.
   CommitAcceptance acceptance() const;
   StatusOr<CommitResult> Wait() const;
 
@@ -98,8 +107,9 @@ class Transaction {
   // admission) without waiting for epoch selection, WAL durability or
   // publication. CommitHandle::Wait() remains the barrier for the durable
   // terminal result; callers must not treat the returned handle as durable.
-  // A nonzero TransactionOptions::commit_deadline_us is rejected because the
-  // queued-request cancellation contract belongs to CommitAsync().
+  // A nonzero TransactionOptions::commit_deadline_us is rejected with
+  // InvalidArgument because the queued-request cancellation contract belongs to
+  // CommitAsync(); there is no automatic fallback to the legacy call.
   StatusOr<CommitHandle> CommitAsyncPipelined();
   Status Rollback();
 

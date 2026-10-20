@@ -119,10 +119,12 @@ if (committed.ValueOrDie().outcome != cedar::CommitOutcome::kCommitted) {
 `CommitHandle`; call `Wait()` before treating the transaction as durable.
 `CommitAsyncPipelined()` is an opt-in variant that returns the same handle once
 the request is admitted into the append pipeline, without waiting for WAL
-durability or publication; `Wait()` is still the durable/terminal barrier and a
-nonzero `commit_deadline_us` is rejected in that mode. A transaction can also
-`Retract` an entity, `Unset` a property, `Scan` facts, or
-`BeginReadSnapshot(true)` to read its staged mutations.
+durability or publication; `Wait()` is still the durable/terminal barrier. A
+nonzero `commit_deadline_us` is rejected with `InvalidArgument` in that mode,
+with no automatic fallback to `CommitAsync()`; the handle's `acceptance()` value
+is recorded at creation and therefore stays `kEnqueued` even after `Wait()`
+succeeds. A transaction can also `Retract` an entity, `Unset` a property, `Scan`
+facts, or `BeginReadSnapshot(true)` to read its staged mutations.
 
 ### 3.4 Read a snapshot directly
 

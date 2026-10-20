@@ -885,7 +885,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
           const size_t general_max = std::min<size_t>(
               append_commit_requests.size(),
               LimitsForQueueLocked().max_transactions);
-          if (general_max > planned_size) {
+          // Only pipelined admission can grow the queue past the preflight
+          // snapshot while the predecessor epoch is still writing. Gating the
+          // fallback on that mode keeps a legacy-only database on the original
+          // promotion path (promote exactly the predicted prefix and collect
+          // the rest in the next group).
+          if (append_commit_pipelined_admission && general_max > planned_size) {
             next_epoch_slot->state = SlotState::kDiscarded;
             RecordNPlusOneDiscard(&append_commit_metrics,
                                   NPlusOneDiscardReason::kGenerationMismatch,
@@ -1439,6 +1444,7 @@ Status Database::Impl::SubmitAsyncCommitToAppendPipeline(
   runtime_queued_request_count.fetch_add(1, std::memory_order_release);
   queued_append_commit_bytes += request->estimated_bytes;
   reserved_append_commit_bytes += request->estimated_bytes;
+  if (request->pipelined) append_commit_pipelined_admission = true;
   if (active_pending_version_overlay != nullptr) {
     ++preflight_request_generation;
   }
@@ -1531,6 +1537,7 @@ Status Database::Impl::SubmitAsyncCommit(
     ++append_commit_metrics.rejected;
     return Status::ResourceExhausted("async commit", "encoded batch exceeds hard byte limit");
   }
+  request->pipelined = pipelined;
   request->handle = std::move(handle);
   auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
   ticket->estimated_bytes = request->estimated_bytes;

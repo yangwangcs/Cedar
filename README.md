@@ -366,8 +366,13 @@ the transaction semantics unchanged: one fsync per group, unchanged commit
 sequence assignment and visibility ordering, and the same aborted/indeterminate
 outcomes. It does not relax ordering between related transactions: a caller
 must still use one handle per stream (or wait) before submitting a transaction
-that depends on an earlier one. A nonzero `commit_deadline_us` is rejected in
-this mode; use `CommitAsync()` when queued-request cancellation is required.
+that depends on an earlier one. `CommitHandle::acceptance()` records the
+acceptance at handle creation, so a pipelined handle returns
+`CommitAcceptance::kEnqueued` even after `Wait()` succeeds; use `Wait()`'s
+result as the durability barrier. A nonzero `commit_deadline_us` is rejected
+with `InvalidArgument` in this mode; there is no automatic fallback to
+`CommitAsync()`, so use `CommitAsync()` when queued-request cancellation is
+required.
 
 ## Database Format
 

@@ -392,6 +392,48 @@ TEST_F(KernelSnapshotTest, GetPointAtRecordsPointReadMetric) {
             before.ValueOrDie().point_read_operations + 1);
 }
 
+TEST_F(KernelSnapshotTest,
+       GetPointAtRecordsSinglePointReadMetricForEdgeProperty) {
+  // Edge-property point reads additionally consult both endpoint vertex states,
+  // but they are one logical point-read operation: Snapshot::Get and
+  // Database::GetPointAt must each bump point_read_operations by exactly one and
+  // return the same value for the same pinned sequence.
+  const EdgeIdentity identity{EdgeId{9}, VertexId{1}, VertexId{2}, 7};
+  Seed({Batch(TxnId{1},
+              {VertexMutation(1, 10, FactOperation::kPut),
+               VertexMutation(2, 10, FactOperation::kPut),
+               EdgeMutation(9, 10, FactOperation::kPut),
+               PendingFactMutation{
+                   PropertyFact::Edge(EdgeRef{PartId{0}, EdgeId{9}},
+                                      PropertyId{7})
+                       .ref(),
+                   ValidTime{10}, FactOperation::kPut, 1, Value::Int64(99)}},
+              {identity})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact property =
+      PropertyFact::Edge(EdgeRef{PartId{0}, EdgeId{9}}, PropertyId{7});
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  const auto before_handle = database->SampleRuntimeMetrics();
+  ASSERT_TRUE(before_handle.ok()) << before_handle.status().ToString();
+  const auto expected = snapshot.ValueOrDie().Get(property, ValidTime{15});
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+  ASSERT_EQ(expected.ValueOrDie(), std::optional<Value>{Value::Int64(99)});
+  const auto after_handle = database->SampleRuntimeMetrics();
+  ASSERT_TRUE(after_handle.ok()) << after_handle.status().ToString();
+  EXPECT_EQ(after_handle.ValueOrDie().point_read_operations,
+            before_handle.ValueOrDie().point_read_operations + 1);
+
+  const auto actual = database->GetPointAt(property.ref(), ValidTime{15});
+  ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+  EXPECT_EQ(actual.ValueOrDie(), expected.ValueOrDie());
+  const auto after_point = database->SampleRuntimeMetrics();
+  ASSERT_TRUE(after_point.ok()) << after_point.status().ToString();
+  EXPECT_EQ(after_point.ValueOrDie().point_read_operations,
+            after_handle.ValueOrDie().point_read_operations + 1);
+}
+
 TEST_F(KernelSnapshotTest, GetPointAtAtMatchesSnapshotGetForHistoricalVintage) {
   Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
                          PropertyMutation(1, 7, 10, FactOperation::kPut,

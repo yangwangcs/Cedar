@@ -323,8 +323,12 @@ class Transaction::State {
   std::vector<EdgeIdentity> edge_identities;
   std::vector<StrictReadDependency> strict_read_dependencies;
   std::unordered_set<MutationKey, MutationKeyHash> mutation_keys;
-  // Schema is stable for the transaction's pinned snapshot; cache successful
-  // lookups so a multi-fact write does not resolve the same property per fact.
+  // First-use memo only: the store's live schema catalog can be refreshed in
+  // place by a concurrent RegisterProperty (property registration does not
+  // advance the visible sequence), so a pinned snapshot does not freeze schemas.
+  // Caching here deliberately keeps this transaction's first resolution for the
+  // rest of its writes, which preserves per-transaction schema consistency while
+  // a multi-fact write avoids re-resolving the same property per fact.
   std::unordered_map<uint16_t, PropertyDefinition> property_definitions;
   bool terminal = false;
 

@@ -226,6 +226,29 @@ TEST_F(VacuumTest, TracksDuplicateSnapshotSequencesUntilEveryHandleIsReleased) {
   EXPECT_TRUE(database_->Vacuum(CommitSeq{1}).ok());
 }
 
+TEST_F(VacuumTest, CachedAsOfEpochDoesNotPinVacuum) {
+  EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
+  EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  // Populate the bounded per-sequence as_of epoch cache with a seq-1 epoch. That
+  // entry owns an epoch reference for its whole cache lifetime; a retention scan
+  // that forgot to evict the cache would see a "live reader" at seq 1 and refuse
+  // to advance the boundary.
+  const auto cached = database_->GetPointAtAt(CommitSeq{1}, ref, ValidTime{1});
+  ASSERT_TRUE(cached.ok()) << cached.status().ToString();
+
+  EXPECT_TRUE(database_->Vacuum(CommitSeq{2}).ok());
+
+  // The historical vintage is below the boundary now, and the new one is still
+  // readable through the same as_of point path.
+  EXPECT_TRUE(database_->GetPointAtAt(CommitSeq{1}, ref, ValidTime{1})
+                  .status()
+                  .IsSnapshotExpired());
+  const auto latest = database_->GetPointAtAt(CommitSeq{2}, ref, ValidTime{1});
+  ASSERT_TRUE(latest.ok()) << latest.status().ToString();
+}
+
 TEST_F(VacuumTest, PreservesBoundaryAcrossReopen) {
   EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
   EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});

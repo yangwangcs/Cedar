@@ -223,6 +223,62 @@ TEST_F(FactStoreMetadataTest,
 }
 
 TEST_F(FactStoreMetadataTest,
+       RefreshesCachedAsOfEpochSchemasWhenPropertyIsRegistered) {
+  // The 8-slot as_of cache keeps its epoch registered as retired-from-birth, so
+  // a property publish must repoint the cached epoch too; otherwise a cache hit
+  // after RegisterProperty resolves against the pre-registration catalog.
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+
+  int created_epochs = 0;
+  FactStoreOptions options{path_};
+  options.snapshot_epoch_created_observer_for_testing = [&created_epochs] {
+    ++created_epochs;
+  };
+  ASSERT_TRUE(store_->Close().ok());
+  store_ = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store_->Open().ok());
+
+  auto first = store_->BeginCurrentSnapshotAt(CommitSeq{1});
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  std::optional<StoreSnapshot> first_handle(
+      std::move(first).ConsumeValueOrDie());
+  ASSERT_EQ(created_epochs, 1);
+
+  ASSERT_TRUE(store_->RegisterProperty(
+                        Property(PropertyId{41}, "cached_late",
+                                 PropertyEntityKind::kVertex,
+                                 PhysicalType::kString))
+                  .ok());
+
+  // The second exact-sequence pin must be a cache hit (no new epoch) and must
+  // resolve the property registered after the cached epoch was created.
+  auto cached = store_->BeginCurrentSnapshotAt(CommitSeq{1});
+  ASSERT_TRUE(cached.ok()) << cached.status().ToString();
+  std::optional<StoreSnapshot> cached_handle(
+      std::move(cached).ConsumeValueOrDie());
+  EXPECT_EQ(created_epochs, 1);
+  const auto from_cached =
+      store_->LookupProperty(*cached_handle, PropertyId{41});
+  ASSERT_TRUE(from_cached.ok()) << from_cached.status().ToString();
+  ASSERT_TRUE(from_cached.ValueOrDie().has_value());
+  EXPECT_EQ(from_cached.ValueOrDie()->name, "cached_late");
+
+  // The handle opened before the registration sees the refreshed catalog too:
+  // refresh is in place for every live epoch, not a new-epoch-only behavior.
+  const auto from_first =
+      store_->LookupProperty(*first_handle, PropertyId{41});
+  ASSERT_TRUE(from_first.ok()) << from_first.status().ToString();
+  ASSERT_TRUE(from_first.ValueOrDie().has_value());
+  EXPECT_EQ(from_first.ValueOrDie()->name, "cached_late");
+
+  cached_handle.reset();
+  first_handle.reset();
+  ASSERT_TRUE(store_->Close().ok());
+  store_.reset();
+}
+
+TEST_F(FactStoreMetadataTest,
        PropertyRegistrationKeepsVisibleSequenceAndExpirySemantics) {
   // Requirement: refreshing live epoch schemas must not change snapshot
   // visibility. RegisterProperty writes metadata only, so the visible sequence

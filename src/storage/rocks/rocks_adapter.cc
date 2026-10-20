@@ -4304,6 +4304,17 @@ void FactStore::RecordPointRead() const {
   }
 }
 
+void FactStore::RecordPointRead(const StoreSnapshot& snapshot) const {
+  // The snapshot owns a reference to the same store instance, so liveness is
+  // already established; no lifecycle lock is needed to touch the counter.
+  if (snapshot.epoch_ == nullptr || snapshot.owner_ != this ||
+      snapshot.store_ == nullptr) {
+    return;
+  }
+  snapshot.store_->point_read_operations.fetch_add(1,
+                                                   std::memory_order_relaxed);
+}
+
 void FactStore::RecordMultiGet(uint64_t requests) const {
   std::shared_ptr<FactStoreImpl> store;
   {

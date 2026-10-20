@@ -16,6 +16,7 @@
 #include "storage/facts/group_commit_planner.h"
 #include "storage/rocks/rocksdb_config.h"
 #include "kernel/database_impl.h"
+#include "kernel/point_read.h"
 #include "query/resource/query_scratch.h"
 #include "query/runtime/graph_frontier.h"
 #include "query/projection/property_index_builder.h"
@@ -2137,14 +2138,13 @@ StatusOr<std::optional<Value>> Database::GetPointAt(FactRef ref,
   }
   // The epoch handle is scoped to this call: BeginSnapshot pins the latest
   // visible sequence and the handle releases it when this function returns, so
-  // a concurrent commit is observed by the next call. No Snapshot object, no
-  // extra locking, and no read semantics beyond FactStore::Read.
+  // a concurrent commit is observed by the next call. The read itself goes
+  // through the exact helper Snapshot::Get uses, so metric accounting and edge
+  // endpoint visibility filtering cannot diverge from the snapshot API.
   auto snapshot = impl_->store.BeginSnapshot();
   if (!snapshot.ok()) return snapshot.status();
-  auto event = impl_->store.Read(snapshot.ValueOrDie(), ref, valid_time);
-  if (!event.ok()) return event.status();
-  if (!event.ValueOrDie().has_value()) return std::optional<Value>{};
-  return event.ValueOrDie()->value;
+  return ReadPropertyPointAt(impl_->store, snapshot.ValueOrDie(), ref,
+                             valid_time);
 }
 
 Status Database::Impl::ValidatePreparedQuery(

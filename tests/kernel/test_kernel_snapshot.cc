@@ -305,6 +305,89 @@ TEST_F(KernelSnapshotTest, GetPointAtRejectsInvalidRef) {
   EXPECT_EQ(actual.status().ToString(), expected.status().ToString());
 }
 
+TEST_F(KernelSnapshotTest, GetPointAtMatchesSnapshotGetForVertexProperty) {
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(10))}),
+        Batch(TxnId{2}, {PropertyMutation(1, 7, 20, FactOperation::kPut,
+                                          Value::Int64(20))})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  for (const ValidTime valid_time :
+       {ValidTime{5}, ValidTime{15}, ValidTime{25}, ValidTime{35}}) {
+    const auto expected = snapshot.ValueOrDie().Get(property, valid_time);
+    ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+    const auto actual = database->GetPointAt(property.ref(), valid_time);
+    ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+    EXPECT_EQ(actual.ValueOrDie(), expected.ValueOrDie())
+        << "valid_time=" << valid_time.value;
+  }
+}
+
+TEST_F(KernelSnapshotTest, GetPointAtMatchesSnapshotGetForEdgeProperty) {
+  const EdgeIdentity identity{EdgeId{9}, VertexId{1}, VertexId{2}, 7};
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         VertexMutation(2, 10, FactOperation::kPut),
+                         EdgeMutation(9, 10, FactOperation::kPut),
+                         PendingFactMutation{
+                             PropertyFact::Edge(EdgeRef{PartId{0}, EdgeId{9}},
+                                                PropertyId{7}).ref(),
+                             ValidTime{10}, FactOperation::kPut, 1,
+                             Value::Int64(99)}},
+              {identity}),
+        Batch(TxnId{2}, {VertexMutation(1, 20, FactOperation::kDelete)}),
+        Batch(TxnId{3}, {VertexMutation(1, 30, FactOperation::kPut)}),
+        Batch(TxnId{4}, {VertexMutation(2, 40, FactOperation::kDelete)}),
+        Batch(TxnId{5}, {VertexMutation(2, 45, FactOperation::kPut)}),
+        Batch(TxnId{6}, {EdgeMutation(9, 50, FactOperation::kDelete)})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact property =
+      PropertyFact::Edge(EdgeRef{PartId{0}, EdgeId{9}}, PropertyId{7});
+
+  const auto snapshot = database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  bool saw_visible = false;
+  bool saw_hidden = false;
+  for (const ValidTime valid_time : {ValidTime{15}, ValidTime{25},
+                                     ValidTime{35}, ValidTime{42},
+                                     ValidTime{47}, ValidTime{55}}) {
+    const auto expected = snapshot.ValueOrDie().Get(property, valid_time);
+    ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+    const auto actual = database->GetPointAt(property.ref(), valid_time);
+    ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+    EXPECT_EQ(actual.ValueOrDie(), expected.ValueOrDie())
+        << "valid_time=" << valid_time.value;
+    saw_visible = saw_visible || expected.ValueOrDie().has_value();
+    saw_hidden = saw_hidden || !expected.ValueOrDie().has_value();
+  }
+  // The committed endpoint/edge deletes must exercise both sides of the filter,
+  // otherwise this test would not distinguish the shared path from a bare read.
+  EXPECT_TRUE(saw_visible);
+  EXPECT_TRUE(saw_hidden);
+}
+
+TEST_F(KernelSnapshotTest, GetPointAtRecordsPointReadMetric) {
+  Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
+                         PropertyMutation(1, 7, 10, FactOperation::kPut,
+                                          Value::Int64(10))})});
+  const std::unique_ptr<Database> database = Open();
+  const PropertyFact property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}}, PropertyId{7});
+
+  const auto before = database->SampleRuntimeMetrics();
+  ASSERT_TRUE(before.ok()) << before.status().ToString();
+  const auto actual = database->GetPointAt(property.ref(), ValidTime{15});
+  ASSERT_TRUE(actual.ok()) << actual.status().ToString();
+  const auto after = database->SampleRuntimeMetrics();
+  ASSERT_TRUE(after.ok()) << after.status().ToString();
+  EXPECT_EQ(after.ValueOrDie().point_read_operations,
+            before.ValueOrDie().point_read_operations + 1);
+}
+
 TEST_F(KernelSnapshotTest, PreservesBitemporalReadsAfterFlushCompactionAndReopen) {
   Seed({Batch(TxnId{1}, {VertexMutation(1, 10, FactOperation::kPut),
                          PropertyMutation(1, 7, 10, FactOperation::kPut,

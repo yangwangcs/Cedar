@@ -560,6 +560,10 @@ class FactStore {
   StatusOr<RocksDbRuntimeMetrics> SampleRuntimeMetrics() const;
   StatusOr<FactStoreRuntimeSample> SampleRuntime() const;
   void RecordPointRead() const;
+  // Lock-free variant for callers that already hold a pinned StoreSnapshot:
+  // the snapshot keeps the underlying store instance alive, so the counter can
+  // be bumped without re-acquiring lifecycle_mutex_.
+  void RecordPointRead(const StoreSnapshot& snapshot) const;
   void RecordMultiGet(uint64_t requests) const;
   StatusOr<FactStoreMaintenanceResult> RunNativeMaintenance(
       const FactStoreMaintenanceRequest& request,

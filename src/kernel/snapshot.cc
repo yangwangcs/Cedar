@@ -10,6 +10,7 @@
 #include "cedar/database.h"
 #include "cedar/fact/fact_codec.h"
 #include "kernel/database_impl.h"
+#include "kernel/point_read.h"
 #include "query/runtime/graph_frontier.h"
 #include "query/temporal/state_reader.h"
 
@@ -249,6 +250,31 @@ FactColumnarBatch PrefixColumnarBatch(const FactColumnarBatch& source,
   return prefix;
 }
 
+// An edge is visible only while its own state and both endpoint vertex states
+// resolve at valid_time. Read side only: this participates in the canonical
+// point-read path instead of duplicating the filter per caller.
+StatusOr<bool> EdgeVisibleAt(const FactStore& store,
+                             const StoreSnapshot& snapshot, EdgeRef edge_ref,
+                             ValidTime valid_time) {
+  const auto edge =
+      store.Read(snapshot, EntityFact::Edge(edge_ref).ref(), valid_time);
+  if (!edge.ok()) return edge.status();
+  if (!edge.ValueOrDie().has_value()) return false;
+  const auto identity = store.LookupEdgeIdentity(snapshot, edge_ref);
+  if (!identity.ok()) return identity.status();
+  if (!identity.ValueOrDie().has_value()) return false;
+  const auto source = store.Read(
+      snapshot, EntityFact::Vertex(identity.ValueOrDie()->source_ref()).ref(),
+      valid_time);
+  if (!source.ok()) return source.status();
+  if (!source.ValueOrDie().has_value()) return false;
+  const auto target = store.Read(
+      snapshot, EntityFact::Vertex(identity.ValueOrDie()->target_ref()).ref(),
+      valid_time);
+  if (!target.ok()) return target.status();
+  return target.ValueOrDie().has_value();
+}
+
 }  // namespace
 
 class Snapshot::State final : public CanonicalFactReader {
@@ -272,28 +298,6 @@ class Snapshot::State final : public CanonicalFactReader {
                       const CanonicalColumnarBatchVisitor& visitor) const override;
   StatusOr<std::vector<FactEvent>> ReadExact(
       const std::vector<std::string>& encoded_keys) const override;
-
-  StatusOr<bool> EdgeVisible(EdgeRef edge_ref, ValidTime valid_time) const {
-    const auto edge = database->store.Read(
-        snapshot, EntityFact::Edge(edge_ref).ref(), valid_time);
-    if (!edge.ok()) return edge.status();
-    if (!edge.ValueOrDie().has_value()) return false;
-    const auto identity = database->store.LookupEdgeIdentity(snapshot, edge_ref);
-    if (!identity.ok()) return identity.status();
-    if (!identity.ValueOrDie().has_value()) return false;
-    const auto source = database->store.Read(
-        snapshot,
-        EntityFact::Vertex(identity.ValueOrDie()->source_ref()).ref(),
-        valid_time);
-    if (!source.ok()) return source.status();
-    if (!source.ValueOrDie().has_value()) return false;
-    const auto target = database->store.Read(
-        snapshot,
-        EntityFact::Vertex(identity.ValueOrDie()->target_ref()).ref(),
-        valid_time);
-    if (!target.ok()) return target.status();
-    return target.ValueOrDie().has_value();
-  }
 };
 
 namespace {
@@ -606,8 +610,10 @@ StatusOr<bool> Snapshot::Exists(EntityFact entity, ValidTime valid_time) const {
   if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
   if (entity.ref().family() == FactFamily::kEdgeState) {
     state_->database->store.RecordPointRead();
-    return state_->EdgeVisible(
-        EdgeRef{entity.ref().part_id(), EdgeId{entity.ref().entity_id()}}, valid_time);
+    return EdgeVisibleAt(
+        state_->database->store, state_->snapshot,
+        EdgeRef{entity.ref().part_id(), EdgeId{entity.ref().entity_id()}},
+        valid_time);
   }
   state_->database->store.RecordPointRead();
   const auto event = state_->database->store.Read(state_->snapshot, entity.ref(),
@@ -630,22 +636,29 @@ StatusOr<std::vector<bool>> Snapshot::MultiExists(
   return results;
 }
 
-StatusOr<std::optional<Value>> Snapshot::Get(PropertyFact property,
-                                              ValidTime valid_time) const {
-  if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
-  state_->database->store.RecordPointRead();
-  const auto event = state_->database->store.Read(state_->snapshot, property.ref(),
-                                                   valid_time);
+StatusOr<std::optional<Value>> ReadPropertyPointAt(
+    const FactStore& store, const StoreSnapshot& snapshot, const FactRef& ref,
+    ValidTime valid_time) {
+  store.RecordPointRead(snapshot);
+  const auto event = store.Read(snapshot, ref, valid_time);
   if (!event.ok()) return event.status();
   if (!event.ValueOrDie().has_value()) return std::optional<Value>{};
-  if (property.ref().family() == FactFamily::kEdgeProperty) {
-    const auto visible = state_->EdgeVisible(
-        EdgeRef{property.ref().part_id(), EdgeId{property.ref().entity_id()}},
-        valid_time);
+  if (ref.family() == FactFamily::kEdgeProperty) {
+    const auto visible =
+        EdgeVisibleAt(store, snapshot,
+                      EdgeRef{ref.part_id(), EdgeId{ref.entity_id()}},
+                      valid_time);
     if (!visible.ok()) return visible.status();
     if (!visible.ValueOrDie()) return std::optional<Value>{};
   }
   return event.ValueOrDie()->value;
+}
+
+StatusOr<std::optional<Value>> Snapshot::Get(PropertyFact property,
+                                              ValidTime valid_time) const {
+  if (!state_) return Status::InvalidArgument("snapshot", "moved-from snapshot");
+  return ReadPropertyPointAt(state_->database->store, state_->snapshot,
+                             property.ref(), valid_time);
 }
 
 Status Snapshot::Scan(FactFamily family, PropertyId property_id,

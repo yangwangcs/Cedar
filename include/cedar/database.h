@@ -377,9 +377,12 @@ class Database {
   StatusOr<Snapshot> BeginSnapshot(SnapshotOptions options = {}) const;
   // Reads one fact point at the latest visible commit sequence without
   // materializing a Snapshot object. Each call pins the current snapshot epoch
-  // for exactly one store read, so it observes the latest visible sequence and
-  // holds no cached handle between calls. Missing or deleted facts yield an
-  // empty optional, exactly like Snapshot::Get for a vertex property fact.
+  // for exactly one read through the same internal path as Snapshot::Get, so it
+  // observes the latest visible sequence and holds no cached handle between
+  // calls. Semantics match BeginSnapshot() + Snapshot::Get for every property
+  // fact: missing or deleted facts yield an empty optional, and edge-property
+  // facts additionally require both endpoint vertex states to be visible at
+  // valid_time.
   StatusOr<std::optional<Value>> GetPointAt(FactRef ref,
                                             ValidTime valid_time) const;
   StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;

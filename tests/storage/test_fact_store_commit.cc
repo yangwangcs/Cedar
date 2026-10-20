@@ -511,8 +511,10 @@ TEST_F(FactStoreCommitTest, SharesEpochForSameVisibleSequence) {
   ASSERT_TRUE(next.ok()) << next.status().ToString();
   EXPECT_EQ(next.ValueOrDie().commit_seq(), CommitSeq{1});
   EXPECT_EQ(created.load(std::memory_order_relaxed), 2);
-  // Task 1 only creates/reuses epochs; retirement observers fire in Task 2.
-  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+  // The snapshots above were all released before the commit, so the epoch at
+  // seq 0 had zero references when the commit retired it; retirement must
+  // release it right away instead of keeping the RocksDB snapshot cached.
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
 }
 
 TEST_F(FactStoreCommitTest, RetiresEpochAfterLastReader) {
@@ -566,6 +568,48 @@ TEST_F(FactStoreCommitTest, RetiresEpochAfterLastReader) {
     // The retired epoch is not destroyed while `old` still holds a reference.
     EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
   }
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
+}
+
+TEST_F(FactStoreCommitTest, ReleasesEpochWhenLastReaderLeftBeforeRetirement) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::atomic<int> created{0};
+  std::atomic<int> destroyed{0};
+  FactStoreOptions options;
+  options.path = path_;
+  options.snapshot_epoch_created_observer_for_testing = [&created] {
+    created.fetch_add(1, std::memory_order_relaxed);
+  };
+  options.snapshot_epoch_destroyed_observer_for_testing = [&destroyed] {
+    destroyed.fetch_add(1, std::memory_order_relaxed);
+  };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{1}, {VertexPut(7, 10)})).ok());
+  {
+    // Release the only reader while the epoch is still current: its reference
+    // count drops to zero before any retirement happens.
+    auto snapshot = store_->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{1});
+  }
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+
+  // Advancing the visible sequence retires that zero-ref epoch. It must be
+  // released by this commit's publish, not by a later commit; asserting right
+  // after the commit detects any deferred reap.
+  const auto committed = store_->Commit(Batch(TxnId{2}, {VertexPut(7, 20)}));
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  ASSERT_EQ(store_->visible_seq(), CommitSeq{2});
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
+
+  // A reader at the new sequence lazily creates a fresh epoch.
+  const auto latest = store_->BeginSnapshot();
+  ASSERT_TRUE(latest.ok()) << latest.status().ToString();
+  EXPECT_EQ(latest.ValueOrDie().commit_seq(), CommitSeq{2});
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 2);
   EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
 }
 

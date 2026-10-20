@@ -459,8 +459,9 @@ class FactStoreImpl {
   // One SnapshotEpoch per visible sequence is shared by every reader opened at
   // that sequence. Lookup/creation and retirement are serialized by
   // epoch_mutex; readers only touch a sharded reference count. The current
-  // epoch is retired when the visible sequence advances and is destroyed by
-  // whichever reader drops the last reference.
+  // epoch is retired when the visible sequence advances. A retired epoch is
+  // destroyed by the publish that retires it if its readers already left, or
+  // else by the reader that drops the last reference.
   static constexpr size_t kEpochRefShards = 32;
   std::mutex epoch_mutex;
   uint64_t next_epoch_id = 1;
@@ -514,8 +515,9 @@ class SnapshotLease {
 // One shared RocksDB snapshot per visible commit sequence. Every snapshot
 // opened at the current visible sequence pins this epoch instead of taking its
 // own RocksDB snapshot. The store keeps the epoch registered (current or
-// retired) until its reference count reaches zero; the last reader that
-// released it then unlinks and destroys it.
+// retired) until its reference count reaches zero; the last reader releases a
+// retired epoch directly, and a publish releases a retired epoch whose readers
+// already left before the retirement.
 struct SnapshotEpoch {
   SnapshotEpoch() {
     for (auto& ref : refs) ref.store(0, std::memory_order_relaxed);
@@ -581,9 +583,11 @@ void FactStoreImpl::RetireCurrentEpochLocked() {
   if (retired == nullptr) return;
   current_epoch = nullptr;
   retired->retired.store(true, std::memory_order_release);
-  // Deliberately keep the just-retired epoch registered even when its readers
-  // already left: a release racing this retirement must find it by ID instead
-  // of touching freed memory. The next publish reaps it.
+  // The registry is keyed by the epoch's monotonic ID and a releaser never
+  // dereferences the epoch after its last decrement, so a caller may reap this
+  // epoch in the same critical section: a release racing the retirement either
+  // lands before the reap and is accounted for, or finds no live entry by ID
+  // and returns without touching freed memory.
   retired_epochs.push_back(retired);
 }
 
@@ -603,13 +607,15 @@ void FactStoreImpl::PublishVisible(CommitSeq sequence) {
   std::lock_guard<std::mutex> lock(epoch_mutex);
   visible_seq = sequence;
   published_visible_seq.store(sequence.value, std::memory_order_release);
-  // Reap epochs retired by earlier publishes whose readers already left. The
-  // epoch retired by this publish stays registered until its own readers
-  // drain, so a concurrently releasing reader never races with deletion.
-  ReapRetiredEpochsLocked();
+  // Retire first, then reap. An epoch whose last reader left before this
+  // publish has zero references and must be released by this publish: deferring
+  // it to the next publish would keep its RocksDB snapshot (and the WAL it
+  // pins) alive indefinitely on a commit-idle store. A reader that releases
+  // after the retirement finds the zero-ref epoch and destroys it directly.
   if (current_epoch != nullptr && current_epoch->seq.value != sequence.value) {
     RetireCurrentEpochLocked();
   }
+  ReapRetiredEpochsLocked();
 }
 
 FactStoreImpl::~FactStoreImpl() {
@@ -646,7 +652,9 @@ SnapshotEpoch* FactStoreImpl::PinCurrentEpoch(size_t shard) {
   }
   if (current_epoch != nullptr) {
     // Publishes retire under this lock, so this is only a consistency guard.
+    // Reap here too so the guard can never strand a zero-ref retired epoch.
     RetireCurrentEpochLocked();
+    ReapRetiredEpochsLocked();
   }
   const rocksdb::Snapshot* raw =
       db != nullptr ? db->GetSnapshot() : nullptr;
@@ -708,7 +716,8 @@ void FactStoreImpl::ReleaseEpochRef(SnapshotEpoch* epoch, size_t shard) {
   SnapshotEpoch* live = FindLiveEpochLocked(id);
   if (live == nullptr) return;  // another releaser already destroyed it
   if (!live->retired.load(std::memory_order_acquire)) {
-    // Still current: retirement by the next publish handles destruction.
+    // Still current: the publish that retires it reaps it if no reader is
+    // left, otherwise a later release takes the path below.
     return;
   }
   if (EpochRefs(live) != 0) return;

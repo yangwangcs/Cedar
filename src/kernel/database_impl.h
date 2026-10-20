@@ -246,7 +246,12 @@ class Database::Impl {
                                std::move(options.runtime_sample_observer_for_testing),
                                std::move(options.snapshot_open_observer_for_testing),
                                std::move(options.kernel_write_observer_for_testing),
-                               options.wal_sync_mode}),
+                               options.wal_sync_mode,
+                               {},
+                               {},
+                               {},
+                               {},
+                               std::move(options.non_epoch_op_observer_for_testing)}),
         async_executor(ResolveAsyncExecutorOptions(options)),
         query_runtime_options(ResolveQueryRuntimeOptions(options)),
         query_database_path(options.path) {
@@ -344,13 +349,17 @@ class Database::Impl {
   std::condition_variable commits_drained;
   std::string query_database_path;
   FactStore store;
-  std::unique_ptr<internal::QueryProjectionStore> projection_store;
-  std::unique_ptr<internal::QueryStatisticsStore> query_statistics;
+  // Derived query state. Bind/Explain take a reference to these under `mutex`
+  // and Close detaches them under the same mutex, so neither side can race a
+  // read of the owner with its reset. A detached object stays alive until the
+  // last planning/execution reference is released.
+  std::shared_ptr<internal::QueryProjectionStore> projection_store;
+  std::shared_ptr<internal::QueryStatisticsStore> query_statistics;
   internal::QueryMetrics query_metrics;
   // Derived, rebuildable commit tail.  It is deliberately independent from
   // the durable commit path; queue overflow records a gap but never rejects a
   // commit that RocksDB has already published.
-  std::unique_ptr<internal::QueryDelta> query_delta;
+  std::shared_ptr<internal::QueryDelta> query_delta;
   std::shared_ptr<internal::AdjacencyIndex> adjacency_index;
   AsyncSubmissionExecutor async_executor;
   QueryRuntimeOptions query_runtime_options;

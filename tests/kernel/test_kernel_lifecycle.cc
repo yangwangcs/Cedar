@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cedar/database.h"
@@ -237,6 +238,98 @@ TEST_F(KernelLifecycleTest, LiveSnapshotPinsCloseButReleaseAllowsRetryAndReopen)
   const auto committed = transaction->Commit();
   ASSERT_TRUE(committed.ok()) << committed.status().ToString();
   EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+}
+
+// Regression: RefreshQueryStatistics checked closed/closing under
+// Database::Impl::mutex but called FactStore::SchemaFingerprint() after
+// releasing it. A concurrent successful Close could reset the property schema
+// catalog between the store-handle copy and SchemasSnapshot(), dereferencing a
+// null catalog. The fingerprint is now captured in the protected region and is
+// itself a registered non-epoch operation, so Close waits for it.
+TEST_F(KernelLifecycleTest, CloseRacingQueryStatisticsDoesNotReadReleasedCatalog) {
+  std::atomic<bool> fingerprint_entered{false};
+  std::atomic<bool> release_fingerprint{false};
+  std::mutex refresh_thread_mutex;
+  std::thread::id refresh_thread;
+  database_ = Open(DatabaseOptions{
+      .non_epoch_op_observer_for_testing = [&] {
+        {
+          std::lock_guard<std::mutex> lock(refresh_thread_mutex);
+          if (refresh_thread != std::this_thread::get_id()) return;
+        }
+        fingerprint_entered.store(true, std::memory_order_release);
+        while (!release_fingerprint.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+      }});
+  ASSERT_TRUE(database_);
+
+  // RefreshQueryStatistics requires a selected projection generation; build one
+  // with the same canonical-validated property index path the public API uses.
+  auto property = database_->RegisterProperty(
+      PropertyDefinition{PropertyId{7}, 0, "country",
+                         PropertyEntityKind::kVertex, PhysicalType::kString,
+                         4096});
+  ASSERT_TRUE(property.ok()) << property.status().ToString();
+  auto prepared_transaction = database_->BeginTransaction();
+  ASSERT_TRUE(prepared_transaction.ok())
+      << prepared_transaction.status().ToString();
+  ASSERT_TRUE(prepared_transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
+                           ValidTime{0})
+                  .ok());
+  ASSERT_TRUE(prepared_transaction.ValueOrDie()
+                  ->Set(PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{1}},
+                                             PropertyId{7}),
+                        ValidTime{0}, Value::String("CN"))
+                  .ok());
+  ASSERT_TRUE(prepared_transaction.ValueOrDie()->Commit().ok());
+  auto index_refresh = database_->RefreshQueryIndexes(ValidTime{0});
+  ASSERT_TRUE(index_refresh.ok()) << index_refresh.status().ToString();
+  ASSERT_TRUE(index_refresh.ValueOrDie().Await().ok());
+
+  StatusOr<QueryMaintenanceHandle> refresh =
+      Status::InvalidArgument("query maintenance", "not executed");
+  std::thread refresher([&] {
+    {
+      std::lock_guard<std::mutex> lock(refresh_thread_mutex);
+      refresh_thread = std::this_thread::get_id();
+    }
+    refresh = database_->RefreshQueryStatistics();
+  });
+  const auto entered_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!fingerprint_entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < entered_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(fingerprint_entered.load(std::memory_order_acquire));
+
+  Status close_status;
+  std::atomic<bool> close_finished{false};
+  std::thread closer([&] {
+    close_status = database_->Close();
+    close_finished.store(true, std::memory_order_release);
+  });
+  // Bounded liveness check only: with the fingerprint held by the protected
+  // region / close drain, Close cannot tear the catalog down yet.
+  const auto drained_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!close_finished.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < drained_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_FALSE(close_finished.load(std::memory_order_acquire))
+      << "Close released the property catalog while RefreshQueryStatistics was "
+         "fingerprinting it";
+
+  release_fingerprint.store(true, std::memory_order_release);
+  refresher.join();
+  closer.join();
+
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  EXPECT_TRUE(refresh.ok() || refresh.status().IsShutdownInProgress())
+      << refresh.status().ToString();
 }
 
 }  // namespace

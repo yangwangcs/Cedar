@@ -4772,13 +4772,27 @@ StatusOr<std::vector<PropertyDefinition>> FactStore::ListProperties() const {
 }
 
 StatusOr<std::string> FactStore::SchemaFingerprint() const {
+  // The fingerprint reads the property schema catalog, which a successful Close
+  // releases (ReleaseRetainedStateForClose resets property_schemas). Register
+  // with the close drain so a close that starts after the handle copy waits for
+  // this read instead of releasing the catalog between the two steps.
   std::shared_ptr<FactStoreImpl> store;
+  NonEpochUseGuard non_epoch_use;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     store = impl_;
     if (!store) return Status::InvalidArgument("property definition", "store is not open");
+    non_epoch_use = RegisterNonEpochUseLocked();
   }
+  RunNonEpochOpObserverForTesting();
   const auto schemas = store->SchemasSnapshot();
+  if (!schemas) {
+    // Unreachable while the non-epoch registration is held: Close drains it
+    // before releasing the catalog. Keep a contract violation from becoming a
+    // null dereference instead of masking one (the registration is the fix).
+    return Status::ShutdownInProgress("property definition",
+                                      "store is closing or closed");
+  }
   std::ostringstream canonical;
   for (const auto& [property_id, epochs] : *schemas) {
     if (epochs.empty()) continue;

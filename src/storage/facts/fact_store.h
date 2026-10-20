@@ -477,13 +477,13 @@ class FactStore {
   //   the RocksDB snapshot alive and makes Close fail with SnapshotPinned.
   // * Registered non-epoch operations: CreateCheckpoint, SampleRuntime (and its
   //   SampleRuntimeMetrics/SamplePressure wrappers), SampleValidationCacheMetrics,
-  //   RunNativeMaintenance and AllocateTransactionId register in the in-flight
-  //   count under lifecycle_mutex_ after copying the store. Close drains that
-  //   count after draining snapshot opens and lock-free pins and before it
-  //   releases any RocksDB handle or heavy state. Registration and the Close
-  //   handshake both need lifecycle_mutex_, so a zero observation is final: an
-  //   operation either registered before Close and is waited for, or blocks
-  //   behind Close and then sees "store is not open".
+  //   RunNativeMaintenance, AllocateTransactionId, and SchemaFingerprint
+  //   register in the in-flight count under lifecycle_mutex_ after copying the
+  //   store. Close drains that count after draining snapshot opens and lock-free
+  //   pins and before it releases any RocksDB handle or heavy state.
+  //   Registration and the Close handshake both need lifecycle_mutex_, so a zero
+  //   observation is final: an operation either registered before Close and is
+  //   waited for, or blocks behind Close and then sees "store is not open".
   // * Unregistered operations: every public method that touches a RocksDB
   //   handle or mutable store metadata is not covered by that handshake. This
   //   includes Commit/CommitWithWalCallback/CommitGroupWithWalCallback,
@@ -632,7 +632,10 @@ class FactStore {
   StatusOr<std::vector<PropertyDefinition>> ListProperties() const;
   // Stable fingerprint of the latest registered definition for every property.
   // The value is derived from the authoritative schema catalog and is used to
-  // bind derived query statistics to the schema that produced them.
+  // bind derived query statistics to the schema that produced them. Registered
+  // non-epoch operation: Close drains it before releasing the schema catalog, so
+  // callers (including query planning) may invoke it without holding the kernel
+  // lifecycle lock.
   StatusOr<std::string> SchemaFingerprint() const;
   StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
       const StoreSnapshot& snapshot, EdgeRef edge) const;

@@ -1402,5 +1402,65 @@ TEST_F(RocksDbLifecycleTest,
   EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
 }
 
+// Regression: SchemaFingerprint copied impl_ under lifecycle_mutex_, released
+// the lock, and only then called SchemasSnapshot(). Database::Close could
+// complete in that window and ReleaseRetainedStateForClose() resets
+// property_schemas, so the fingerprint dereferenced a null catalog. The
+// fingerprint is now a registered non-epoch operation: Close's drain must wait
+// for it before releasing the property catalog.
+TEST_F(RocksDbLifecycleTest, CloseDrainsSchemaFingerprintBeforeTeardown) {
+  FactStoreOptions options{database_path_};
+  std::atomic<bool> fingerprint_parked{false};
+  std::atomic<bool> release_fingerprint{false};
+  options.non_epoch_op_observer_for_testing = [&] {
+    fingerprint_parked.store(true, std::memory_order_release);
+    while (!release_fingerprint.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  };
+  FactStore store(options);
+  ASSERT_TRUE(store.Open().ok());
+  ASSERT_TRUE(store.Commit(Batch(1, 301)).ok());
+
+  StatusOr<std::string> fingerprint = Status::InvalidArgument("test", "not run");
+  std::thread reader([&] { fingerprint = store.SchemaFingerprint(); });
+  const auto entered_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!fingerprint_parked.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < entered_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(fingerprint_parked.load(std::memory_order_acquire));
+  EXPECT_EQ(store.NonEpochUsersForTesting(), 1U);
+
+  Status close_status;
+  std::atomic<bool> close_finished{false};
+  std::thread closer([&] {
+    close_status = store.Close();
+    close_finished.store(true, std::memory_order_release);
+  });
+  // Bounded liveness check only: Close must not release the catalog while the
+  // registered fingerprint is in flight.
+  const auto drained_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!close_finished.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < drained_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_FALSE(close_finished.load(std::memory_order_acquire))
+      << "Close released the property catalog while SchemaFingerprint was in "
+         "flight";
+
+  release_fingerprint.store(true, std::memory_order_release);
+  reader.join();
+  closer.join();
+
+  ASSERT_TRUE(fingerprint.ok()) << fingerprint.status().ToString();
+  EXPECT_FALSE(fingerprint.ValueOrDie().empty());
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  EXPECT_EQ(store.NonEpochUsersForTesting(), 0U);
+  EXPECT_TRUE(store.RetainedShellsAreInertForTesting());
+}
+
 }  // namespace
 }  // namespace cedar

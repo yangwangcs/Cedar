@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cedar/database.h"
@@ -220,6 +223,80 @@ TEST_F(QueryLifecycleTest, VacuumRespectsAnalyticalQuerySnapshotPin) {
   ASSERT_TRUE(active.Close().ok());
   const Status vacuum_status = database_->Vacuum(CommitSeq{2});
   EXPECT_TRUE(vacuum_status.ok()) << vacuum_status.ToString();
+}
+
+// Regression for the Close vs query-planning race: Database::Close used to
+// reset query_delta/projection_store without Database::Impl::mutex while
+// QueryExecutionContextFactory::Bind read those unique_ptrs without any lock.
+// The observer parks Bind after it has reached the derived query state and
+// before the state is used; a concurrent pinned Close detaches the state in
+// that window. With the fix Bind holds a reference taken under the same mutex
+// and completes; without it the parked Bind dereferences the reset owner.
+TEST_F(QueryLifecycleTest, CloseRacingBindDoesNotDereferenceTornDownQueryState) {
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  std::atomic<bool> bind_entered{false};
+  std::atomic<bool> bind_release{false};
+  DatabaseOptions options;
+  options.path = path_;
+  options.query_open_stage_observer_for_testing = [&](const char* stage) {
+    if (std::string(stage) != "query_bind_state_acquired") return;
+    bind_entered.store(true, std::memory_order_release);
+    while (!bind_release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  };
+  auto reopened = Database::Open(std::move(options));
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database_ = std::move(reopened).ConsumeValueOrDie();
+
+  auto committed = database_->BeginTransaction();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  ASSERT_TRUE(committed.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{11}}),
+                           ValidTime{1})
+                  .ok());
+  ASSERT_TRUE(committed.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto scan = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(scan.ok());
+  auto query = scan.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  StatusOr<QueryCursor> cursor = Status::InvalidArgument("query", "not executed");
+  std::thread executor([&] {
+    cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), Bindings{},
+        QueryOptions{.mode = QueryExecutionMode::kAnalytical});
+  });
+
+  const auto entered_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!bind_entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < entered_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(bind_entered.load(std::memory_order_acquire));
+
+  // The snapshot held by Execute pins the store, so Close must fail with
+  // SnapshotPinned. The race under test is the derived query state being
+  // detached while Bind is parked between reading it and using it.
+  const Status close_status = database_->Close();
+  EXPECT_TRUE(close_status.IsSnapshotPinned()) << close_status.ToString();
+
+  bind_release.store(true, std::memory_order_release);
+  executor.join();
+
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  QueryCursor active = std::move(cursor).ConsumeValueOrDie();
+  EXPECT_TRUE(active.Close().ok());
+  EXPECT_TRUE(database_->Close().ok());
 }
 
 }  // namespace

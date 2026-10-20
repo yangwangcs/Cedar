@@ -261,9 +261,15 @@ struct DatabaseOptions {
   std::function<void(PressureSample*)> runtime_pressure_override_for_testing;
   std::function<void(bool)> kernel_write_observer_for_testing;
   std::function<void(const char*)> shutdown_stage_observer_for_testing;
-  // Open-order observer used by recovery tests. Names are
-  // authoritative_recovery, query_delta_repaired, and derived_loaded.
+  // Open-order observer used by recovery and query-planning tests. Names are
+  // authoritative_recovery, query_delta_repaired, derived_loaded, and
+  // query_bind_state_acquired (fired by query planning after it has taken a
+  // synchronized reference to the derived query state).
   std::function<void(const char*)> query_open_stage_observer_for_testing;
+  // Forwards the storage-level registered non-epoch operation observer. Tests
+  // use it to park such an operation (for example SchemaFingerprint) after its
+  // close-drain registration and prove Close waits for it.
+  std::function<void()> non_epoch_op_observer_for_testing;
   // Recovery test hook exposing the configured QueryDelta repair byte cap.
   std::function<void(uint64_t)>
       query_delta_repair_budget_observer_for_testing;

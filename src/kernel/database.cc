@@ -1910,6 +1910,7 @@ StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
   if (!impl_) return Status::InvalidArgument("database", "moved-from database");
   std::shared_ptr<internal::QueryStatisticsStore> statistics;
   std::shared_ptr<internal::ProjectionManifest> manifest;
+  StatusOr<std::string> schema;
   {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->closed) return Status::InvalidArgument("database", "database is closed");
@@ -1924,9 +1925,14 @@ StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
     // worker lifetime. Database shutdown joins the executor before destruction.
     statistics = std::shared_ptr<internal::QueryStatisticsStore>(
         impl_, impl_->query_statistics.get());
+    // FactStore::SchemaFingerprint reads the mutable property catalog, and the
+    // kernel contract requires unregistered store reads to be serialized with
+    // FactStore::Close. Capture it in the same critical section as the
+    // closed/closing check so Close cannot release the catalog in between.
+    // The store entry point is additionally registered with the close drain.
+    schema = impl_->store.SchemaFingerprint();
+    if (!schema.ok()) return schema.status();
   }
-  const auto schema = impl_->store.SchemaFingerprint();
-  if (!schema.ok()) return schema.status();
   auto state = std::make_shared<QueryMaintenanceHandle::State::Shared>();
   auto ticket = std::make_shared<AsyncSubmissionExecutor::Ticket>();
   ticket->estimated_bytes = 1;
@@ -2079,9 +2085,22 @@ Status Database::Close() {
   impl_->StopAppendCommitPipeline();
   impl_->RefreshRuntimeSnapshot().IgnoreError();
   impl_->ObserveShutdownStage("final_runtime_snapshot");
-  impl_->query_delta.reset();
+  // Detach the derived query state under the lifecycle mutex. Bind/Explain take
+  // their references to these members under the same mutex, so a teardown can
+  // never race a read of the owner; a planning operation that already took a
+  // reference keeps its object alive until it is done. Only the detachment
+  // happens under the lock: the destructors (QueryDelta joins its indexing
+  // worker) run after it is released.
+  std::shared_ptr<internal::QueryDelta> stopped_query_delta;
+  std::shared_ptr<internal::QueryProjectionStore> stopped_projection_store;
+  {
+    std::lock_guard<std::mutex> detach_lock(impl_->mutex);
+    stopped_query_delta = std::move(impl_->query_delta);
+    stopped_projection_store = std::move(impl_->projection_store);
+  }
+  stopped_query_delta.reset();
   impl_->ObserveShutdownStage("query_delta_stopped");
-  impl_->projection_store.reset();
+  stopped_projection_store.reset();
   if (had_active_queries) impl_->ObserveShutdownStage("projection_builders_stopped");
   if (had_active_queries) impl_->ObserveShutdownStage("maintenance_joined");
   if (had_active_queries) impl_->ObserveShutdownStage("scratch_cleaned");

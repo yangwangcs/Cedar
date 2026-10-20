@@ -75,15 +75,35 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     const std::shared_ptr<Database::Impl>& database,
     const std::shared_ptr<const LogicalPlanNode>& root, CommitSeq snapshot_seq,
     const QueryOptions& options, const PartScope& part_scope) {
+  // Database::Close detaches the derived query state under the same lifecycle
+  // mutex, so take references to everything this binding needs in one critical
+  // section. Bind never holds the kernel mutex while planning: the references
+  // keep the objects alive independently of the members that Close detaches,
+  // and the closed/closing check cannot race the teardown.
+  std::shared_ptr<internal::QueryProjectionStore> projection_store;
+  std::shared_ptr<internal::QueryDelta> query_delta;
+  std::shared_ptr<internal::QueryStatisticsStore> query_statistics;
+  {
+    std::lock_guard<std::mutex> lock(database->mutex);
+    if (database->closed || database->closing) {
+      return Status::ShutdownInProgress("query", "database is closing or closed");
+    }
+    projection_store = database->projection_store;
+    query_delta = database->query_delta;
+    query_statistics = database->query_statistics;
+  }
+  if (database->query_open_stage_observer_for_testing) {
+    database->query_open_stage_observer_for_testing("query_bind_state_acquired");
+  }
   ProjectionCatalogView catalog;
-  if (database->projection_store) {
-    const auto manifest = database->projection_store->current_manifest();
+  if (projection_store) {
+    const auto manifest = projection_store->current_manifest();
     if (manifest) catalog = ProjectionCatalogView(*manifest);
   }
   QueryDeltaView delta{catalog.base_seq, snapshot_seq, {}, {}, {}, {}};
   bool delta_usable = false;
-  if (database->query_delta) {
-    auto acquired = database->query_delta->AcquireThrough(snapshot_seq);
+  if (query_delta) {
+    auto acquired = query_delta->AcquireThrough(snapshot_seq);
     if (acquired.ok()) {
       delta = std::move(acquired).ConsumeValueOrDie();
       delta_usable = delta.base_seq == catalog.base_seq &&
@@ -94,11 +114,11 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     }
   }
   QueryStatisticsView statistics;
-  if (database->query_statistics && catalog.generation_id != 0) {
+  if (query_statistics && catalog.generation_id != 0) {
     const auto schema = database->store.SchemaFingerprint();
     const auto loaded = schema.ok()
-        ? database->query_statistics->Load(catalog.generation_id, catalog.base_seq,
-                                           schema.ValueOrDie())
+        ? query_statistics->Load(catalog.generation_id, catalog.base_seq,
+                                 schema.ValueOrDie())
         : StatusOr<QueryStatisticsSnapshot>(schema.status());
     if (loaded.ok() && loaded.ValueOrDie().complete &&
         !loaded.ValueOrDie().schema_fingerprint.empty()) {
@@ -136,13 +156,13 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
   binding.projection_stats = std::make_shared<ProjectionReadStats>();
   if (delta_usable) {
     binding.delta_view = std::make_shared<const QueryDeltaView>(delta);
-    if (database->query_delta) {
-      auto lease = database->query_delta->AcquireLeaseThrough(snapshot_seq);
+    if (query_delta) {
+      auto lease = query_delta->AcquireLeaseThrough(snapshot_seq);
       if (!lease.ok()) return lease.status();
       binding.delta_lease = std::move(lease).ConsumeValueOrDie();
     }
   }
-  if (database->projection_store) {
+  if (projection_store) {
     for (const auto& slice : physical_plan->coverage_slices) {
       if (slice.source == CoverageSource::kCanonical ||
           !slice.projection_generation) continue;
@@ -159,7 +179,7 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
       request.expected_base_seq = slice.projection_base;
       request.database_identity = slice.database_identity;
       request.stats = binding.projection_stats.get();
-      auto acquired = database->projection_store->Acquire(request);
+      auto acquired = projection_store->Acquire(request);
       if (!acquired.has_value()) {
         return Status::Conflict("query", "projection generation rolled over during planning");
       }
@@ -194,7 +214,7 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
       request.generation_id = catalog.generation_id;
       request.expected_base_seq = catalog.base_seq;
       request.database_identity = catalog.database_identity;
-      auto acquired = database->projection_store->Acquire(request);
+      auto acquired = projection_store->Acquire(request);
       if (!acquired.has_value()) continue;
       if (binding.projection_generation.has_value() &&
           binding.projection_generation->generation_id() != acquired->generation_id()) {
@@ -206,14 +226,15 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
       break;
     }
   }
-  const std::weak_ptr<Database::Impl> weak_database = database;
+  // Execution outlives planning. The readers capture their own references to
+  // the derived objects instead of re-reading Database::Impl members that Close
+  // detaches, and they deliberately do not retain the database itself.
   const auto pinned_generation = binding.projection_generation;
   const auto projection_stats = binding.projection_stats;
   binding.projection_reader =
-      [weak_database, snapshot_seq, pinned_generation, projection_stats](const CoverageSlice& slice)
-      -> StatusOr<std::vector<ProjectionChain>> {
-    const auto db = weak_database.lock();
-    if (!db || !db->projection_store || !pinned_generation ||
+      [projection_store, snapshot_seq, pinned_generation, projection_stats](
+          const CoverageSlice& slice) -> StatusOr<std::vector<ProjectionChain>> {
+    if (!projection_store || !pinned_generation ||
         !pinned_generation->exists()) {
       return Status::NotFound("query", "pinned projection generation is unavailable");
     }
@@ -230,23 +251,20 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     request.expected_base_seq = slice.projection_base;
     request.database_identity = slice.database_identity;
     request.stats = projection_stats.get();
-    return db->projection_store->ReadChains(request, *pinned_generation);
+    return projection_store->ReadChains(request, *pinned_generation);
   };
-  binding.delta_reader = [weak_database, snapshot_seq]()
-      -> StatusOr<QueryDeltaView> {
-    const auto db = weak_database.lock();
-    if (!db || !db->query_delta) {
+  binding.delta_reader = [query_delta, snapshot_seq]() -> StatusOr<QueryDeltaView> {
+    if (!query_delta) {
       return Status::NotFound("query", "query delta is unavailable");
     }
-    return db->query_delta->AcquireThrough(snapshot_seq);
+    return query_delta->AcquireThrough(snapshot_seq);
   };
   const auto pinned_property_generation = binding.projection_generation;
   binding.property_index_reader =
-      [weak_database, snapshot_seq, pinned_property_generation](
+      [projection_store, snapshot_seq, pinned_property_generation](
           PartId part, PropertyId property, uint32_t schema_epoch,
           ValidTimeInterval valid_time) -> StatusOr<PropertyIndexSegment> {
-    const auto db = weak_database.lock();
-    if (!db || !db->projection_store || !pinned_property_generation ||
+    if (!projection_store || !pinned_property_generation ||
         !pinned_property_generation->exists()) {
       return Status::NotFound("query", "property index generation is unavailable");
     }
@@ -267,8 +285,8 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     request.database_identity = pinned_property_generation->manifest()
                                     ? pinned_property_generation->manifest()->database_identity
                                     : std::string{};
-    return db->projection_store->ReadPropertyIndex(request,
-                                                   *pinned_property_generation);
+    return projection_store->ReadPropertyIndex(request,
+                                               *pinned_property_generation);
   };
   // The capsule is the ownership boundary for all snapshot-specific state.
   // Keep the value-shaped fields above for explain/test compatibility, but

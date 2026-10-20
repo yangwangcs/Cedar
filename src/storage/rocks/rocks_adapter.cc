@@ -4,6 +4,7 @@
 #include "storage/rocks/rocks_adapter.h"
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <sstream>
 #include <tuple>
@@ -386,6 +387,9 @@ class FactStoreImpl {
   // epoch references permit the close.
   std::atomic<size_t> snapshot_opens_in_flight{0};
   std::atomic<bool> accepting_snapshots{true};
+  // Gate for the lock-free current-epoch pin. Close clears it (and then drains
+  // pin_attempts) before it can tear the epoch registry down.
+  std::atomic<bool> accepting_fast{true};
   std::mutex group_commit_mutex;
   std::condition_variable group_commit_cv;
   std::deque<std::shared_ptr<GroupCommitRequest>> group_commit_requests;
@@ -456,49 +460,113 @@ class FactStoreImpl {
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
   RecoveryState recovery_required;
   // One SnapshotEpoch per visible sequence is shared by every reader opened at
-  // that sequence. Lookup/creation and retirement are serialized by
-  // epoch_mutex; readers only touch a sharded reference count. The current
-  // epoch is retired when the visible sequence advances. A retired epoch is
-  // destroyed by the publish that retires it if its readers already left, or
-  // else by the reader that drops the last reference.
+  // that sequence. Creation, publication, retirement, and reclamation are
+  // serialized by epoch_mutex. Hot-path readers never take that mutex: they
+  // load current_epoch_fast and increment one atomic reference word with a
+  // DEAD bit (see TryPinCurrentEpochLockFree and ReleaseEpochRef).
+  //
+  // Every registered epoch carries one owner reference in addition to reader
+  // references: the store's own reference for the current epoch, or the as_of
+  // cache's reference for a cached historical epoch. That makes a zero
+  // reference count unambiguous: only a retired epoch can reach it, and exactly
+  // one thread observes the final decrement.
   static constexpr size_t kEpochRefShards = 32;
+  static constexpr uint32_t kEpochDeadBit = 1u << 31;
+  // One padded attempt counter per shard so the lock-free pin registration does
+  // not bounce a cache line between workers.
+  struct alignas(64) EpochAttemptCounter {
+    std::atomic<uint32_t> value{0};
+  };
+  static constexpr size_t kAsOfCacheSlots = 8;
+  struct AsOfCacheEntry {
+    CommitSeq seq;
+    SnapshotEpoch* epoch = nullptr;
+  };
+
   std::mutex epoch_mutex;
   uint64_t next_epoch_id = 1;
   SnapshotEpoch* current_epoch = nullptr;
+  std::atomic<SnapshotEpoch*> current_epoch_fast{nullptr};
   std::vector<SnapshotEpoch*> retired_epochs;
+  // Retired epochs that are DEAD but whose memory cannot be freed yet because a
+  // lock-free pin attempt may still hold the pointer. Freed once every attempt
+  // counter has drained.
+  std::vector<SnapshotEpoch*> dead_epochs_pending_free;
+  std::atomic<bool> pending_reclaim{false};
+  // Epochs detached by a successful Close. Their memory is kept (leases are
+  // already released) until the store is destroyed so that a last-reader
+  // release that raced the close can never touch freed memory.
+  std::vector<SnapshotEpoch*> close_graveyard;
+  std::array<EpochAttemptCounter, kEpochRefShards> pin_attempts{};
 
-  // Returns the epoch for the current visible sequence (creating it on first
-  // use) with one reference pinned for the caller. Returns nullptr when
-  // RocksDB refuses a snapshot. Must be paired with ReleaseEpochRef.
-  SnapshotEpoch* PinCurrentEpoch(size_t shard);
-  // Creates a non-cached epoch pinned for one caller at an arbitrary readable
-  // sequence. Used by as_of reads so they never share the current lease.
-  SnapshotEpoch* CreateUncachedEpoch(CommitSeq seq, CommitSeq oldest_readable,
-                                     size_t shard);
-  // Drops one reference; the last released reference of a retired epoch
-  // unlinks it, releases its lease, and deletes it under epoch_mutex.
-  void ReleaseEpochRef(SnapshotEpoch* epoch, size_t shard);
+  // Bounded per-sequence cache for historical point reads (GetPointAtAt). Each
+  // entry owns one epoch reference; the epoch is retired from birth and is
+  // released when the entry is evicted or the cache is cleared.
+  std::mutex as_of_cache_mutex;
+  std::array<AsOfCacheEntry, kAsOfCacheSlots> as_of_cache{};
+
+  // Lock-free current-epoch pin. Returns true with one reference pinned for the
+  // caller plus the store shared_ptr that the epoch owns, or false when the
+  // caller must use the lifecycle/epoch-mutex slow path.
+  bool TryPinCurrentEpochLockFree(std::shared_ptr<FactStoreImpl>* store_owner,
+                                  SnapshotEpoch** pinned);
+  // Slow path: returns the epoch for the current visible sequence (creating it
+  // on first use) with one reference pinned for the caller and the store's own
+  // owner reference held. Returns nullptr when RocksDB refuses a snapshot. Must
+  // be paired with ReleaseEpochRef.
+  SnapshotEpoch* PinCurrentEpoch(const std::shared_ptr<FactStoreImpl>& self);
+  // Creates a non-cached epoch at an arbitrary readable sequence, retired from
+  // birth, with exactly one reference owned by the caller. Used by as_of reads
+  // and by the as_of cache. Returns nullptr when RocksDB refuses a snapshot.
+  SnapshotEpoch* CreateUncachedEpoch(const std::shared_ptr<FactStoreImpl>& self,
+                                     CommitSeq seq, CommitSeq oldest_readable);
+  // Drops one reference. The last reference of a retired epoch marks it DEAD,
+  // unlinks it, releases its lease, and frees its memory once the lock-free
+  // pin-attempt protocol proves no reader can still reach it.
+  void ReleaseEpochRef(SnapshotEpoch* epoch);
 
   // Publishes a new visible watermark and retires the previous current epoch.
   void PublishVisible(CommitSeq sequence);
 
-  // Reports whether any registered epoch (current or retired, including
-  // one-off as_of epochs) still has a live reader reference. Caller must hold
-  // epoch_mutex.
+  // Reports whether any registered epoch still has a live reader reference.
+  // The current epoch's owner reference is not a reader reference. Caller must
+  // hold epoch_mutex.
   bool HasActiveEpochRefsLocked() const;
   // Smallest sequence among epochs with a live reader reference, or nullopt
   // when no epoch is pinned. Caller must hold epoch_mutex.
   std::optional<uint64_t> OldestActiveEpochSeqLocked() const;
-  // Releases every registered epoch and its RocksDB snapshot without firing
-  // the destroyed observer (teardown contract). Caller must hold epoch_mutex,
-  // or have exclusive ownership (destructor), and no epoch may be referenced.
-  void ReleaseAllEpochsLocked();
+  // Total number of in-flight lock-free pin attempts. Draining it proves that
+  // no thread is between loading current_epoch_fast and deciding its reference.
+  uint32_t PinAttemptsTotal() const;
+  // Detaches every registered epoch and releases its RocksDB lease without
+  // firing the destroyed observer (teardown contract). Epoch memory is kept in
+  // close_graveyard until the store is destroyed. Caller must hold epoch_mutex
+  // and PinAttemptsTotal() must be zero.
+  void CloseEpochsLocked();
+  // Releases every remaining epoch and graveyard entry. Exclusive ownership.
+  void DestroyEpochsLocked();
+  // Destroys the RocksDB handle and column families while keeping the store
+  // object (and its graveyard) alive for a lock-free pin that raced the close.
+  void DestroyDatabaseHandles();
+  // Drops every cached as_of epoch reference (may reclaim epochs).
+  void ClearAsOfCache();
+  // Deletes DEAD epochs once no lock-free pin attempt can still reference them.
+  void MaybeFreeDeadEpochs();
 
  private:
-  SnapshotEpoch* FindLiveEpochLocked(uint64_t id) const;
+  SnapshotEpoch* CreateEpochLocked(const std::shared_ptr<FactStoreImpl>& self,
+                                   CommitSeq seq, CommitSeq oldest_readable);
   void RetireCurrentEpochLocked();
-  void ReapRetiredEpochsLocked();
-  void DestroyEpochLocked(SnapshotEpoch* epoch);
+  void DropOwnerReferenceLocked(SnapshotEpoch* epoch);
+  // Caller observed the reference count fall to zero. Caller must hold
+  // epoch_mutex.
+  void ReclaimEpochLocked(SnapshotEpoch* epoch);
+  void UnlinkEpochLocked(SnapshotEpoch* epoch);
+  // Releases the lease and the store shared_ptr exactly once. `notify` fires
+  // the destroyed observer; teardown paths pass false (contract).
+  void ReleaseEpochPayloadLocked(SnapshotEpoch* epoch, bool notify);
+  bool ClaimEpochMemoryLocked(SnapshotEpoch* epoch);
+  void FreeDeadEpochsLocked();
   static uint32_t EpochRefs(const SnapshotEpoch* epoch);
 };
 
@@ -523,55 +591,68 @@ class SnapshotLease {
   const rocksdb::Snapshot* snapshot_ = nullptr;
 };
 
-// One shared RocksDB snapshot per visible commit sequence. Every snapshot
-// opened at the current visible sequence pins this epoch instead of taking its
-// own RocksDB snapshot. The store keeps the epoch registered (current or
-// retired) until its reference count reaches zero; the last reader releases a
-// retired epoch directly, and a publish releases a retired epoch whose readers
-// already left before the retirement.
+// Lock-free pin attempts register in one padded counter per thread, and the
+// as_of cache uses the same shard count. Pin a stable shard per thread.
+size_t SnapshotEpochShardIndex() {
+  static std::atomic<size_t> next{0};
+  thread_local const size_t index =
+      next.fetch_add(1, std::memory_order_relaxed) %
+      FactStoreImpl::kEpochRefShards;
+  return index;
+}
+
+// One shared RocksDB snapshot per visible commit sequence. Readers opened at
+// the current visible sequence pin this epoch instead of taking their own
+// RocksDB snapshot. The reference count is a single atomic word; the highest
+// bit marks the epoch DEAD, which makes a pin that raced the last release see a
+// value it can never increment. Every registered epoch also carries one owner
+// reference (the store's current reference or the as_of cache's reference), so
+// a zero count unambiguously means "retired and no reader".
 struct SnapshotEpoch {
-  SnapshotEpoch() {
-    for (auto& ref : refs) ref.store(0, std::memory_order_relaxed);
-  }
+  SnapshotEpoch() = default;
   SnapshotEpoch(const SnapshotEpoch&) = delete;
   SnapshotEpoch& operator=(const SnapshotEpoch&) = delete;
 
-  void Pin(size_t shard) {
-    refs[shard % refs.size()].fetch_add(1, std::memory_order_relaxed);
-  }
-
-  // Stable identity for safe registry lookup after a concurrent release may
-  // already have removed (and destroyed) the epoch.
+  // Stable identity for diagnostics and registry lookups that are only used on
+  // the serialized slow path.
   uint64_t id = 0;
-  // The owning store outlives every epoch it holds, so a raw back-pointer
-  // avoids a FactStoreImpl -> epoch -> FactStoreImpl reference cycle.
+  // The owning store outlives every epoch it holds on the slow path; the
+  // shared_ptr keeps the store alive for a lock-free handle that outlives a
+  // close attempt (a successful close implies no live reference).
   FactStoreImpl* store = nullptr;
   std::shared_ptr<SnapshotLease> lease;
+  std::shared_ptr<FactStoreImpl> store_owner;
   const FactStoreImpl::PropertySchemas* schemas = nullptr;
   CommitSeq seq;
   CommitSeq oldest_readable;
-  std::array<std::atomic<uint32_t>, FactStoreImpl::kEpochRefShards> refs;
+  std::atomic<uint32_t> refs{0};
   std::atomic<bool> retired{false};
+  // Set exactly once when the lease and the store shared_ptr are released.
+  std::atomic<bool> reclaimed{false};
+  // Set exactly once by whichever owner takes responsibility for the epoch's
+  // memory (the last reader, or a close that detached it into its graveyard).
+  std::atomic<bool> memory_owned{false};
 };
 
-namespace {
+uint32_t FactStoreImpl::EpochRefs(const SnapshotEpoch* epoch) {
+  return epoch->refs.load(std::memory_order_acquire);
+}
 
-uint32_t SumEpochRefs(const SnapshotEpoch* epoch) {
+uint32_t FactStoreImpl::PinAttemptsTotal() const {
+  // seq_cst: the fence participates in the pin attempt / reclamation protocol
+  // (a pin raises its counter before loading current_epoch_fast, and the
+  // reclaimer reads this total only after it has made the epoch unreachable).
   uint32_t total = 0;
-  for (const auto& ref : epoch->refs) {
-    total += ref.load(std::memory_order_acquire);
+  for (const EpochAttemptCounter& counter : pin_attempts) {
+    total += counter.value.load(std::memory_order_seq_cst);
   }
   return total;
 }
 
-}  // namespace
-
-uint32_t FactStoreImpl::EpochRefs(const SnapshotEpoch* epoch) {
-  return SumEpochRefs(epoch);
-}
-
 bool FactStoreImpl::HasActiveEpochRefsLocked() const {
-  if (current_epoch != nullptr && EpochRefs(current_epoch) != 0) return true;
+  // The current epoch's owner reference is held by the store, so only counts
+  // above it are reader references.
+  if (current_epoch != nullptr && EpochRefs(current_epoch) > 1) return true;
   for (const SnapshotEpoch* epoch : retired_epochs) {
     if (EpochRefs(epoch) != 0) return true;
   }
@@ -580,189 +661,335 @@ bool FactStoreImpl::HasActiveEpochRefsLocked() const {
 
 std::optional<uint64_t> FactStoreImpl::OldestActiveEpochSeqLocked() const {
   std::optional<uint64_t> oldest;
-  const auto consider = [&oldest](const SnapshotEpoch* epoch) {
-    if (epoch == nullptr || EpochRefs(epoch) == 0) return;
+  const auto consider = [&oldest](const SnapshotEpoch* epoch, bool current) {
+    if (epoch == nullptr) return;
+    const uint32_t refs = EpochRefs(epoch);
+    if (current ? refs <= 1 : refs == 0) return;
     if (!oldest.has_value() || epoch->seq.value < *oldest) {
       oldest = epoch->seq.value;
     }
   };
-  consider(current_epoch);
-  for (const SnapshotEpoch* epoch : retired_epochs) consider(epoch);
+  consider(current_epoch, true);
+  for (const SnapshotEpoch* epoch : retired_epochs) consider(epoch, false);
   return oldest;
 }
 
-void FactStoreImpl::ReleaseAllEpochsLocked() {
-  // Teardown deliberately bypasses DestroyEpochLocked: test observers may
-  // already be gone when the store is closed, so they are never fired here.
-  for (SnapshotEpoch* epoch : retired_epochs) {
-    assert(EpochRefs(epoch) == 0);
-    epoch->lease.reset();
-    delete epoch;
-  }
-  retired_epochs.clear();
-  if (current_epoch != nullptr) {
-    assert(EpochRefs(current_epoch) == 0);
-    current_epoch->lease.reset();
-    delete current_epoch;
-    current_epoch = nullptr;
-  }
+void FactStoreImpl::UnlinkEpochLocked(SnapshotEpoch* epoch) {
+  if (current_epoch == epoch) current_epoch = nullptr;
+  const auto found = std::find(retired_epochs.begin(), retired_epochs.end(),
+                               epoch);
+  if (found != retired_epochs.end()) retired_epochs.erase(found);
 }
 
-SnapshotEpoch* FactStoreImpl::FindLiveEpochLocked(uint64_t id) const {
-  if (current_epoch != nullptr && current_epoch->id == id) return current_epoch;
-  for (SnapshotEpoch* epoch : retired_epochs) {
-    if (epoch->id == id) return epoch;
-  }
-  return nullptr;
-}
-
-void FactStoreImpl::DestroyEpochLocked(SnapshotEpoch* epoch) {
-  // Release the RocksDB snapshot before the observer can run or the epoch is
-  // freed; observers must never observe a lease that is still registered.
+void FactStoreImpl::ReleaseEpochPayloadLocked(SnapshotEpoch* epoch,
+                                              bool notify) {
+  bool expected = false;
+  if (!epoch->reclaimed.compare_exchange_strong(expected, true)) return;
+  // Release the RocksDB snapshot before the observer can run; observers must
+  // never observe a lease that is still registered.
   epoch->lease.reset();
-  if (snapshot_epoch_destroyed_observer_for_testing) {
+  epoch->store_owner.reset();
+  if (notify && snapshot_epoch_destroyed_observer_for_testing) {
     snapshot_epoch_destroyed_observer_for_testing();
   }
-  delete epoch;
+}
+
+bool FactStoreImpl::ClaimEpochMemoryLocked(SnapshotEpoch* epoch) {
+  bool expected = false;
+  return epoch->memory_owned.compare_exchange_strong(expected, true);
+}
+
+void FactStoreImpl::FreeDeadEpochsLocked() {
+  for (SnapshotEpoch* epoch : dead_epochs_pending_free) delete epoch;
+  dead_epochs_pending_free.clear();
+  pending_reclaim.store(false, std::memory_order_seq_cst);
+}
+
+void FactStoreImpl::MaybeFreeDeadEpochs() {
+  if (!pending_reclaim.load(std::memory_order_acquire)) return;
+  if (PinAttemptsTotal() != 0) return;
+  std::lock_guard<std::mutex> lock(epoch_mutex);
+  if (PinAttemptsTotal() != 0) return;
+  FreeDeadEpochsLocked();
+}
+
+void FactStoreImpl::ReclaimEpochLocked(SnapshotEpoch* epoch) {
+  // The caller observed the reference count fall to zero, so no reader holds a
+  // reference. A lock-free pin that loaded this epoch before it became
+  // unreachable may still try to increment the count: the DEAD bit makes that
+  // compare-exchange fail, and the epoch's memory is only freed once every pin
+  // attempt has drained (see TryPinCurrentEpochLockFree).
+  uint32_t expected = 0;
+  if (!epoch->refs.compare_exchange_strong(expected, kEpochDeadBit,
+                                           std::memory_order_seq_cst,
+                                           std::memory_order_relaxed)) {
+    // A racing reader re-pinned the retired epoch; its own release reclaims it.
+    return;
+  }
+  UnlinkEpochLocked(epoch);
+  ReleaseEpochPayloadLocked(epoch, /*notify=*/true);
+  if (!ClaimEpochMemoryLocked(epoch)) return;
+  if (PinAttemptsTotal() == 0) {
+    delete epoch;
+    return;
+  }
+  dead_epochs_pending_free.push_back(epoch);
+  // Publish the pending flag before the final check so the attempt that is
+  // still in flight either frees it on exit or is observed by a later check.
+  pending_reclaim.store(true, std::memory_order_seq_cst);
+  if (PinAttemptsTotal() == 0) {
+    FreeDeadEpochsLocked();
+  }
+}
+
+void FactStoreImpl::DropOwnerReferenceLocked(SnapshotEpoch* epoch) {
+  const uint32_t previous =
+      epoch->refs.fetch_sub(1, std::memory_order_acq_rel);
+  assert(previous >= 1 && (previous & kEpochDeadBit) == 0);
+  if (previous == 1) ReclaimEpochLocked(epoch);
 }
 
 void FactStoreImpl::RetireCurrentEpochLocked() {
   SnapshotEpoch* retired = current_epoch;
   if (retired == nullptr) return;
+  // Readers must stop discovering this epoch before its owner reference can be
+  // dropped: publish the cleared fast pointer first. That ordering is what
+  // makes a retired epoch's zero reference count imply "no reader can pin".
+  current_epoch_fast.store(nullptr, std::memory_order_seq_cst);
   current_epoch = nullptr;
   retired->retired.store(true, std::memory_order_release);
-  // The registry is keyed by the epoch's monotonic ID and a releaser never
-  // dereferences the epoch after its last decrement, so a caller may reap this
-  // epoch in the same critical section: a release racing the retirement either
-  // lands before the reap and is accounted for, or finds no live entry by ID
-  // and returns without touching freed memory.
   retired_epochs.push_back(retired);
-}
-
-void FactStoreImpl::ReapRetiredEpochsLocked() {
-  for (auto it = retired_epochs.begin(); it != retired_epochs.end();) {
-    SnapshotEpoch* epoch = *it;
-    if (EpochRefs(epoch) == 0) {
-      it = retired_epochs.erase(it);
-      DestroyEpochLocked(epoch);
-    } else {
-      ++it;
-    }
-  }
+  DropOwnerReferenceLocked(retired);
 }
 
 void FactStoreImpl::PublishVisible(CommitSeq sequence) {
   std::lock_guard<std::mutex> lock(epoch_mutex);
   visible_seq = sequence;
   published_visible_seq.store(sequence.value, std::memory_order_release);
-  // Retire first, then reap. An epoch whose last reader left before this
-  // publish has zero references and must be released by this publish: deferring
-  // it to the next publish would keep its RocksDB snapshot (and the WAL it
-  // pins) alive indefinitely on a commit-idle store. A reader that releases
-  // after the retirement finds the zero-ref epoch and destroys it directly.
+  // Retiring first drops the store's owner reference. If that was the last
+  // reference the epoch is released right here (the immediate-release
+  // contract); otherwise the last reader's release reclaims it.
   if (current_epoch != nullptr && current_epoch->seq.value != sequence.value) {
     RetireCurrentEpochLocked();
   }
-  ReapRetiredEpochsLocked();
 }
 
-FactStoreImpl::~FactStoreImpl() {
-  // The store cannot be destroyed while a StoreSnapshot handle exists (handles
-  // own a shared_ptr to it), so every remaining epoch has a zero reference
-  // count. Observers are not fired here: test lambdas may already be gone by
-  // the time the owning FactStore is torn down. Leases are still released
-  // before the RocksDB handle and column families are destroyed.
-  ReleaseAllEpochsLocked();
-  if (!db) return;
-  if (default_cf != nullptr) db->DestroyColumnFamilyHandle(default_cf);
-  if (facts_cf != nullptr) db->DestroyColumnFamilyHandle(facts_cf);
-  if (meta_cf != nullptr) db->DestroyColumnFamilyHandle(meta_cf);
+SnapshotEpoch* FactStoreImpl::CreateEpochLocked(
+    const std::shared_ptr<FactStoreImpl>& self, CommitSeq seq,
+    CommitSeq oldest_readable) {
+  const rocksdb::Snapshot* raw = db != nullptr ? db->GetSnapshot() : nullptr;
+  if (raw == nullptr) return nullptr;
+  auto epoch = std::make_unique<SnapshotEpoch>();
+  epoch->id = next_epoch_id++;
+  epoch->store = this;
+  epoch->lease = std::make_shared<SnapshotLease>(this, raw);
+  epoch->store_owner = self;
+  epoch->schemas = current_schemas.load(std::memory_order_acquire);
+  epoch->seq = seq;
+  epoch->oldest_readable = oldest_readable;
+  // The returned owner reference: the store's current reference, or the
+  // caller's reference for a one-off epoch.
+  epoch->refs.store(1, std::memory_order_relaxed);
+  return epoch.release();
 }
 
-SnapshotEpoch* FactStoreImpl::PinCurrentEpoch(size_t shard) {
+SnapshotEpoch* FactStoreImpl::PinCurrentEpoch(
+    const std::shared_ptr<FactStoreImpl>& self) {
   std::lock_guard<std::mutex> lock(epoch_mutex);
   // Read the watermark under the epoch lock so a concurrent publish cannot
   // make a stale sequence look like the epoch to cache.
   const CommitSeq current{
       published_visible_seq.load(std::memory_order_acquire)};
   if (current_epoch != nullptr && current_epoch->seq.value == current.value) {
-    current_epoch->Pin(shard);
+    current_epoch->refs.fetch_add(1, std::memory_order_relaxed);
     return current_epoch;
   }
   if (current_epoch != nullptr) {
     // Publishes retire under this lock, so this is only a consistency guard.
-    // Reap here too so the guard can never strand a zero-ref retired epoch.
     RetireCurrentEpochLocked();
-    ReapRetiredEpochsLocked();
   }
-  const rocksdb::Snapshot* raw =
-      db != nullptr ? db->GetSnapshot() : nullptr;
-  if (raw == nullptr) return nullptr;
-  auto epoch = std::make_unique<SnapshotEpoch>();
-  epoch->id = next_epoch_id++;
-  epoch->store = this;
-  epoch->lease = std::make_shared<SnapshotLease>(this, raw);
-  epoch->schemas = current_schemas.load(std::memory_order_acquire);
-  epoch->seq = current;
-  epoch->oldest_readable = CommitSeq{
-      published_oldest_readable_seq.load(std::memory_order_acquire)};
-  SnapshotEpoch* published = epoch.release();
+  SnapshotEpoch* published = CreateEpochLocked(self, current,
+      CommitSeq{published_oldest_readable_seq.load(std::memory_order_acquire)});
+  if (published == nullptr) return nullptr;
   current_epoch = published;
+  current_epoch_fast.store(published, std::memory_order_seq_cst);
   if (snapshot_epoch_created_observer_for_testing) {
     snapshot_epoch_created_observer_for_testing();
   }
-  published->Pin(shard);
+  published->refs.fetch_add(1, std::memory_order_relaxed);  // caller reference
   return published;
 }
 
-SnapshotEpoch* FactStoreImpl::CreateUncachedEpoch(CommitSeq seq,
-                                                  CommitSeq oldest_readable,
-                                                  size_t shard) {
+SnapshotEpoch* FactStoreImpl::CreateUncachedEpoch(
+    const std::shared_ptr<FactStoreImpl>& self, CommitSeq seq,
+    CommitSeq oldest_readable) {
   std::lock_guard<std::mutex> lock(epoch_mutex);
-  const rocksdb::Snapshot* raw =
-      db != nullptr ? db->GetSnapshot() : nullptr;
-  if (raw == nullptr) return nullptr;
-  auto epoch = std::make_unique<SnapshotEpoch>();
-  epoch->id = next_epoch_id++;
-  epoch->store = this;
-  epoch->lease = std::make_shared<SnapshotLease>(this, raw);
-  epoch->schemas = current_schemas.load(std::memory_order_acquire);
-  epoch->seq = seq;
-  epoch->oldest_readable = oldest_readable;
-  // A one-off epoch is never published as current and never pinned again, so
-  // it is retired from birth and destroyed by its single reader's release.
-  epoch->retired.store(true, std::memory_order_release);
-  SnapshotEpoch* uncached = epoch.release();
+  SnapshotEpoch* uncached = CreateEpochLocked(self, seq, oldest_readable);
+  if (uncached == nullptr) return nullptr;
+  // A one-off epoch is never published as current and is never pinned by the
+  // lock-free path; its owner (a reader or the as_of cache) releases it.
+  uncached->retired.store(true, std::memory_order_release);
   retired_epochs.push_back(uncached);
   if (snapshot_epoch_created_observer_for_testing) {
     snapshot_epoch_created_observer_for_testing();
   }
-  uncached->Pin(shard);
   return uncached;
 }
 
-void FactStoreImpl::ReleaseEpochRef(SnapshotEpoch* epoch, size_t shard) {
-  // Reading the identity while this handle's reference is still counted keeps
-  // the epoch alive; after the decrement only the ID is used, never the
-  // pointer, because another reader may destroy the epoch concurrently.
-  const uint64_t id = epoch->id;
+bool FactStoreImpl::TryPinCurrentEpochLockFree(
+    std::shared_ptr<FactStoreImpl>* store_owner, SnapshotEpoch** pinned) {
+  const size_t shard = SnapshotEpochShardIndex();
+  EpochAttemptCounter& attempts = pin_attempts[shard];
+  // Raise the attempt counter before the epoch pointer is loaded and clear it
+  // only after the reference decision is final. A reclaimer that observes a
+  // zero total therefore cannot free an epoch this attempt may still touch.
+  attempts.value.fetch_add(1, std::memory_order_seq_cst);
+  SnapshotEpoch* epoch = nullptr;
+  for (int attempt = 0; attempt < 4 && epoch == nullptr; ++attempt) {
+    if (!accepting_fast.load(std::memory_order_seq_cst)) break;
+    SnapshotEpoch* candidate =
+        current_epoch_fast.load(std::memory_order_seq_cst);
+    if (candidate == nullptr) break;
+    // Validate before incrementing. A publish clears current_epoch_fast before
+    // it can drop the epoch's last owner reference, so a re-read that still
+    // sees the same pointer means the epoch is still pinned-and-alive; a
+    // re-read that observes the retirement makes this attempt touch nothing.
+    if (current_epoch_fast.load(std::memory_order_seq_cst) != candidate) {
+      continue;
+    }
+    uint32_t word = candidate->refs.load(std::memory_order_relaxed);
+    if ((word & kEpochDeadBit) != 0) continue;
+    if (!candidate->refs.compare_exchange_weak(
+            word, word + 1, std::memory_order_seq_cst,
+            std::memory_order_relaxed)) {
+      continue;
+    }
+    // The reference now protects the epoch from reclamation.
+    if (current_epoch_fast.load(std::memory_order_seq_cst) != candidate) {
+      // Retired between validation and increment: drop it and try again (or
+      // fall back to the slow path when the retries are exhausted).
+      ReleaseEpochRef(candidate);
+      continue;
+    }
+    epoch = candidate;
+  }
+  if (epoch != nullptr) {
+    // Safe: the pinned reference keeps the epoch and its store owner alive.
+    *store_owner = epoch->store_owner;
+    *pinned = epoch;
+  }
+  attempts.value.fetch_sub(1, std::memory_order_seq_cst);
+  if (pending_reclaim.load(std::memory_order_acquire)) {
+    MaybeFreeDeadEpochs();
+  }
+  return epoch != nullptr;
+}
+
+void FactStoreImpl::ReleaseEpochRef(SnapshotEpoch* epoch) {
+  if (epoch == nullptr) return;
+  // The caller holds a reference, so the epoch cannot be freed concurrently:
+  // every reclamation path starts from the same zero-count transition and only
+  // the thread that observes the final decrement proceeds.
   const uint32_t previous =
-      epoch->refs[shard % kEpochRefShards].fetch_sub(
-          1, std::memory_order_acq_rel);
-  assert(previous > 0);
+      epoch->refs.fetch_sub(1, std::memory_order_acq_rel);
+  assert(previous >= 1 && (previous & kEpochDeadBit) == 0);
   if (previous != 1) return;
   std::lock_guard<std::mutex> lock(epoch_mutex);
-  SnapshotEpoch* live = FindLiveEpochLocked(id);
-  if (live == nullptr) return;  // another releaser already destroyed it
-  if (!live->retired.load(std::memory_order_acquire)) {
-    // Still current: the publish that retires it reaps it if no reader is
-    // left, otherwise a later release takes the path below.
-    return;
+  ReclaimEpochLocked(epoch);
+}
+
+void FactStoreImpl::CloseEpochsLocked() {
+  // Called by a successful close: no lock-free pin attempt is in flight and no
+  // registered epoch has a reader reference (the current epoch keeps only the
+  // store's owner reference). Epoch memory is deliberately not freed here: a
+  // last-reader release that raced this close may still hold the pointer, so it
+  // is handed to the close graveyard and freed with the store.
+  for (SnapshotEpoch* epoch : retired_epochs) {
+    assert(EpochRefs(epoch) == 0);
+    epoch->refs.store(kEpochDeadBit, std::memory_order_seq_cst);
+    ReleaseEpochPayloadLocked(epoch, /*notify=*/false);
+    if (ClaimEpochMemoryLocked(epoch)) close_graveyard.push_back(epoch);
   }
-  if (EpochRefs(live) != 0) return;
-  auto found = std::find(retired_epochs.begin(), retired_epochs.end(), live);
-  if (found != retired_epochs.end()) retired_epochs.erase(found);
-  DestroyEpochLocked(live);
+  retired_epochs.clear();
+  if (current_epoch != nullptr) {
+    assert(EpochRefs(current_epoch) <= 1);
+    current_epoch_fast.store(nullptr, std::memory_order_seq_cst);
+    current_epoch->refs.store(kEpochDeadBit, std::memory_order_seq_cst);
+    ReleaseEpochPayloadLocked(current_epoch, /*notify=*/false);
+    if (ClaimEpochMemoryLocked(current_epoch)) {
+      close_graveyard.push_back(current_epoch);
+    }
+    current_epoch = nullptr;
+  }
+}
+
+void FactStoreImpl::DestroyEpochsLocked() {
+  // Exclusive ownership (store destruction): every remaining reference is the
+  // store's own, and no other thread may touch the cache or registry. Observers
+  // are not fired here (teardown contract).
+  for (AsOfCacheEntry& entry : as_of_cache) {
+    if (entry.epoch == nullptr) continue;
+    const uint32_t previous =
+        entry.epoch->refs.fetch_sub(1, std::memory_order_acq_rel);
+    assert(previous >= 1 && (previous & kEpochDeadBit) == 0);
+    entry.epoch = nullptr;
+    entry.seq = CommitSeq{};
+  }
+  for (SnapshotEpoch* epoch : close_graveyard) delete epoch;
+  close_graveyard.clear();
+  for (SnapshotEpoch* epoch : dead_epochs_pending_free) delete epoch;
+  dead_epochs_pending_free.clear();
+  for (SnapshotEpoch* epoch : retired_epochs) {
+    assert(EpochRefs(epoch) == 0);
+    epoch->refs.store(kEpochDeadBit, std::memory_order_seq_cst);
+    ReleaseEpochPayloadLocked(epoch, /*notify=*/false);
+    delete epoch;
+  }
+  retired_epochs.clear();
+  if (current_epoch != nullptr) {
+    assert(EpochRefs(current_epoch) <= 1);
+    current_epoch->refs.store(kEpochDeadBit, std::memory_order_seq_cst);
+    ReleaseEpochPayloadLocked(current_epoch, /*notify=*/false);
+    delete current_epoch;
+    current_epoch = nullptr;
+  }
+  current_epoch_fast.store(nullptr, std::memory_order_seq_cst);
+  pending_reclaim.store(false, std::memory_order_relaxed);
+}
+
+FactStoreImpl::~FactStoreImpl() {
+  // The store cannot be destroyed while a StoreSnapshot handle exists (handles
+  // own a shared_ptr to it), so every remaining epoch has at most the store's
+  // own reference. Observers are not fired here: test lambdas may already be
+  // gone by the time the owning FactStore is torn down.
+  {
+    std::lock_guard<std::mutex> lock(epoch_mutex);
+    DestroyEpochsLocked();
+  }
+  DestroyDatabaseHandles();
+}
+
+void FactStoreImpl::DestroyDatabaseHandles() {
+  if (!db) return;
+  if (default_cf != nullptr) db->DestroyColumnFamilyHandle(default_cf);
+  if (facts_cf != nullptr) db->DestroyColumnFamilyHandle(facts_cf);
+  if (meta_cf != nullptr) db->DestroyColumnFamilyHandle(meta_cf);
+  default_cf = nullptr;
+  facts_cf = nullptr;
+  meta_cf = nullptr;
+  db.reset();
+}
+
+void FactStoreImpl::ClearAsOfCache() {
+  std::lock_guard<std::mutex> cache_lock(as_of_cache_mutex);
+  std::vector<SnapshotEpoch*> released;
+  for (AsOfCacheEntry& entry : as_of_cache) {
+    if (entry.epoch == nullptr) continue;
+    released.push_back(entry.epoch);
+    entry.epoch = nullptr;
+    entry.seq = CommitSeq{};
+  }
+  for (SnapshotEpoch* epoch : released) ReleaseEpochRef(epoch);
 }
 
 namespace {
@@ -1467,31 +1694,16 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   return Status::OK();
 }
 
-// Epoch references use 32 shards so the last-reader decrement (Task 2) does not
-// bounce one cache line across every worker. Pin a stable shard per thread.
-size_t SnapshotEpochShardIndex() {
-  static std::atomic<size_t> next{0};
-  thread_local const size_t index =
-      next.fetch_add(1, std::memory_order_relaxed) %
-      FactStoreImpl::kEpochRefShards;
-  return index;
-}
-
 StoreSnapshot::StoreSnapshot(std::shared_ptr<FactStoreImpl> store,
-                             const FactStore* owner, SnapshotEpoch* epoch,
-                             size_t epoch_shard)
-    : store_(std::move(store)),
-      owner_(owner),
-      epoch_(epoch),
-      epoch_shard_(epoch_shard) {}
+                             const FactStore* owner, SnapshotEpoch* epoch)
+    : store_(std::move(store)), owner_(owner), epoch_(epoch) {}
 
 StoreSnapshot::~StoreSnapshot() { Release(); }
 
 StoreSnapshot::StoreSnapshot(StoreSnapshot&& other) noexcept
     : store_(std::move(other.store_)),
       owner_(other.owner_),
-      epoch_(other.epoch_),
-      epoch_shard_(other.epoch_shard_) {
+      epoch_(other.epoch_) {
   other.owner_ = nullptr;
   other.epoch_ = nullptr;
 }
@@ -1502,7 +1714,6 @@ StoreSnapshot& StoreSnapshot::operator=(StoreSnapshot&& other) noexcept {
     store_ = std::move(other.store_);
     owner_ = other.owner_;
     epoch_ = other.epoch_;
-    epoch_shard_ = other.epoch_shard_;
     other.owner_ = nullptr;
     other.epoch_ = nullptr;
   }
@@ -1512,10 +1723,10 @@ StoreSnapshot& StoreSnapshot::operator=(StoreSnapshot&& other) noexcept {
 void StoreSnapshot::Release() {
   if (epoch_ == nullptr) return;
   if (store_) {
-    // This may destroy the epoch (and release its lease) when the handle was
-    // the last reader of a retired epoch. The store's epoch reference count is
-    // the only liveness registry: Close and Vacuum read it directly.
-    store_->ReleaseEpochRef(epoch_, epoch_shard_);
+    // This may reclaim the epoch (and release its lease) when the handle was
+    // the last reader of a retired epoch. The epoch reference count is the only
+    // liveness registry: Close and Vacuum read it directly.
+    store_->ReleaseEpochRef(epoch_);
   }
   epoch_ = nullptr;
   owner_ = nullptr;
@@ -1913,6 +2124,7 @@ Status FactStore::Open() {
     }
   }
   impl_ = std::move(store);
+  fast_impl_.store(impl_.get(), std::memory_order_seq_cst);
   return Status::OK();
 }
 
@@ -1921,6 +2133,7 @@ Status FactStore::Close() {
   if (!impl_) return Status::OK();
   auto store = impl_;
   store->accepting_snapshots.store(false, std::memory_order_release);
+  store->accepting_fast.store(false, std::memory_order_seq_cst);
   // Wait only for opens that already registered themselves as in flight (see
   // BeginSnapshot, which increments under lifecycle_mutex_): their remaining
   // work is one RocksDB GetSnapshot plus registry insertion under epoch_mutex,
@@ -1930,11 +2143,18 @@ Status FactStore::Close() {
   while (store->snapshot_opens_in_flight.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
+  // Drain lock-free pin attempts that already passed the accepting_fast gate.
+  // Such an attempt either finishes here (and is then accounted as a live
+  // reference below) or falls back to the slow path this close serializes with.
+  while (store->PinAttemptsTotal() != 0) {
+    std::this_thread::yield();
+  }
   bool pinned = false;
   {
     // Serialize with a publisher so no visible-sequence advance retires or
-    // reaps an epoch between the reference test and the teardown.
+    // reclaims an epoch between the reference test and the teardown.
     std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
+    store->ClearAsOfCache();
     {
       std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
       pinned = store->HasActiveEpochRefsLocked();
@@ -1942,13 +2162,23 @@ Status FactStore::Close() {
         // Release the current/retired epoch leases before the store is closed.
         // A successful close implies zero live references; teardown does not
         // fire the destroyed observer, as documented in fact_store.h.
-        store->ReleaseAllEpochsLocked();
+        store->CloseEpochsLocked();
       }
     }
-    if (!pinned) impl_.reset();
+    if (!pinned) {
+      // Destroy RocksDB resources, but keep the inert store object alive for a
+      // lock-free pin that loaded it before the gate was cleared. The retained
+      // shell also owns the epoch graveyard, so such a pin can never touch
+      // freed memory even though it is guaranteed to fail.
+      store->DestroyDatabaseHandles();
+      fast_impl_.store(nullptr, std::memory_order_seq_cst);
+      retained_impls_.push_back(std::move(store));
+      impl_.reset();
+    }
   }
   if (pinned) {
     // Semantics unchanged: a failed close leaves the store open and usable.
+    store->accepting_fast.store(true, std::memory_order_seq_cst);
     store->accepting_snapshots.store(true, std::memory_order_release);
     return Status::SnapshotPinned("fact store", "active snapshots prevent close");
   }
@@ -2026,12 +2256,11 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
     return Status::InvalidArgument("snapshot", "sequence exceeds visible watermark");
   }
   SnapshotEpoch* epoch = nullptr;
-  const size_t epoch_shard = SnapshotEpochShardIndex();
   if (!options.as_of.has_value() && selected.value == visible.value) {
     // Every reader at the current visible sequence shares one epoch (and one
     // RocksDB snapshot). A cache hit only pins a reference; the created
     // observer fires once when the epoch is first constructed.
-    epoch = store->PinCurrentEpoch(epoch_shard);
+    epoch = store->PinCurrentEpoch(store);
     if (epoch == nullptr) {
       leave_open();
       return Status::IOError("snapshot", "RocksDB refused snapshot");
@@ -2039,7 +2268,7 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
   } else {
     // Historical as_of reads use a one-off, uncached epoch: they must never
     // share the current epoch's lease.
-    epoch = store->CreateUncachedEpoch(selected, oldest, epoch_shard);
+    epoch = store->CreateUncachedEpoch(store, selected, oldest);
     if (epoch == nullptr) {
       leave_open();
       return Status::IOError("snapshot", "RocksDB refused snapshot");
@@ -2048,7 +2277,159 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
   // The epoch reference is the only liveness registry read by Vacuum/Close:
   // it was pinned under epoch_mutex before this open is reported finished.
   leave_open();
-  return StoreSnapshot(std::move(store), this, epoch, epoch_shard);
+  return StoreSnapshot(std::move(store), this, epoch);
+}
+
+StatusOr<StoreSnapshot> FactStore::BeginCurrentSnapshot() const {
+  FactStoreImpl* store = fast_impl_.load(std::memory_order_seq_cst);
+  if (store != nullptr) {
+    std::shared_ptr<FactStoreImpl> owner;
+    SnapshotEpoch* epoch = nullptr;
+    if (store->TryPinCurrentEpochLockFree(&owner, &epoch)) {
+      return StoreSnapshot(std::move(owner), this, epoch);
+    }
+  }
+  // Cold cases only: no current epoch yet, a retire/close race, or a closed
+  // store. The slow path registers the open with the close handshake.
+  return BeginSnapshot();
+}
+
+StatusOr<StoreSnapshot> FactStore::BeginCurrentSnapshotAt(
+    CommitSeq sequence) const {
+  FactStoreImpl* store = fast_impl_.load(std::memory_order_seq_cst);
+  if (store != nullptr) {
+    const CommitSeq visible{store->published_visible_seq.load(
+        std::memory_order_acquire)};
+    const CommitSeq oldest{store->published_oldest_readable_seq.load(
+        std::memory_order_acquire)};
+    if (sequence.value < oldest.value) {
+      return Status::SnapshotExpired("snapshot",
+                                     "sequence is below retention boundary");
+    }
+    if (sequence.value > visible.value) {
+      return Status::InvalidArgument("snapshot",
+                                     "sequence exceeds visible watermark");
+    }
+    if (sequence.value == visible.value) {
+      // The latest vintage is the same lock-free current-epoch pin.
+      return BeginCurrentSnapshot();
+    }
+    // Historical vintage: use the bounded per-sequence epoch cache. The cache
+    // mutex keeps the entry's owner reference alive while it is pinned.
+    {
+      std::lock_guard<std::mutex> cache_lock(store->as_of_cache_mutex);
+      for (const FactStoreImpl::AsOfCacheEntry& entry : store->as_of_cache) {
+        if (entry.epoch == nullptr || entry.seq.value != sequence.value) {
+          continue;
+        }
+        entry.epoch->refs.fetch_add(1, std::memory_order_relaxed);
+        std::shared_ptr<FactStoreImpl> owner = entry.epoch->store_owner;
+        return StoreSnapshot(std::move(owner), this, entry.epoch);
+      }
+    }
+  }
+  return BeginSnapshotAtCached(sequence);
+}
+
+StatusOr<StoreSnapshot> FactStore::BeginSnapshotAtCached(
+    CommitSeq sequence) const {
+  std::shared_ptr<FactStoreImpl> store;
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    store = impl_;
+    if (!store) return Status::InvalidArgument("fact store", "store is not open");
+    store->snapshot_opens_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    if (!store->accepting_snapshots.load(std::memory_order_acquire)) {
+      store->snapshot_opens_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+      return Status::ShutdownInProgress("snapshot", "fact store is closing");
+    }
+  }
+  if (options_.snapshot_open_observer_for_testing) {
+    options_.snapshot_open_observer_for_testing();
+  }
+  FactStoreImpl* raw_store = store.get();
+  const auto leave_open = [raw_store] {
+    raw_store->snapshot_opens_in_flight.fetch_sub(
+        1, std::memory_order_acq_rel);
+  };
+  const CommitSeq visible{store->published_visible_seq.load(
+      std::memory_order_acquire)};
+  const CommitSeq oldest{store->published_oldest_readable_seq.load(
+      std::memory_order_acquire)};
+  if (sequence.value < oldest.value) {
+    leave_open();
+    return Status::SnapshotExpired("snapshot",
+                                   "sequence is below retention boundary");
+  }
+  if (sequence.value > visible.value) {
+    leave_open();
+    return Status::InvalidArgument("snapshot",
+                                   "sequence exceeds visible watermark");
+  }
+  if (sequence.value == visible.value) {
+    SnapshotEpoch* epoch = store->PinCurrentEpoch(store);
+    leave_open();
+    if (epoch == nullptr) {
+      return Status::IOError("snapshot", "RocksDB refused snapshot");
+    }
+    return StoreSnapshot(std::move(store), this, epoch);
+  }
+  SnapshotEpoch* created = store->CreateUncachedEpoch(store, sequence, oldest);
+  leave_open();
+  if (created == nullptr) {
+    return Status::IOError("snapshot", "RocksDB refused snapshot");
+  }
+  // Insert into the bounded cache. The created epoch owns the insertion
+  // reference; a concurrent miss for the same sequence may have won, in which
+  // case the winner's epoch is reused and ours is released.
+  SnapshotEpoch* chosen = created;
+  SnapshotEpoch* released = nullptr;
+  std::shared_ptr<FactStoreImpl> owner;
+  {
+    std::lock_guard<std::mutex> cache_lock(store->as_of_cache_mutex);
+    bool inserted = false;
+    for (const FactStoreImpl::AsOfCacheEntry& entry : store->as_of_cache) {
+      if (entry.epoch != nullptr && entry.seq.value == sequence.value) {
+        chosen = entry.epoch;
+        break;
+      }
+    }
+    if (chosen == created) {
+      size_t slot = store->as_of_cache.size();
+      for (size_t index = 0; index < store->as_of_cache.size(); ++index) {
+        if (store->as_of_cache[index].epoch == nullptr) {
+          slot = index;
+          break;
+        }
+      }
+      if (slot == store->as_of_cache.size()) {
+        slot = 0;
+        for (size_t index = 1; index < store->as_of_cache.size(); ++index) {
+          if (store->as_of_cache[index].seq.value <
+              store->as_of_cache[slot].seq.value) {
+            slot = index;
+          }
+        }
+        released = store->as_of_cache[slot].epoch;
+      }
+      store->as_of_cache[slot] =
+          FactStoreImpl::AsOfCacheEntry{sequence, created};
+      inserted = true;
+    }
+    if (!inserted) {
+      // A concurrent miss for the same sequence won the insertion; drop the
+      // reference we created for the cache and use the winner's epoch.
+      released = created;
+    }
+    // Pin the chosen epoch and copy its store owner before releasing the cache
+    // mutex: the entry reference keeps it alive while we pin.
+    chosen->refs.fetch_add(1, std::memory_order_relaxed);
+    owner = chosen->store_owner;
+  }
+  if (released != nullptr && released != chosen) {
+    store->ReleaseEpochRef(released);
+  }
+  return StoreSnapshot(std::move(owner), this, chosen);
 }
 
 StatusOr<std::optional<FactEvent>> FactStore::Read(
@@ -2087,6 +2468,20 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
   }
   if (!iterator->status().ok()) return FromRocksDb(iterator->status(), "iterate fact read");
   return std::optional<FactEvent>{};
+}
+
+StatusOr<std::optional<FactEvent>> FactStore::ReadCurrent(
+    const FactRef& ref, ValidTime valid_time) const {
+  const auto snapshot = BeginCurrentSnapshot();
+  if (!snapshot.ok()) return snapshot.status();
+  return Read(snapshot.ValueOrDie(), ref, valid_time);
+}
+
+StatusOr<std::optional<FactEvent>> FactStore::ReadCurrentAt(
+    CommitSeq sequence, const FactRef& ref, ValidTime valid_time) const {
+  const auto snapshot = BeginCurrentSnapshotAt(sequence);
+  if (!snapshot.ok()) return snapshot.status();
+  return Read(snapshot.ValueOrDie(), ref, valid_time);
 }
 
 StatusOr<TemporalNeighborhood> FactStore::ReadTemporalNeighborhood(
@@ -4144,6 +4539,10 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
     return Status::InvalidArgument("vacuum", "target is outside readable range");
   }
   if (oldest_readable == store->oldest_readable_seq) return Status::OK();
+  // Cached historical epochs hold references that would otherwise pin the
+  // retention boundary forever. Evict them first; readers still inside a cached
+  // as_of read keep their own reference and are visible to the scan below.
+  store->ClearAsOfCache();
   // The retention boundary is the smallest sequence among epochs that still
   // have a live reader reference. The epoch registry (current + retired,
   // including one-off as_of epochs) is the active list: pins, creation, and

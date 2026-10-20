@@ -385,6 +385,16 @@ class Database {
   // valid_time.
   StatusOr<std::optional<Value>> GetPointAt(FactRef ref,
                                             ValidTime valid_time) const;
+  // Reads one fact point at an explicit historical commit sequence (the as_of
+  // vintage) without materializing a Snapshot object. The sequence must be
+  // within the readable range: a sequence below the durable retention boundary
+  // reports SnapshotExpired and one above the visible watermark reports
+  // InvalidArgument, exactly like BeginSnapshot(SnapshotOptions{as_of}) followed
+  // by Snapshot::Get. Every property fact - including edge-property endpoint
+  // visibility at valid_time - resolves through the same shared point-read path
+  // as GetPointAt; only the pinned commit sequence differs.
+  StatusOr<std::optional<Value>> GetPointAtAt(CommitSeq sequence, FactRef ref,
+                                              ValidTime valid_time) const;
   StatusOr<PreparedQuery> PrepareQuery(const Query& query) const;
   StatusOr<QueryMaintenanceHandle> RefreshQueryStatistics();
   // Builds a snapshot-bound typed property index in the derived-read lane.

@@ -2136,12 +2136,30 @@ StatusOr<std::optional<Value>> Database::GetPointAt(FactRef ref,
   if (impl_->closing) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
-  // The epoch handle is scoped to this call: BeginSnapshot pins the latest
-  // visible sequence and the handle releases it when this function returns, so
-  // a concurrent commit is observed by the next call. The read itself goes
-  // through the exact helper Snapshot::Get uses, so metric accounting and edge
-  // endpoint visibility filtering cannot diverge from the snapshot API.
-  auto snapshot = impl_->store.BeginSnapshot();
+  // The current-epoch pin is lock-free on the hot path: it takes no lifecycle or
+  // epoch mutex, so concurrent commits do not serialize point reads. The epoch
+  // handle is scoped to this call and releases its reference when the function
+  // returns, so a concurrent commit is observed by the next call. The read
+  // itself goes through the exact helper Snapshot::Get uses, so metric
+  // accounting and edge endpoint visibility filtering cannot diverge.
+  auto snapshot = impl_->store.BeginCurrentSnapshot();
+  if (!snapshot.ok()) return snapshot.status();
+  return ReadPropertyPointAt(impl_->store, snapshot.ValueOrDie(), ref,
+                             valid_time);
+}
+
+StatusOr<std::optional<Value>> Database::GetPointAtAt(CommitSeq sequence,
+                                                      FactRef ref,
+                                                      ValidTime valid_time) const {
+  if (!impl_) return Status::InvalidArgument("database", "moved-from database");
+  if (impl_->closed.load(std::memory_order_acquire)) {
+    return Status::InvalidArgument("database", "database is closed");
+  }
+  if (impl_->closing) {
+    return Status::ShutdownInProgress("database", "database close is in progress");
+  }
+  // Same shared point-read helper as GetPointAt, pinned at the requested seq.
+  auto snapshot = impl_->store.BeginCurrentSnapshotAt(sequence);
   if (!snapshot.ok()) return snapshot.status();
   return ReadPropertyPointAt(impl_->store, snapshot.ValueOrDie(), ref,
                              valid_time);

@@ -393,22 +393,20 @@ class StoreSnapshot {
 
  private:
   explicit StoreSnapshot(std::shared_ptr<FactStoreImpl> store,
-                         const FactStore* owner, SnapshotEpoch* epoch,
-                         size_t epoch_shard);
+                         const FactStore* owner, SnapshotEpoch* epoch);
 
-  // Drops the one epoch reference held by this handle. The store's epoch
-  // registry is the liveness source of truth for Close and Vacuum; there is no
+  // Drops the one epoch reference held by this handle. The epoch reference
+  // count is the liveness source of truth for Close and Vacuum; there is no
   // per-request bookkeeping to unregister. Safe to call only once.
   void Release();
 
   // The epoch outlives every read because it owns a RocksDB snapshot lease
-  // and only the last released reference destroys it. The shared_ptr keeps the
+  // and only the last released reference reclaims it. The shared_ptr keeps the
   // owning store (and therefore that registry) alive without a cycle, since
   // SnapshotEpoch holds a raw store back-pointer instead.
   std::shared_ptr<FactStoreImpl> store_;
   const FactStore* owner_ = nullptr;
   SnapshotEpoch* epoch_ = nullptr;
-  size_t epoch_shard_ = 0;
 
   friend class FactStore;
 };
@@ -447,6 +445,27 @@ class FactStore {
   // handles or file-format details across the Cedar storage boundary.
   Status CreateCheckpoint(const std::string& checkpoint_path) const;
   StatusOr<StoreSnapshot> BeginSnapshot(SnapshotOptions options = {}) const;
+  // Lock-free pin of the latest visible sequence for point reads. Reads no
+  // mutex on the hot path; falls back to BeginSnapshot only when the current
+  // epoch has not been created yet, a publication/retirement raced the pin, or
+  // the store is closing. The returned handle owns one epoch reference and (like
+  // BeginSnapshot) keeps the read pinned until it is destroyed.
+  StatusOr<StoreSnapshot> BeginCurrentSnapshot() const;
+  // Historical as_of pin for point reads (GetPointAtAt). Reads at the exact
+  // commit sequence with a small bounded per-sequence epoch cache (8 entries,
+  // each holding its own reference). Reports SnapshotExpired below the durable
+  // retention boundary and InvalidArgument above the visible watermark, exactly
+  // like BeginSnapshot(options.as_of).
+  StatusOr<StoreSnapshot> BeginCurrentSnapshotAt(CommitSeq sequence) const;
+  // One-shot point reads on top of the lock-free pins above. They return the
+  // storage-level fact event; kernel callers that need metric/edge visibility
+  // semantics use BeginCurrentSnapshot* together with the shared snapshot
+  // helper.
+  StatusOr<std::optional<FactEvent>> ReadCurrent(const FactRef& ref,
+                                                 ValidTime valid_time) const;
+  StatusOr<std::optional<FactEvent>> ReadCurrentAt(CommitSeq sequence,
+                                                   const FactRef& ref,
+                                                   ValidTime valid_time) const;
   StatusOr<std::optional<FactEvent>> Read(const StoreSnapshot& snapshot,
                                           const FactRef& ref,
                                           ValidTime valid_time) const;
@@ -571,6 +590,10 @@ class FactStore {
   StatusOr<ValidationCacheMetrics> SampleValidationCacheMetrics() const;
 
  private:
+  // Slow path of BeginCurrentSnapshotAt for a historical sequence whose epoch
+  // is not cached: acquires the open store through the close handshake, creates
+  // the one-off epoch, and inserts it into the bounded cache.
+  StatusOr<StoreSnapshot> BeginSnapshotAtCached(CommitSeq sequence) const;
   StatusOr<StoreCommitResult> CommitDirect(
       const StoreCommitBatch& batch,
       const std::optional<std::string>& prepared_key = std::nullopt,
@@ -590,6 +613,12 @@ class FactStore {
   FactStoreOptions options_;
   mutable std::mutex lifecycle_mutex_;
   std::shared_ptr<FactStoreImpl> impl_;
+  // Raw publication of impl_ for the lock-free point-read path. The pointer is
+  // stable for the lifetime of this FactStore: a closed store is moved into
+  // retained_impls_ instead of being destroyed, so a pin that raced Close can
+  // still read the gate and fail safely.
+  std::atomic<FactStoreImpl*> fast_impl_{nullptr};
+  std::vector<std::shared_ptr<FactStoreImpl>> retained_impls_;
 };
 
 }  // namespace cedar

@@ -613,5 +613,61 @@ TEST_F(FactStoreCommitTest, ReleasesEpochWhenLastReaderLeftBeforeRetirement) {
   EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
 }
 
+TEST_F(FactStoreCommitTest, LockFreeCurrentAndCachedAsOfReads) {
+  ASSERT_TRUE(store_->Close().ok());
+  std::atomic<int> created{0};
+  FactStoreOptions options;
+  options.path = path_;
+  options.snapshot_epoch_created_observer_for_testing = [&created] {
+    created.fetch_add(1, std::memory_order_relaxed);
+  };
+  store_ = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store_->Open().ok());
+
+  const auto property_put = [](uint64_t valid_from, int64_t value) {
+    return PendingFactMutation{
+        PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{7})
+            .ref(),
+        ValidTime{valid_from}, FactOperation::kPut, 1, Value::Int64(value)};
+  };
+  const FactRef property =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{7})
+          .ref();
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{1}, {VertexPut(7, 10),
+                                              property_put(10, 11)})).ok());
+  ASSERT_TRUE(store_->Commit(Batch(TxnId{2}, {property_put(20, 22)})).ok());
+
+  // Latest vintage through the lock-free current-epoch pin.
+  const auto latest = store_->ReadCurrent(property, ValidTime{25});
+  ASSERT_TRUE(latest.ok()) << latest.status().ToString();
+  ASSERT_TRUE(latest.ValueOrDie().has_value());
+  EXPECT_EQ(latest.ValueOrDie()->commit_seq, CommitSeq{2});
+  EXPECT_EQ(latest.ValueOrDie()->value, std::optional<Value>{Value::Int64(22)});
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 1);
+
+  // Historical vintage through the bounded per-sequence epoch cache.
+  const auto as_of =
+      store_->ReadCurrentAt(CommitSeq{1}, property, ValidTime{25});
+  ASSERT_TRUE(as_of.ok()) << as_of.status().ToString();
+  ASSERT_TRUE(as_of.ValueOrDie().has_value());
+  EXPECT_EQ(as_of.ValueOrDie()->commit_seq, CommitSeq{1});
+  EXPECT_EQ(as_of.ValueOrDie()->value, std::optional<Value>{Value::Int64(11)});
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 2);
+
+  // A second read of the same sequence must reuse the cached epoch.
+  const auto again =
+      store_->ReadCurrentAt(CommitSeq{1}, property, ValidTime{25});
+  ASSERT_TRUE(again.ok()) << again.status().ToString();
+  ASSERT_TRUE(again.ValueOrDie().has_value());
+  EXPECT_EQ(again.ValueOrDie()->value, std::optional<Value>{Value::Int64(11)});
+  EXPECT_EQ(created.load(std::memory_order_relaxed), 2);
+
+  // Bounds match BeginSnapshot(as_of): above the visible watermark is invalid.
+  const auto future = store_->ReadCurrentAt(CommitSeq{3}, property, ValidTime{25});
+  ASSERT_FALSE(future.ok());
+  EXPECT_TRUE(future.status().IsInvalidArgument());
+  EXPECT_TRUE(store_->Close().ok());
+}
+
 }  // namespace
 }  // namespace cedar

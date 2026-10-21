@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "cedar/fact/fact_codec.h"
@@ -10,6 +12,12 @@
 
 namespace cedar {
 namespace {
+
+std::string EncodeStringValueFact(const FactRef& ref, std::string value) {
+  const FactEvent event{ref, ValidTime{10}, CommitSeq{3}, FactOperation::kPut,
+                        2, Value::String(std::move(value))};
+  return EncodeFactValue(event).ConsumeValueOrDie();
+}
 
 std::string Hex(std::string_view bytes) {
   static constexpr char kDigits[] = "0123456789abcdef";
@@ -116,9 +124,8 @@ TEST(FactCodecTest, DecodesBorrowedRecordViews) {
   const FactRef ref =
       PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{9})
           .ref();
-  const FactEvent event{ref, ValidTime{10}, CommitSeq{3},
-                        FactOperation::kPut, 2, Value::String("borrowed")};
-  const std::string encoded = EncodeFactValue(event).ConsumeValueOrDie();
+  // Mutable owner so the test can prove payload independence, not just success.
+  std::string encoded = EncodeStringValueFact(ref, "borrowed");
 
   // The view overloads decode the exact same record without an owning copy.
   const auto decoded =
@@ -130,11 +137,17 @@ TEST(FactCodecTest, DecodesBorrowedRecordViews) {
   EXPECT_EQ(std::get<std::string>(decoded.ValueOrDie().value->data()),
             "borrowed");
 
-  const std::string encoded_key =
-      EncodeFactKey(ref, ValidTime{10}, CommitSeq{3});
-  const auto key =
-      DecodeFactKey(std::string_view(encoded_key.data(), encoded_key.size()));
+  // Overwrite every source byte after decoding: the decoded value must be
+  // independent of the borrowed buffer (the view path copies the payload into the
+  // owning Value).
+  std::fill(encoded.begin(), encoded.end(), '\x5a');
+  EXPECT_EQ(std::get<std::string>(decoded.ValueOrDie().value->data()),
+            "borrowed");
+
+  std::string encoded_key = EncodeFactKey(ref, ValidTime{10}, CommitSeq{3});
+  const auto key = DecodeFactKey(std::string_view(encoded_key));
   ASSERT_TRUE(key.ok()) << key.status().ToString();
+  std::fill(encoded_key.begin(), encoded_key.end(), '\x5a');
   EXPECT_EQ(key.ValueOrDie().ref, ref);
   EXPECT_EQ(key.ValueOrDie().valid_from, ValidTime{10});
   EXPECT_EQ(key.ValueOrDie().commit_seq, CommitSeq{3});
@@ -144,9 +157,7 @@ TEST(FactCodecTest, BorrowedRecordViewRejectsMalformedRecords) {
   const FactRef ref =
       PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{9})
           .ref();
-  const FactEvent event{ref, ValidTime{10}, CommitSeq{3},
-                        FactOperation::kPut, 2, Value::String("cedar")};
-  const std::string encoded = EncodeFactValue(event).ConsumeValueOrDie();
+  const std::string encoded = EncodeStringValueFact(ref, "cedar");
 
   // Truncated header.
   EXPECT_TRUE(DecodeFactValue(ref, ValidTime{10}, CommitSeq{3},

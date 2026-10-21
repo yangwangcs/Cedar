@@ -339,6 +339,76 @@ TEST_F(FactStoreCommitTest, PlanningViewsDecideWithoutOwningBatches) {
   EXPECT_EQ(epoch.ValueOrDie()->committed_count(), 1U);
 }
 
+// F6b review: publication consumes the caller's live request batches, so the
+// writer must verify that they are exactly the batches, in the same order, that
+// the decision was made from -- a matching total size alone is not enough. A
+// same-size permutation must be rejected before the WAL write; otherwise the
+// recent-write index and validation cache would be published under the wrong
+// commit sequences.
+TEST_F(FactStoreCommitTest, RejectsMisorderedDecidedRequestBatches) {
+  StoreCommitBatch first = Batch(TxnId{84}, {VertexPut(804, 10)});
+  StoreCommitBatch second = Batch(TxnId{85}, {VertexPut(805, 20)});
+  first.fresh_transaction_id = true;
+  second.fresh_transaction_id = true;
+  std::vector<StoreCommitGroupRequest> decided{{first, true}, {second, true}};
+
+  const auto epoch = store_->DecideIndependentAppendGroup(CommitSeq{0},
+                                                          CommitSeq{0}, decided);
+  ASSERT_TRUE(epoch.ok()) << epoch.status().ToString();
+  ASSERT_EQ(epoch.ValueOrDie()->committed_count(), 2U);
+
+  std::vector<StoreCommitGroupRequest> permuted{{second, true}, {first, true}};
+  ASSERT_EQ(permuted.size(), decided.size());
+  const auto written = store_->WriteDecidedGroup(
+      epoch.ValueOrDie().get(), permuted, IgnoreWalDurable, nullptr);
+  ASSERT_FALSE(written.ok())
+      << "the writer committed a same-size misordered request batch";
+  EXPECT_TRUE(written.status().IsCorruption()) << written.status().ToString();
+
+  // Rejected before the write: no commit sequence became visible and none was
+  // consumed by the rejected decision.
+  EXPECT_EQ(store_->visible_seq(), CommitSeq{0});
+  StoreCommitBatch follow_up = Batch(TxnId{86}, {VertexPut(806, 40)});
+  follow_up.fresh_transaction_id = true;
+  const auto committed = store_->Commit(follow_up);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().commit_seq, CommitSeq{1});
+}
+
+// Same-size replacement (one planned batch swapped for another with the same
+// shape) is the other way a stale/mismatched request list can reach the writer
+// while keeping the size-only guard satisfied.
+TEST_F(FactStoreCommitTest, RejectsSameSizeReplacedDecidedRequestBatches) {
+  StoreCommitBatch first = Batch(TxnId{87}, {VertexPut(807, 10)});
+  StoreCommitBatch second = Batch(TxnId{88}, {VertexPut(808, 20)});
+  first.fresh_transaction_id = true;
+  second.fresh_transaction_id = true;
+  std::vector<StoreCommitGroupRequest> decided{{first, true}, {second, true}};
+
+  const auto epoch = store_->DecideIndependentAppendGroup(CommitSeq{0},
+                                                          CommitSeq{0}, decided);
+  ASSERT_TRUE(epoch.ok()) << epoch.status().ToString();
+  ASSERT_EQ(epoch.ValueOrDie()->committed_count(), 2U);
+
+  StoreCommitBatch replacement = Batch(TxnId{89}, {VertexPut(809, 30)});
+  replacement.fresh_transaction_id = true;
+  std::vector<StoreCommitGroupRequest> replaced{{first, true},
+                                                 {replacement, true}};
+  ASSERT_EQ(replaced.size(), decided.size());
+  const auto written = store_->WriteDecidedGroup(
+      epoch.ValueOrDie().get(), replaced, IgnoreWalDurable, nullptr);
+  ASSERT_FALSE(written.ok())
+      << "the writer committed a same-size replacement request batch";
+  EXPECT_TRUE(written.status().IsCorruption()) << written.status().ToString();
+
+  EXPECT_EQ(store_->visible_seq(), CommitSeq{0});
+  StoreCommitBatch follow_up = Batch(TxnId{90}, {VertexPut(810, 50)});
+  follow_up.fresh_transaction_id = true;
+  const auto committed = store_->Commit(follow_up);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().commit_seq, CommitSeq{1});
+}
+
 TEST_F(FactStoreCommitTest, PersistsPreparedCommitAcrossReopenThenFinalizesIt) {
   const StoreCommitBatch batch = Batch(TxnId{78}, {VertexPut(8, 11)});
   ASSERT_TRUE(store_->PersistPreparedCommit(batch).ok());

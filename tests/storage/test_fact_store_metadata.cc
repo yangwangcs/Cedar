@@ -607,6 +607,16 @@ TEST_F(FactStoreMetadataTest, ObservedEdgeStateLookupMatchesScanningLookup) {
       snapshot.ValueOrDie(), identity.edge_ref(), mismatched);
   EXPECT_TRUE(rejected.status().IsInvalidArgument())
       << rejected.status().ToString();
+
+  // An observation above the snapshot sequence cannot be the visible edge-state
+  // PUT Read returned (Read filters those out), so the cheap commit-visibility
+  // guard must reject it instead of trusting the caller.
+  FactEvent too_new = *edge_state.ValueOrDie();
+  too_new.commit_seq = CommitSeq{snapshot.ValueOrDie().commit_seq().value + 1};
+  const auto rejected_newer = store_->LookupEdgeIdentity(
+      snapshot.ValueOrDie(), identity.edge_ref(), too_new);
+  EXPECT_TRUE(rejected_newer.status().IsInvalidArgument())
+      << rejected_newer.status().ToString();
 }
 
 TEST_F(FactStoreMetadataTest,

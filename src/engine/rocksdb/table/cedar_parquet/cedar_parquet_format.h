@@ -14,6 +14,12 @@
 #include "rocksdb/status.h"
 #include "table/cedar_parquet/parquet_metadata.h"
 
+namespace ROCKSDB_NAMESPACE {
+
+struct ParsedInternalKey;
+
+}  // namespace ROCKSDB_NAMESPACE
+
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 
 inline constexpr char kCedarParquetFormatVersion[] = "cedar.parquet.facts.v3";
@@ -211,6 +217,13 @@ Status DecodeCedarParquetSortKey(const Slice& sort_key,
 // overload.
 Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
                                  size_t capacity);
+// Same derivation, additionally returning the parsed internal key so a caller
+// that needs both the key bytes and its (user key, sequence, type) fields pays
+// the parse once instead of decoding and then re-parsing the derived key.
+// `parsed->user_key` borrows `internal_key`, so it is valid until the buffer is
+// overwritten. On failure nothing is guaranteed about either output.
+Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
+                                 size_t capacity, ParsedInternalKey* parsed);
 Status EncodeCedarParquetRow(const Slice& internal_key, const Slice& encoded_value,
                              CedarParquetRow* row);
 Status DecodeCedarParquetRow(const CedarParquetRow& row, std::string* internal_key,

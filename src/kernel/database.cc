@@ -2132,7 +2132,21 @@ Status Database::Close() {
   if (impl_->closing) {
     return Status::ShutdownInProgress("database", "database close is in progress");
   }
-  impl_->closing.store(true, std::memory_order_release);
+  // Close-transition publication. Every `closing`/`closed` flip in this function
+  // is a seq_cst store, and BeginCommit registers with a seq_cst fetch_add and
+  // seq_cst loads (transaction.cc). Both sides therefore participate in the one
+  // seq_cst total order S, which is what the no-admit-after-close proof needs:
+  // if a registration is ordered before the drain load in WaitForActiveCommitCalls
+  // (also seq_cst), the drain observes it and waits for EndCommit; otherwise the
+  // registration is ordered after this transition, so its `closing`/`closed`
+  // recheck must observe true. The success tail stores `closed=true` before
+  // `closing=false` so a recheck that reads the final false still fails closed on
+  // `closed`. A release store here would not participate in S: a seq_cst recheck
+  // could miss the transition while the drain load misses the registration,
+  // admitting a commit after Close decided no commit was registered. The same
+  // argument covers the rollback flips below (a failed close reopens admission
+  // only after it has undone its teardown).
+  impl_->closing.store(true, std::memory_order_seq_cst);
   impl_->query_shutdown_stage_mode = std::any_of(
       impl_->active_query_states.begin(), impl_->active_query_states.end(),
       [](const std::shared_ptr<QueryExecutionState>& candidate) {
@@ -2163,7 +2177,7 @@ Status Database::Close() {
   const Status drained = impl_->DrainAppendCommitPipeline();
   if (!drained.ok()) {
     lock.lock();
-    impl_->closing.store(false, std::memory_order_release);
+    impl_->closing.store(false, std::memory_order_seq_cst);
     return drained;
   }
   impl_->ObserveShutdownStage("active_commit_resolution");
@@ -2177,7 +2191,7 @@ Status Database::Close() {
   lock.lock();
   const Status prepared = impl_->store.PrepareClose();
   if (!prepared.ok()) {
-    impl_->closing.store(false, std::memory_order_release);
+    impl_->closing.store(false, std::memory_order_seq_cst);
     lock.unlock();
     return prepared;
   }
@@ -2210,11 +2224,11 @@ Status Database::Close() {
   // completes it instead of deciding it; it cannot report SnapshotPinned.
   const Status closed = impl_->store.FinishClose();
   if (!closed.ok()) {
-    impl_->closing.store(false, std::memory_order_release);
+    impl_->closing.store(false, std::memory_order_seq_cst);
     return closed;
   }
-  impl_->closed.store(true, std::memory_order_release);
-  impl_->closing.store(false, std::memory_order_release);
+  impl_->closed.store(true, std::memory_order_seq_cst);
+  impl_->closing.store(false, std::memory_order_seq_cst);
   return Status::OK();
 }
 

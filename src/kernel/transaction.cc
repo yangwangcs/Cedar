@@ -359,9 +359,12 @@ class Transaction::State {
     // before the closing re-check while Close publishes `closing` (seq_cst)
     // before it observes the counter, so a race resolves one of two ways: Close
     // sees this call and waits for EndCommit, or this call observes the close
-    // transition and withdraws without touching the store. The re-check reads
-    // `closing` before `closed` so the successful-close tail
-    // (`closed=true; closing=false`) is still caught by the `closed` load.
+    // transition and withdraws without touching the store. All `closing`/`closed`
+    // flips are seq_cst stores for exactly this reason: a release store would not
+    // join the seq_cst total order, so this recheck could miss the transition
+    // while the drain load misses the registration. The re-check reads `closing`
+    // before `closed` so the successful-close tail (`closed=true;
+    // closing=false`) is still caught by the `closed` load.
     if (database->closed.load(std::memory_order_seq_cst)) {
       return Status::InvalidArgument("transaction", "database is closed");
     }
@@ -741,12 +744,15 @@ StatusOr<std::unique_ptr<Transaction>> Database::BeginTransaction(
   }
   auto txn_id = impl_->store.AllocateTransactionId();
   if (!txn_id.ok()) return txn_id.status();
-  // A transaction with no as_of is by construction a current-vintage pin, so
-  // use the lock-free current-epoch path directly (same snapshot as
-  // BeginSnapshot() would create, without lifecycle_mutex_/epoch_mutex). The
-  // fast path falls back to the registered BeginSnapshot path internally when
-  // the store is closing or the current epoch has not been created yet, so the
-  // close handshake and error statuses are unchanged.
+  // A transaction with no as_of is a current-vintage pin, so use the lock-free
+  // current-epoch path directly (the same lock-free pin the point-read path
+  // uses, without lifecycle_mutex_/epoch_mutex). It is not necessarily the exact
+  // snapshot BeginSnapshot() would take: during the PublishVisible->retire window
+  // it can pin the still-current pre-publication epoch, which linearizes this
+  // begin before that publication (linearizable begin, no isolation
+  // regression). The fast path falls back to the registered BeginSnapshot path
+  // internally when the store is closing or the current epoch has not been
+  // created yet, so the close handshake and error statuses are unchanged.
   auto snapshot = impl_->store.BeginCurrentSnapshot();
   if (!snapshot.ok()) return snapshot.status();
   return std::unique_ptr<Transaction>(

@@ -366,11 +366,14 @@ class Database::Impl {
   // Commit calls that have registered with the Close drain but have not reached
   // EndCommit yet. Atomic on purpose: the transaction path must not take
   // `mutex` (it is the database-wide lifecycle lock). Registration publishes
-  // the count before it re-checks `closing`, and Close publishes `closing`
-  // before it reads the count, so either Close observes the registration or the
-  // registration observes the close transition and withdraws (see
-  // Transaction::State::BeginCommit). Close waits on this counter with
-  // atomic::wait; EndCommit notifies when it drops to zero.
+  // the count with a seq_cst RMW before it re-checks `closing`, Close publishes
+  // `closing` with a seq_cst store before it reads the count under seq_cst, so
+  // both sides share one seq_cst total order: either Close observes the
+  // registration or the registration observes the close transition and
+  // withdraws (see Transaction::State::BeginCommit and Database::Close). All
+  // `closing`/`closed` transitions are seq_cst stores for this reason. Close
+  // waits on this counter with atomic::wait; EndCommit notifies when it drops
+  // to zero.
   std::atomic<size_t> active_commit_calls{0};
   std::string query_database_path;
   FactStore store;

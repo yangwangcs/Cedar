@@ -455,7 +455,9 @@ class FactStoreImpl {
   std::vector<std::shared_ptr<const PropertySchemas>> retired_schemas;
 
   // Readers on the hot path load a raw pointer; retired schema versions are
-  // kept alive until the store is destroyed so no refcount is touched.
+  // kept alive while the store is open (a successful close drains every epoch
+  // reference before ReleaseRetainedStateForClose drops them), so the hot path
+  // never touches a refcount.
   //
   // A property registration does not advance the visible sequence, so every
   // snapshot epoch opened so far (the current epoch, retired epochs, and the
@@ -804,8 +806,10 @@ struct SnapshotEpoch {
   std::shared_ptr<FactStoreImpl> store_owner;
   // The property catalog this epoch resolves against. Refreshed in place by
   // PublishSchemas for every live epoch because property registration is not
-  // tied to a visible sequence; readers load it with acquire and old catalog
-  // versions stay alive in FactStoreImpl::retired_schemas until destruction.
+  // tied to a visible sequence; readers load it with acquire. Old catalog
+  // versions are retained in FactStoreImpl::retired_schemas while the store is
+  // open; a successful close drains every epoch reference before it releases
+  // them (ReleaseRetainedStateForClose).
   std::atomic<const FactStoreImpl::PropertySchemas*> schemas{nullptr};
   CommitSeq seq;
   // Published durable retention boundary captured when the epoch was created.
@@ -4634,6 +4638,54 @@ StatusOr<StoreCommitResult> FactStore::CommitWithWalCallbackDirect(
 
 namespace {
 
+// Order-sensitive digest of the request descriptors a decision was built from.
+// Publication reads the caller's live batches, so the writer recomputes this
+// from those batches and rejects a mismatch before the WAL write. It hashes only
+// per-request scalar metadata and payload counts (never mutation payloads), so
+// it stays O(requests) with no allocation and no copy of the batches themselves.
+constexpr uint64_t kRequestAlignmentSeed = 0x9e3779b97f4a7c15ULL;
+
+uint64_t MixRequestAlignment(uint64_t digest, uint64_t value) {
+  digest ^= value + 0x9e3779b97f4a7c15ULL + (digest << 6) + (digest >> 2);
+  return digest;
+}
+
+uint64_t RequestAlignmentDigest(const StoreCommitBatch& batch,
+                                bool persist_async_abort) {
+  uint64_t digest = MixRequestAlignment(kRequestAlignmentSeed, 1);
+  digest = MixRequestAlignment(digest, batch.txn_id.value);
+  digest = MixRequestAlignment(digest, persist_async_abort ? 1 : 0);
+  digest = MixRequestAlignment(digest, batch.system_hlc);
+  digest = MixRequestAlignment(digest, batch.mutations.size());
+  digest = MixRequestAlignment(digest, batch.edge_identities.size());
+  digest = MixRequestAlignment(digest,
+                               batch.snapshot_write_dependencies.size());
+  digest = MixRequestAlignment(digest, batch.strict_read_dependencies.size());
+  return digest;
+}
+
+uint64_t RequestAlignmentDigest(
+    const std::vector<StoreCommitGroupRequest>& requests) {
+  uint64_t digest = kRequestAlignmentSeed;
+  for (const StoreCommitGroupRequest& request : requests) {
+    digest = MixRequestAlignment(
+        digest, RequestAlignmentDigest(request.batch,
+                                       request.persist_async_abort));
+  }
+  return digest;
+}
+
+uint64_t RequestAlignmentDigest(
+    const std::vector<StoreCommitGroupRequestView>& requests) {
+  uint64_t digest = kRequestAlignmentSeed;
+  for (const StoreCommitGroupRequestView& request : requests) {
+    digest = MixRequestAlignment(
+        digest, RequestAlignmentDigest(*request.batch,
+                                       request.persist_async_abort));
+  }
+  return digest;
+}
+
 // The caller holds FactStoreImpl::publisher_mutex. This stage has no RocksDB
 // write side effect: it fixes terminal outcomes, assigns Cedar sequences, and
 // constructs the one final WriteBatch before the writer receives it.
@@ -4734,11 +4786,12 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
           validation_finished_at - validation_started_at)
           .count());
   const auto assembly_started_at = validation_finished_at;
+  const uint64_t request_alignment = RequestAlignmentDigest(requests);
   if (committed_count == 0 && !has_durable_terminal) {
     group.assembly_us = 0;
     return internal::DecidedEpoch(
         base_visible_seq, base_visible_seq, 0, false, nullptr,
-        std::move(group));
+        request_alignment, std::move(group));
   }
   if (committed_count != 0) {
     const auto watermark = EncodeWatermark(
@@ -4758,7 +4811,7 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
       base_visible_seq,
       CommitSeq{base_visible_seq.value + committed_count}, committed_count,
       committed_count != 0 || has_durable_terminal, std::move(write_batch),
-      std::move(group));
+      request_alignment, std::move(group));
 }
 
 // The caller holds FactStoreImpl::publisher_mutex. This stage intentionally
@@ -4780,10 +4833,16 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     return Status::Conflict("commit", "decided epoch base is no longer current");
   }
   // Publication below reads the caller's live batches. The decision and the
-  // request list must describe the same transactions, in the same order; this
-  // is checked before the write so a contract violation cannot produce a
-  // durable commit with no publication.
-  if (epoch->group_result().results.size() != requests.size()) {
+  // request list must describe the same transactions, in the same order; a
+  // matching count alone does not prove that (a permutation or a same-size
+  // replacement would publish recent-write/validation entries under the wrong
+  // sequences), so compare the order-sensitive alignment digest the decision
+  // retained. Checked before the write so a contract violation cannot produce a
+  // durable commit with no publication, or the wrong publication.
+  const std::vector<StatusOr<StoreCommitResult>>& decisions =
+      epoch->group_result().results;
+  if (decisions.size() != requests.size() ||
+      epoch->request_alignment() != RequestAlignmentDigest(requests)) {
     return Status::Corruption(
         "commit", "decided epoch requests do not match its decision");
   }
@@ -4833,10 +4892,8 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
   if (epoch->committed_count() != 0) {
     // Publication consumes the caller's live request batches: no per-mutation
     // publication copy is retained across the decision/predecision window. The
-    // result vector is aligned with `requests`; aborted decisions have no
-    // commit sequence and are skipped.
-    const std::vector<StatusOr<StoreCommitResult>>& decisions =
-        epoch->group_result().results;
+    // result vector is aligned with `requests` (verified above); aborted
+    // decisions have no commit sequence and are skipped.
     for (size_t index = 0; index < requests.size(); ++index) {
       if (!decisions[index].ok()) continue;
       const CommitSeq commit_seq = decisions[index].ValueOrDie().commit_seq;
@@ -4988,10 +5045,13 @@ FactStore::DecideIndependentAppendGroup(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - validation_finished_at)
           .count());
+  // All views were validated non-null above; the digest is the writer's
+  // alignment contract for the live batches passed to WriteDecidedGroup.
+  const uint64_t request_alignment = RequestAlignmentDigest(requests);
   return std::make_unique<internal::DecidedEpoch>(
       base_visible_seq,
       CommitSeq{base_visible_seq.value + committed_count}, committed_count,
-      true, std::move(write_batch), std::move(group));
+      true, std::move(write_batch), request_alignment, std::move(group));
 }
 
 Status FactStore::ValidatePredictedGroup(
@@ -5306,11 +5366,14 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
   // the FactStore it was opened from, and every snapshot handle owns an epoch
   // reference. A successful Close requires the epoch registry to have no live
   // references (otherwise it reports SnapshotPinned and rolls back), so a live
-  // snapshot implies the schema catalogs are still retained. Catalogs are only
-  // retired, never freed, until the store itself is destroyed; destruction is
-  // documented to be serialized with users of an outliving handle (~FactStore).
-  // No lifecycle_mutex_ is needed here, which removes the last store-global lock
-  // from first-property resolution on the transaction path.
+  // snapshot implies the schema catalogs are still retained: catalogs are
+  // retired while the store is open and a successful close drains every epoch
+  // reference before ReleaseRetainedStateForClose frees them. A handle that
+  // outlives a force-detach must not be read, and destruction is documented to
+  // be serialized with users of such a handle (~FactStore), so reading
+  // concurrently with that release is a contract violation, not a supported
+  // path. No lifecycle_mutex_ is needed here, which removes the last
+  // store-global lock from first-property resolution on the transaction path.
   if (snapshot.epoch_ == nullptr || snapshot.owner_ != this) {
     return Status::InvalidArgument("property definition",
                                    "snapshot belongs to another store");
@@ -5384,6 +5447,18 @@ StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
       observed_edge_state.operation == FactOperation::kDelete) {
     return Status::InvalidArgument(
         "edge identity", "observed edge state does not match the lookup key");
+  }
+  // Locally re-check the one fact this overload can verify without the scan:
+  // Read never returns an event above the snapshot's commit sequence, so a newer
+  // observation cannot be the visible edge-state PUT. The remaining trust
+  // boundary is deliberate - proving that this event is the version visible at
+  // the caller's valid_time is exactly the edge-state scan this overload exists
+  // to avoid. The caller must pass the event returned by
+  // Read(snapshot, EntityFact::Edge(edge).ref(), valid_time) on this same
+  // snapshot; a caller that cannot promise that must use the scanning overload.
+  if (observed_edge_state.commit_seq.value > snapshot.commit_seq().value) {
+    return Status::InvalidArgument(
+        "edge identity", "observed edge state is newer than the snapshot");
   }
   // Derivation of the scan above: the scanning overload refuses the lookup
   // unless some visible event exists under the edge-state identity prefix.

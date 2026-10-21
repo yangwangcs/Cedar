@@ -127,9 +127,19 @@ Status DecodeCedarParquetSortKey(const Slice& sort_key,
 
 Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
                                  size_t capacity) {
+  ParsedInternalKey parsed;
+  return DecodeCedarParquetSortKey(sort_key, internal_key, capacity, &parsed);
+}
+
+Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
+                                 size_t capacity, ParsedInternalKey* parsed) {
   if (internal_key == nullptr || capacity < kCedarParquetV2SortKeyBytes) {
     return Status::InvalidArgument(
         "Cedar Parquet internal-key buffer is too small");
+  }
+  if (parsed == nullptr) {
+    return Status::InvalidArgument(
+        "Cedar Parquet parsed internal-key output is null");
   }
   if (sort_key.size() != kCedarParquetV2SortKeyBytes ||
       static_cast<uint8_t>(sort_key[0]) != 2) {
@@ -147,10 +157,9 @@ Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
     internal_key[kCedarParquetV2UserKeyBytes + byte] =
         static_cast<char>((packed >> (byte * 8U)) & 0xffU);
   }
-  ParsedInternalKey parsed;
   return ParseInternalKey(
       Slice(internal_key, kCedarParquetV2UserKeyBytes + kInternalKeyFooterBytes),
-      &parsed, false);
+      parsed, false);
 }
 
 Status EncodeCedarParquetRow(const Slice& internal_key, const Slice& encoded_value,

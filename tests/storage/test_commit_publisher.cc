@@ -347,8 +347,10 @@ TEST(DecidedEpochTest, ExposesOneImmutablePrebuiltBatchSubmission) {
   StoreCommittedGroupResult result;
   result.results.emplace_back(StoreCommitResult{CommitSeq{8}, 17});
 
+  // The alignment digest is irrelevant here: this test never calls
+  // WriteDecidedGroup, which is the only verifier of it.
   DecidedEpoch epoch(CommitSeq{7}, CommitSeq{8}, 1, true, std::move(batch),
-                     std::move(result));
+                     0, std::move(result));
 
   EXPECT_EQ(epoch.base_visible_seq(), CommitSeq{7});
   EXPECT_EQ(epoch.visible_seq_target(), CommitSeq{8});
@@ -366,7 +368,7 @@ TEST(DecidedEpochTest, TransfersCommittedResultsWithoutRetainingACopy) {
   result.results.emplace_back(StoreCommitResult{CommitSeq{9}, 18});
 
   DecidedEpoch epoch(CommitSeq{7}, CommitSeq{9}, 2, true, std::move(batch),
-                     std::move(result));
+                     0, std::move(result));
 
   StoreCommittedGroupResult transferred = epoch.TakeGroupResult();
   ASSERT_EQ(transferred.results.size(), 2U);
@@ -382,7 +384,7 @@ TEST(DecidedEpochTest, DoesNotRetainABatchForANonDurableDecision) {
   result.results.emplace_back(Status::Conflict("commit", "rejected"));
 
   DecidedEpoch epoch(CommitSeq{7}, CommitSeq{7}, 0, false, std::move(batch),
-                     std::move(result));
+                     0, std::move(result));
 
   EXPECT_FALSE(epoch.requires_durable_write());
   EXPECT_EQ(epoch.ClaimBatchForWrite(), nullptr);

@@ -775,7 +775,11 @@ class FactStore {
   // skipped and the edge fact is read once. Contract: `observed_edge_state`
   // must be the value returned by `Read(snapshot,
   // EntityFact::Edge(edge).ref(), valid_time)` on the same snapshot; a
-  // mismatched observation is reported as InvalidArgument rather than trusted.
+  // mismatched observation (different fact, a delete, or a commit sequence above
+  // the snapshot) is reported as InvalidArgument rather than trusted. The
+  // overload deliberately does not re-prove valid-time-chain visibility: that
+  // proof is the scan it removes, so the caller remains its sole owner (that
+  // `EdgeVisibleAt` is the only caller is part of the contract).
   StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
       const StoreSnapshot& snapshot, EdgeRef edge,
       const FactEvent& observed_edge_state) const;

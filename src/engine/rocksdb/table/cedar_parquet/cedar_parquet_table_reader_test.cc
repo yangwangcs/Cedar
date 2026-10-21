@@ -229,6 +229,62 @@ TEST(CedarParquetTableReaderTest, IteratesAndSeeksAcrossBoundedRowGroups) {
   EXPECT_EQ(reader->GetTableProperties()->num_entries, keys.size());
 }
 
+TEST(CedarParquetTableReaderTest,
+     SeekOrdersSameUserKeyVersionsByBytewiseSortKey) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  // One user key with four versions in one page. InternalKeyComparator order is
+  // descending sequence, then descending type number (kTypeValue=1 before
+  // kTypeDeletion=0 at the same sequence); the sort-key trailer is the inverted
+  // packed (sequence,type), so its bytewise order must be the same.
+  const std::vector<std::string> keys = {
+      InternalKeyFor(9, 30, kTypeValue), InternalKeyFor(9, 20, kTypeValue),
+      InternalKeyFor(9, 20, kTypeDeletion), InternalKeyFor(9, 10, kTypeValue)};
+  std::vector<std::string> values(keys.size(), StateFactValue());
+  values[2].clear();  // deletion rows carry no encoded value
+  std::vector<std::string> sort_keys;
+  sort_keys.reserve(keys.size());
+  for (const std::string& key : keys) sort_keys.push_back(SortKeyFor(key));
+
+  // Premise of the F7 Seek implementation: bytewise sort-key order equals
+  // InternalKeyComparator order, including versions that differ only by
+  // sequence/type. A one-row-per-page fixture cannot observe this because every
+  // page search is trivial there.
+  for (size_t left = 0; left < keys.size(); ++left) {
+    for (size_t right = 0; right < keys.size(); ++right) {
+      if (left == right) continue;
+      EXPECT_EQ(comparator.Compare(keys[left], keys[right]) < 0,
+                sort_keys[left] < sort_keys[right])
+          << left << " vs " << right;
+    }
+  }
+
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator,
+      /*row_group_max_rows=*/4, /*page_max_rows=*/4);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  reader->ResetPageDecodeCountForTesting();
+  for (size_t index = 0; index < keys.size(); ++index) {
+    iterator->Seek(keys[index]);
+    ASSERT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+    ASSERT_TRUE(iterator->Valid()) << index;
+    EXPECT_EQ(iterator->key().ToString(), keys[index]) << "seek " << index;
+    EXPECT_EQ(iterator->value().ToString(), values[index]) << "value " << index;
+    // The first Seek decodes the single four-row page; every later Seek must
+    // locate its row in that cached page, so the search really is intra-page.
+    EXPECT_EQ(reader->PageDecodeCountForTesting(), 1U) << "seek " << index;
+  }
+  for (size_t index = 0; index < keys.size(); ++index) {
+    iterator->SeekForPrev(keys[index]);
+    ASSERT_TRUE(iterator->Valid()) << index;
+    EXPECT_EQ(iterator->key().ToString(), keys[index]) << "seek-for-prev " << index;
+  }
+}
+
 TEST(CedarParquetTableReaderTest, GetsNewestVisibleVersionAcrossRowGroups) {
   Options options;
   ImmutableOptions immutable_options(options);
@@ -846,16 +902,20 @@ TEST(CedarParquetTableReaderTest, MultiGetReusesCanonicalPages) {
   ImmutableOptions immutable_options(options);
   MutableCFOptions mutable_options(options);
   InternalKeyComparator comparator(BytewiseComparator());
-  const std::vector<std::string> keys = {InternalKeyFor(1, 5), InternalKeyFor(1, 4),
-                                         InternalKeyFor(2, 3), InternalKeyFor(3, 2)};
+  // Two rows per page: request 2 must skip row 0 inside page 0 and derive its
+  // internal key from the cached sort-key column (F7 no longer caches the
+  // internal-key column), and request 3 must reuse the second decoded page.
+  const std::vector<std::string> keys = {InternalKeyFor(1, 5), InternalKeyFor(2, 4),
+                                         InternalKeyFor(3, 3), InternalKeyFor(4, 2)};
   const std::vector<std::string> values = {StateFactValue(), StateFactValue(),
                                            StateFactValue(), StateFactValue()};
   std::unique_ptr<CedarParquetTableReader> reader =
-      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator);
+      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator,
+                   /*row_group_max_rows=*/4, /*page_max_rows=*/2);
   ASSERT_NE(reader, nullptr);
 
-  const std::array<std::string, 3> user_key_bytes = {V2UserKey(1), V2UserKey(1),
-                                                       V2UserKey(2)};
+  const std::array<std::string, 3> user_key_bytes = {V2UserKey(1), V2UserKey(2),
+                                                       V2UserKey(3)};
   const std::array<Slice, 3> user_keys = {Slice(user_key_bytes[0]),
                                           Slice(user_key_bytes[1]),
                                           Slice(user_key_bytes[2])};
@@ -888,6 +948,9 @@ TEST(CedarParquetTableReaderTest, MultiGetReusesCanonicalPages) {
   for (size_t index = 0; index < user_keys.size(); ++index) {
     ASSERT_TRUE(statuses[index].ok()) << statuses[index].ToString();
     EXPECT_EQ(contexts[index].State(), GetContext::kFound);
+    // The page-cache path must return the value of the matching row, not just
+    // report a hit: each request maps to the same-index stored row here.
+    EXPECT_EQ(output_values[index].ToString(), values[index]);
   }
   EXPECT_EQ(reader->PageDecodeCountForTesting(), 2U);
 }

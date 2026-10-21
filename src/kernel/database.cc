@@ -732,7 +732,12 @@ Status Database::Impl::StartAppendCommitPipeline() {
       internal::CommitConflictIndex planned_index;
       uint64_t planned_bytes = 0;
       uint64_t planned_transactions = 0;
-      std::vector<StoreCommitGroupRequest> planned_requests;
+      // Planning views: the decision encodes from the queued batches directly,
+      // so a preflight pass does not copy every candidate batch. The shared_ptr
+      // candidates keep the batches alive for the duration of the decision, and
+      // the decided epoch retains no reference to them (publication consumes the
+      // live request batches at write time).
+      std::vector<StoreCommitGroupRequestView> planned_requests;
       std::vector<std::shared_ptr<AppendCommitRequest>> planned_candidates;
       planned_requests.reserve(maximum);
       planned_candidates.reserve(maximum);
@@ -749,8 +754,8 @@ Status Database::Impl::StartAppendCommitPipeline() {
         if (!planned_index.Insert(footprint)) break;
         planned_bytes += candidate->estimated_bytes;
         ++planned_transactions;
-        planned_requests.push_back(StoreCommitGroupRequest{
-            candidate->batch, candidate->handle != nullptr});
+        planned_requests.push_back(StoreCommitGroupRequestView{
+            &candidate->batch, candidate->handle != nullptr});
         planned_candidates.push_back(candidate);
       }
       std::unique_ptr<internal::DecidedEpoch> predecided;
@@ -1091,8 +1096,11 @@ Status Database::Impl::StartAppendCommitPipeline() {
       }
       StatusOr<StoreCommittedGroupResult> result;
       if (use_predecided) {
-        result = store.WriteDecidedGroup(predecided_epoch.get(), NotifyWalDurable,
-                                         &durability, &wal_sync_critical);
+        // The writer receives the live request batches for publication: the
+        // predecision retains no mutation copies (see FactStore::WriteDecidedGroup).
+        result = store.WriteDecidedGroup(predecided_epoch.get(), store_requests,
+                                         NotifyWalDurable, &durability,
+                                         &wal_sync_critical);
         if (!result.ok() && result.status().IsConflict()) {
           discarded_stale_predecision = true;
           result = store.CommitGroupWithWalCallback(
@@ -1215,25 +1223,27 @@ Status Database::Impl::StartAppendCommitPipeline() {
                 const CommitSeq sequence =
                     requests[index]->result->ValueOrDie().commit_seq;
                 internal::QueryDeltaCommit descriptor(sequence);
-                descriptor.facts.reserve(store_requests[index].batch.mutations.size() +
-                                         store_requests[index].batch.edge_identities.size());
-                for (const PendingFactMutation& mutation :
-                     store_requests[index].batch.mutations) {
+                StoreCommitBatch& batch = store_requests[index].batch;
+                descriptor.facts.reserve(batch.mutations.size() +
+                                         batch.edge_identities.size());
+                // The store write and publication already consumed this batch;
+                // the descriptor owns the values from here on, so move instead of
+                // copying every mutation value (and identity).
+                for (PendingFactMutation& mutation : batch.mutations) {
                   descriptor.facts.push_back(
                       FactEvent{mutation.ref, mutation.valid_from, sequence,
                                 mutation.operation, mutation.schema_epoch,
-                                mutation.value, std::nullopt});
+                                std::move(mutation.value), std::nullopt});
                 }
-                for (const EdgeIdentity& identity :
-                     store_requests[index].batch.edge_identities) {
+                for (EdgeIdentity& identity : batch.edge_identities) {
+                  descriptor.edge_identities.push_back(std::move(identity));
+                  const EdgeIdentity& stored = descriptor.edge_identities.back();
                   const FactRef identity_ref =
-                      FactRef(identity.home_part_id, FactFamily::kEdgeIdentity,
-                              PropertyId{}, identity.edge_id.value);
+                      FactRef(stored.home_part_id, FactFamily::kEdgeIdentity,
+                              PropertyId{}, stored.edge_id.value);
                   descriptor.facts.push_back(
                       FactEvent{identity_ref, ValidTime{0}, sequence,
-                                FactOperation::kPut, 0, std::nullopt,
-                                identity});
-                  descriptor.edge_identities.push_back(identity);
+                                FactOperation::kPut, 0, std::nullopt, stored});
                 }
                 published_delta.push_back(std::move(descriptor));
               }
@@ -2104,6 +2114,17 @@ StatusOr<QueryMaintenanceHandle> Database::RefreshQueryIndexes(ValidTime valid_t
       std::move(state)));
 }
 
+void Database::Impl::WaitForActiveCommitCalls() {
+  if (active_commit_drain_wait_observer_for_testing) {
+    active_commit_drain_wait_observer_for_testing();
+  }
+  size_t active = active_commit_calls.load(std::memory_order_seq_cst);
+  while (active != 0) {
+    active_commit_calls.wait(active, std::memory_order_seq_cst);
+    active = active_commit_calls.load(std::memory_order_seq_cst);
+  }
+}
+
 Status Database::Close() {
   if (!impl_) return Status::OK();
   std::unique_lock<std::mutex> lock(impl_->mutex);
@@ -2128,9 +2149,12 @@ Status Database::Close() {
   }
   lock.lock();
   if (!impl_->stop_pipeline_before_drain_for_testing) {
-    impl_->commits_drained.wait(lock, [this] {
-      return impl_->active_commit_calls == 0;
-    });
+    // Release the lifecycle mutex while waiting: a registered commit does not
+    // take it any more (registration is lock-free), and holding it here would
+    // stall unrelated lifecycle operations for the duration of the commit.
+    lock.unlock();
+    impl_->WaitForActiveCommitCalls();
+    lock.lock();
   }
   lock.unlock();
   if (impl_->stop_pipeline_before_drain_for_testing) {

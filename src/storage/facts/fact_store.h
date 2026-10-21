@@ -115,6 +115,12 @@ struct FactStoreOptions {
   // Sync flag that write will use. Tests pin the durability contract here; it
   // must not call back into FactStore.
   std::function<void(bool)> transaction_lease_write_observer_for_testing;
+  // Fires at the very top of FactStore::PrepareCloseLocked while
+  // lifecycle_mutex_ is held. Tests park it to prove that an operation which no
+  // longer needs the lifecycle lock (for example LookupProperty on a pinned
+  // snapshot) is not serialized behind a concurrent close handshake. Must not
+  // call back into FactStore. Production callers leave it unset.
+  std::function<void()> prepare_close_locked_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {
@@ -348,6 +354,15 @@ struct ValidationCacheMetrics {
 
 struct StoreCommitGroupRequest {
   StoreCommitBatch batch;
+  bool persist_async_abort = false;
+};
+
+// Lightweight non-owning planning view used by the N+1 preflight worker. It is
+// valid only while the owning AppendCommitRequest batches stay alive; the
+// preflight decision is built from these views and the decided epoch retains no
+// reference to them, because publication reads the live batches at write time.
+struct StoreCommitGroupRequestView {
+  const StoreCommitBatch* batch = nullptr;
   bool persist_async_abort = false;
 };
 
@@ -681,7 +696,11 @@ class FactStore {
       WalDurableCallback on_wal_durable, void* callback_context,
       std::atomic<bool>* wal_sync_critical = nullptr);
   // Pipeline-only hand-off. The returned epoch owns a final immutable batch
-  // but has not entered RocksDB; WriteDecidedGroup is its only writer path.
+  // but has not entered RocksDB; WriteDecidedGroup is its only writer path and
+  // must receive the same request batches the epoch was decided from (same
+  // order and size). Publication of the recent-write index and validation
+  // cache reads those live batches at write time, so the epoch retains no
+  // per-mutation publication copy.
   StatusOr<std::unique_ptr<internal::DecidedEpoch>> DecideAndEncodeGroup(
       const std::vector<StoreCommitGroupRequest>& requests);
   // This deliberately narrower operation is safe while a predecessor epoch
@@ -691,13 +710,21 @@ class FactStore {
   DecideIndependentAppendGroup(
       CommitSeq base_visible_seq, CommitSeq required_snapshot_seq,
       const std::vector<StoreCommitGroupRequest>& requests);
+  // Planning-view overload: the caller guarantees every `batch` pointer stays
+  // valid and unmodified until this call returns. Used by the preflight worker
+  // so planning a group does not copy every queued batch.
+  StatusOr<std::unique_ptr<internal::DecidedEpoch>>
+  DecideIndependentAppendGroup(
+      CommitSeq base_visible_seq, CommitSeq required_snapshot_seq,
+      const std::vector<StoreCommitGroupRequestView>& requests);
   // Validates snapshot-write dependencies for a predicted (predecided) group
   // immediately before its write. Returns Conflict when a dependency changed.
   Status ValidatePredictedGroup(
       const std::vector<StoreCommitGroupRequest>& requests) const;
   StatusOr<StoreCommittedGroupResult> WriteDecidedGroup(
-      internal::DecidedEpoch* epoch, WalDurableCallback on_wal_durable,
-      void* callback_context,
+      internal::DecidedEpoch* epoch,
+      const std::vector<StoreCommitGroupRequest>& requests,
+      WalDurableCallback on_wal_durable, void* callback_context,
       std::atomic<bool>* wal_sync_critical = nullptr);
   Status PersistPreparedCommit(const StoreCommitBatch& batch);
   Status PersistPreparedCommits(const std::vector<StoreCommitBatch>& batches);

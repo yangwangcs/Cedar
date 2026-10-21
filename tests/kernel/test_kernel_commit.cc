@@ -12,6 +12,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <limits>
@@ -4796,6 +4797,257 @@ TEST(KernelGroupCommitTest,
   ASSERT_TRUE(completed.ok()) << completed.status().ToString();
   EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
   EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{1});
+  std::filesystem::remove_all(path);
+}
+
+// F6b: the transaction path registers commit calls without taking
+// Database::Impl::mutex. These tests pin the registration protocol against the
+// Close drain: Close must reach its drain wait while a commit is registered
+// (nothing serializes it behind the transaction path), and it may not finish
+// before that registration withdraws or the commit ends.
+class CommitRegistrationGate {
+ public:
+  void Hook() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!armed_) return;
+    armed_ = false;
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [this] { return released_; });
+  }
+
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+    entered_ = false;
+    released_ = false;
+  }
+
+  bool WaitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, timeout, [this] { return entered_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    changed_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool armed_ = false;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+TEST(KernelTransactionCommitPathTest,
+     CloseReachesDrainWhileCommitRegistrationIsParked) {
+  char pattern[] = "/tmp/cedar_kernel_commit_registration_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  CommitRegistrationGate registration;
+  std::mutex drain_mutex;
+  std::condition_variable drain_cv;
+  bool drain_wait_entered = false;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 1,
+      .group_commit_window_us = 0,
+      .transaction_commit_registration_observer_for_testing =
+          [&registration] { registration.Hook(); },
+      .active_commit_drain_wait_observer_for_testing = [&] {
+        {
+          std::lock_guard<std::mutex> lock(drain_mutex);
+          drain_wait_entered = true;
+        }
+        drain_cv.notify_all();
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'720}}),
+                           ValidTime{1})
+                  .ok());
+  registration.Arm();
+  Status commit_status = Status::OK();
+  std::jthread committing([&] {
+    commit_status = transaction.ValueOrDie()->Commit().status();
+  });
+  if (!registration.WaitUntilEntered(std::chrono::seconds(5))) {
+    registration.Release();
+    FAIL() << "the commit never reached the registration boundary";
+  }
+  Status close_status = Status::OK();
+  std::jthread closing([&] { close_status = database->Close(); });
+  bool observed_drain_wait = false;
+  {
+    std::unique_lock<std::mutex> lock(drain_mutex);
+    observed_drain_wait = drain_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+      return drain_wait_entered;
+    });
+  }
+  registration.Release();
+  committing.join();
+  closing.join();
+  ASSERT_TRUE(observed_drain_wait)
+      << "Close could not reach its commit drain while a transaction commit was "
+         "registering; the transaction path still serializes on a global lock";
+  // The commit observed the close transition and withdrew without touching the
+  // store, and EndCommit released the drain.
+  EXPECT_TRUE(commit_status.IsShutdownInProgress()) << commit_status.ToString();
+  // The transaction still owns its snapshot pin, so the first Close may report
+  // SnapshotPinned; after the transaction dies the retry must succeed.
+  if (!close_status.ok()) {
+    EXPECT_TRUE(close_status.IsSnapshotPinned()) << close_status.ToString();
+    transaction.ValueOrDie().reset();
+    EXPECT_TRUE(database->Close().ok());
+  }
+  std::filesystem::remove_all(path);
+}
+
+TEST(KernelTransactionCommitPathTest, CloseWaitsForAdmittedCommitToFinish) {
+  char pattern[] = "/tmp/cedar_kernel_commit_admitted_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  CommitRegistrationGate admitted;
+  std::mutex drain_mutex;
+  std::condition_variable drain_cv;
+  bool drain_wait_entered = false;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 1,
+      .group_commit_window_us = 0,
+      .transaction_commit_admitted_observer_for_testing =
+          [&admitted] { admitted.Hook(); },
+      .active_commit_drain_wait_observer_for_testing = [&] {
+        {
+          std::lock_guard<std::mutex> lock(drain_mutex);
+          drain_wait_entered = true;
+        }
+        drain_cv.notify_all();
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'721}}),
+                           ValidTime{1})
+                  .ok());
+  admitted.Arm();
+  StatusOr<CommitResult> committed = Status::InvalidArgument("test", "not run");
+  std::jthread committing([&] {
+    committed = transaction.ValueOrDie()->Commit();
+  });
+  if (!admitted.WaitUntilEntered(std::chrono::seconds(5))) {
+    admitted.Release();
+    FAIL() << "the commit was never admitted";
+  }
+  Status close_status = Status::OK();
+  std::jthread closing([&] { close_status = database->Close(); });
+  bool observed_drain_wait = false;
+  {
+    std::unique_lock<std::mutex> lock(drain_mutex);
+    observed_drain_wait = drain_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+      return drain_wait_entered;
+    });
+  }
+  admitted.Release();
+  committing.join();
+  closing.join();
+  ASSERT_TRUE(observed_drain_wait)
+      << "Close never reached its commit drain for a registered commit";
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  std::filesystem::remove_all(path);
+}
+
+// F6b: a transaction without as_of is by construction a current-vintage pin, so
+// BeginTransaction must use the lock-free BeginCurrentSnapshot path instead of
+// the registered BeginSnapshot path (which takes lifecycle_mutex_ and
+// epoch_mutex). The registered path fires snapshot_open_observer_for_testing;
+// after the current epoch exists, BeginTransaction must not fire it.
+TEST(KernelTransactionCommitPathTest, BeginTransactionUsesLockFreeCurrentSnapshot) {
+  char pattern[] = "/tmp/cedar_kernel_commit_fast_begin_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::atomic<uint32_t> registered_opens{0};
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .snapshot_open_observer_for_testing = [&registered_opens] {
+        registered_opens.fetch_add(1, std::memory_order_relaxed);
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  // Establish the shared current epoch through one registered open.
+  {
+    auto warm = database->BeginSnapshot();
+    ASSERT_TRUE(warm.ok()) << warm.status().ToString();
+    Snapshot snapshot = std::move(warm).ConsumeValueOrDie();
+    EXPECT_EQ(snapshot.commit_seq(), CommitSeq{0});
+  }
+  ASSERT_GT(registered_opens.load(), 0U);
+  registered_opens.store(0, std::memory_order_relaxed);
+
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  EXPECT_EQ(registered_opens.load(), 0U)
+      << "BeginTransaction still took the registered BeginSnapshot path";
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'722}}),
+                           ValidTime{1})
+                  .ok());
+  const auto committed = transaction.ValueOrDie()->Commit();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+// The fast path falls back to the registered path when the store is closing;
+// the observable contract (a ShutdownInProgress error from BeginTransaction) is
+// unchanged.
+TEST(KernelTransactionCommitPathTest, BeginTransactionReportsCloseInProgress) {
+  char pattern[] = "/tmp/cedar_kernel_commit_close_begin_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex stage_mutex;
+  std::condition_variable stage_cv;
+  bool admission_closed = false;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .shutdown_stage_observer_for_testing = [&](const char* stage) {
+        if (std::strcmp(stage, "queue_admission_closed") != 0) return;
+        {
+          std::lock_guard<std::mutex> lock(stage_mutex);
+          admission_closed = true;
+        }
+        stage_cv.notify_all();
+      }});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  Status close_status = Status::OK();
+  std::jthread closing([&] { close_status = database->Close(); });
+  bool observed = false;
+  {
+    std::unique_lock<std::mutex> lock(stage_mutex);
+    observed = stage_cv.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return admission_closed; });
+  }
+  const auto begun = database->BeginTransaction();
+  closing.join();
+  ASSERT_TRUE(observed) << "Close never published its admission-closed stage";
+  ASSERT_FALSE(begun.ok());
+  EXPECT_TRUE(begun.status().IsShutdownInProgress())
+      << begun.status().ToString();
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
   std::filesystem::remove_all(path);
 }
 

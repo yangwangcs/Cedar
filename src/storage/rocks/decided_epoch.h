@@ -16,21 +16,18 @@ class WriteBatch;
 
 namespace cedar::internal {
 
-// The immutable hand-off from validation/encoding to the single RocksDB
-// writer. It contains no request payload references: after construction the
-// sole mutable operation is claiming its already encoded batch once.
+// The immutable hand-off from validation/encoding to the single RocksDB writer.
+// It contains no request payload references: after construction the sole
+// mutable operation is claiming its already encoded batch once. Publication
+// (recent-write index / validation cache) is intentionally not stored here:
+// the writer receives the caller's live request batches alongside the epoch, so
+// no per-mutation copy has to be retained across the predecision window.
 class DecidedEpoch {
  public:
-  struct PublishedCommit {
-    CommitSeq commit_seq;
-    std::vector<PendingFactMutation> mutations;
-  };
-
   DecidedEpoch(CommitSeq base_visible_seq, CommitSeq visible_seq_target,
                uint64_t committed_count, bool has_durable_terminal,
                std::unique_ptr<rocksdb::WriteBatch> write_batch,
-               StoreCommittedGroupResult group_result,
-               std::vector<PublishedCommit> publications = {});
+               StoreCommittedGroupResult group_result);
   ~DecidedEpoch();
 
   DecidedEpoch(DecidedEpoch&&) noexcept = default;
@@ -43,9 +40,6 @@ class DecidedEpoch {
   uint64_t committed_count() const { return committed_count_; }
   bool requires_durable_write() const { return has_durable_terminal_; }
   const StoreCommittedGroupResult& group_result() const { return group_result_; }
-  const std::vector<PublishedCommit>& publications() const {
-    return publications_;
-  }
 
   const rocksdb::WriteBatch& batch() const;
   std::unique_ptr<rocksdb::WriteBatch> ClaimBatchForWrite();
@@ -58,7 +52,6 @@ class DecidedEpoch {
   bool has_durable_terminal_ = false;
   std::unique_ptr<rocksdb::WriteBatch> write_batch_;
   StoreCommittedGroupResult group_result_;
-  std::vector<PublishedCommit> publications_;
 };
 
 }  // namespace cedar::internal

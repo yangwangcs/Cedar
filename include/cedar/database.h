@@ -280,6 +280,21 @@ struct DatabaseOptions {
   std::function<void()> runtime_snapshot_before_publish_observer_for_testing;
   std::function<void()> runtime_snapshot_published_observer_for_testing;
   std::function<void()> snapshot_open_observer_for_testing;
+  // Test-only ordering hooks for the lock-free transaction commit registration.
+  // `transaction_commit_registration` fires after Transaction::State::BeginCommit
+  // has incremented the active-commit counter and before it re-checks the closing
+  // gate; a test parks there to race a Close transition against the registration
+  // (a correct implementation must let Close reach its drain wait while this
+  // commit is registered). `transaction_commit_admitted` fires after that
+  // re-check accepted the commit, before the caller stages/commits its batch.
+  // Both run on the committing thread, may park, and must not call back into the
+  // database. Production callers leave them unset.
+  std::function<void()> transaction_commit_registration_observer_for_testing;
+  std::function<void()> transaction_commit_admitted_observer_for_testing;
+  // Test-only observer fired by Database::Close immediately before it waits for
+  // registered commit calls to drain. It runs outside Database::Impl::mutex and
+  // must not call back into the database.
+  std::function<void()> active_commit_drain_wait_observer_for_testing;
   std::function<void(uint64_t)> runtime_sampler_interval_observer_for_testing;
   std::function<void()> runtime_sampler_thread_started_observer_for_testing;
   std::function<void(PressureSample*)> runtime_pressure_override_for_testing;

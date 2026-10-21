@@ -15,15 +15,13 @@ DecidedEpoch::DecidedEpoch(CommitSeq base_visible_seq,
                            uint64_t committed_count,
                            bool has_durable_terminal,
                            std::unique_ptr<rocksdb::WriteBatch> write_batch,
-                           StoreCommittedGroupResult group_result,
-                           std::vector<PublishedCommit> publications)
+                           StoreCommittedGroupResult group_result)
     : base_visible_seq_(base_visible_seq),
       visible_seq_target_(visible_seq_target),
       committed_count_(committed_count),
       has_durable_terminal_(has_durable_terminal),
       write_batch_(std::move(write_batch)),
-      group_result_(std::move(group_result)),
-      publications_(std::move(publications)) {
+      group_result_(std::move(group_result)) {
   assert(!has_durable_terminal_ || write_batch_ != nullptr);
   assert(has_durable_terminal_ || committed_count_ == 0);
   assert(committed_count_ == 0 ||

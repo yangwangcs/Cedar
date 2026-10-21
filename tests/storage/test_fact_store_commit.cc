@@ -42,6 +42,8 @@ StoreCommitBatch EdgeBatch(TxnId txn_id, EdgeIdentity identity) {
           {identity}};
 }
 
+void IgnoreWalDurable(void*) noexcept {}
+
 void EraseMetaRecord(const std::string& path, const std::string& key) {
   FactStoreOptions store_options;
   store_options.path = path;
@@ -282,6 +284,59 @@ TEST_F(FactStoreCommitTest,
   ASSERT_FALSE(epoch.ok());
   EXPECT_TRUE(epoch.status().IsInvalidArgument())
       << epoch.status().ToString();
+}
+
+// F6b: the predecision retains no publication copies. The writer receives the
+// caller's live request batches, bounds-checks that they match the decision, and
+// publishes the recent-write index / validation cache from them.
+TEST_F(FactStoreCommitTest,
+       WritesDecidedIndependentGroupAndPublishesCallerBatches) {
+  StoreCommitBatch first = Batch(TxnId{81}, {VertexPut(801, 10)});
+  StoreCommitBatch second = Batch(TxnId{82}, {VertexPut(802, 20)});
+  first.fresh_transaction_id = true;
+  second.fresh_transaction_id = true;
+  std::vector<StoreCommitGroupRequest> requests{{first, true}, {second, true}};
+
+  const auto epoch =
+      store_->DecideIndependentAppendGroup(CommitSeq{0}, CommitSeq{0}, requests);
+  ASSERT_TRUE(epoch.ok()) << epoch.status().ToString();
+  EXPECT_EQ(epoch.ValueOrDie()->committed_count(), 2U);
+  const auto written = store_->WriteDecidedGroup(
+      epoch.ValueOrDie().get(), requests, IgnoreWalDurable, nullptr);
+  ASSERT_TRUE(written.ok()) << written.status().ToString();
+  ASSERT_EQ(written.ValueOrDie().results.size(), 2U);
+  ASSERT_TRUE(written.ValueOrDie().results[0].ok());
+  ASSERT_TRUE(written.ValueOrDie().results[1].ok());
+  EXPECT_EQ(written.ValueOrDie().results[0].ValueOrDie().commit_seq,
+            CommitSeq{1});
+  EXPECT_EQ(written.ValueOrDie().results[1].ValueOrDie().commit_seq,
+            CommitSeq{2});
+
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{2});
+  for (uint64_t vertex_id : {801U, 802U}) {
+    const auto event = store_->Read(
+        snapshot.ValueOrDie(),
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}).ref(),
+        ValidTime{1000});
+    ASSERT_TRUE(event.ok()) << event.status().ToString();
+    ASSERT_TRUE(event.ValueOrDie().has_value());
+  }
+}
+
+// The planning-view overload decides from non-owning batch pointers, which is
+// what lets the N+1 preflight worker avoid copying every queued batch.
+TEST_F(FactStoreCommitTest, PlanningViewsDecideWithoutOwningBatches) {
+  StoreCommitBatch fresh = Batch(TxnId{83}, {VertexPut(803, 30)});
+  fresh.fresh_transaction_id = true;
+  std::vector<StoreCommitGroupRequestView> views{{&fresh, false}};
+
+  const auto epoch =
+      store_->DecideIndependentAppendGroup(CommitSeq{0}, CommitSeq{0}, views);
+  ASSERT_TRUE(epoch.ok()) << epoch.status().ToString();
+  EXPECT_EQ(epoch.ValueOrDie()->visible_seq_target(), CommitSeq{1});
+  EXPECT_EQ(epoch.ValueOrDie()->committed_count(), 1U);
 }
 
 TEST_F(FactStoreCommitTest, PersistsPreparedCommitAcrossReopenThenFinalizesIt) {

@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -604,6 +606,113 @@ TEST_F(FactStoreMetadataTest, RejectsCorruptedAllocatorAndSchemaMetadataOnReopen
   PutMetaRecord(path_, EncodeSchemaMetaKey(PropertyId{9}, 1).ValueOrDie(), "corrupt");
   const Status corrupted_schema = store_->Open();
   EXPECT_TRUE(corrupted_schema.IsCorruption()) << corrupted_schema.ToString();
+}
+
+// F6b: LookupProperty on a pinned snapshot validates ownership from the snapshot
+// handle itself (same lock-free check as Read). A live snapshot owns an epoch
+// reference, so a successful close cannot release the schema catalog underneath
+// it; the lookup therefore must not queue behind a concurrent close handshake
+// that is holding lifecycle_mutex_.
+TEST(FactStoreSnapshotSchemaLookupTest,
+     DoesNotSerializeBehindStoreLifecycleLock) {
+  char pattern[] = "/tmp/cedar_fact_store_schema_lookup_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool prepare_close_entered = false;
+  bool release_prepare_close = false;
+  FactStoreOptions options{path};
+  options.prepare_close_locked_observer_for_testing = [&] {
+    // Runs with lifecycle_mutex_ held by the close handshake.
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    prepare_close_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_prepare_close; });
+  };
+  FactStore store(std::move(options));
+  ASSERT_TRUE(store.Open().ok());
+  ASSERT_TRUE(store.RegisterProperty(Property(PropertyId{9}, "name",
+                                              PropertyEntityKind::kVertex,
+                                              PhysicalType::kString))
+                  .ok());
+  auto opened_snapshot = store.BeginSnapshot();
+  ASSERT_TRUE(opened_snapshot.ok()) << opened_snapshot.status().ToString();
+  std::optional<StoreSnapshot> snapshot(
+      std::move(opened_snapshot).ConsumeValueOrDie());
+
+  Status prepare_status = Status::OK();
+  std::jthread preparing([&] { prepare_status = store.PrepareClose(); });
+  bool parked = false;
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    parked = gate_cv.wait_for(lock, std::chrono::seconds(5),
+                              [&] { return prepare_close_entered; });
+  }
+  if (!parked) {
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      release_prepare_close = true;
+    }
+    gate_cv.notify_all();
+    preparing.join();
+    FAIL() << "the close handshake never reached the lifecycle-locked window";
+  }
+  // While PrepareClose holds lifecycle_mutex_, the pinned snapshot must still
+  // resolve its property catalog without waiting for that mutex.
+  auto lookup = std::async(std::launch::async, [&] {
+    return store.LookupProperty(*snapshot, PropertyId{9});
+  });
+  const bool lookup_completed =
+      lookup.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_prepare_close = true;
+  }
+  gate_cv.notify_all();
+  preparing.join();
+  ASSERT_TRUE(lookup_completed)
+      << "LookupProperty blocked on the store lifecycle mutex";
+  const auto definition = lookup.get();
+  ASSERT_TRUE(definition.ok()) << definition.status().ToString();
+  ASSERT_TRUE(definition.ValueOrDie().has_value());
+  EXPECT_EQ(definition.ValueOrDie()->name, "name");
+  // The pinned snapshot made PrepareClose report SnapshotPinned and leave the
+  // store usable; the retry after releasing the pin must succeed.
+  EXPECT_TRUE(prepare_status.IsSnapshotPinned()) << prepare_status.ToString();
+  snapshot.reset();
+  ASSERT_TRUE(store.Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+// Ownership validation is preserved without the lifecycle lock: a snapshot from
+// another store is still rejected.
+TEST(FactStoreSnapshotSchemaLookupTest, RejectsSnapshotFromAnotherStore) {
+  char first_pattern[] = "/tmp/cedar_fact_store_schema_owner_a_XXXXXX";
+  char second_pattern[] = "/tmp/cedar_fact_store_schema_owner_b_XXXXXX";
+  ASSERT_NE(mkdtemp(first_pattern), nullptr);
+  ASSERT_NE(mkdtemp(second_pattern), nullptr);
+  const std::string first_path = first_pattern;
+  const std::string second_path = second_pattern;
+  FactStore first(FactStoreOptions{first_path});
+  FactStore second(FactStoreOptions{second_path});
+  ASSERT_TRUE(first.Open().ok());
+  ASSERT_TRUE(second.Open().ok());
+  ASSERT_TRUE(first.RegisterProperty(Property(PropertyId{9}, "name",
+                                              PropertyEntityKind::kVertex,
+                                              PhysicalType::kString))
+                  .ok());
+  auto foreign = second.BeginSnapshot();
+  ASSERT_TRUE(foreign.ok()) << foreign.status().ToString();
+  const auto result =
+      first.LookupProperty(foreign.ValueOrDie(), PropertyId{9});
+  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsInvalidArgument()) << result.status().ToString();
+  foreign = StatusOr<StoreSnapshot>(Status::InvalidArgument("test", "released"));
+  EXPECT_TRUE(first.Close().ok());
+  EXPECT_TRUE(second.Close().ok());
+  std::filesystem::remove_all(first_path);
+  std::filesystem::remove_all(second_path);
 }
 
 }  // namespace

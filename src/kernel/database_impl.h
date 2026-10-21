@@ -194,6 +194,12 @@ class Database::Impl {
             std::move(options.epoch_publication_observer_for_testing)),
         append_drained_observer_for_testing(
             std::move(options.append_drained_observer_for_testing)),
+        transaction_commit_registration_observer_for_testing(
+            std::move(options.transaction_commit_registration_observer_for_testing)),
+        transaction_commit_admitted_observer_for_testing(
+            std::move(options.transaction_commit_admitted_observer_for_testing)),
+        active_commit_drain_wait_observer_for_testing(
+            std::move(options.active_commit_drain_wait_observer_for_testing)),
         async_commit_handle_observer_for_testing(
             std::move(options.async_commit_handle_observer_for_testing)),
         runtime_sampler_interval_observer_for_testing(
@@ -316,6 +322,10 @@ class Database::Impl {
       const std::shared_ptr<AppendCommitRequest>& request);
   internal::EpochLimits LimitsForQueueLocked() const;
   Status DrainAppendCommitPipeline();
+  // Waits until no commit call is registered with the Close drain. The caller
+  // has already published `closing`; see the `active_commit_calls` comment for
+  // the registration protocol. Must be called without holding `mutex`.
+  void WaitForActiveCommitCalls();
   void StopAppendCommitPipeline();
   void ObserveShutdownStage(const char* stage) {
     if (!shutdown_stage_observer_for_testing) return;
@@ -353,7 +363,15 @@ class Database::Impl {
   void WaitForActiveQueries();
 
   mutable std::mutex mutex;
-  std::condition_variable commits_drained;
+  // Commit calls that have registered with the Close drain but have not reached
+  // EndCommit yet. Atomic on purpose: the transaction path must not take
+  // `mutex` (it is the database-wide lifecycle lock). Registration publishes
+  // the count before it re-checks `closing`, and Close publishes `closing`
+  // before it reads the count, so either Close observes the registration or the
+  // registration observes the close transition and withdraws (see
+  // Transaction::State::BeginCommit). Close waits on this counter with
+  // atomic::wait; EndCommit notifies when it drops to zero.
+  std::atomic<size_t> active_commit_calls{0};
   std::string query_database_path;
   FactStore store;
   // Derived query state. Bind/Explain take a reference to these under `mutex`
@@ -383,7 +401,6 @@ class Database::Impl {
   uint64_t vertex_lease_limit = 0;
   uint64_t next_edge_id = 0;
   uint64_t edge_lease_limit = 0;
-  size_t active_commit_calls = 0;
   PreparedCommitRecoveryPolicy prepared_commit_recovery =
       PreparedCommitRecoveryPolicy::kFinalizeOnOpen;
   uint32_t append_commit_max_batch_size = 1;
@@ -400,6 +417,9 @@ class Database::Impl {
   std::function<void()> commit_result_processing_observer_for_testing;
   std::function<void()> epoch_publication_observer_for_testing;
   std::function<void(bool)> append_drained_observer_for_testing;
+  std::function<void()> transaction_commit_registration_observer_for_testing;
+  std::function<void()> transaction_commit_admitted_observer_for_testing;
+  std::function<void()> active_commit_drain_wait_observer_for_testing;
   std::function<void(const std::shared_ptr<CommitHandle::State>&)>
       async_commit_handle_observer_for_testing;
   std::function<void(uint64_t)> runtime_sampler_interval_observer_for_testing;

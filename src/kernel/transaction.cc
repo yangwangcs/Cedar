@@ -4,6 +4,7 @@
 #include "cedar/transaction.h"
 
 #include <algorithm>
+#include <cassert>
 #include <map>
 #include <limits>
 #include <optional>
@@ -339,33 +340,59 @@ class Transaction::State {
   bool terminal = false;
 
   Status CheckDatabaseOpen() const {
-    std::lock_guard<std::mutex> lock(database->mutex);
-    if (database->closed) {
+    // Lock-free: `closed`/`closing` are already atomics, and staging does not
+    // touch any state that Close releases - the transaction's own StoreSnapshot
+    // keeps its epoch (and therefore the schema catalog it resolves against)
+    // alive, so Close reports SnapshotPinned instead of tearing that down.
+    // Ordering matches the previous locked check: closed wins over closing.
+    if (database->closed.load(std::memory_order_acquire)) {
       return Status::InvalidArgument("transaction", "database is closed");
     }
-    if (database->closing) {
+    if (database->closing.load(std::memory_order_acquire)) {
       return Status::ShutdownInProgress("transaction", "database close is in progress");
     }
     return Status::OK();
   }
 
   Status BeginCommit() {
-    std::lock_guard<std::mutex> lock(database->mutex);
-    if (database->closed) {
+    // Lock-free registration with the Close drain. The seq_cst increment happens
+    // before the closing re-check while Close publishes `closing` (seq_cst)
+    // before it observes the counter, so a race resolves one of two ways: Close
+    // sees this call and waits for EndCommit, or this call observes the close
+    // transition and withdraws without touching the store. The re-check reads
+    // `closing` before `closed` so the successful-close tail
+    // (`closed=true; closing=false`) is still caught by the `closed` load.
+    if (database->closed.load(std::memory_order_seq_cst)) {
       return Status::InvalidArgument("transaction", "database is closed");
     }
-    if (database->closing) {
+    database->active_commit_calls.fetch_add(1, std::memory_order_seq_cst);
+    if (database->transaction_commit_registration_observer_for_testing) {
+      database->transaction_commit_registration_observer_for_testing();
+    }
+    if (database->closing.load(std::memory_order_seq_cst)) {
+      EndCommit();
       return Status::ShutdownInProgress("transaction", "database close is in progress");
     }
-    ++database->active_commit_calls;
+    if (database->closed.load(std::memory_order_seq_cst)) {
+      EndCommit();
+      return Status::InvalidArgument("transaction", "database is closed");
+    }
+    if (database->transaction_commit_admitted_observer_for_testing) {
+      database->transaction_commit_admitted_observer_for_testing();
+    }
     return Status::OK();
   }
 
   void EndCommit() {
-    std::lock_guard<std::mutex> lock(database->mutex);
-    --database->active_commit_calls;
-    if (database->active_commit_calls == 0) {
-      database->commits_drained.notify_all();
+    const size_t previous =
+        database->active_commit_calls.fetch_sub(1, std::memory_order_seq_cst);
+    // Only the transition to zero can release a Close drain waiter. A waiter
+    // that observed a nonzero value is guaranteed to wake here: every nonzero
+    // count eventually reaches this decrement, and atomic::wait re-checks the
+    // value after the notification.
+    assert(previous > 0);
+    if (previous == 1) {
+      database->active_commit_calls.notify_all();
     }
   }
 
@@ -714,7 +741,13 @@ StatusOr<std::unique_ptr<Transaction>> Database::BeginTransaction(
   }
   auto txn_id = impl_->store.AllocateTransactionId();
   if (!txn_id.ok()) return txn_id.status();
-  auto snapshot = impl_->store.BeginSnapshot();
+  // A transaction with no as_of is by construction a current-vintage pin, so
+  // use the lock-free current-epoch path directly (same snapshot as
+  // BeginSnapshot() would create, without lifecycle_mutex_/epoch_mutex). The
+  // fast path falls back to the registered BeginSnapshot path internally when
+  // the store is closing or the current epoch has not been created yet, so the
+  // close handshake and error statuses are unchanged.
+  auto snapshot = impl_->store.BeginCurrentSnapshot();
   if (!snapshot.ok()) return snapshot.status();
   return std::unique_ptr<Transaction>(
       new Transaction(std::make_unique<Transaction::State>(

@@ -2216,8 +2216,10 @@ Status StoreCommitBatch::Validate() const {
     return Status::InvalidArgument("commit batch", "missing transaction, time, or facts");
   }
   // Batches can carry thousands of mutations; hash membership keeps this
-  // validation linear instead of a red-black-tree insert per fact.
+  // validation linear instead of a red-black-tree insert per fact. The sets are
+  // sized up front because this runs on the append and preflight hot paths.
   std::unordered_set<std::string> facts;
+  facts.reserve(mutations.size());
   for (const PendingFactMutation& mutation : mutations) {
     const Status valid = mutation.Validate();
     if (!valid.ok()) return valid;
@@ -2228,6 +2230,7 @@ Status StoreCommitBatch::Validate() const {
     }
   }
   std::unordered_set<std::string> dependencies;
+  dependencies.reserve(snapshot_write_dependencies.size());
   for (const SnapshotWriteDependency& dependency : snapshot_write_dependencies) {
     const Status dependency_valid = dependency.Validate();
     if (!dependency_valid.ok()) return dependency_valid;
@@ -2239,6 +2242,7 @@ Status StoreCommitBatch::Validate() const {
     }
   }
   std::unordered_set<std::string> strict_reads;
+  strict_reads.reserve(strict_read_dependencies.size());
   for (const StrictReadDependency& dependency : strict_read_dependencies) {
     const Status dependency_valid = dependency.Validate();
     if (!dependency_valid.ok()) return dependency_valid;
@@ -2256,6 +2260,7 @@ Status StoreCommitBatch::Validate() const {
     }
   }
   std::unordered_set<uint64_t> edge_ids;
+  edge_ids.reserve(edge_identities.size());
   for (const EdgeIdentity& identity : edge_identities) {
     const Status valid = identity.Validate();
     if (!valid.ok()) return valid;
@@ -2265,6 +2270,7 @@ Status StoreCommitBatch::Validate() const {
   }
   if (!edge_ids.empty()) {
     std::unordered_set<uint64_t> edge_state_assertions;
+    edge_state_assertions.reserve(edge_ids.size());
     for (const PendingFactMutation& mutation : mutations) {
       if (mutation.ref.family() == FactFamily::kEdgeState &&
           mutation.operation == FactOperation::kPut) {
@@ -2578,6 +2584,11 @@ Status FactStore::FinishClose() {
 Status FactStore::PrepareCloseLocked() {
   if (!impl_) return Status::OK();
   if (close_prepared_) return Status::OK();
+  if (options_.prepare_close_locked_observer_for_testing) {
+    // Test-only window: lifecycle_mutex_ is held (the caller locked it), exactly
+    // the handshake that must not serialize lock-free snapshot lookups.
+    options_.prepare_close_locked_observer_for_testing();
+  }
   auto store = impl_;
   store->accepting_snapshots.store(false, std::memory_order_release);
   store->accepting_fast.store(false, std::memory_order_seq_cst);
@@ -4625,9 +4636,7 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
   std::set<uint64_t> transaction_ids;
   auto write_batch = std::make_unique<rocksdb::WriteBatch>();
   StoreCommittedGroupResult group;
-  std::vector<internal::DecidedEpoch::PublishedCommit> publications;
   group.results.reserve(requests.size());
-  publications.reserve(requests.size());
   const auto validation_started_at = std::chrono::steady_clock::now();
   uint64_t committed_count = 0;
   bool has_durable_terminal = false;
@@ -4710,8 +4719,6 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
     if (!appended.ok()) return appended;
     ++committed_count;
     group.results.emplace_back(StoreCommitResult{commit_seq, batch.system_hlc});
-    publications.push_back(
-        internal::DecidedEpoch::PublishedCommit{commit_seq, batch.mutations});
   }
   const auto validation_finished_at = std::chrono::steady_clock::now();
   group.validation_us = static_cast<uint64_t>(
@@ -4743,7 +4750,7 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
       base_visible_seq,
       CommitSeq{base_visible_seq.value + committed_count}, committed_count,
       committed_count != 0 || has_durable_terminal, std::move(write_batch),
-      std::move(group), std::move(publications));
+      std::move(group));
 }
 
 // The caller holds FactStoreImpl::publisher_mutex. This stage intentionally
@@ -4751,8 +4758,10 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
 // makes an already decided epoch a one-shot writer submission.
 StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
     FactStoreImpl* store, const FactStoreOptions& options,
-    internal::DecidedEpoch* epoch, WalDurableCallback on_wal_durable,
-    void* callback_context, std::atomic<bool>* wal_sync_critical) {
+    internal::DecidedEpoch* epoch,
+    const std::vector<StoreCommitGroupRequest>& requests,
+    WalDurableCallback on_wal_durable, void* callback_context,
+    std::atomic<bool>* wal_sync_critical) {
   if (epoch == nullptr) {
     return Status::InvalidArgument("commit", "missing decided epoch");
   }
@@ -4761,6 +4770,14 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
   }
   if (store->visible_seq != epoch->base_visible_seq()) {
     return Status::Conflict("commit", "decided epoch base is no longer current");
+  }
+  // Publication below reads the caller's live batches. The decision and the
+  // request list must describe the same transactions, in the same order; this
+  // is checked before the write so a contract violation cannot produce a
+  // durable commit with no publication.
+  if (epoch->group_result().results.size() != requests.size()) {
+    return Status::Corruption(
+        "commit", "decided epoch requests do not match its decision");
   }
 
   if (options.commit_prewrite_fault_injector_for_testing) {
@@ -4806,12 +4823,17 @@ StatusOr<StoreCommittedGroupResult> WriteDecidedGroupLocked(
   }
   const auto publication_started_at = std::chrono::steady_clock::now();
   if (epoch->committed_count() != 0) {
-    for (const internal::DecidedEpoch::PublishedCommit& publication :
-         epoch->publications()) {
-      PublishRecentFactWriteIndex(store, publication.mutations,
-                                  publication.commit_seq);
-      PublishValidationCache(store, publication.mutations,
-                             publication.commit_seq);
+    // Publication consumes the caller's live request batches: no per-mutation
+    // publication copy is retained across the decision/predecision window. The
+    // result vector is aligned with `requests`; aborted decisions have no
+    // commit sequence and are skipped.
+    const std::vector<StatusOr<StoreCommitResult>>& decisions =
+        epoch->group_result().results;
+    for (size_t index = 0; index < requests.size(); ++index) {
+      if (!decisions[index].ok()) continue;
+      const CommitSeq commit_seq = decisions[index].ValueOrDie().commit_seq;
+      PublishRecentFactWriteIndex(store, requests[index].batch, commit_seq);
+      PublishValidationCache(store, requests[index].batch, commit_seq);
     }
     store->PublishVisible(epoch->visible_seq_target());
   }
@@ -4855,6 +4877,22 @@ StatusOr<std::unique_ptr<internal::DecidedEpoch>>
 FactStore::DecideIndependentAppendGroup(
     CommitSeq base_visible_seq, CommitSeq required_snapshot_seq,
     const std::vector<StoreCommitGroupRequest>& requests) {
+  // The planning-view overload keeps no reference past the call, so building the
+  // temporary view vector is enough: the batches themselves are never copied.
+  std::vector<StoreCommitGroupRequestView> views;
+  views.reserve(requests.size());
+  for (const StoreCommitGroupRequest& request : requests) {
+    views.push_back(StoreCommitGroupRequestView{&request.batch,
+                                                request.persist_async_abort});
+  }
+  return DecideIndependentAppendGroup(base_visible_seq, required_snapshot_seq,
+                                      views);
+}
+
+StatusOr<std::unique_ptr<internal::DecidedEpoch>>
+FactStore::DecideIndependentAppendGroup(
+    CommitSeq base_visible_seq, CommitSeq required_snapshot_seq,
+    const std::vector<StoreCommitGroupRequestView>& requests) {
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -4877,12 +4915,14 @@ FactStore::DecideIndependentAppendGroup(
   internal::CommitConflictIndex conflict_index;
   auto write_batch = std::make_unique<rocksdb::WriteBatch>();
   StoreCommittedGroupResult group;
-  std::vector<internal::DecidedEpoch::PublishedCommit> publications;
   group.results.reserve(requests.size());
-  publications.reserve(requests.size());
   uint64_t committed_count = 0;
-  for (const StoreCommitGroupRequest& request : requests) {
-    const StoreCommitBatch& batch = request.batch;
+  for (const StoreCommitGroupRequestView& request : requests) {
+    if (request.batch == nullptr) {
+      return Status::InvalidArgument("commit",
+                                     "missing independent append batch");
+    }
+    const StoreCommitBatch& batch = *request.batch;
     if (!batch.fresh_transaction_id ||
         !internal::CanUseAppendFastPath(batch)) {
       return Status::InvalidArgument(
@@ -4922,8 +4962,6 @@ FactStore::DecideIndependentAppendGroup(
     if (!appended.ok()) return appended;
     ++committed_count;
     group.results.emplace_back(StoreCommitResult{commit_seq, batch.system_hlc});
-    publications.push_back(
-        internal::DecidedEpoch::PublishedCommit{commit_seq, batch.mutations});
   }
   const auto validation_finished_at = std::chrono::steady_clock::now();
   group.validation_us = static_cast<uint64_t>(
@@ -4945,7 +4983,7 @@ FactStore::DecideIndependentAppendGroup(
   return std::make_unique<internal::DecidedEpoch>(
       base_visible_seq,
       CommitSeq{base_visible_seq.value + committed_count}, committed_count,
-      true, std::move(write_batch), std::move(group), std::move(publications));
+      true, std::move(write_batch), std::move(group));
 }
 
 Status FactStore::ValidatePredictedGroup(
@@ -4969,8 +5007,10 @@ Status FactStore::ValidatePredictedGroup(
 }
 
 StatusOr<StoreCommittedGroupResult> FactStore::WriteDecidedGroup(
-    internal::DecidedEpoch* epoch, WalDurableCallback on_wal_durable,
-    void* callback_context, std::atomic<bool>* wal_sync_critical) {
+    internal::DecidedEpoch* epoch,
+    const std::vector<StoreCommitGroupRequest>& requests,
+    WalDurableCallback on_wal_durable, void* callback_context,
+    std::atomic<bool>* wal_sync_critical) {
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -4982,8 +5022,9 @@ StatusOr<StoreCommittedGroupResult> FactStore::WriteDecidedGroup(
     return Status::RecoveryRequired("commit",
                                     "reopen required after indeterminate write");
   }
-  return WriteDecidedGroupLocked(store.get(), options_, epoch, on_wal_durable,
-                                 callback_context, wal_sync_critical);
+  return WriteDecidedGroupLocked(store.get(), options_, epoch, requests,
+                                 on_wal_durable, callback_context,
+                                 wal_sync_critical);
 }
 
 StatusOr<StoreCommittedGroupResult> FactStore::CommitGroupWithWalCallbackDirect(
@@ -5003,7 +5044,7 @@ StatusOr<StoreCommittedGroupResult> FactStore::CommitGroupWithWalCallbackDirect(
   auto epoch = DecideAndEncodeGroupLocked(store.get(), options_, requests);
   if (!epoch.ok()) return epoch.status();
   return WriteDecidedGroupLocked(store.get(), options_, &epoch.ValueOrDie(),
-                                 on_wal_durable, callback_context,
+                                 requests, on_wal_durable, callback_context,
                                  wal_sync_critical);
 }
 
@@ -5253,15 +5294,18 @@ StatusOr<std::string> FactStore::SchemaFingerprint() const {
 StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
     const StoreSnapshot& snapshot, PropertyId property_id,
     uint32_t schema_epoch) const {
-  std::shared_ptr<FactStoreImpl> store;
-  {
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-    store = impl_;
-    if (!store || snapshot.epoch_ == nullptr ||
-        snapshot.epoch_->store != store.get()) {
-      return Status::InvalidArgument("property definition",
-                                     "snapshot belongs to another store");
-    }
+  // Lock-free ownership validation, same check as Read: the snapshot records
+  // the FactStore it was opened from, and every snapshot handle owns an epoch
+  // reference. A successful Close requires the epoch registry to have no live
+  // references (otherwise it reports SnapshotPinned and rolls back), so a live
+  // snapshot implies the schema catalogs are still retained. Catalogs are only
+  // retired, never freed, until the store itself is destroyed; destruction is
+  // documented to be serialized with users of an outliving handle (~FactStore).
+  // No lifecycle_mutex_ is needed here, which removes the last store-global lock
+  // from first-property resolution on the transaction path.
+  if (snapshot.epoch_ == nullptr || snapshot.owner_ != this) {
+    return Status::InvalidArgument("property definition",
+                                   "snapshot belongs to another store");
   }
   const FactStoreImpl::PropertySchemas* schemas =
       snapshot.epoch_->schemas.load(std::memory_order_acquire);

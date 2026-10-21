@@ -190,6 +190,8 @@ class Database::Impl {
             std::move(options.append_commit_collection_observer_for_testing)),
         commit_result_processing_observer_for_testing(
             std::move(options.commit_result_processing_observer_for_testing)),
+        epoch_publication_observer_for_testing(
+            std::move(options.epoch_publication_observer_for_testing)),
         append_drained_observer_for_testing(
             std::move(options.append_drained_observer_for_testing)),
         async_commit_handle_observer_for_testing(
@@ -396,6 +398,7 @@ class Database::Impl {
   std::function<void()> append_commit_enqueued_observer_for_testing;
   std::function<void()> append_commit_collection_observer_for_testing;
   std::function<void()> commit_result_processing_observer_for_testing;
+  std::function<void()> epoch_publication_observer_for_testing;
   std::function<void(bool)> append_drained_observer_for_testing;
   std::function<void(const std::shared_ptr<CommitHandle::State>&)>
       async_commit_handle_observer_for_testing;
@@ -427,6 +430,13 @@ class Database::Impl {
   std::mutex runtime_refresh_mutex;
   std::condition_variable runtime_sampler_cv;
   size_t active_append_commit_requests = 0;
+  // Epochs that finished append bookkeeping but whose terminal results have not
+  // been published yet. Guarded by append_commit_mutex. It keeps the drained
+  // predicate closed across the out-of-lock publication: the drained barrier
+  // implies every terminal result is published, which is what lets Close sweep
+  // the executor and tear down the store without observing an unpublished
+  // epoch result.
+  size_t active_append_publications = 0;
   uint64_t queued_append_commit_bytes = 0;
   uint64_t reserved_append_commit_bytes = 0;
   std::shared_ptr<const internal::PendingVersionOverlay>

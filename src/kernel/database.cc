@@ -1116,6 +1116,7 @@ Status Database::Impl::StartAppendCommitPipeline() {
       if (epoch_completion != nullptr) epoch_results.reserve(requests.size());
       bool drained_barrier_notified = false;
       bool drained_epoch_published = true;
+      bool epoch_publication_pending = false;
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
         if (commit_result_processing_observer_for_testing) {
@@ -1258,13 +1259,15 @@ Status Database::Impl::StartAppendCommitPipeline() {
           }
         }
         const auto publication_observed_at = std::chrono::steady_clock::now();
-        // Publish the epoch's terminal results before the dropped-request
-        // bookkeeping and the drained barrier. The shutdown sweep (executor
-        // Stop) must never observe a WAL-less request whose real terminal -
-        // kIndeterminate/RecoveryRequired or an abort - is still unpublished;
-        // otherwise it can mask that outcome with ShutdownInProgress.
+        // The terminal results are published below, outside this bookkeeping
+        // lock: a published epoch wakes every waiting client, and those clients
+        // must be able to admit their next transactions without contending with
+        // the rest of the epoch's bookkeeping. Keep the drain predicate closed
+        // until that publication completed so the barrier still implies every
+        // terminal result is visible (Close may only sweep/tear down after it).
         if (epoch_completion != nullptr) {
-          epoch_completion->Publish(std::move(epoch_results));
+          ++active_append_publications;
+          epoch_publication_pending = true;
         }
         active_append_commit_requests -= requests.size();
         append_commit_metrics.n_plus_one_preflight_transactions +=
@@ -1284,16 +1287,6 @@ Status Database::Impl::StartAppendCommitPipeline() {
         }
         active_pending_version_overlay.reset();
         ++preflight_request_generation;
-        if (append_commit_requests.empty() && active_append_commit_requests == 0) {
-          drained_barrier_notified = true;
-          drained_epoch_published =
-              epoch_completion == nullptr || epoch_completion->IsPublished();
-          append_drained.notify_all();
-        }
-      }
-      if (drained_barrier_notified &&
-          append_drained_observer_for_testing) {
-        append_drained_observer_for_testing(drained_epoch_published);
       }
       for (const auto& request : requests) {
         if (request->handle == nullptr) request->completed.notify_one();
@@ -1306,14 +1299,37 @@ Status Database::Impl::StartAppendCommitPipeline() {
           query_delta->EnqueuePublished(std::move(descriptor)).IgnoreError();
         }
       }
+      // Publish the epoch's terminal results outside the append bookkeeping
+      // lock. The drained barrier below (and therefore the shutdown sweep) may
+      // only be notified after this publication completed.
+      if (epoch_publication_pending) {
+        if (epoch_publication_observer_for_testing) {
+          epoch_publication_observer_for_testing();
+        }
+        epoch_completion->Publish(std::move(epoch_results));
+      }
       store_requests.clear();
       uint64_t released_bytes = 0;
       for (const auto& request : requests) released_bytes += request->estimated_bytes;
       requests.clear();
       {
         std::lock_guard<std::mutex> lock(append_commit_mutex);
+        if (epoch_publication_pending) {
+          --active_append_publications;
+        }
         reserved_append_commit_bytes -= released_bytes;
         append_admission_changed.notify_all();
+        if (append_commit_requests.empty() && active_append_commit_requests == 0 &&
+            active_append_publications == 0) {
+          drained_barrier_notified = true;
+          drained_epoch_published =
+              epoch_completion == nullptr || epoch_completion->IsPublished();
+          append_drained.notify_all();
+        }
+      }
+      if (drained_barrier_notified &&
+          append_drained_observer_for_testing) {
+        append_drained_observer_for_testing(drained_epoch_published);
       }
     }
   });
@@ -1519,7 +1535,8 @@ void Database::Impl::CancelQueuedAsyncCommit(
       ++preflight_request_generation;
       append_preflight_available.notify_one();
       append_admission_changed.notify_all();
-      if (append_commit_requests.empty() && active_append_commit_requests == 0) {
+      if (append_commit_requests.empty() && active_append_commit_requests == 0 &&
+          active_append_publications == 0) {
         append_drained.notify_all();
       }
     }
@@ -1666,7 +1683,8 @@ Status Database::Impl::SubmitAsyncCommit(
 Status Database::Impl::DrainAppendCommitPipeline() {
   std::unique_lock<std::mutex> lock(append_commit_mutex);
   append_drained.wait(lock, [this] {
-    return append_commit_requests.empty() && active_append_commit_requests == 0;
+    return append_commit_requests.empty() && active_append_commit_requests == 0 &&
+           active_append_publications == 0;
   });
   return Status::OK();
 }

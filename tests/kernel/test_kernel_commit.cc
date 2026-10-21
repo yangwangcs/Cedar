@@ -4609,6 +4609,196 @@ TEST(KernelGroupCommitTest, ClosePublishesEpochTerminalBeforeDrainedBarrier) {
   std::filesystem::remove_all(path);
 }
 
+// F6a: publication is terminal-result fan-out, not part of the append
+// bookkeeping that gates the next collection. The F3 placement called
+// EpochCompletion::Publish inside append_commit_mutex, so every waiter woken by
+// the publication immediately contended with the bookkeeping lock and the next
+// queue admission had to wait for all post-publication bookkeeping. This gate
+// parks the publication and then observes whether another commit can still be
+// admitted (admission needs the same bookkeeping lock).
+class EpochPublicationGate {
+ public:
+  void Hook() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!armed_) return;
+    armed_ = false;
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [this] { return released_; });
+  }
+
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+    entered_ = false;
+    released_ = false;
+  }
+
+  bool WaitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, timeout, [this] { return entered_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    changed_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool armed_ = false;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+TEST(KernelGroupCommitTest, EpochPublicationDoesNotSerializeAppendAdmission) {
+  char pattern[] = "/tmp/cedar_kernel_publication_admission_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  EpochPublicationGate gate;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 1,
+      .group_commit_window_us = 0,
+      .collection_latency_slo_us_for_testing = 60'000'000,
+      .epoch_publication_observer_for_testing = [&gate] { gate.Hook(); },
+      .runtime_pressure_override_for_testing = PinHealthyPressure});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+
+  auto first_transaction = database->BeginTransaction();
+  ASSERT_TRUE(first_transaction.ok()) << first_transaction.status().ToString();
+  ASSERT_TRUE(first_transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'700}}),
+                           ValidTime{1})
+                  .ok());
+  gate.Arm();
+  auto first_submission = std::async(std::launch::async, [&] {
+    return first_transaction.ValueOrDie()->CommitAsyncPipelined();
+  });
+  const bool parked = gate.WaitUntilEntered(std::chrono::seconds(5));
+  if (!parked) gate.Release();
+  ASSERT_TRUE(parked) << "the append worker never reached the publication boundary";
+  ASSERT_EQ(first_submission.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  auto first_accepted = first_submission.get();
+  ASSERT_TRUE(first_accepted.ok()) << first_accepted.status().ToString();
+
+  // The worker is parked at publication. This second admission only needs the
+  // append bookkeeping lock, which must therefore not be held across publish.
+  auto second_transaction = database->BeginTransaction();
+  ASSERT_TRUE(second_transaction.ok()) << second_transaction.status().ToString();
+  ASSERT_TRUE(second_transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'701}}),
+                           ValidTime{2})
+                  .ok());
+  auto second_submission = std::async(std::launch::async, [&] {
+    return second_transaction.ValueOrDie()->CommitAsyncPipelined();
+  });
+  const bool admitted_while_parked =
+      second_submission.wait_for(std::chrono::seconds(2)) ==
+      std::future_status::ready;
+  if (!admitted_while_parked) gate.Release();
+  auto second_accepted = second_submission.get();
+  EXPECT_TRUE(admitted_while_parked)
+      << "append queue admission blocked behind a parked epoch publication";
+  ASSERT_TRUE(second_accepted.ok()) << second_accepted.status().ToString();
+  gate.Release();
+
+  const auto first_completed = first_accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(first_completed.ok()) << first_completed.status().ToString();
+  EXPECT_EQ(first_completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(first_completed.ValueOrDie().commit_seq, CommitSeq{1});
+  const auto second_completed = second_accepted.ValueOrDie().Wait();
+  ASSERT_TRUE(second_completed.ok()) << second_completed.status().ToString();
+  EXPECT_EQ(second_completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(second_completed.ValueOrDie().commit_seq, CommitSeq{2});
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+// F6a: publishing outside the bookkeeping lock must not open a drain window.
+// The drained barrier is what lets Close proceed to the executor sweep and to
+// store teardown, so it may only fire once the epoch's terminal results are
+// published. The pending-publication count keeps the drain predicate closed
+// until the worker finishes the out-of-lock publication, and no epoch may be
+// published twice.
+TEST(KernelGroupCommitTest,
+     CloseDrainWaitsForEpochPublicationAndObservesItPublished) {
+  char pattern[] = "/tmp/cedar_kernel_publication_drain_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  EpochPublicationGate gate;
+  std::mutex observations_mutex;
+  std::vector<bool> published_at_drain;
+  std::atomic<uint32_t> publications{0};
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 1,
+      .group_commit_window_us = 0,
+      .collection_latency_slo_us_for_testing = 60'000'000,
+      .epoch_publication_observer_for_testing =
+          [&] {
+            ++publications;
+            gate.Hook();
+          },
+      .append_drained_observer_for_testing = [&](bool epoch_published) {
+        std::lock_guard<std::mutex> lock(observations_mutex);
+        published_at_drain.push_back(epoch_published);
+      },
+      .runtime_pressure_override_for_testing = PinHealthyPressure});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'710}}),
+                           ValidTime{1})
+                  .ok());
+  gate.Arm();
+  auto accepted = transaction.ValueOrDie()->CommitAsyncPipelined();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  CommitHandle handle = std::move(accepted).ValueOrDie();
+  const bool parked = gate.WaitUntilEntered(std::chrono::seconds(5));
+  if (!parked) gate.Release();
+  ASSERT_TRUE(parked) << "the append worker never reached the publication boundary";
+
+  std::atomic<bool> close_done{false};
+  Status close_status = Status::OK();
+  std::thread closing([&] {
+    close_status = database->Close();
+    close_done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const bool closed_while_publication_parked = close_done.load();
+  gate.Release();
+  closing.join();
+  EXPECT_FALSE(closed_while_publication_parked)
+      << "Close drained an epoch whose terminal results were not published";
+  EXPECT_TRUE(close_status.ok()) << close_status.ToString();
+  {
+    std::lock_guard<std::mutex> lock(observations_mutex);
+    ASSERT_FALSE(published_at_drain.empty())
+        << "the drained barrier was never observed";
+    for (bool epoch_published : published_at_drain) {
+      EXPECT_TRUE(epoch_published)
+          << "the drained barrier was signalled before the epoch terminal "
+             "result was published";
+    }
+  }
+  EXPECT_EQ(publications.load(), 1U)
+      << "the epoch terminal result was published more than once";
+  const auto completed = handle.Wait();
+  ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+  EXPECT_EQ(completed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(completed.ValueOrDie().commit_seq, CommitSeq{1});
+  std::filesystem::remove_all(path);
+}
+
 TEST_F(KernelCommitTest, PipelinedReportsValidationAbortConsistentWithLegacy) {
   std::unique_ptr<Transaction> winner = Begin();
   std::unique_ptr<Transaction> pipelined = Begin();

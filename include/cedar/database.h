@@ -246,6 +246,13 @@ struct DatabaseOptions {
   // SLO. Zero keeps the production default (5 ms).
   uint64_t collection_latency_slo_us_for_testing = 0;
   std::function<void()> commit_result_processing_observer_for_testing;
+  // Test-only observer fired by the append worker immediately before it
+  // publishes an epoch's terminal results (EpochCompletion::Publish). It runs
+  // on the append worker and may park there deterministically; a conforming
+  // implementation calls it outside the append bookkeeping lock so publication
+  // never serializes collection or queue admission. It must not call back into
+  // the database. Production callers leave this unset.
+  std::function<void()> epoch_publication_observer_for_testing;
   // Test-only observer fired by the append worker immediately after it signals
   // `append_drained` for an epoch. The boolean reports whether that epoch's
   // terminal results were already published (EpochCompletion) when the drained

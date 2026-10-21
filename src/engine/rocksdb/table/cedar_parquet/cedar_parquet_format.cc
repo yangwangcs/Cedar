@@ -125,6 +125,34 @@ Status DecodeCedarParquetSortKey(const Slice& sort_key,
   return ParseInternalKey(*internal_key, &parsed, false);
 }
 
+Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
+                                 size_t capacity) {
+  if (internal_key == nullptr || capacity < kCedarParquetV2SortKeyBytes) {
+    return Status::InvalidArgument(
+        "Cedar Parquet internal-key buffer is too small");
+  }
+  if (sort_key.size() != kCedarParquetV2SortKeyBytes ||
+      static_cast<uint8_t>(sort_key[0]) != 2) {
+    return Status::Corruption("invalid Cedar Parquet v2 sort key");
+  }
+  const uint64_t packed = ~DecodeBigEndian64(
+      sort_key.data() + kCedarParquetV2UserKeyBytes);
+  const SequenceNumber sequence = packed >> 8U;
+  const ValueType type = static_cast<ValueType>(packed & 0xffU);
+  if (sequence > kMaxSequenceNumber || !IsExtendedValueType(type)) {
+    return Status::Corruption("invalid Cedar Parquet internal-key footer");
+  }
+  std::memcpy(internal_key, sort_key.data(), kCedarParquetV2UserKeyBytes);
+  for (uint32_t byte = 0; byte < kInternalKeyFooterBytes; ++byte) {
+    internal_key[kCedarParquetV2UserKeyBytes + byte] =
+        static_cast<char>((packed >> (byte * 8U)) & 0xffU);
+  }
+  ParsedInternalKey parsed;
+  return ParseInternalKey(
+      Slice(internal_key, kCedarParquetV2UserKeyBytes + kInternalKeyFooterBytes),
+      &parsed, false);
+}
+
 Status EncodeCedarParquetRow(const Slice& internal_key, const Slice& encoded_value,
                              CedarParquetRow* row) {
   Status status = EncodeCedarParquetSortKey(internal_key, &row->sort_key);

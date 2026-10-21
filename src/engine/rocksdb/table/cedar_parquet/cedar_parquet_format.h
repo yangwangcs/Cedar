@@ -204,6 +204,13 @@ Status EncodeCedarParquetSortKey(const Slice& internal_key,
                                  std::string* sort_key);
 Status DecodeCedarParquetSortKey(const Slice& sort_key,
                                  std::string* internal_key);
+// Allocation-free variant for readers that need a borrowed 40-byte internal key
+// (the canonical page cache derives it from the cached sort key on demand).
+// Writes exactly `kCedarParquetV2UserKeyBytes + 8` bytes into `internal_key`,
+// which must have that capacity. Same validation and statuses as the owning
+// overload.
+Status DecodeCedarParquetSortKey(const Slice& sort_key, char* internal_key,
+                                 size_t capacity);
 Status EncodeCedarParquetRow(const Slice& internal_key, const Slice& encoded_value,
                              CedarParquetRow* row);
 Status DecodeCedarParquetRow(const CedarParquetRow& row, std::string* internal_key,

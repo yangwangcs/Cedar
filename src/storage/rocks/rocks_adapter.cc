@@ -121,9 +121,12 @@ void AppendU64(std::string* out, uint64_t value) {
   }
 }
 
-bool StartsWith(const rocksdb::Slice& value, const std::string& prefix) {
+// Prefix test over borrowed key bytes. Kept as `Slice` (not `std::string`) so a
+// point-read prefix can be compared without materializing another string;
+// `std::string` and NUL-terminated constants convert implicitly.
+bool StartsWith(const rocksdb::Slice& value, const rocksdb::Slice& prefix) {
   return value.size() >= prefix.size() &&
-         std::equal(prefix.begin(), prefix.end(), value.data());
+         std::equal(prefix.data(), prefix.data() + prefix.size(), value.data());
 }
 
 uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
@@ -1090,13 +1093,15 @@ bool FactStoreImpl::TryPinCurrentEpochLockFree(
     SnapshotEpoch* candidate =
         current_epoch_fast.load(std::memory_order_seq_cst);
     if (candidate == nullptr) break;
-    // Validate before incrementing. A publish clears current_epoch_fast before
-    // it can drop the epoch's last owner reference, so a re-read that still
-    // sees the same pointer means the epoch is still pinned-and-alive; a
-    // re-read that observes the retirement makes this attempt touch nothing.
-    if (current_epoch_fast.load(std::memory_order_seq_cst) != candidate) {
-      continue;
-    }
+    // No pre-CAS revalidation load: a retirement between the load above and the
+    // reference increment is handled by the post-CAS check below, which is the
+    // authoritative one. The retired epoch cannot be freed while this attempt
+    // is registered (see the attempt counter above), so touching `refs` is
+    // safe; if the CAS lands on a retired epoch the post-CAS load observes the
+    // cleared fast pointer and the reference is released. A reclaimer that
+    // already claimed the epoch is rejected by the DEAD bit, which the CAS
+    // itself cannot overwrite. This removes one seq_cst load per pin without
+    // weakening either invariant.
     uint32_t word = candidate->refs.load(std::memory_order_relaxed);
     if ((word & kEpochDeadBit) != 0) continue;
     if (!candidate->refs.compare_exchange_weak(
@@ -1106,8 +1111,8 @@ bool FactStoreImpl::TryPinCurrentEpochLockFree(
     }
     // The reference now protects the epoch from reclamation.
     if (current_epoch_fast.load(std::memory_order_seq_cst) != candidate) {
-      // Retired between validation and increment: drop it and try again (or
-      // fall back to the slow path when the retries are exhausted).
+      // Retired between the load above and the increment: drop it and try again
+      // (or fall back to the slow path when the retries are exhausted).
       ReleaseEpochRef(candidate);
       continue;
     }
@@ -3206,7 +3211,8 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
   const std::string seek = EncodeFactKey(
       ref, valid_time, CommitSeq{std::numeric_limits<uint64_t>::max()});
   if (seek.empty()) return Status::InvalidArgument("fact read", "invalid fact key");
-  const std::string prefix = seek.substr(0, kFactIdentityPrefixBytes);
+  // Borrow the identity prefix from the encoded seek key: no substring copy.
+  const rocksdb::Slice prefix(seek.data(), kFactIdentityPrefixBytes);
   CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
   options.snapshot = snapshot.epoch_->lease->get();
@@ -3214,14 +3220,16 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
       store->db->NewIterator(options, store->facts_cf));
   for (iterator->Seek(seek); iterator->Valid() && StartsWith(iterator->key(), prefix);
        iterator->Next()) {
-    const auto decoded_key = DecodeFactKey(iterator->key().ToString());
+    // Decode the iterator's borrowed key/value slices in place. `ToString()`
+    // here used to allocate a string for both records on every point read.
+    const auto decoded_key = DecodeFactKey(iterator->key().ToStringView());
     if (!decoded_key.ok()) return decoded_key.status();
     if (decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value) {
       continue;
     }
     auto decoded_value = DecodeFactValue(
         decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
-        decoded_key.ValueOrDie().commit_seq, iterator->value().ToString());
+        decoded_key.ValueOrDie().commit_seq, iterator->value().ToStringView());
     if (!decoded_value.ok()) return decoded_value.status();
     if (decoded_value.ValueOrDie().operation == FactOperation::kDelete) {
       return std::optional<FactEvent>{};
@@ -5316,6 +5324,31 @@ StatusOr<std::optional<PropertyDefinition>> FactStore::LookupProperty(
   return LookupPropertyInSchemas(*schemas, property_id, schema_epoch);
 }
 
+namespace {
+
+// Reads the immutable edge identity fact for `edge`. The caller has already
+// established that a visible edge-state event exists in this snapshot (either by
+// scanning the edge-state prefix or by observing one through Read).
+StatusOr<std::optional<EdgeIdentity>> ReadEdgeIdentity(
+    const FactStore& store, const StoreSnapshot& snapshot, EdgeRef edge) {
+  const FactRef identity_ref(edge.home_part_id, FactFamily::kEdgeIdentity,
+                             PropertyId{}, edge.edge_id.value);
+  const auto identity_fact = store.Read(snapshot, identity_ref, ValidTime{0});
+  if (!identity_fact.ok()) return identity_fact.status();
+  if (!identity_fact.ValueOrDie().has_value() ||
+      !identity_fact.ValueOrDie()->edge_identity.has_value()) {
+    return Status::Corruption("edge identity",
+                              "edge state lacks an authoritative identity fact");
+  }
+  const EdgeIdentity& identity = *identity_fact.ValueOrDie()->edge_identity;
+  if (identity.edge_ref() != edge) {
+    return Status::Corruption("edge identity", "identity fact disagrees with key");
+  }
+  return std::optional<EdgeIdentity>{identity};
+}
+
+}  // namespace
+
 StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
     const StoreSnapshot& snapshot, EdgeRef edge) const {
   if (!edge.valid()) {
@@ -5334,20 +5367,32 @@ StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
       });
   if (!scanned.ok()) return scanned;
   if (!has_visible_edge_state) return std::optional<EdgeIdentity>{};
+  return ReadEdgeIdentity(*this, snapshot, edge);
+}
 
-  const FactRef identity_ref(edge.home_part_id, FactFamily::kEdgeIdentity,
-                             PropertyId{}, edge.edge_id.value);
-  const auto identity_fact = Read(snapshot, identity_ref, ValidTime{0});
-  if (!identity_fact.ok()) return identity_fact.status();
-  if (!identity_fact.ValueOrDie().has_value() ||
-      !identity_fact.ValueOrDie()->edge_identity.has_value()) {
-    return Status::Corruption("edge identity", "edge state lacks an authoritative identity fact");
+StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
+    const StoreSnapshot& snapshot, EdgeRef edge,
+    const FactEvent& observed_edge_state) const {
+  if (!edge.valid()) {
+    return Status::InvalidArgument("edge identity", "zero edge ID");
   }
-  const EdgeIdentity& identity = *identity_fact.ValueOrDie()->edge_identity;
-  if (identity.edge_ref() != edge) {
-    return Status::Corruption("edge identity", "identity fact disagrees with key");
+  // The observation must be the visible edge-state PUT the caller read from this
+  // same snapshot. A mismatch is a programming error: it would mean the
+  // visibility walk and the identity lookup could disagree about which edge they
+  // are resolving, so reject instead of silently trusting it.
+  if (observed_edge_state.ref != EntityFact::Edge(edge).ref() ||
+      observed_edge_state.operation == FactOperation::kDelete) {
+    return Status::InvalidArgument(
+        "edge identity", "observed edge state does not match the lookup key");
   }
-  return std::optional<EdgeIdentity>{identity};
+  // Derivation of the scan above: the scanning overload refuses the lookup
+  // unless some visible event exists under the edge-state identity prefix.
+  // `observed_edge_state` is exactly such an event (Read returned it from this
+  // snapshot at the same prefix, so its commit_seq is visible and its
+  // valid_from chain exists), therefore the scan can only report true and the
+  // edge fact does not need to be read a second time. Everything after the scan
+  // is unchanged.
+  return ReadEdgeIdentity(*this, snapshot, edge);
 }
 
 namespace {

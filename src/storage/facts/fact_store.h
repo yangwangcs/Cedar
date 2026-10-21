@@ -471,6 +471,18 @@ class StoreSnapshot {
   // ownership cycle in the close path because Close releases every epoch's
   // owner reference before the closed shell is retained, and the retained
   // shell (bounded to one) holds the DEAD epoch memory until it is freed.
+  //
+  // This handle reference is not redundant with `epoch_->store_owner` and must
+  // not be replaced by a raw `epoch_->store` pointer: `~FactStore` deliberately
+  // supports an outliving handle (Close reports SnapshotPinned) and
+  // ForceDetachEpochsLocked clears every epoch's `store_owner` while reader
+  // references are still live. The later handle release then still has to
+  // decrement the epoch reference and take `epoch_mutex`, i.e. call into a store
+  // whose owner is already gone. This shared reference is what keeps that store
+  // shell (and its close graveyard) alive until the last handle is released; see
+  // RocksDbLifecycleTest.DestructorForceClosesStoreWithOutlivingSnapshot and
+  // ForceDetachRetiresOutlivingHandlesAfterDestruction. The per-read RMW pair is
+  // therefore a lifetime requirement, not an optimization opportunity.
   std::shared_ptr<FactStoreImpl> store_;
   const FactStore* owner_ = nullptr;
   SnapshotEpoch* epoch_ = nullptr;
@@ -756,6 +768,17 @@ class FactStore {
   StatusOr<std::string> SchemaFingerprint() const;
   StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
       const StoreSnapshot& snapshot, EdgeRef edge) const;
+  // Same lookup when the caller has already observed a visible edge-state PUT
+  // for `edge` in this snapshot (the edge-visibility walk in
+  // `EdgeVisibleAt`). The observation is exactly the condition the overload
+  // above re-establishes by scanning the edge-state prefix, so the scan is
+  // skipped and the edge fact is read once. Contract: `observed_edge_state`
+  // must be the value returned by `Read(snapshot,
+  // EntityFact::Edge(edge).ref(), valid_time)` on the same snapshot; a
+  // mismatched observation is reported as InvalidArgument rather than trusted.
+  StatusOr<std::optional<EdgeIdentity>> LookupEdgeIdentity(
+      const StoreSnapshot& snapshot, EdgeRef edge,
+      const FactEvent& observed_edge_state) const;
   // Advances the durable retention boundary to `oldest_readable` and deletes
   // obsolete versions at or below it (one baseline per valid-time chain is
   // kept). Unregistered operation: the caller serializes it with Close.

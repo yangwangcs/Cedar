@@ -84,9 +84,14 @@ class CedarParquetTableReader final : public TableReader {
     std::vector<std::string> values;
   };
 
+  // Page-cache resident form of one canonical page. `internal_keys` is not
+  // cached: the internal key is byte-identical to
+  // DecodeCedarParquetSortKey(sort_key), DecodeCanonicalPage validates the
+  // stored column against that derivation before the page becomes resident, and
+  // consumers reconstruct it on demand. This removes one vector of per-row
+  // strings (about a third of the page charge) from every cached page.
   struct DecodedCanonicalPage {
     std::vector<std::string> sort_keys;
-    std::vector<std::string> internal_keys;
     std::vector<std::string> values;
   };
   struct CachePage {

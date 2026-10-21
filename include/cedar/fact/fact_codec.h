@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
@@ -23,9 +24,19 @@ struct DecodedFactKey {
 
 std::string EncodeFactKey(const FactRef& ref, ValidTime valid_from,
                           CommitSeq commit_seq);
+// The `std::string_view` overloads decode in place: they never materialize an
+// intermediate copy of the encoded bytes, so callers that already own a
+// contiguous record (a borrowed key/value slice, a page buffer, a payload
+// region) can validate and decode it without an allocation. Behavior and error
+// statuses are identical to the owning `std::string` overloads, which remain
+// for callers that build a buffer first.
+StatusOr<DecodedFactKey> DecodeFactKey(std::string_view encoded);
 StatusOr<DecodedFactKey> DecodeFactKey(const std::string& encoded);
 
 StatusOr<std::string> EncodeFactValue(const FactEvent& event);
+StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
+                                    CommitSeq commit_seq,
+                                    std::string_view encoded);
 StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
                                     CommitSeq commit_seq,
                                     const std::string& encoded);

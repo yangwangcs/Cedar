@@ -1243,6 +1243,13 @@ TEST_F(RocksDbLifecycleTest, DestructorForceClosesStoreWithOutlivingSnapshot) {
   // blocked by that.
   store.reset();
 
+  // F7 (handle lifetime): the handle's own strong reference to the store shell is
+  // what keeps the force-detached epoch memory (and the close graveyard)
+  // addressable after the owner is gone. These accessors touch only the epoch, so
+  // they must still work while other reads through the handle remain forbidden.
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  EXPECT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{1});
+
   auto reopened = std::make_unique<FactStore>(FactStoreOptions{database_path_});
   const Status reopened_status = reopened->Open();
   ASSERT_TRUE(reopened_status.ok())

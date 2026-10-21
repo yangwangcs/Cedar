@@ -629,7 +629,7 @@ class CedarParquetTableIterator final : public InternalIterator {
 
   bool Valid() const override {
     return status_.ok() && row_group_index_ < reader_->footer_.row_groups.size() &&
-           decoded_ != nullptr && row_index_ < decoded_->internal_keys.size();
+           decoded_ != nullptr && row_index_ < RowCount();
   }
 
   void SeekToFirst() override { PositionAt(0, 0, 0); }
@@ -642,7 +642,7 @@ class CedarParquetTableIterator final : public InternalIterator {
     const size_t group = reader_->footer_.row_groups.size() - 1;
     const size_t page = reader_->footer_.row_groups[group].columns.front().page_locations.size() - 1;
     if (!Load(group, page)) return;
-    row_index_ = decoded_->internal_keys.empty() ? 0 : decoded_->internal_keys.size() - 1;
+    row_index_ = RowCount() == 0 ? 0 : RowCount() - 1;
   }
 
   void Seek(const Slice& target) override {
@@ -650,6 +650,7 @@ class CedarParquetTableIterator final : public InternalIterator {
     std::string sort_key;
     bool is_prefix = false;
     status_ = MakeCedarParquetSeekKey(target, &sort_key, &is_prefix);
+    static_cast<void>(is_prefix);
     if (status_.ok()) status_ = reader_->FindRowGroup(sort_key, &group);
     if (!status_.ok()) return;
     if (group >= reader_->footer_.row_groups.size()) {
@@ -667,19 +668,16 @@ class CedarParquetTableIterator final : public InternalIterator {
       return;
     }
     if (!Load(group, page)) return;
-    if (is_prefix) {
-      const auto position = std::lower_bound(decoded_->sort_keys.begin(),
-                                             decoded_->sort_keys.end(), sort_key);
-      row_index_ = static_cast<size_t>(position - decoded_->sort_keys.begin());
-    } else {
-      const auto position = std::lower_bound(
-          decoded_->internal_keys.begin(), decoded_->internal_keys.end(), target,
-          [this](const std::string& key, const Slice& seek_key) {
-            return reader_->internal_comparator_->Compare(key, seek_key) < 0;
-          });
-      row_index_ = static_cast<size_t>(position - decoded_->internal_keys.begin());
-    }
-    if (row_index_ == decoded_->internal_keys.size()) {
+    // Search the cached sort-key column for both the prefix and the exact-key
+    // case. Sort keys are bytewise-ordered exactly like internal keys under the
+    // InternalKeyComparator: the user key is the prefix and the inverted
+    // big-endian (sequence,type) trailer orders equal user keys by descending
+    // sequence/type. The derived internal-key column is therefore not needed to
+    // locate the first row >= target.
+    const auto position = std::lower_bound(decoded_->sort_keys.begin(),
+                                           decoded_->sort_keys.end(), sort_key);
+    row_index_ = static_cast<size_t>(position - decoded_->sort_keys.begin());
+    if (row_index_ == RowCount()) {
       Advance();
     }
   }
@@ -697,7 +695,7 @@ class CedarParquetTableIterator final : public InternalIterator {
   void Next() override {
     if (!Valid()) return;
     ++row_index_;
-    if (row_index_ == decoded_->internal_keys.size()) Advance();
+    if (row_index_ == RowCount()) Advance();
   }
 
   void Prev() override {
@@ -708,7 +706,7 @@ class CedarParquetTableIterator final : public InternalIterator {
     }
     if (page_index_ > 0) {
       if (Load(row_group_index_, page_index_ - 1)) {
-        row_index_ = decoded_->internal_keys.size() - 1;
+        row_index_ = RowCount() - 1;
       }
       return;
     }
@@ -720,10 +718,19 @@ class CedarParquetTableIterator final : public InternalIterator {
     const size_t previous_page =
         reader_->footer_.row_groups[previous_group].columns.front().page_locations.size() - 1;
     if (!Load(previous_group, previous_page)) return;
-    row_index_ = decoded_->internal_keys.size() - 1;
+    row_index_ = RowCount() - 1;
   }
 
-  Slice key() const override { return Slice(decoded_->internal_keys[row_index_]); }
+  Slice key() const override {
+    // Derive the internal key from the cached sort key on demand. The page was
+    // validated at decode, so a failure here would mean a broken cache
+    // invariant; return an empty slice rather than a dangling reference.
+    const Status status = DecodeCedarParquetSortKey(
+        Slice(decoded_->sort_keys[row_index_]), internal_key_,
+        sizeof(internal_key_));
+    if (!status.ok()) return Slice();
+    return Slice(internal_key_, sizeof(internal_key_));
+  }
   Slice value() const override {
     // DBIter keeps the value Slice across further iterator movement (for
     // example while scanning earlier versions of the same user key), so the
@@ -734,12 +741,16 @@ class CedarParquetTableIterator final : public InternalIterator {
     return Slice(decoded_->values[row_index_]);
   }
   Status status() const override { return status_; }
-  // Keys are slices into the decoded page, which can be replaced by a later
-  // reposition, so DBIter must copy them.
+  // The derived key is a slice into the iterator's own scratch buffer, which a
+  // later reposition overwrites, so DBIter must copy keys.
   bool IsKeyPinned() const override { return false; }
   bool IsValuePinned() const override { return true; }
 
  private:
+  size_t RowCount() const {
+    return decoded_ == nullptr ? 0 : decoded_->sort_keys.size();
+  }
+
   void Invalidate() {
     row_group_index_ = reader_->footer_.row_groups.size();
     page_index_ = 0;
@@ -791,6 +802,11 @@ class CedarParquetTableIterator final : public InternalIterator {
   std::shared_ptr<const CedarParquetTableReader::DecodedCanonicalPage> decoded_;
   mutable std::shared_ptr<const CedarParquetTableReader::DecodedCanonicalPage>
       pinned_value_page_;
+  // Scratch storage for `key()`: the cached page no longer holds the derived
+  // internal-key column, so the current row's key is reconstructed here on
+  // demand without an allocation. IsKeyPinned() is false because a later
+  // reposition overwrites it.
+  mutable char internal_key_[kCedarParquetV2UserKeyBytes + 8] = {};
   size_t row_group_index_ = std::numeric_limits<size_t>::max();
   size_t page_index_ = 0;
   size_t row_index_ = 0;
@@ -1237,23 +1253,29 @@ Status CedarParquetTableReader::DecodeCanonicalPage(
   Status status = DecodeColumnPage(row_group_index, 0, page_index,
                                    &decoded->sort_keys);
   if (!status.ok()) return status;
+  // The stored internal-key column is derivable from the sort keys, so it is
+  // not kept resident. It is still decoded here (transiently) to validate every
+  // row: a page whose stored key disagrees with its sort key must fail closed
+  // exactly as before, and the ordering of the column is checked by the
+  // row-group verification path.
+  std::vector<std::string> stored_internal_keys;
   status = DecodeColumnPage(row_group_index, 1, page_index,
-                            &decoded->internal_keys);
+                            &stored_internal_keys);
   if (!status.ok()) return status;
   status = DecodeColumnPage(row_group_index, 2, page_index, &decoded->values);
   if (!status.ok()) return status;
-  if (decoded->sort_keys.size() != decoded->internal_keys.size() ||
-      decoded->internal_keys.size() != decoded->values.size()) {
+  if (decoded->sort_keys.size() != stored_internal_keys.size() ||
+      stored_internal_keys.size() != decoded->values.size()) {
     return Status::Corruption("Cedar Parquet canonical page column length mismatch");
   }
-  status = ValidateCanonicalRowBytes(decoded->sort_keys, decoded->internal_keys,
+  status = ValidateCanonicalRowBytes(decoded->sort_keys, stored_internal_keys,
                                      decoded->values, options_.max_row_bytes);
   if (!status.ok()) return status;
-  for (size_t index = 0; index < decoded->internal_keys.size(); ++index) {
+  for (size_t index = 0; index < stored_internal_keys.size(); ++index) {
     std::string decoded_key;
     status = DecodeCedarParquetSortKey(decoded->sort_keys[index], &decoded_key);
     if (!status.ok()) return status;
-    if (decoded_key != decoded->internal_keys[index]) {
+    if (decoded_key != stored_internal_keys[index]) {
       return Status::Corruption("Cedar Parquet canonical page key mismatch");
     }
   }
@@ -1320,7 +1342,6 @@ Status CedarParquetTableReader::LoadCanonicalPage(
     for (const std::string& value : column) bytes += value.capacity();
   };
   add_column_bytes(loaded->page.sort_keys);
-  add_column_bytes(loaded->page.internal_keys);
   add_column_bytes(loaded->page.values);
   metrics->decoded_bytes.fetch_add(bytes, std::memory_order_relaxed);
   loaded->charge = bytes;
@@ -1865,21 +1886,20 @@ Status CedarParquetTableReader::Get(const ReadOptions& read_options, const Slice
       if (!status.ok()) return status;
       const auto& sort_keys = decoded_page->sort_keys;
       if (!sort_keys.empty() && sort_keys.back() < sort_key) continue;
-      const auto& internal_keys = decoded_page->internal_keys;
       const auto& values = decoded_page->values;
-      if (sort_keys.size() != internal_keys.size() ||
-          internal_keys.size() != values.size()) {
+      if (sort_keys.size() != values.size()) {
         return Status::Corruption("Cedar Parquet page column length mismatch");
       }
-      for (size_t row_index = 0; row_index < internal_keys.size(); ++row_index) {
-        std::string decoded_key;
-        status = DecodeCedarParquetSortKey(sort_keys[row_index], &decoded_key);
-        if (!status.ok() || decoded_key != internal_keys[row_index]) {
-          return Status::Corruption("Cedar Parquet canonical key mismatch");
-        }
-        if (internal_comparator_->Compare(internal_keys[row_index], key) < 0) continue;
+      // DecodeCanonicalPage validated every cached sort key against the stored
+      // internal-key column, so the internal key can be reconstructed from the
+      // cached sort key on demand instead of being kept resident.
+      std::string internal_key;
+      for (size_t row_index = 0; row_index < sort_keys.size(); ++row_index) {
+        status = DecodeCedarParquetSortKey(sort_keys[row_index], &internal_key);
+        if (!status.ok()) return status;
+        if (internal_comparator_->Compare(internal_key, key) < 0) continue;
         ParsedInternalKey parsed;
-        status = ParseInternalKey(internal_keys[row_index], &parsed, false);
+        status = ParseInternalKey(internal_key, &parsed, false);
         if (!status.ok()) return status;
         if (parsed.user_key != target.user_key) return Status::OK();
         bool matched = false;
@@ -1992,6 +2012,9 @@ void CedarParquetTableReader::MultiGet(
       }
       if (first_page >= sort_column.page_locations.size()) continue;
 
+      // Derive each row's internal key from the cached sort key on demand; the
+      // page decode already validated the derivation against the stored column.
+      std::string internal_key;
       for (size_t page_index = first_page;
            page_index < sort_column.page_locations.size() && !request_done;
            ++page_index) {
@@ -2002,9 +2025,15 @@ void CedarParquetTableReader::MultiGet(
           request_done = true;
           break;
         }
-        for (size_t row_index = 0; row_index < page->internal_keys.size();
+        for (size_t row_index = 0; row_index < page->sort_keys.size();
              ++row_index) {
-          const std::string& internal_key = page->internal_keys[row_index];
+          status = DecodeCedarParquetSortKey(page->sort_keys[row_index],
+                                             &internal_key);
+          if (!status.ok()) {
+            *iter->s = status;
+            request_done = true;
+            break;
+          }
           if (internal_comparator_->Compare(internal_key, iter->ikey) < 0) {
             continue;
           }

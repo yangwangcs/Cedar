@@ -567,6 +567,48 @@ TEST_F(FactStoreMetadataTest, HidesEdgeIdentityCreatedAfterLogicalSnapshot) {
   EXPECT_EQ(visible.ValueOrDie(), std::optional<EdgeIdentity>{identity});
 }
 
+TEST_F(FactStoreMetadataTest, ObservedEdgeStateLookupMatchesScanningLookup) {
+  // F7: callers that already read the visible edge-state fact (the edge
+  // visibility walk) may skip the duplicate edge-state scan in
+  // LookupEdgeIdentity. The observed-state overload must resolve the same
+  // identity, and it must reject an observation that is not the edge-state PUT
+  // it claims to be.
+  const EdgeIdentity identity{EdgeId{9}, VertexId{1}, VertexId{2}, 7};
+  const StoreCommitBatch batch{
+      TxnId{1},
+      1,
+      {{EntityFact::Edge(identity.edge_ref()).ref(), ValidTime{10},
+        FactOperation::kPut, 0, std::nullopt}},
+      {identity}};
+  ASSERT_TRUE(store_->Commit(batch).ok());
+
+  const auto snapshot = store_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto edge_state = store_->Read(
+      snapshot.ValueOrDie(), EntityFact::Edge(identity.edge_ref()).ref(),
+      ValidTime{10});
+  ASSERT_TRUE(edge_state.ok()) << edge_state.status().ToString();
+  ASSERT_TRUE(edge_state.ValueOrDie().has_value());
+
+  const auto scanned = store_->LookupEdgeIdentity(snapshot.ValueOrDie(),
+                                                  identity.edge_ref());
+  ASSERT_TRUE(scanned.ok()) << scanned.status().ToString();
+  const auto observed = store_->LookupEdgeIdentity(
+      snapshot.ValueOrDie(), identity.edge_ref(), *edge_state.ValueOrDie());
+  ASSERT_TRUE(observed.ok()) << observed.status().ToString();
+  EXPECT_EQ(observed.ValueOrDie(), scanned.ValueOrDie());
+  EXPECT_EQ(observed.ValueOrDie(), std::optional<EdgeIdentity>{identity});
+
+  // A visible vertex fact is not the promised edge-state observation.
+  FactEvent mismatched = *edge_state.ValueOrDie();
+  mismatched.ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  const auto rejected = store_->LookupEdgeIdentity(
+      snapshot.ValueOrDie(), identity.edge_ref(), mismatched);
+  EXPECT_TRUE(rejected.status().IsInvalidArgument())
+      << rejected.status().ToString();
+}
+
 TEST_F(FactStoreMetadataTest,
        RejectsTypeChangeForPropertyNameAcrossNonAdjacentEpochs) {
   ASSERT_TRUE(store_->RegisterProperty(

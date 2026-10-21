@@ -1347,6 +1347,71 @@ TEST(CedarParquetTableReaderTest, RejectsCorruptBloomHeaderWhenOpeningTable) {
   EXPECT_EQ(rejected, nullptr);
 }
 
+// F7: the page cache no longer keeps the derivable internal-key column, but a
+// page is still validated when it is decoded: the stored column is decoded
+// transiently and compared with DecodeCedarParquetSortKey(sort_key). Corrupt one
+// stored internal key and prove the on-demand derivation cannot mask the
+// mismatch - the first read of that page must fail closed with Corruption.
+TEST(CedarParquetTableReaderTest,
+     RejectsStoredInternalKeyThatDisagreesWithSortKey) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {InternalKeyFor(1, 4),
+                                         InternalKeyFor(2, 4)};
+  const std::vector<std::string> values = {StateFactValue(), StateFactValue()};
+  std::unique_ptr<CedarParquetTableReader> reader =
+      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator);
+  ASSERT_NE(reader, nullptr);
+  reader.reset();
+
+  std::ifstream input(TestPath(), std::ios::binary);
+  ASSERT_TRUE(input.good());
+  const std::string bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
+  CedarParquetFooter footer;
+  ASSERT_TRUE(ParseParquetFooter(bytes, &footer, nullptr).ok());
+  const auto& internal_key_column = footer.row_groups[0].columns[1];
+  ASSERT_GT(internal_key_column.offset_index_length, 0);
+  const std::string encoded_index = bytes.substr(
+      static_cast<size_t>(internal_key_column.offset_index_offset),
+      static_cast<size_t>(internal_key_column.offset_index_length));
+  std::vector<CedarParquetFooter::ColumnChunk::PageLocation> locations;
+  ASSERT_TRUE(DecodeOffsetIndex(encoded_index, &locations).ok());
+  ASSERT_FALSE(locations.empty());
+  const auto& location = locations[0];
+  std::string wrong_internal_key = keys[0];
+  wrong_internal_key.back() ^= 0x01;
+  std::string replacement_page;
+  ASSERT_TRUE(
+      EncodePlainByteArrayDataPage({Slice(wrong_internal_key)}, &replacement_page)
+          .ok());
+  ASSERT_LE(replacement_page.size(),
+            static_cast<size_t>(location.compressed_page_size));
+  std::fstream output(TestPath(),
+                      std::ios::binary | std::ios::in | std::ios::out);
+  ASSERT_TRUE(output.good());
+  output.seekp(static_cast<std::streamoff>(location.offset));
+  output.write(replacement_page.data(),
+               static_cast<std::streamsize>(replacement_page.size()));
+  const std::string padding(
+      static_cast<size_t>(location.compressed_page_size) - replacement_page.size(),
+      '\0');
+  output.write(padding.data(), static_cast<std::streamsize>(padding.size()));
+  ASSERT_TRUE(output.good());
+  output.close();
+
+  reader = OpenExisting(immutable_options, mutable_options, comparator);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  iterator->Seek(keys[0]);
+  EXPECT_TRUE(iterator->status().IsCorruption())
+      << iterator->status().ToString();
+  EXPECT_FALSE(iterator->Valid());
+}
+
 TEST(CedarParquetTableReaderTest, RejectsOverlappingOffsetIndexPages) {
   Options options;
   ImmutableOptions immutable_options(options);

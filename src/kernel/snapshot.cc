@@ -260,7 +260,11 @@ StatusOr<bool> EdgeVisibleAt(const FactStore& store,
       store.Read(snapshot, EntityFact::Edge(edge_ref).ref(), valid_time);
   if (!edge.ok()) return edge.status();
   if (!edge.ValueOrDie().has_value()) return false;
-  const auto identity = store.LookupEdgeIdentity(snapshot, edge_ref);
+  // Reuse the edge-state fact just read: the identity lookup would otherwise
+  // scan the same edge-state prefix only to establish the visibility this read
+  // already proved (see LookupEdgeIdentity's observed-state overload).
+  const auto identity = store.LookupEdgeIdentity(
+      snapshot, edge_ref, *edge.ValueOrDie());
   if (!identity.ok()) return identity.status();
   if (!identity.ValueOrDie().has_value()) return false;
   const auto source = store.Read(
@@ -640,7 +644,7 @@ StatusOr<std::optional<Value>> ReadPropertyPointAt(
     const FactStore& store, const StoreSnapshot& snapshot, const FactRef& ref,
     ValidTime valid_time) {
   store.RecordPointRead(snapshot);
-  const auto event = store.Read(snapshot, ref, valid_time);
+  auto event = store.Read(snapshot, ref, valid_time);
   if (!event.ok()) return event.status();
   if (!event.ValueOrDie().has_value()) return std::optional<Value>{};
   if (ref.family() == FactFamily::kEdgeProperty) {
@@ -651,7 +655,9 @@ StatusOr<std::optional<Value>> ReadPropertyPointAt(
     if (!visible.ok()) return visible.status();
     if (!visible.ValueOrDie()) return std::optional<Value>{};
   }
-  return event.ValueOrDie()->value;
+  // The event is local to this function, so move its optional payload out
+  // instead of copying the string-valued result.
+  return std::optional<Value>{std::move(event.ValueOrDie()->value)};
 }
 
 StatusOr<std::optional<Value>> Snapshot::Get(PropertyFact property,

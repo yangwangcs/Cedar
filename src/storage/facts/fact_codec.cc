@@ -54,7 +54,7 @@ void WriteU64(char** out, uint64_t value) {
   }
 }
 
-bool ReadU16(const std::string& input, size_t* offset, uint16_t* value) {
+bool ReadU16(std::string_view input, size_t* offset, uint16_t* value) {
   if (input.size() - *offset < 2) return false;
   *value = (static_cast<uint16_t>(static_cast<uint8_t>(input[*offset])) << 8) |
            static_cast<uint8_t>(input[*offset + 1]);
@@ -62,7 +62,7 @@ bool ReadU16(const std::string& input, size_t* offset, uint16_t* value) {
   return true;
 }
 
-bool ReadU32(const std::string& input, size_t* offset, uint32_t* value) {
+bool ReadU32(std::string_view input, size_t* offset, uint32_t* value) {
   if (input.size() - *offset < 4) return false;
   *value = 0;
   for (int index = 0; index < 4; ++index) {
@@ -72,7 +72,7 @@ bool ReadU32(const std::string& input, size_t* offset, uint32_t* value) {
   return true;
 }
 
-bool ReadU64(const std::string& input, size_t* offset, uint64_t* value) {
+bool ReadU64(std::string_view input, size_t* offset, uint64_t* value) {
   if (input.size() - *offset < 8) return false;
   *value = 0;
   for (int index = 0; index < 8; ++index) {
@@ -130,7 +130,7 @@ StatusOr<std::string> EncodeValuePayload(const Value& value) {
 }
 
 StatusOr<Value> DecodeValuePayload(PhysicalType type,
-                                   const std::string& payload) {
+                                   std::string_view payload) {
   size_t offset = 0;
   uint32_t bits32 = 0;
   uint64_t bits64 = 0;
@@ -166,9 +166,12 @@ StatusOr<Value> DecodeValuePayload(PhysicalType type,
       }
       break;
     case PhysicalType::kString:
-      return Value::String(payload);
+      // One owning allocation (the Value payload itself); the encoded bytes are
+      // copied directly out of the caller's record instead of through a
+      // temporary `std::string`.
+      return Value::String(std::string(payload));
     case PhysicalType::kBinary:
-      return Value::Binary(payload);
+      return Value::Binary(std::string(payload));
   }
   return Status::Corruption("fact value", "invalid physical value payload");
 }
@@ -188,7 +191,7 @@ StatusOr<std::string> EncodeEdgeIdentityPayload(const EdgeIdentity& identity) {
   return payload;
 }
 
-StatusOr<EdgeIdentity> DecodeEdgeIdentityPayload(const std::string& payload) {
+StatusOr<EdgeIdentity> DecodeEdgeIdentityPayload(std::string_view payload) {
   if (payload.size() != 44) {
     return Status::Corruption("edge identity fact", "invalid identity payload length");
   }
@@ -236,6 +239,10 @@ std::string EncodeFactKey(const FactRef& ref, ValidTime valid_from,
 }
 
 StatusOr<DecodedFactKey> DecodeFactKey(const std::string& encoded) {
+  return DecodeFactKey(std::string_view(encoded));
+}
+
+StatusOr<DecodedFactKey> DecodeFactKey(std::string_view encoded) {
   if (encoded.size() != kEncodedFactKeyBytes) {
     return Status::Corruption("fact key", "incorrect fixed key length");
   }
@@ -299,6 +306,13 @@ StatusOr<std::string> EncodeFactValue(const FactEvent& event) {
 StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
                                     CommitSeq commit_seq,
                                     const std::string& encoded) {
+  return DecodeFactValue(ref, valid_from, commit_seq,
+                         std::string_view(encoded));
+}
+
+StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
+                                    CommitSeq commit_seq,
+                                    std::string_view encoded) {
   if (encoded.size() < kFactValueHeaderBytes + kFactValueChecksumBytes) {
     return Status::Corruption("fact value", "truncated value record");
   }
@@ -323,15 +337,18 @@ StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
       stored_checksum != crc32c::Value(encoded.data(), checksum_offset)) {
     return Status::Corruption("fact value", "CRC32C mismatch");
   }
+  // The payload is a view into the caller's record: no intermediate string is
+  // materialized, and the decoded value is the only owning copy.
+  const std::string_view payload =
+      encoded.substr(offset, payload_length);
   std::optional<Value> value;
   if (kind == kEdgeIdentityValueKind) {
-    const auto identity = DecodeEdgeIdentityPayload(
-        encoded.substr(offset, payload_length));
+    auto identity = DecodeEdgeIdentityPayload(payload);
     if (!identity.ok()) return identity.status();
     value = std::nullopt;
     FactEvent event{ref, valid_from, commit_seq,
-                    static_cast<FactOperation>(operation), schema_epoch, value,
-                    identity.ValueOrDie()};
+                    static_cast<FactOperation>(operation), schema_epoch,
+                    std::move(value), std::move(identity.ValueOrDie())};
     const Status valid = event.Validate();
     if (!valid.ok()) return Status::Corruption("fact value", valid.ToString());
     return event;
@@ -344,13 +361,13 @@ StatusOr<FactEvent> DecodeFactValue(const FactRef& ref, ValidTime valid_from,
     if (!IsPhysicalType(kind)) {
       return Status::Corruption("fact value", "unknown physical value kind");
     }
-    const auto decoded = DecodeValuePayload(
-        static_cast<PhysicalType>(kind), encoded.substr(offset, payload_length));
+    auto decoded = DecodeValuePayload(static_cast<PhysicalType>(kind), payload);
     if (!decoded.ok()) return decoded.status();
-    value = decoded.ValueOrDie();
+    value = decoded.ConsumeValueOrDie();
   }
   FactEvent event{ref, valid_from, commit_seq,
-                  static_cast<FactOperation>(operation), schema_epoch, value};
+                  static_cast<FactOperation>(operation), schema_epoch,
+                  std::move(value)};
   const Status valid = event.Validate();
   if (!valid.ok()) {
     return Status::Corruption("fact value", valid.ToString());

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cedar/fact/fact_codec.h"
@@ -107,6 +108,75 @@ TEST(FactCodecTest, RejectsCorruptAndOversizedValues) {
   oversized[1] = static_cast<char>(FactOperation::kDelete);
   oversized[10] = static_cast<char>(0x04);
   EXPECT_TRUE(DecodeFactValue(ref, ValidTime{10}, CommitSeq{3}, oversized)
+                  .status()
+                  .IsCorruption());
+}
+
+TEST(FactCodecTest, DecodesBorrowedRecordViews) {
+  const FactRef ref =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{9})
+          .ref();
+  const FactEvent event{ref, ValidTime{10}, CommitSeq{3},
+                        FactOperation::kPut, 2, Value::String("borrowed")};
+  const std::string encoded = EncodeFactValue(event).ConsumeValueOrDie();
+
+  // The view overloads decode the exact same record without an owning copy.
+  const auto decoded =
+      DecodeFactValue(ref, ValidTime{10}, CommitSeq{3},
+                      std::string_view(encoded.data(), encoded.size()));
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  ASSERT_TRUE(decoded.ValueOrDie().value.has_value());
+  EXPECT_EQ(decoded.ValueOrDie().value->type(), PhysicalType::kString);
+  EXPECT_EQ(std::get<std::string>(decoded.ValueOrDie().value->data()),
+            "borrowed");
+
+  const std::string encoded_key =
+      EncodeFactKey(ref, ValidTime{10}, CommitSeq{3});
+  const auto key =
+      DecodeFactKey(std::string_view(encoded_key.data(), encoded_key.size()));
+  ASSERT_TRUE(key.ok()) << key.status().ToString();
+  EXPECT_EQ(key.ValueOrDie().ref, ref);
+  EXPECT_EQ(key.ValueOrDie().valid_from, ValidTime{10});
+  EXPECT_EQ(key.ValueOrDie().commit_seq, CommitSeq{3});
+}
+
+TEST(FactCodecTest, BorrowedRecordViewRejectsMalformedRecords) {
+  const FactRef ref =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{7}}, PropertyId{9})
+          .ref();
+  const FactEvent event{ref, ValidTime{10}, CommitSeq{3},
+                        FactOperation::kPut, 2, Value::String("cedar")};
+  const std::string encoded = EncodeFactValue(event).ConsumeValueOrDie();
+
+  // Truncated header.
+  EXPECT_TRUE(DecodeFactValue(ref, ValidTime{10}, CommitSeq{3},
+                              std::string_view(encoded).substr(0, 4))
+                  .status()
+                  .IsCorruption());
+  // CRC mismatch and a payload-length disagreement must both survive the
+  // zero-copy path unchanged.
+  std::string corrupt = encoded;
+  corrupt.back() ^= 0x01;
+  const auto checksum = DecodeFactValue(
+      ref, ValidTime{10}, CommitSeq{3}, std::string_view(corrupt));
+  ASSERT_FALSE(checksum.ok());
+  EXPECT_TRUE(checksum.status().IsCorruption());
+  std::string wrong_length = encoded;
+  wrong_length.erase(wrong_length.size() - 5, 1);
+  EXPECT_TRUE(DecodeFactValue(ref, ValidTime{10}, CommitSeq{3},
+                              std::string_view(wrong_length))
+                  .status()
+                  .IsCorruption());
+
+  // Borrowed key views reject the same malformed encodings as owning strings.
+  const std::string encoded_key =
+      EncodeFactKey(ref, ValidTime{10}, CommitSeq{3});
+  EXPECT_TRUE(DecodeFactKey(std::string_view(encoded_key).substr(0, 8))
+                  .status()
+                  .IsCorruption());
+  std::string wrong_version = encoded_key;
+  wrong_version[0] = 1;
+  EXPECT_TRUE(DecodeFactKey(std::string_view(wrong_version))
                   .status()
                   .IsCorruption());
 }

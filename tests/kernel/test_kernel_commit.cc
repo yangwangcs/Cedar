@@ -4950,6 +4950,69 @@ TEST(KernelGroupCommitTest, PipelinedWaitIsIdempotentAndAcceptanceIsSticky) {
   std::filesystem::remove_all(path);
 }
 
+// F3 review minor: Wait() is idempotent for a legacy (non-pipelined) async
+// handle bound to an epoch. Repeated calls must keep returning the same terminal
+// result/status and must not consume or corrupt the retained terminal state.
+TEST(KernelGroupCommitTest, LegacyAsyncWaitIsRepeatableAndIdempotent) {
+  char pattern[] = "/tmp/cedar_kernel_legacy_idempotent_wait_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  auto opened = Database::Open(DatabaseOptions{
+      .path = path,
+      .group_commit_max_batch_size = 8,
+      .group_commit_window_us = 0,
+      .predicted_preflight_min_bytes = 0});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+  auto transaction = database->BeginTransaction();
+  ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+  ASSERT_TRUE(transaction.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'951}}),
+                           ValidTime{10})
+                  .ok());
+  auto accepted = transaction.ValueOrDie()->CommitAsync();
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  CommitHandle handle = std::move(accepted).ValueOrDie();
+  EXPECT_EQ(handle.acceptance(), CommitAcceptance::kAccepted);
+
+  const auto first = handle.Wait();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  EXPECT_EQ(first.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  EXPECT_EQ(first.ValueOrDie().commit_seq, CommitSeq{1});
+
+  const auto second = handle.Wait();
+  const auto third = handle.Wait();
+  for (const auto* repeated : {&second, &third}) {
+    ASSERT_TRUE(repeated->ok()) << repeated->status().ToString();
+    EXPECT_EQ(repeated->ValueOrDie().outcome, first.ValueOrDie().outcome);
+    EXPECT_EQ(repeated->ValueOrDie().commit_seq, first.ValueOrDie().commit_seq);
+    EXPECT_EQ(repeated->ValueOrDie().txn_id, first.ValueOrDie().txn_id);
+    EXPECT_EQ(repeated->ValueOrDie().status.ToString(),
+              first.ValueOrDie().status.ToString());
+  }
+  // Wait() does not mutate the handle's immutable identity/acceptance.
+  EXPECT_EQ(handle.txn_id(), first.ValueOrDie().txn_id);
+  EXPECT_EQ(handle.acceptance(), CommitAcceptance::kAccepted);
+
+  // The repeated waits did not disturb the committed visibility: the entity
+  // state is readable and the pipeline reports exactly one committed
+  // transaction.
+  {
+    const EntityFact committed =
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{9'951}});
+    const auto snapshot = database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    const auto exists = snapshot.ValueOrDie().Exists(committed, ValidTime{10});
+    ASSERT_TRUE(exists.ok()) << exists.status().ToString();
+    EXPECT_TRUE(exists.ValueOrDie());
+  }
+  const CommitPipelineMetrics metrics = database->GetCommitPipelineMetrics();
+  EXPECT_EQ(metrics.submitted, 1U);
+  EXPECT_EQ(metrics.published, 1U);
+  EXPECT_TRUE(database->Close().ok());
+  std::filesystem::remove_all(path);
+}
+
 TEST(KernelGroupCommitTest,
      PipelinedHandleWaitIsSafeAfterDatabaseDestruction) {
   char pattern[] = "/tmp/cedar_kernel_pipelined_handle_lifetime_XXXXXX";

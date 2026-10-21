@@ -223,6 +223,33 @@ TEST_F(FactStoreTest, CloseRejectsLiveSnapshotThenSucceedsAfterRelease) {
   EXPECT_TRUE(store.Close().ok());
 }
 
+// F3 review minor: FinishClose is the second phase of a successful
+// PrepareClose. Calling it on an open, not-prepared store is a contract
+// violation and must be reported instead of silently closing the store.
+TEST_F(FactStoreTest, FinishCloseWithoutPrepareIsInvalidArgument) {
+  FactStore store(FactStoreOptions{path_});
+  ASSERT_TRUE(store.Open().ok());
+
+  const Status premature = store.FinishClose();
+  EXPECT_TRUE(premature.IsInvalidArgument()) << premature.ToString();
+
+  // The rejected call must not have destroyed the store: reads still work and a
+  // later two-phase Close (or the single-call Close) still succeeds.
+  {
+    auto snapshot = store.BeginSnapshot({});
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    const FactRef ref =
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref();
+    const auto read = store.Read(snapshot.ValueOrDie(), ref, ValidTime{10});
+    ASSERT_TRUE(read.ok()) << read.status().ToString();
+    EXPECT_FALSE(read.ValueOrDie().has_value());
+  }
+
+  EXPECT_TRUE(store.Close().ok());
+  // An already-closed store is an idempotent no-op, as documented.
+  EXPECT_TRUE(store.FinishClose().ok());
+}
+
 TEST_F(FactStoreTest, ReopensAfterSnapshotIsReleasedBeforeClose) {
   FactStore store(FactStoreOptions{path_});
   ASSERT_TRUE(store.Open().ok());

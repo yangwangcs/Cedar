@@ -468,11 +468,15 @@ class FactStore {
   explicit FactStore(FactStoreOptions options);
   // Destroys the store. Unlike Close(), destruction cannot report
   // SnapshotPinned: a StoreSnapshot handle that still pins an epoch is
-  // force-detached (payloads/leases released, epoch memory retained until the
-  // handle is gone) and the RocksDB handle is destroyed, so an outliving handle
-  // can neither keep the database (LOCK/WAL) open nor cause a use-after-free.
-  // Such a handle may only be destroyed after the FactStore is gone; reading
-  // through it after destruction is not supported.
+  // force-detached during destruction - its epoch payload (the RocksDB snapshot
+  // lease and the strong store back-reference) is released and the RocksDB
+  // handle is destroyed, while the epoch memory itself is retained until the
+  // handle is gone. Such an outliving handle cannot keep the database (LOCK/WAL)
+  // open and cannot cause a use-after-free, but it is detached from a live
+  // store: it must only be destroyed after the FactStore is gone, and it must
+  // never be read (or otherwise used) after that point. Destroying it afterwards
+  // is safe and is the required way to retire it. The normal path - Close()
+  // before destruction, or destruction with no outliving handle - is unchanged.
   ~FactStore();
 
   FactStore(const FactStore&) = delete;
@@ -521,16 +525,23 @@ class FactStore {
   // Two-phase close used by the kernel to keep a failed (SnapshotPinned) close
   // non-destructive. PrepareClose performs the irreversible *decision* part of
   // Close: it unpublishes the lock-free fast path, drains registered opens,
-  // fast pins and non-epoch users, and checks the epoch registry with the
-  // publisher/epoch locks. If an epoch is still referenced it fully restores
-  // the store and returns SnapshotPinned, so the caller can keep using it. If
-  // not, the store is committed to closing: accepting_snapshots stays false and
-  // fast_impl_ stays null, so no epoch reference can be created afterwards, but
-  // no heavy state has been released yet. The caller may then perform its own
-  // irreversible teardown (stop commit workers, detach derived state) knowing
-  // the close can no longer fail for pinning, and finally call FinishClose.
-  // A successful PrepareClose must be followed by FinishClose; Close() is the
-  // single-call composition of both under one lifecycle critical section.
+  // fast pins and non-epoch users, evicts the rebuildable as_of epoch cache,
+  // and checks the epoch registry under the publisher/epoch locks. If an epoch
+  // is still referenced it rolls the publication gates back (the lock-free fast
+  // path is republished and snapshot/fast-pin acceptance is restored) and
+  // returns SnapshotPinned; nothing heavy is destroyed, so the store stays open
+  // and usable. The rollback deliberately does not repopulate the as_of cache:
+  // the pin test runs after the eviction, and later as_of reads rebuild cache
+  // entries lazily. Cache entries hold only rebuildable epoch references and
+  // never pin the retention boundary, so a pinned close costs a cache refill,
+  // not correctness. If no epoch is referenced, the store is committed to
+  // closing: accepting_snapshots stays false and fast_impl_ stays null, so no
+  // epoch reference can be created afterwards, but no heavy state has been
+  // released yet. The caller may then perform its own irreversible teardown
+  // (stop commit workers, detach derived state) knowing the close can no longer
+  // fail for pinning, and finally call FinishClose. A successful PrepareClose
+  // must be followed by FinishClose; Close() is the single-call composition of
+  // both under one lifecycle critical section.
   Status PrepareClose();
   // Completes a successful PrepareClose: drains any remaining registered
   // operation (the caller has stopped its producers), releases the epoch

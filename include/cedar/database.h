@@ -295,6 +295,16 @@ struct DatabaseOptions {
       query_delta_repair_budget_observer_for_testing;
   // Test-only lifecycle switch for exercising shutdown discard accounting.
   // Production keeps the normal drain-before-stop ordering.
+  //
+  // Caveat (test-only, unreachable from production): with this override the
+  // append pipeline is stopped *before* the commit drain, so the executor Stop
+  // sweep can run while a legacy (non-pipelined) CommitAsync request is not yet
+  // bound to its epoch. That sweep may write a synthetic ShutdownInProgress
+  // terminal into such a request, which can mask or race the result the append
+  // worker publishes afterwards. The normal drain-before-stop path publishes
+  // every epoch terminal before the sweep can observe the request, so production
+  // (false) never has this window; tests must not combine this switch with
+  // legacy submissions whose terminal result they assert.
   bool stop_pipeline_before_drain_for_testing = false;
   uint32_t foreground_admission_concurrency = 0;
   std::function<void()> foreground_admission_observer_for_testing;
@@ -388,6 +398,16 @@ class Database {
  public:
   static StatusOr<std::unique_ptr<Database>> Open(DatabaseOptions options);
 
+  // Destroys the database (attempting a normal Close first). A Snapshot handle
+  // that still pins a storage epoch at destruction is force-detached: its epoch
+  // payload (the storage-engine snapshot lease and the store back-reference) is
+  // released and the storage handles are destroyed, so it cannot keep the
+  // database (LOCK/WAL) open. Such a handle must only be destroyed after the
+  // Database is gone and must never be read (or otherwise used) after that
+  // point; destroying it afterwards is safe and is the required way to retire
+  // it. The normal path - Close() before destruction, or destruction with no
+  // outliving handle - is unchanged. See FactStore::~FactStore for the
+  // storage-level contract.
   ~Database();
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;

@@ -2127,7 +2127,8 @@ Status Database::Close() {
   impl_->ObserveShutdownStage("active_commit_resolution");
   // Irreversible-decision point: confirm that the store can close (no live
   // epoch pin) *before* stopping the commit pipeline/executor or detaching the
-  // derived query state. A pinned failure fully restores the store here and
+  // derived query state. A pinned failure rolls the publication gates back here
+  // (the rebuildable as_of cache that PrepareClose evicted is left empty) and
   // only `closing` is rolled back, so the retriable SnapshotPinned contract
   // cannot leave an open-but-write-dead database behind. Once this succeeds no
   // new epoch reference can be created, so the remaining teardown cannot fail.

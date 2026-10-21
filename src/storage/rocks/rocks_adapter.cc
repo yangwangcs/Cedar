@@ -2552,6 +2552,12 @@ Status FactStore::PrepareCloseLocked() {
     // Serialize with a publisher so no visible-sequence advance retires or
     // reclaims an epoch between the reference test and the teardown.
     std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
+    // Evict the rebuildable as_of epoch cache before the reference test. Eviction
+    // is one-way for this attempt: a pinned (failed) close does not repopulate
+    // it, and later as_of reads rebuild entries lazily. Cache entries hold only
+    // rebuildable epoch references and never pin the retention boundary, so this
+    // cannot affect correctness; the rollback below restores the publication
+    // gates, not the cache.
     store->ClearAsOfCache();
     {
       std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
@@ -2560,8 +2566,11 @@ Status FactStore::PrepareCloseLocked() {
   }
   if (pinned) {
     // Semantics unchanged: a failed close leaves the store open and usable.
-    // Nothing heavy has been released, so restoring the publication gates is a
-    // complete rollback of this attempt.
+    // Nothing heavy has been released and no live reader reference is dropped
+    // (a reader inside a cached as_of read holds its own reference); the
+    // publication gates are the only state this attempt changed, so restoring
+    // them restores usability. The as_of cache stays empty (see above): it is
+    // rebuildable and its eviction has no correctness effect.
     fast_impl_.store(store.get(), std::memory_order_seq_cst);
     store->accepting_fast.store(true, std::memory_order_seq_cst);
     store->accepting_snapshots.store(true, std::memory_order_release);

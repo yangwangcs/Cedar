@@ -82,6 +82,10 @@ class CommitHandle {
   // the transaction becomes durable, so Wait()'s result is the durability
   // barrier and the acceptance value must not be used to infer it.
   CommitAcceptance acceptance() const;
+  // Returns the terminal result, waiting for it if necessary. Idempotent:
+  // repeated calls return the same result and status (a bound epoch's published
+  // terminal is authoritative) and never mutate the handle or its terminal
+  // state.
   StatusOr<CommitResult> Wait() const;
 
  private:

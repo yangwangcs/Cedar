@@ -121,6 +121,18 @@ struct FactStoreOptions {
   // snapshot) is not serialized behind a concurrent close handshake. Must not
   // call back into FactStore. Production callers leave it unset.
   std::function<void()> prepare_close_locked_observer_for_testing;
+  // Fires once per committed sequence record consumed by reopen validation with
+  // `read_from_iterator == true` when the record came from the meta-CF iterator
+  // the scan is already holding, or false when the validator had to re-read the
+  // sequence key. S1 removed that second read, so the reopen scan reports true
+  // for every record; a regression that re-reads the key is expected to report
+  // false here. Must not call back into FactStore.
+  std::function<void(bool)> sequence_validation_read_source_observer_for_testing;
+  // Forces the reopen identity-history rebuild to be skipped even when the
+  // facts CF could be represented by the filter. Tests use it to prove the skip
+  // path leaves the filter in its always-true state on a small database.
+  // Production takes the capacity decision from the facts CF estimate.
+  bool identity_history_skip_rebuild_for_testing = false;
 };
 
 struct SnapshotWriteDependency {
@@ -349,6 +361,12 @@ struct ValidationCacheMetrics {
   uint64_t recent_write_coverage_misses = 0;
   uint64_t recent_write_exact_capacity = 0;
   uint64_t recent_write_exact_resident_bytes = 0;
+  // S3: state of the ever-written identity Bloom. `disabled` means the reopen
+  // rebuild was skipped because the facts CF outgrew the filter budget; the
+  // filter is then always-true (resident_bytes == 0) and every probe falls back
+  // to the canonical read.
+  uint64_t identity_history_resident_bytes = 0;
+  bool identity_history_disabled = false;
 
 };
 

@@ -2701,6 +2701,10 @@ CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {
         cache_metrics.ValueOrDie().recent_write_index_capacity;
     metrics.recent_write_index_resident_bytes =
         cache_metrics.ValueOrDie().recent_write_index_resident_bytes;
+    metrics.identity_history_resident_bytes =
+        cache_metrics.ValueOrDie().identity_history_resident_bytes;
+    metrics.identity_history_disabled =
+        cache_metrics.ValueOrDie().identity_history_disabled;
   }
   return metrics;
 }

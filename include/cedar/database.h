@@ -401,6 +401,12 @@ struct CommitPipelineMetrics {
   uint64_t recent_write_coverage_misses = 0;
   uint64_t recent_write_exact_capacity = 0;
   uint64_t recent_write_exact_resident_bytes = 0;
+  // S3: a reopen whose facts CF outgrew the fixed identity-history Bloom budget
+  // skips the rebuild and leaves the filter always-true. `disabled` exposes that
+  // state (resident_bytes is then zero and every probe falls back to the
+  // canonical read).
+  uint64_t identity_history_resident_bytes = 0;
+  bool identity_history_disabled = false;
 
   uint64_t async_mailbox_accepted = 0;
   uint64_t async_mailbox_rejected = 0;

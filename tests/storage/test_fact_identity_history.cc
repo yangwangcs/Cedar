@@ -39,5 +39,47 @@ TEST(FactIdentityHistoryTest, FallsBackConservativelyForInvalidRefs) {
   history.Publish(invalid);
 }
 
+TEST(FactIdentityHistoryTest, CapacityIsTheBitsPerIdentityBudget) {
+  // 4096 bytes -> 512 words (the power-of-two word count) -> 32,768 bits, i.e.
+  // 4096 identities at the 8-bits-per-identity usefulness point.
+  EXPECT_TRUE(FactIdentityHistory::CanRepresent(4096, 0));
+  EXPECT_TRUE(FactIdentityHistory::CanRepresent(4096, 4096));
+  EXPECT_FALSE(FactIdentityHistory::CanRepresent(4096, 4097));
+  EXPECT_FALSE(FactIdentityHistory::CanRepresent(4096, 1'000'000));
+  // The decision uses the same arithmetic the constructor allocates with, so a
+  // filter that claims it can represent N identities really has the bits.
+  FactIdentityHistory history(4096);
+  EXPECT_EQ(history.bit_count(), 32768U);
+  EXPECT_EQ(history.resident_bytes(), 4096U);
+  EXPECT_EQ(history.bit_count() / FactIdentityHistory::kUsefulBitsPerIdentity,
+            4096U);
+}
+
+TEST(FactIdentityHistoryTest, DisableLeavesTheFilterInItsAlwaysTrueState) {
+  FactIdentityHistory history(4096);
+  const FactRef published =
+      EntityFact::Vertex(VertexRef{PartId{3}, VertexId{42}}).ref();
+  const FactRef never_written =
+      EntityFact::Vertex(VertexRef{PartId{3}, VertexId{43}}).ref();
+  history.Publish(published);
+  EXPECT_TRUE(history.MightContain(published));
+  EXPECT_FALSE(history.MightContain(never_written));
+
+  history.Disable();
+
+  EXPECT_TRUE(history.disabled());
+  EXPECT_EQ(history.resident_bytes(), 0U);
+  EXPECT_EQ(history.bit_count(), 0U);
+  // No false negatives: a skip must never turn into an empty filter that
+  // answers "definitely not" for identities that exist (or for any identity).
+  EXPECT_TRUE(history.MightContain(published));
+  EXPECT_TRUE(history.MightContain(never_written));
+  // Publish stays a no-op, so the state cannot silently become a real filter
+  // again with a zero word count.
+  history.Publish(never_written);
+  EXPECT_TRUE(history.MightContain(never_written));
+  EXPECT_EQ(history.resident_bytes(), 0U);
+}
+
 }  // namespace
 }  // namespace cedar::internal

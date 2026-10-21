@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "storage/facts/fact_store.h"
+#include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
 
 #include <rocksdb/db.h>
@@ -29,11 +30,19 @@ PropertyDefinition Property(PropertyId property_id, std::string name,
   return {property_id, 0, std::move(name), entity_kind, physical_type, 4096};
 }
 
+// Raw meta-CF mutation helpers for reopen-corruption tests. They open the
+// database with vanilla RocksDB options, so the embedded Cedar Parquet table
+// factory is not installed for the facts CF here; `avoid_flush_during_shutdown`
+// keeps this close from flushing a recovered facts memtable into a block-based
+// SST that the Cedar factory would later reject. The meta write still reaches
+// the WAL, so the next Cedar open replays it.
 void PutMetaRecord(const std::string& path, const std::string& key,
                    const std::string& value) {
   rocksdb::Options options;
   options.create_if_missing = false;
   options.atomic_flush = true;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
   std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
   descriptors.emplace_back(rocksdb::kDefaultColumnFamilyName,
                            rocksdb::ColumnFamilyOptions(options));
@@ -46,6 +55,29 @@ void PutMetaRecord(const std::string& path, const std::string& key,
   std::unique_ptr<rocksdb::DB> database;
   ASSERT_TRUE(rocksdb::DB::Open(options, path, descriptors, &handles, &database).ok());
   ASSERT_TRUE(database->Put(rocksdb::WriteOptions(), handles[2], key, value).ok());
+  for (rocksdb::ColumnFamilyHandle* handle : handles) {
+    database->DestroyColumnFamilyHandle(handle);
+  }
+}
+
+void DeleteMetaRecord(const std::string& path, const std::string& key) {
+  rocksdb::Options options;
+  options.create_if_missing = false;
+  options.atomic_flush = true;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
+  descriptors.emplace_back(rocksdb::kDefaultColumnFamilyName,
+                           rocksdb::ColumnFamilyOptions(options));
+  rocksdb::ColumnFamilyOptions facts_options(options);
+  facts_options.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
+      rocksdb::NewFixedPrefixTransform(12));
+  descriptors.emplace_back("facts", std::move(facts_options));
+  descriptors.emplace_back("meta", rocksdb::ColumnFamilyOptions(options));
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  std::unique_ptr<rocksdb::DB> database;
+  ASSERT_TRUE(rocksdb::DB::Open(options, path, descriptors, &handles, &database).ok());
+  ASSERT_TRUE(database->Delete(rocksdb::WriteOptions(), handles[2], key).ok());
   for (rocksdb::ColumnFamilyHandle* handle : handles) {
     database->DestroyColumnFamilyHandle(handle);
   }
@@ -658,6 +690,180 @@ TEST_F(FactStoreMetadataTest, RejectsCorruptedAllocatorAndSchemaMetadataOnReopen
   PutMetaRecord(path_, EncodeSchemaMetaKey(PropertyId{9}, 1).ValueOrDie(), "corrupt");
   const Status corrupted_schema = store_->Open();
   EXPECT_TRUE(corrupted_schema.IsCorruption()) << corrupted_schema.ToString();
+}
+
+// S1: the reopen scan already holds every committed sequence record in its
+// meta-CF iterator, so validation must consume that value instead of issuing a
+// second meta Get for the same key (42.5M duplicate Gets per reopen on the
+// production dataset). The test hook reports the record source; the count must
+// equal the committed sequence count and every source must be the iterator.
+TEST_F(FactStoreMetadataTest,
+       ReopenValidationReadsEachSequenceRecordFromTheIterator) {
+  for (uint64_t index = 1; index <= 3; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index},
+                                              10 + index))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+  std::vector<bool> read_sources;
+  FactStoreOptions options{path_};
+  options.sequence_validation_read_source_observer_for_testing =
+      [&read_sources](bool from_iterator) {
+        read_sources.push_back(from_iterator);
+      };
+  store_ = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store_->Open().ok());
+  ASSERT_EQ(read_sources.size(), 3U);
+  EXPECT_TRUE(std::all_of(read_sources.begin(), read_sources.end(),
+                          [](bool from_iterator) { return from_iterator; }))
+      << "reopen validation re-read a sequence record the iterator already held";
+}
+
+// S1 must not lose a failure: a sequence record whose stored value disagrees
+// with its key is still rejected with the same corruption the per-key Get
+// produced, even though the validator now trusts the iterator's value.
+TEST_F(FactStoreMetadataTest,
+       ReopenValidationRejectsSequenceRecordWithWrongCommitSequence) {
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+  ASSERT_TRUE(store_->Close().ok());
+  const FactRef first =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  const auto mismatched = EncodeSequenceRecord(SequenceRecord{
+      CommitSeq{2}, TxnId{1}, 10,
+      {EncodeFactKey(first, ValidTime{10}, CommitSeq{2})}});
+  ASSERT_TRUE(mismatched.ok()) << mismatched.status().ToString();
+  const auto key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(key.ok()) << key.status().ToString();
+  PutMetaRecord(path_, key.ValueOrDie(), mismatched.ValueOrDie());
+  const Status status = store_->Open();
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(status.ToString().find("wrong commit sequence"), std::string::npos)
+      << status.ToString();
+}
+
+// S1 replaces the canonical-key Get with a comparison against the iterated key;
+// a missing record in the middle of the watermark range must still be reported
+// as corruption (same failure the Get's NotFound produced).
+TEST_F(FactStoreMetadataTest, ReopenValidationRejectsMissingSequenceRecord) {
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+  ASSERT_TRUE(store_->Close().ok());
+  const auto key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(key.ok()) << key.status().ToString();
+  DeleteMetaRecord(path_, key.ValueOrDie());
+  const Status status = store_->Open();
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(status.ToString().find("missing durable sequence record"),
+            std::string::npos)
+      << status.ToString();
+}
+
+// S3: when the identity-history rebuild is skipped, the filter must end up in
+// its always-true state, never an empty filter. An empty filter would report a
+// false negative for an identity that exists, and the point read that consults
+// it would return no facts at all.
+TEST_F(FactStoreMetadataTest,
+       ReopenSkipLeavesIdentityHistoryAlwaysTrueAndReadsStayCorrect) {
+  const FactRef ref =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Close().ok());
+  FactStoreOptions options{path_};
+  options.identity_history_skip_rebuild_for_testing = true;
+  store_ = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store_->Open().ok());
+  const auto metrics = store_->SampleValidationCacheMetrics();
+  ASSERT_TRUE(metrics.ok()) << metrics.status().ToString();
+  EXPECT_TRUE(metrics.ValueOrDie().identity_history_disabled);
+  EXPECT_EQ(metrics.ValueOrDie().identity_history_resident_bytes, 0U);
+
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto observed =
+      store_->Read(snapshot.ValueOrDie(), ref, ValidTime{10});
+  ASSERT_TRUE(observed.ok()) << observed.status().ToString();
+  ASSERT_TRUE(observed.ValueOrDie().has_value());
+  EXPECT_EQ(observed.ValueOrDie()->valid_from.value, 10U);
+  // The identity-history short-circuit lives in the temporal-neighborhood path:
+  // an always-true filter must never turn an existing chain into "no facts".
+  const auto neighborhood =
+      store_->ReadTemporalNeighborhood(snapshot.ValueOrDie(), ref, ValidTime{10});
+  ASSERT_TRUE(neighborhood.ok()) << neighborhood.status().ToString();
+  ASSERT_TRUE(neighborhood.ValueOrDie().observed.has_value())
+      << "the skipped filter reported a false negative for an existing identity";
+
+  // The always-true filter falls back to the canonical read on the write path,
+  // so a new version of the same identity still chains correctly.
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{1}, 20)).ok());
+  const auto newer_snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(newer_snapshot.ok()) << newer_snapshot.status().ToString();
+  const auto newer =
+      store_->Read(newer_snapshot.ValueOrDie(), ref, ValidTime{20});
+  ASSERT_TRUE(newer.ok()) << newer.status().ToString();
+  ASSERT_TRUE(newer.ValueOrDie().has_value());
+  EXPECT_EQ(newer.ValueOrDie()->valid_from.value, 20U);
+}
+
+// Negative control for S3: a database whose facts fit the filter keeps the
+// existing rebuild (populated filter, not disabled).
+TEST_F(FactStoreMetadataTest, ReopenRebuildsIdentityHistoryWhenFactsFitTheFilter) {
+  ASSERT_TRUE(store_->Close().ok());
+  store_ = std::make_unique<FactStore>(FactStoreOptions{path_});
+  ASSERT_TRUE(store_->Open().ok());
+  const auto metrics = store_->SampleValidationCacheMetrics();
+  ASSERT_TRUE(metrics.ok()) << metrics.status().ToString();
+  EXPECT_FALSE(metrics.ValueOrDie().identity_history_disabled);
+  EXPECT_GT(metrics.ValueOrDie().identity_history_resident_bytes, 0U);
+}
+
+// S3 capacity path, end to end: 4096 validation-cache bytes leave 1536 bytes for
+// identity history (128 words = 8192 bits = 1024 useful identities at 8 bits).
+// Twelve hundred committed identities exceed that, so reopen must skip the
+// rebuild and leave the filter always-true.
+TEST_F(FactStoreMetadataTest,
+       ReopenSkipsIdentityHistoryRebuildWhenFactsOutgrowFilter) {
+  ASSERT_TRUE(store_->Close().ok());
+  FactStoreOptions options{path_};
+  options.validation_cache_bytes = 4096;
+  store_ = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store_->Open().ok());
+  std::vector<PendingFactMutation> mutations;
+  mutations.reserve(1200);
+  for (uint64_t id = 1; id <= 1200; ++id) {
+    mutations.push_back(PendingFactMutation{
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{id}}).ref(),
+        ValidTime{10}, FactOperation::kPut, 0, std::nullopt});
+  }
+  ASSERT_TRUE(store_
+                  ->Commit(StoreCommitBatch{TxnId{1}, 10, std::move(mutations),
+                                            {}, {}, {}, false})
+                  .ok());
+  ASSERT_TRUE(store_->Close().ok());
+  store_ = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store_->Open().ok());
+  const auto metrics = store_->SampleValidationCacheMetrics();
+  ASSERT_TRUE(metrics.ok()) << metrics.status().ToString();
+  EXPECT_TRUE(metrics.ValueOrDie().identity_history_disabled);
+  EXPECT_EQ(metrics.ValueOrDie().identity_history_resident_bytes, 0U);
+
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto observed = store_->Read(
+      snapshot.ValueOrDie(),
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1200}}).ref(),
+      ValidTime{10});
+  ASSERT_TRUE(observed.ok()) << observed.status().ToString();
+  ASSERT_TRUE(observed.ValueOrDie().has_value());
+  // Same no-false-negative contract through the identity-history read path.
+  const auto neighborhood = store_->ReadTemporalNeighborhood(
+      snapshot.ValueOrDie(),
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1200}}).ref(),
+      ValidTime{10});
+  ASSERT_TRUE(neighborhood.ok()) << neighborhood.status().ToString();
+  ASSERT_TRUE(neighborhood.ValueOrDie().observed.has_value())
+      << "the skipped filter reported a false negative for an existing identity";
 }
 
 // F6b: LookupProperty on a pinned snapshot validates ownership from the snapshot

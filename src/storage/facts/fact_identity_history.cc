@@ -18,16 +18,32 @@ uint64_t MixHash(uint64_t value) {
 
 }  // namespace
 
-FactIdentityHistory::FactIdentityHistory(size_t max_bytes) {
+size_t FactIdentityHistory::WordCountForBytes(size_t max_bytes) {
   size_t words = std::max<size_t>(1, max_bytes / sizeof(uint64_t));
   // Keep the mask a power-of-two friendly size without growing the budget.
   size_t power = 1;
   while (power <= words / 2) power <<= 1;
-  word_count_ = power;
+  return power;
+}
+
+FactIdentityHistory::FactIdentityHistory(size_t max_bytes)
+    : word_count_(WordCountForBytes(max_bytes)) {
   words_ = std::make_unique<std::atomic<uint64_t>[]>(word_count_);
   for (size_t index = 0; index < word_count_; ++index) {
     words_[index].store(0, std::memory_order_relaxed);
   }
+}
+
+bool FactIdentityHistory::CanRepresent(size_t max_bytes,
+                                       uint64_t estimated_identities) {
+  const uint64_t bits =
+      static_cast<uint64_t>(WordCountForBytes(max_bytes)) * 64;
+  return estimated_identities <= bits / kUsefulBitsPerIdentity;
+}
+
+void FactIdentityHistory::Disable() {
+  word_count_ = 0;
+  words_.reset();
 }
 
 uint64_t FactIdentityHistory::Mix(uint64_t value) { return MixHash(value); }

@@ -68,6 +68,19 @@ constexpr uint64_t kDefaultEntityIdLeaseSize = 4096;
 constexpr size_t kFactIdentityPrefixBytes = 16;
 constexpr char kSchemaMetaPrefix[] = "schema/";
 constexpr char kSequenceMetaPrefix[] = "sequence/";
+// `sequence/` + big-endian commit sequence, i.e. the key EncodeSequenceMetaKey()
+// produces. Reopen validation rebuilds it in place to compare the key the
+// meta-CF iterator already holds without allocating or re-reading it.
+constexpr size_t kSequenceMetaPrefixBytes = sizeof(kSequenceMetaPrefix) - 1;
+constexpr size_t kSequenceMetaKeyBytes =
+    kSequenceMetaPrefixBytes + sizeof(uint64_t);
+
+void AssignSequenceMetaKey(uint64_t commit_seq, std::string* out) {
+  out->assign(kSequenceMetaPrefix);
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    out->push_back(static_cast<char>(commit_seq >> shift));
+  }
+}
 
 uint64_t TransactionIdLeaseSize(const FactStoreOptions& options) {
   return options.transaction_id_lease_size_for_testing == 0
@@ -488,6 +501,9 @@ class FactStoreImpl {
   std::unique_ptr<internal::FactIdentityHistory> identity_history;
   std::shared_ptr<rocksdb::cedar_parquet::CanonicalPageCacheMetrics> canonical_page_metrics;
   std::function<void()> validation_scan_observer_for_testing;
+  // S1: reports the source of every committed sequence record consumed by
+  // reopen validation. See FactStoreOptions for the contract.
+  std::function<void(bool)> sequence_validation_read_source_observer_for_testing;
   std::function<void()> snapshot_epoch_created_observer_for_testing;
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
   // Fired by PublishVisible after the new visible watermark is stored and
@@ -2029,17 +2045,16 @@ Status LoadPropertySchemas(FactStoreImpl* store) {
   return Status::OK();
 }
 
+// Validates one committed sequence record from bytes the reopen scan already
+// holds. The scan owns the record's key and value through its meta-CF iterator,
+// so re-reading the sequence key (the previous behaviour) was one extra meta Get
+// for every committed sequence: 42.5M duplicate Gets per reopen on the
+// production dataset. The transaction outcome record is still read: it lives
+// under a different key, and its *existence* is what this check pins, which the
+// sequence record cannot prove.
 Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq,
+                                 const std::string& encoded_sequence,
                                  bool require_facts) {
-  const auto sequence_key = EncodeSequenceMetaKey(commit_seq);
-  if (!sequence_key.ok()) return sequence_key.status();
-  std::string encoded_sequence;
-  const rocksdb::Status got_sequence = store->db->Get(
-      rocksdb::ReadOptions(), store->meta_cf, sequence_key.ValueOrDie(),
-      &encoded_sequence);
-  if (!got_sequence.ok()) {
-    return Status::Corruption("fact store", "missing durable sequence record");
-  }
   const auto sequence = DecodeSequenceRecord(encoded_sequence);
   if (!sequence.ok()) return sequence.status();
   if (sequence.ValueOrDie().commit_seq != commit_seq) {
@@ -2086,19 +2101,37 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   rocksdb::ReadOptions options;
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->meta_cf));
+  // Canonical key of the next expected sequence, rebuilt in place. Comparing it
+  // against the iterated key proves the record being validated is the one it
+  // claims to be (and still bounds the scan at the watermark) without the meta
+  // Get the old loop issued per sequence.
+  std::string expected_key;
+  expected_key.reserve(kSequenceMetaKeyBytes);
+  // Reused value buffer: the iterator owns the record bytes, so copy them once
+  // into a stable string instead of allocating one string per sequence.
+  std::string encoded_sequence;
   uint64_t expected = 1;
   for (iterator->Seek(kSequenceMetaPrefix);
-       iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix);
-       iterator->Next()) {
-    const Status valid = ValidateCommittedSequence(
-        store, CommitSeq{expected}, expected >= oldest_readable_seq.value);
-    if (!valid.ok()) return valid;
-    if (expected == visible_seq.value) {
-      ++expected;
-      iterator->Next();
-      break;
+       iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix) &&
+       expected <= visible_seq.value;
+       iterator->Next(), ++expected) {
+    if (store->sequence_validation_read_source_observer_for_testing) {
+      // S1: the record comes from the iterator's own key/value pair.
+      store->sequence_validation_read_source_observer_for_testing(true);
     }
-    ++expected;
+    AssignSequenceMetaKey(expected, &expected_key);
+    if (iterator->key().compare(rocksdb::Slice(expected_key)) != 0) {
+      // The canonical record for this sequence is missing (or the iterated key
+      // is not canonical), exactly what the previous per-sequence Get reported
+      // when it returned NotFound.
+      return Status::Corruption("fact store", "missing durable sequence record");
+    }
+    encoded_sequence.assign(iterator->value().data(),
+                            iterator->value().size());
+    const Status valid = ValidateCommittedSequence(
+        store, CommitSeq{expected}, encoded_sequence,
+        expected >= oldest_readable_seq.value);
+    if (!valid.ok()) return valid;
   }
   if (!iterator->status().ok()) {
     return FromRocksDb(iterator->status(), "iterate durable sequence records");
@@ -2435,6 +2468,8 @@ Status FactStore::Open() {
   store->statistics = options.statistics;
   store->validation_scan_observer_for_testing =
       options_.validation_scan_observer_for_testing;
+  store->sequence_validation_read_source_observer_for_testing =
+      options_.sequence_validation_read_source_observer_for_testing;
   store->snapshot_epoch_created_observer_for_testing =
       options_.snapshot_epoch_created_observer_for_testing;
   store->snapshot_epoch_destroyed_observer_for_testing =
@@ -2555,7 +2590,47 @@ Status FactStore::Open() {
   store->identity_history =
       std::make_unique<internal::FactIdentityHistory>(
           identity_history_bytes);
-  {
+  // The identity-history Bloom is a write/read-path optimization: "has this
+  // identity ever been written" lets the write path skip canonical neighborhood
+  // reads for brand-new identities, and lets point reads skip the chain scan for
+  // them. Rebuilding it at open costs a full facts-CF scan (792M rows on the
+  // production dataset), so skip the rebuild when the facts CF holds more
+  // identities than the fixed filter budget can usefully represent.
+  //
+  // Capacity check, deliberately conservative:
+  //  * The capacity math is exact and shared with the constructor
+  //    (FactIdentityHistory::WordCountForBytes), so CanRepresent() means "the
+  //    filter keeps at least 8 bits per identity", the point where 3 probes
+  //    still give a low (~3%) false-positive rate. Below that a rebuild spends
+  //    the scan only to answer "maybe" for nearly every probe.
+  //  * rocksdb.estimate-num-keys counts *keys*, and one identity has one key per
+  //    version, so it can only over-count distinct identities. An over-count can
+  //    only trigger an unnecessary skip, never a missed one, so a database whose
+  //    chain history floods the filter cannot evade the check.
+  //  * If the property cannot be read, the estimate is unreliable: keep today's
+  //    rebuild. Rebuilding is always safe; skipping is only safe because the
+  //    skip leaves the filter in its always-true state (next paragraph).
+  //
+  // The skip must leave the filter *always true* (word_count_ == 0, so
+  // MightContain returns true and Publish is a no-op). Leaving a zeroed/empty
+  // filter would break the no-false-negative contract: the write path would
+  // skip the canonical read that detects prior versions of an existing identity,
+  // and point reads of that identity would return no facts at all.
+  bool skip_identity_history_rebuild =
+      options_.identity_history_skip_rebuild_for_testing;
+  if (!skip_identity_history_rebuild) {
+    uint64_t estimated_fact_keys = 0;
+    if (store->db->GetIntProperty(store->facts_cf,
+                                  rocksdb::DB::Properties::kEstimateNumKeys,
+                                  &estimated_fact_keys)) {
+      skip_identity_history_rebuild =
+          !internal::FactIdentityHistory::CanRepresent(identity_history_bytes,
+                                                       estimated_fact_keys);
+    }
+  }
+  if (skip_identity_history_rebuild) {
+    store->identity_history->Disable();
+  } else {
     rocksdb::ReadOptions options;
     std::unique_ptr<rocksdb::Iterator> iterator(
         store->db->NewIterator(options, store->facts_cf));
@@ -6109,6 +6184,11 @@ StatusOr<ValidationCacheMetrics> FactStore::SampleValidationCacheMetrics() const
   }
   metrics.canonical_validation_scans = store->canonical_validation_scans.load(std::memory_order_relaxed);
   metrics.canonical_validation_boundaries = store->canonical_validation_boundaries.load(std::memory_order_relaxed);
+  if (store->identity_history != nullptr) {
+    metrics.identity_history_resident_bytes =
+        store->identity_history->resident_bytes();
+    metrics.identity_history_disabled = store->identity_history->disabled();
+  }
   if (store->version_validation_cache == nullptr) return metrics;
   const auto cache_metrics = store->version_validation_cache->metrics();
   metrics.hits = cache_metrics.hits;

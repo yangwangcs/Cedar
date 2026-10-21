@@ -1,10 +1,14 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "storage/facts/fact_store.h"
@@ -94,6 +98,187 @@ TEST_F(FactStoreMetadataTest, PersistsDefaultLeaseAndSkipsUnusedRangeAfterReopen
   ASSERT_TRUE(second.ok()) << second.status().ToString();
   EXPECT_EQ(second.ValueOrDie().first_id, 4097U);
   EXPECT_EQ(second.ValueOrDie().count, 1U);
+}
+
+TEST_F(FactStoreMetadataTest, DefaultTransactionLeaseCoversSixtyFiveThousandIds) {
+  char pattern[] = "/tmp/cedar_fact_store_default_txn_lease_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::atomic<uint32_t> extension_writes{0};
+  FactStoreOptions options;
+  options.path = path;
+  options.transaction_lease_write_observer_for_testing = [&](bool) {
+    extension_writes.fetch_add(1, std::memory_order_relaxed);
+  };
+  {
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    uint64_t last = 0;
+    for (uint64_t index = 1; index <= 65536; ++index) {
+      const auto id = store.AllocateTransactionId();
+      ASSERT_TRUE(id.ok()) << id.status().ToString();
+      last = id.ValueOrDie().value;
+      ASSERT_EQ(last, index) << "index " << index;
+    }
+    EXPECT_EQ(last, 65536U);
+    // The whole default lease is covered by the single initial extension.
+    EXPECT_EQ(extension_writes.load(), 1U);
+    const auto next = store.AllocateTransactionId();
+    ASSERT_TRUE(next.ok()) << next.status().ToString();
+    EXPECT_EQ(next.ValueOrDie().value, 65537U);
+    EXPECT_EQ(extension_writes.load(), 2U);
+    ASSERT_TRUE(store.Close().ok());
+  }
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(FactStoreMetadataTest, InjectedSmallLeaseKeepsTransactionIdsContiguousAndDurable) {
+  char pattern[] = "/tmp/cedar_fact_store_lease_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::atomic<uint32_t> extension_writes{0};
+  std::atomic<uint32_t> unsynchronized_writes{0};
+  FactStoreOptions options;
+  options.path = path;
+  options.transaction_id_lease_size_for_testing = 4;
+  options.transaction_lease_write_observer_for_testing = [&](bool sync) {
+    extension_writes.fetch_add(1, std::memory_order_relaxed);
+    if (!sync) {
+      unsynchronized_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  {
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    std::vector<uint64_t> ids;
+    for (uint32_t index = 0; index < 17; ++index) {
+      const auto id = store.AllocateTransactionId();
+      ASSERT_TRUE(id.ok()) << id.status().ToString();
+      ids.push_back(id.ValueOrDie().value);
+    }
+    for (uint32_t index = 0; index < ids.size(); ++index) {
+      EXPECT_EQ(ids[index], index + 1) << "index " << index;
+    }
+    // IDs 1..17 exhaust five injected leases: [1,5) [5,9) [9,13) [13,17) [17,21).
+    EXPECT_EQ(extension_writes.load(), 5U);
+    EXPECT_EQ(unsynchronized_writes.load(), 0U);
+    ASSERT_TRUE(store.Close().ok());
+  }
+  {
+    // Reopen continues after the durably extended allocator (21), proving the
+    // extension writes persisted before any ID from those leases was used.
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    const auto id = store.AllocateTransactionId();
+    ASSERT_TRUE(id.ok()) << id.status().ToString();
+    EXPECT_EQ(id.ValueOrDie().value, 21U);
+    EXPECT_EQ(extension_writes.load(), 6U);
+    ASSERT_TRUE(store.Close().ok());
+  }
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(FactStoreMetadataTest, ConcurrentAllocationAcrossLeaseExtensionsIsUnique) {
+  char pattern[] = "/tmp/cedar_fact_store_lease_concurrent_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::atomic<uint32_t> extension_writes{0};
+  std::atomic<uint32_t> unsynchronized_writes{0};
+  FactStoreOptions options;
+  options.path = path;
+  options.transaction_id_lease_size_for_testing = 4;
+  options.transaction_lease_write_observer_for_testing = [&](bool sync) {
+    extension_writes.fetch_add(1, std::memory_order_relaxed);
+    if (!sync) {
+      unsynchronized_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  FactStore store(options);
+  ASSERT_TRUE(store.Open().ok());
+  constexpr uint32_t kThreads = 4;
+  constexpr uint32_t kPerThread = 25;
+  std::vector<std::thread> threads;
+  std::vector<std::vector<uint64_t>> per_thread(kThreads);
+  std::atomic<uint32_t> failures{0};
+  for (uint32_t thread = 0; thread < kThreads; ++thread) {
+    threads.emplace_back([&, thread] {
+      per_thread[thread].reserve(kPerThread);
+      for (uint32_t index = 0; index < kPerThread; ++index) {
+        const auto id = store.AllocateTransactionId();
+        if (!id.ok()) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        per_thread[thread].push_back(id.ValueOrDie().value);
+      }
+    });
+  }
+  for (std::thread& thread : threads) thread.join();
+  EXPECT_EQ(failures.load(), 0U);
+
+  std::vector<uint64_t> ids;
+  ids.reserve(kThreads * kPerThread);
+  for (const auto& thread_ids : per_thread) {
+    ids.insert(ids.end(), thread_ids.begin(), thread_ids.end());
+  }
+  std::sort(ids.begin(), ids.end());
+  ASSERT_EQ(ids.size(), static_cast<size_t>(kThreads * kPerThread));
+  for (uint32_t index = 0; index < ids.size(); ++index) {
+    ASSERT_EQ(ids[index], index + 1) << "index " << index;
+  }
+  // 100 allocations with a 4-ID lease extend exactly 25 times, always synced.
+  EXPECT_EQ(extension_writes.load(), 25U);
+  EXPECT_EQ(unsynchronized_writes.load(), 0U);
+  ASSERT_TRUE(store.Close().ok());
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(FactStoreMetadataTest, FastPathTransactionAllocationDoesNotWaitForPublisherMutex) {
+  char pattern[] = "/tmp/cedar_fact_store_lease_fastpath_XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::string path = pattern;
+  std::mutex prewrite_mutex;
+  std::condition_variable prewrite_cv;
+  bool writer_entered = false;
+  bool release_writer = false;
+  FactStoreOptions options;
+  options.path = path;
+  options.transaction_id_lease_size_for_testing = 8;
+  options.commit_prewrite_fault_injector_for_testing = [&] {
+    std::unique_lock<std::mutex> lock(prewrite_mutex);
+    writer_entered = true;
+    prewrite_cv.notify_all();
+    prewrite_cv.wait(lock, [&] { return release_writer; });
+    return Status::OK();
+  };
+  FactStore store(options);
+  ASSERT_TRUE(store.Open().ok());
+
+  // Extend the lease before the writer parks, so the fast path has IDs left.
+  const auto first = store.AllocateTransactionId();
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  EXPECT_EQ(first.ValueOrDie().value, 1U);
+
+  std::future<StatusOr<StoreCommitResult>> committed = std::async(
+      std::launch::async,
+      [&] { return store.Commit(VertexStateBatch(TxnId{1000}, VertexId{7}, 10)); });
+  {
+    std::unique_lock<std::mutex> lock(prewrite_mutex);
+    ASSERT_TRUE(prewrite_cv.wait_for(lock, std::chrono::seconds(2),
+                                     [&] { return writer_entered; }));
+  }
+
+  const auto second = store.AllocateTransactionId();
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  EXPECT_EQ(second.ValueOrDie().value, 2U);
+  {
+    std::lock_guard<std::mutex> lock(prewrite_mutex);
+    release_writer = true;
+  }
+  prewrite_cv.notify_all();
+  ASSERT_TRUE(committed.get().ok());
+  ASSERT_TRUE(store.Close().ok());
+  std::filesystem::remove_all(path);
 }
 
 TEST_F(FactStoreMetadataTest, KeepsVertexAndEdgeLeasesIndependent) {

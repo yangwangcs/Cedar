@@ -3,10 +3,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rocksdb/db.h>
@@ -15,6 +18,7 @@
 
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
+#include "storage/facts/group_commit_planner.h"
 #include "storage/rocks/commit_publisher.h"
 #include "storage/rocks/decided_epoch.h"
 
@@ -48,7 +52,54 @@ class CommitPublisherTest : public ::testing::Test {
   std::string path_;
   std::unique_ptr<rocksdb::DB> db_;
   std::vector<rocksdb::ColumnFamilyHandle*> handles_;
+
+  // Encodes the candidate batches exactly as the commit path does, including
+  // the visible-watermark record the group write appends, and returns the real
+  // RocksDB WriteBatch.
+  rocksdb::WriteBatch EncodeGroup(
+      const std::vector<const StoreCommitBatch*>& batches, CommitSeq base) {
+    rocksdb::WriteBatch write_batch;
+    CommitSeq sequence = base;
+    for (const StoreCommitBatch* batch : batches) {
+      std::vector<std::string> fact_keys;
+      fact_keys.reserve(batch->mutations.size());
+      for (const PendingFactMutation& mutation : batch->mutations) {
+        fact_keys.push_back(
+            EncodeFactKey(mutation.ref, mutation.valid_from, sequence));
+      }
+      const Status appended = AppendCandidateToWriteBatch(
+          CandidateCommit{batch, sequence, std::move(fact_keys)}, handles_[1],
+          handles_[2], &write_batch);
+      EXPECT_TRUE(appended.ok()) << appended.ToString();
+      ++sequence.value;
+    }
+    const auto watermark = EncodeWatermark(sequence);
+    EXPECT_TRUE(watermark.ok()) << watermark.status().ToString();
+    write_batch.Put(handles_[2], EncodeVisibleWatermarkKey(),
+                    watermark.ValueOrDie());
+    return write_batch;
+  }
 };
+
+PendingFactMutation VertexValueMutation(uint64_t entity, uint64_t valid_from,
+                                       std::optional<Value> value) {
+  return {PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{entity}},
+                               PropertyId{7})
+              .ref(),
+          ValidTime{valid_from}, FactOperation::kPut, 1, std::move(value)};
+}
+
+StoreCommitBatch ForecastBatch(uint64_t txn_id, uint64_t first_entity,
+                               size_t facts) {
+  std::vector<PendingFactMutation> mutations;
+  mutations.reserve(facts);
+  for (size_t index = 0; index < facts; ++index) {
+    mutations.push_back(VertexValueMutation(
+        first_entity + index, 10 + index,
+        Value::Int32(static_cast<int32_t>(index))));
+  }
+  return StoreCommitBatch{TxnId{txn_id}, txn_id, std::move(mutations), {}, {}, {}};
+}
 
 TEST_F(CommitPublisherTest, AppendsAllFactsAndMetadataForOneCandidate) {
   const StoreCommitBatch batch{
@@ -164,6 +215,129 @@ TEST_F(CommitPublisherTest, RejectsDuplicateCanonicalFactKeysBeforeWriting) {
       &write_batch);
   EXPECT_FALSE(status.ok());
   EXPECT_EQ(write_batch.Count(), 0U);
+}
+
+TEST_F(CommitPublisherTest, EstimateCommitBatchBytesMatchesEncodedBatchWithinTolerance) {
+  std::vector<std::pair<std::string, StoreCommitBatch>> cases;
+  {
+    std::vector<PendingFactMutation> mutations;
+    for (uint64_t index = 0; index < 5; ++index) {
+      mutations.push_back(
+          VertexValueMutation(100 + index, 10, Value::Int32(7)));
+    }
+    cases.emplace_back(
+        "observation-int32-5",
+        StoreCommitBatch{TxnId{1}, 1, std::move(mutations), {}, {}, {}});
+  }
+  cases.emplace_back("forecast-int32-182", ForecastBatch(2, 1000, 182));
+  {
+    std::vector<PendingFactMutation> mutations;
+    for (uint64_t index = 0; index < 3; ++index) {
+      mutations.push_back(VertexValueMutation(
+          200 + index, 10, Value::String(std::string(4000, 'x'))));
+    }
+    cases.emplace_back(
+        "strings-4000-3",
+        StoreCommitBatch{TxnId{3}, 1, std::move(mutations), {}, {}, {}});
+  }
+  {
+    std::vector<PendingFactMutation> mutations;
+    mutations.push_back(VertexValueMutation(300, 10, Value::Int64(1)));
+    mutations.push_back(VertexValueMutation(301, 11, Value::Bool(true)));
+    mutations.push_back(VertexValueMutation(302, 12, std::nullopt));
+    mutations.back().operation = FactOperation::kDelete;
+    mutations.push_back(VertexValueMutation(303, 13, Value::String("tiny")));
+    cases.emplace_back(
+        "mixed-int64-bool-delete-string",
+        StoreCommitBatch{TxnId{4}, 1, std::move(mutations), {}, {}, {}});
+  }
+  {
+    std::vector<PendingFactMutation> mutations;
+    mutations.push_back(VertexValueMutation(
+        400, 10, Value::String(std::string(1024 * 1024, 'y'))));
+    cases.emplace_back(
+        "single-mebibyte-string",
+        StoreCommitBatch{TxnId{5}, 1, std::move(mutations), {}, {}, {}});
+  }
+  {
+    const EdgeIdentity identity{
+        EdgeRef{PartId{3}, EdgeId{17}},
+        VertexRef{PartId{3}, VertexId{500}},
+        VertexRef{PartId{4}, VertexId{600}}, 9};
+    std::vector<PendingFactMutation> mutations;
+    mutations.push_back({EntityFact::Edge(identity.edge_ref()).ref(),
+                         ValidTime{10}, FactOperation::kPut, 0, std::nullopt});
+    cases.emplace_back(
+        "edge-identity",
+        StoreCommitBatch{TxnId{6}, 1, std::move(mutations), {identity}, {}, {}});
+  }
+
+  for (const auto& [name, batch] : cases) {
+    SCOPED_TRACE(name);
+    const std::vector<const StoreCommitBatch*> group{&batch};
+    const size_t actual = EncodeGroup(group, CommitSeq{1}).GetDataSize();
+    const size_t estimate = EstimateCommitBatchBytes(batch);
+    EXPECT_GE(estimate, actual);
+    // The calibrated estimator may only carry a small absolute safety margin
+    // over the real encoder; the former 2x reservation is not allowed back.
+    EXPECT_LE(estimate - actual, actual / 64 + 512) << "estimate=" << estimate
+                                                    << " actual=" << actual;
+  }
+}
+
+TEST_F(CommitPublisherTest, ForecastGroupAtTwoMebibyteCapIsNotCutEarly) {
+  constexpr uint64_t kByteCap = 2ULL * 1024ULL * 1024ULL;
+  constexpr size_t kCountCap = 128;
+  std::vector<StoreCommitBatch> batches;
+  batches.reserve(kCountCap);
+  for (size_t index = 0; index < kCountCap; ++index) {
+    batches.push_back(ForecastBatch(
+        100 + index, 1'000'000 + index * 1000, 182));
+  }
+
+  // Replay the collector's byte-limit stop for these independent batches.
+  uint64_t selected_bytes = 0;
+  size_t selected = 0;
+  for (const StoreCommitBatch& batch : batches) {
+    const size_t estimate = EstimateCommitBatchBytes(batch);
+    if (selected != 0 &&
+        estimate > kByteCap - std::min<uint64_t>(selected_bytes, kByteCap)) {
+      break;
+    }
+    selected_bytes += estimate;
+    ++selected;
+  }
+  EXPECT_EQ(selected, kCountCap) << "estimate stopped the group at " << selected;
+  EXPECT_LE(selected_bytes, kByteCap);
+
+  std::vector<const StoreCommitBatch*> group;
+  group.reserve(selected);
+  for (size_t index = 0; index < selected; ++index) {
+    group.push_back(&batches[index]);
+  }
+  const rocksdb::WriteBatch encoded = EncodeGroup(group, CommitSeq{1});
+  const size_t actual = encoded.GetDataSize();
+  EXPECT_LE(actual, kByteCap);
+  EXPECT_TRUE(CheckCommittedBatchSize(encoded, kByteCap).ok());
+  // The test is only meaningful if these 128 transactions really do nearly
+  // fill the 2 MiB cap.
+  EXPECT_GE(actual, kByteCap * 95 / 100);
+}
+
+TEST_F(CommitPublisherTest, CommitByteGuardRejectsActualOversizeGroup) {
+  constexpr uint64_t kByteCap = 2ULL * 1024ULL * 1024ULL;
+  std::vector<PendingFactMutation> mutations;
+  mutations.reserve(182);
+  for (uint64_t index = 0; index < 182; ++index) {
+    mutations.push_back(VertexValueMutation(
+        1'000'000 + index, 10 + index,
+        Value::String(std::string(16 * 1024, 'z'))));
+  }
+  const StoreCommitBatch batch{TxnId{900}, 1, std::move(mutations), {}, {}, {}};
+  const std::vector<const StoreCommitBatch*> group{&batch};
+  const rocksdb::WriteBatch encoded = EncodeGroup(group, CommitSeq{1});
+  ASSERT_GT(encoded.GetDataSize(), kByteCap);
+  EXPECT_TRUE(CheckCommittedBatchSize(encoded, kByteCap).IsResourceExhausted());
 }
 
 TEST(DecidedEpochTest, ExposesOneImmutablePrebuiltBatchSubmission) {

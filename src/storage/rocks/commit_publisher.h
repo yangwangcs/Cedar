@@ -28,6 +28,12 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
                                    rocksdb::ColumnFamilyHandle* meta_cf,
                                    rocksdb::WriteBatch* write_batch);
 
+// Rejects a fully assembled group WriteBatch whose real encoded size exceeds
+// the hard byte cap. Callers run it after assembly, so an estimate that is too
+// small can never turn into an oversized durable write.
+Status CheckCommittedBatchSize(const rocksdb::WriteBatch& batch,
+                               uint64_t max_bytes);
+
 }  // namespace cedar::internal
 
 #endif  // CEDAR_FACT_COMMIT_PUBLISHER_H_

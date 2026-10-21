@@ -14,6 +14,15 @@
 
 namespace cedar::internal {
 
+Status CheckCommittedBatchSize(const rocksdb::WriteBatch& batch,
+                               uint64_t max_bytes) {
+  if (batch.GetDataSize() > max_bytes) {
+    return Status::ResourceExhausted("commit",
+                                     "encoded batch exceeds hard byte limit");
+  }
+  return Status::OK();
+}
+
 Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
                                    rocksdb::ColumnFamilyHandle* facts_cf,
                                    rocksdb::ColumnFamilyHandle* meta_cf,

@@ -106,6 +106,15 @@ struct FactStoreOptions {
   // release path).
   std::function<void()> force_detach_epochs_observer_for_testing;
   std::function<void()> epoch_release_before_reclaim_observer_for_testing;
+  // Test-only override of the durable transaction-ID lease size. Zero keeps the
+  // production default. Small values let tests drive lease exhaustion and
+  // extension without allocating tens of thousands of IDs. It intentionally
+  // does not affect vertex/edge lease defaults (`LeaseIds(kind, 0)`).
+  uint64_t transaction_id_lease_size_for_testing = 0;
+  // Fires before every durable transaction-ID lease-extension write with the
+  // Sync flag that write will use. Tests pin the durability contract here; it
+  // must not call back into FactStore.
+  std::function<void(bool)> transaction_lease_write_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {

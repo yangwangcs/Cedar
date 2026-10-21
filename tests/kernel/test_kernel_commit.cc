@@ -1916,7 +1916,10 @@ TEST(KernelGroupCommitTest, CountsSelectedEpochAgainstQueueByteReservation) {
         return Status::OK();
       },
       .group_commit_max_queue_requests = 2,
-      .group_commit_max_queue_bytes = 2'200});
+      // One single-fact transaction estimates below this cap (encoder-aligned
+      // estimate + safety margin), two do not: the selected epoch still owns
+      // its reservation while the writer is parked.
+      .group_commit_max_queue_bytes = 700});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
 

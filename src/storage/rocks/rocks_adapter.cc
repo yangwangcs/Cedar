@@ -55,10 +55,25 @@
 namespace cedar {
 namespace {
 
-constexpr uint64_t kDefaultIdLeaseSize = 4096;
+// One durable lease extension every 65,536 transaction IDs keeps the
+// publisher-mutex fsync off the critical path for ~65k transaction starts.
+// IDs stay opaque: a crash may skip at most the unused tail of one lease (the
+// durable allocator record already reserves the whole range before any ID from
+// it is used).
+constexpr uint64_t kDefaultIdLeaseSize = 65536;
+// Vertex/edge IDs are handed out by explicit Allocate{Vertex,Edge}Id calls, not
+// on the commit hot path, so their default lease keeps the historical 4,096
+// range (raising it would only widen the crash ID gap).
+constexpr uint64_t kDefaultEntityIdLeaseSize = 4096;
 constexpr size_t kFactIdentityPrefixBytes = 16;
 constexpr char kSchemaMetaPrefix[] = "schema/";
 constexpr char kSequenceMetaPrefix[] = "sequence/";
+
+uint64_t TransactionIdLeaseSize(const FactStoreOptions& options) {
+  return options.transaction_id_lease_size_for_testing == 0
+             ? kDefaultIdLeaseSize
+             : options.transaction_id_lease_size_for_testing;
+}
 
 Status FromRocksDb(const rocksdb::Status& status, const char* context) {
   if (status.ok()) return Status::OK();
@@ -86,10 +101,7 @@ Status FromMetadataWriteFailure(const rocksdb::Status& status) {
 
 Status CheckCommittedBatchSize(const rocksdb::WriteBatch& batch,
                                uint64_t max_bytes) {
-  if (batch.GetDataSize() > max_bytes) {
-    return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
-  }
-  return Status::OK();
+  return internal::CheckCommittedBatchSize(batch, max_bytes);
 }
 
 void AppendU16(std::string* out, uint16_t value) {
@@ -5032,21 +5044,22 @@ StatusOr<TxnId> FactStore::AllocateTransactionId() {
         std::memory_order_acquire);
     if (next < current_limit) continue;
 
-    // Lease extension is rare (one synchronized metadata write per 4096
-    // transactions). Keep the existing recovery and allocator ordering for
-    // this slow path while the common path remains lock-free.
+    // Lease extension is rare (one synchronized metadata write per lease). Keep
+    // the existing recovery and allocator ordering for this slow path while the
+    // common path remains lock-free.
     std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
     if (store->recovery_required) {
       return Status::RecoveryRequired(
           "transaction", "reopen required after indeterminate write");
     }
+    const uint64_t lease_size = TransactionIdLeaseSize(options_);
     const uint64_t lease_start = store->transaction_allocator.next_id;
-    if (kDefaultIdLeaseSize >
+    if (lease_size >
         std::numeric_limits<uint64_t>::max() - lease_start) {
       return Status::ResourceExhausted("transaction", "transaction ID space exhausted");
     }
     const IdAllocatorState updated{IdKind::kTransaction,
-                                   lease_start + kDefaultIdLeaseSize};
+                                   lease_start + lease_size};
     const auto encoded = EncodeIdAllocatorState(updated);
     if (!encoded.ok()) return encoded.status();
     rocksdb::WriteBatch batch;
@@ -5054,6 +5067,9 @@ StatusOr<TxnId> FactStore::AllocateTransactionId() {
               encoded.ValueOrDie());
     rocksdb::WriteOptions options;
     options.sync = true;
+    if (options_.transaction_lease_write_observer_for_testing) {
+      options_.transaction_lease_write_observer_for_testing(options.sync);
+    }
     const rocksdb::Status written = store->db->Write(options, &batch);
     if (!written.ok()) {
       const Status status = FromMetadataWriteFailure(written);
@@ -5071,7 +5087,7 @@ StatusOr<IdLease> FactStore::LeaseIds(IdKind kind, uint64_t count) {
   if (kind != IdKind::kVertex && kind != IdKind::kEdge) {
     return Status::InvalidArgument("ID lease", "unknown ID kind");
   }
-  if (count == 0) count = kDefaultIdLeaseSize;
+  if (count == 0) count = kDefaultEntityIdLeaseSize;
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);

@@ -6,8 +6,29 @@
 #include <algorithm>
 #include <limits>
 
+#include "cedar/fact/fact_codec.h"
+
 namespace cedar::internal {
 namespace {
+
+// Encoded-record layout mirrored from fact_codec.cc / meta_codec.cc and the
+// RocksDB WriteBatch record framing used by AppendCandidateToWriteBatch. The
+// estimator must track the encoder instead of carrying a fixed 2x reservation:
+// the group byte cap is enforced again on the assembled batch, so a tight
+// upper bound is safe and stops cutting forecast groups far below the cap.
+constexpr size_t kWriteBatchHeaderBytes = 12;
+constexpr size_t kFactValueHeaderBytes = 11;
+constexpr size_t kFactValueChecksumBytes = 4;
+constexpr size_t kMetaRecordHeaderBytes = 6;
+constexpr size_t kMetaRecordChecksumBytes = 4;
+constexpr size_t kEdgeIdentityPayloadBytes = 44;
+constexpr size_t kTransactionOutcomePayloadBytes = 17;
+constexpr size_t kSequenceFixedPayloadBytes = 28;
+constexpr size_t kVisibleWatermarkPayloadBytes = 8;
+constexpr size_t kTransactionMetaKeyBytes = 4 + 8;         // "txn/"
+constexpr size_t kSequenceMetaKeyBytes = 9 + 8;            // "sequence/"
+constexpr size_t kEdgeIdentityMetaKeyBytes = 5 + 4 + 8;    // "edge/"
+constexpr size_t kVisibleWatermarkKeyBytes = 10 + 7;       // "watermark/visible"
 
 void SaturatingAdd(size_t amount, size_t* total) {
   if (amount > std::numeric_limits<size_t>::max() - *total) {
@@ -15,6 +36,41 @@ void SaturatingAdd(size_t amount, size_t* total) {
   } else {
     *total += amount;
   }
+}
+
+void SaturatingAddProduct(size_t amount, size_t count, size_t* total) {
+  if (amount != 0 && count > std::numeric_limits<size_t>::max() / amount) {
+    *total = std::numeric_limits<size_t>::max();
+    return;
+  }
+  SaturatingAdd(amount * count, total);
+}
+
+size_t Varint32Bytes(size_t value) {
+  if (value < (size_t{1} << 7)) return 1;
+  if (value < (size_t{1} << 14)) return 2;
+  if (value < (size_t{1} << 21)) return 3;
+  if (value < (size_t{1} << 28)) return 4;
+  return 5;
+}
+
+// One WriteBatch put record: value tag, column-family varint, key length, key,
+// value length and value. Facts and meta both live in column families < 128.
+size_t WriteBatchPutBytes(size_t key_bytes, size_t value_bytes) {
+  size_t total = 2;
+  SaturatingAdd(Varint32Bytes(key_bytes), &total);
+  SaturatingAdd(key_bytes, &total);
+  SaturatingAdd(Varint32Bytes(value_bytes), &total);
+  SaturatingAdd(value_bytes, &total);
+  return total;
+}
+
+size_t EncodedFactValueBytes(size_t payload_bytes) {
+  return kFactValueHeaderBytes + payload_bytes + kFactValueChecksumBytes;
+}
+
+size_t EncodedMetaRecordValueBytes(size_t payload_bytes) {
+  return kMetaRecordHeaderBytes + payload_bytes + kMetaRecordChecksumBytes;
 }
 
 size_t ValuePayloadBytes(const Value& value) {
@@ -33,14 +89,6 @@ size_t ValuePayloadBytes(const Value& value) {
       return std::get<std::string>(value.data()).size();
   }
   return 0;
-}
-
-void SaturatingMultiply(size_t left, size_t right, size_t* total) {
-  if (left != 0 && right > std::numeric_limits<size_t>::max() / left) {
-    *total = std::numeric_limits<size_t>::max();
-    return;
-  }
-  SaturatingAdd(left * right, total);
 }
 
 void AddFactEventBytes(const FactEvent& event, size_t* total) {
@@ -118,32 +166,68 @@ CommitFootprint BuildCommitFootprint(const StoreCommitBatch& batch) {
 }
 
 size_t EstimateCommitBatchBytes(const StoreCommitBatch& batch) {
-  // This is deliberately conservative. It accounts for the encoded fact,
-  // sequence, transaction, identity, and dependency records plus RocksDB
-  // WriteBatch framing. A conservative estimate prevents a queued request
-  // from making the hard batch limit fail only after assembly.
-  size_t total = 256;
+  // Per committed batch (one transaction) the writer emits: the transaction
+  // outcome record, the sequence record (with one duplicated canonical key per
+  // fact and per edge identity), the visible watermark, one fact put per
+  // mutation, and one authoritative fact plus routing record per edge identity.
+  // The visible watermark is emitted once per group, so counting it per batch is
+  // a small conservative overcount that costs a single record.
+  const size_t fact_key_count =
+      batch.mutations.size() + batch.edge_identities.size();
+  size_t total = kWriteBatchHeaderBytes;
+  SaturatingAdd(
+      WriteBatchPutBytes(kTransactionMetaKeyBytes,
+                         EncodedMetaRecordValueBytes(
+                             kTransactionOutcomePayloadBytes)),
+      &total);
+  size_t sequence_value_bytes = kMetaRecordHeaderBytes;
+  SaturatingAdd(kSequenceFixedPayloadBytes, &sequence_value_bytes);
+  SaturatingAddProduct(kEncodedFactKeyBytes, fact_key_count,
+                       &sequence_value_bytes);
+  SaturatingAdd(kMetaRecordChecksumBytes, &sequence_value_bytes);
+  SaturatingAdd(
+      WriteBatchPutBytes(kSequenceMetaKeyBytes, sequence_value_bytes), &total);
+  SaturatingAdd(WriteBatchPutBytes(kVisibleWatermarkKeyBytes,
+                                   EncodedMetaRecordValueBytes(
+                                       kVisibleWatermarkPayloadBytes)),
+                &total);
   for (const PendingFactMutation& mutation : batch.mutations) {
-    SaturatingAdd(128, &total);
-    if (mutation.value.has_value()) {
-      SaturatingAdd(ValuePayloadBytes(*mutation.value), &total);
-    }
+    const size_t payload_bytes =
+        mutation.value.has_value() ? ValuePayloadBytes(*mutation.value) : 0;
+    SaturatingAdd(
+        WriteBatchPutBytes(kEncodedFactKeyBytes,
+                           EncodedFactValueBytes(payload_bytes)),
+        &total);
   }
-  SaturatingMultiply(batch.mutations.size(), 32, &total);
-  SaturatingMultiply(batch.edge_identities.size(), 128, &total);
-  SaturatingMultiply(batch.snapshot_write_dependencies.size(), 96, &total);
+  for ([[maybe_unused]] const EdgeIdentity& identity : batch.edge_identities) {
+    // Authoritative identity fact (payload is the fixed 44-byte identity),
+    // its duplicated sequence key (accounted for by fact_key_count above), and
+    // the routing metadata record.
+    SaturatingAdd(
+        WriteBatchPutBytes(kEncodedFactKeyBytes,
+                           EncodedFactValueBytes(kEdgeIdentityPayloadBytes)),
+        &total);
+    SaturatingAdd(
+        WriteBatchPutBytes(kEdgeIdentityMetaKeyBytes,
+                           EncodedMetaRecordValueBytes(
+                               kEdgeIdentityPayloadBytes)),
+        &total);
+  }
+  // Snapshot write dependencies are validated in memory and are not encoded.
+  // Strict-read observed events are also not encoded, but the queued request
+  // retains their payload for validation, so reserve that memory here (this is
+  // a queue-admission bound, not a WAL-byte count).
   for (const StrictReadDependency& dependency : batch.strict_read_dependencies) {
     SaturatingAdd(128, &total);
     if (dependency.observed_event.has_value()) {
       AddFactEventBytes(*dependency.observed_event, &total);
     }
   }
-  // One queued request owns its staged batch and, while an epoch is active,
-  // RocksDB assembly owns encoded representations and completion state. Keep
-  // a conservative two-copy reservation rather than admitting an untracked
-  // temporary allocation burst.
-  SaturatingMultiply(total, 2, &total);
-  SaturatingAdd(512, &total);
+  // Small absolute + 1/256 safety margin keeps the estimate above the real
+  // encoder for every committed record without the former 2x reservation.
+  size_t margin = total / 256;
+  SaturatingAdd(256, &margin);
+  SaturatingAdd(margin, &total);
   return total;
 }
 

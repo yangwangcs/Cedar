@@ -219,7 +219,10 @@ TEST_F(RecoveryCrashMatrixTest, ReopenRecoversActualProcessCrashesAtCommitBounda
   crash_commit(4, 40, true);
   reopened = Open();
   ASSERT_TRUE(reopened);
-  const auto after = reopened->ResolveTransaction(TxnId{4097});
+  // The first transaction durably extended the default 65,536-ID lease, so the
+  // next transaction after the crash starts at 65,537 (IDs are opaque; the gap
+  // is the unused remainder of that durable lease).
+  const auto after = reopened->ResolveTransaction(TxnId{65537});
   ASSERT_TRUE(after.ok()) << after.status().ToString();
   ASSERT_TRUE(after.ValueOrDie().has_value());
   EXPECT_EQ(after.ValueOrDie()->outcome, CommitOutcome::kCommitted);

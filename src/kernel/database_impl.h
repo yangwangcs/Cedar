@@ -355,9 +355,16 @@ class Database::Impl {
   std::string query_database_path;
   FactStore store;
   // Derived query state. Bind/Explain take a reference to these under `mutex`
-  // and Close detaches them under the same mutex, so neither side can race a
-  // read of the owner with its reset. A detached object stays alive until the
-  // last planning/execution reference is released.
+  // and Close detaches `query_delta`/`projection_store` under the same mutex,
+  // so neither side can race a read of the owner with its reset. A detached
+  // object stays alive until the last planning/execution reference is released.
+  // `query_statistics` is deliberately *not* detached by Close: it is owned by
+  // this Impl for the whole database lifetime and released only by ~Impl, after
+  // the async executor is joined. `RefreshQueryStatistics` hands its worker a
+  // non-owning alias (`shared_ptr<QueryStatisticsStore>(impl_, store.get())`)
+  // whose owner is this Impl; resetting the member in Close would leave that
+  // alias pointing at freed memory while the worker runs. Do not "complete" the
+  // detach pattern for this member.
   std::shared_ptr<internal::QueryProjectionStore> projection_store;
   std::shared_ptr<internal::QueryStatisticsStore> query_statistics;
   internal::QueryMetrics query_metrics;

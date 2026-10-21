@@ -84,10 +84,10 @@ struct FactStoreOptions {
   std::function<void()> publish_visible_before_retire_observer_for_testing;
   // Fires in every registered storage-level non-epoch operation (checkpoint,
   // transaction-ID allocation, runtime sampling, validation-cache metrics,
-  // native maintenance) after it has registered with the close drain handshake
-  // and before it touches any store state that Close releases. Tests use it to
-  // hold such an operation in flight while a Close is attempted; it must not
-  // call back into FactStore.
+  // native maintenance, and SchemaFingerprint) after it has registered with the
+  // close drain handshake and before it touches any store state that Close
+  // releases. Tests use it to hold such an operation in flight while a Close is
+  // attempted; it must not call back into FactStore.
   std::function<void()> non_epoch_op_observer_for_testing;
   // Fires in BeginSnapshot and BeginSnapshotAtCached after the retention
   // watermarks have been loaded and the cheap boundary checks passed, but before
@@ -414,6 +414,9 @@ class StoreSnapshot {
   StoreSnapshot& operator=(const StoreSnapshot&) = delete;
 
   CommitSeq commit_seq() const;
+  // Published durable retention boundary captured when the epoch was created
+  // (see the SnapshotEpoch comment in rocks_adapter.cc). A Vacuum's unpublished
+  // pending reservation is deliberately not included.
   CommitSeq oldest_readable_seq() const;
 
  private:
@@ -463,6 +466,13 @@ struct FactColumnarScanOptions {
 class FactStore {
  public:
   explicit FactStore(FactStoreOptions options);
+  // Destroys the store. Unlike Close(), destruction cannot report
+  // SnapshotPinned: a StoreSnapshot handle that still pins an epoch is
+  // force-detached (payloads/leases released, epoch memory retained until the
+  // handle is gone) and the RocksDB handle is destroyed, so an outliving handle
+  // can neither keep the database (LOCK/WAL) open nor cause a use-after-free.
+  // Such a handle may only be destroyed after the FactStore is gone; reading
+  // through it after destruction is not supported.
   ~FactStore();
 
   FactStore(const FactStore&) = delete;
@@ -718,9 +728,18 @@ class FactStore {
   // regression tests only; no production code may depend on it.
   size_t RetainedShellCountForTesting() const;
   bool RetainedShellsAreInertForTesting() const;
+  // Number of as_of opens currently registered with the close handshake.
+  // Test-only: proves that an exception path releases its registration (a leaked
+  // registration makes every later Close drain forever).
+  size_t SnapshotOpensInFlightForTesting() const;
   // Number of storage-level non-epoch operations currently registered with the
   // close drain handshake. Test-only: no production code may depend on it.
   size_t NonEpochUsersForTesting() const;
+  // Number of fast-pin entry points that observed the unpublished fast_impl_ and
+  // skipped attempt registration (the no-new-arrivals gate documented at
+  // FastPinAttempt). Test-only: proves that a closing store cannot be kept busy
+  // by new lock-free arrivals.
+  uint32_t FastPinAttemptsSkippedForTesting() const;
 
  private:
   // Slow path of BeginCurrentSnapshotAt for a historical sequence whose epoch
@@ -753,6 +772,18 @@ class FactStore {
   // Close release the previous shell instead of retaining one full store per
   // Open->Close; the newly closed shell is the only retained one and it is made
   // inert by releasing its heavy state.
+  //
+  // No-new-arrivals invariant (drain boundedness): both lock-free entry points
+  // read fast_impl_ *before* constructing a FastPinAttempt and skip registration
+  // when it is null. PrepareClose clears fast_impl_ before it drains the total,
+  // so once that clear is visible only threads that already passed the gate can
+  // still increment a counter; every later arrival goes straight to the
+  // registered slow path (which reports the closing state) and never touches the
+  // total again. The drain is therefore bounded by a finite set of already
+  // in-flight attempts, not by the arrival rate. An attempt that registers after
+  // the clear still loads null and touches no shell (seq_cst ordering of the
+  // clear, the registration and that load), so shell-lifetime safety does not
+  // depend on the drain having observed zero before the shell is freed.
   static constexpr size_t kFastPinShardCount = 32;
   struct alignas(64) FastPinAttemptCounter {
     std::atomic<uint32_t> value{0};
@@ -806,6 +837,12 @@ class FactStore {
   // The following two helpers require lifecycle_mutex_ to be held.
   Status PrepareCloseLocked();
   Status FinishCloseLocked();
+  // Destructor-only fallback used when PrepareCloseLocked() reports
+  // SnapshotPinned: force-detaches every epoch (see
+  // FactStoreImpl::ForceDetachEpochsLocked), destroys the RocksDB handles and
+  // releases the heavy state without requiring a zero reader count. Requires
+  // lifecycle_mutex_ to be held.
+  void ForceCloseLocked();
 
   FactStoreOptions options_;
   mutable std::mutex lifecycle_mutex_;
@@ -826,6 +863,10 @@ class FactStore {
   // clear is covered by a FastPinAttempt that it registered before the load, so
   // the shell can be freed once close drained the attempts.
   std::atomic<FactStoreImpl*> fast_impl_{nullptr};
+  // Counts fast-pin entry points rejected by the unpublished-fast_impl_ gate
+  // (see FastPinAttempt's no-new-arrivals invariant). Only written on the
+  // closing path, never by a successful lock-free pin.
+  mutable std::atomic<uint32_t> fast_pin_attempts_skipped_{0};
   mutable std::array<FastPinAttemptCounter, kFastPinShardCount>
       fast_pin_attempts_{};
   // Closed shells kept for a lock-free pin that raced the close gate. Bounded

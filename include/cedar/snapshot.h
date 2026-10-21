@@ -54,6 +54,11 @@ class Snapshot {
   Snapshot& operator=(const Snapshot&) = delete;
 
   CommitSeq commit_seq() const;
+  // Durable retention boundary captured when this snapshot's epoch was created.
+  // It excludes the target of a Vacuum that has reserved a boundary but has not
+  // published it yet, so a failed Vacuum cannot make a still-readable prepared
+  // query look expired. A sequence below this value may already have had
+  // obsolete versions cleaned.
   CommitSeq oldest_readable_seq() const;
   const CanonicalFactReader& canonical_reader() const;
   std::shared_ptr<const internal::AdjacencyIndex> adjacency_index() const;

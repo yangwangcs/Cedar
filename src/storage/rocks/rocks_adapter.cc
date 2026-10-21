@@ -511,8 +511,15 @@ class FactStoreImpl {
   // validate against max(published_oldest_readable_seq, pending_vacuum_oldest)
   // in the same critical section that registers their epoch, so a reader either
   // makes its epoch visible to the Vacuum scan (and the Vacuum refuses to clean
-  // below it) or observes this target and reports SnapshotExpired. 0 means no
-  // Vacuum is between its registry scan and its boundary publication.
+  // below it) or observes this target and reports SnapshotExpired.
+  //
+  // Sentinel: 0 means "no Vacuum between its registry scan and its boundary
+  // publication". 0 is unambiguous because a real target is always
+  // >= oldest_readable_seq, and Vacuum early-returns before reserving when the
+  // target equals the current durable boundary; the initial durable boundary is
+  // 0, so a target of 0 can never reach the reservation. Every reservation is
+  // owned by a scope guard (see Vacuum) that clears it on every exit path that
+  // does not publish the boundary.
   uint64_t pending_vacuum_oldest = 0;
   // Retired epochs that are DEAD but whose memory cannot be freed yet because a
   // lock-free pin attempt may still hold the pointer. Freed once every attempt
@@ -552,17 +559,27 @@ class FactStoreImpl {
       const std::shared_ptr<FactStoreImpl>& self);
   // Creates a non-cached epoch at an arbitrary readable sequence, retired from
   // birth, with exactly one reference owned by the caller. Used by as_of reads
-  // and by the as_of cache. Returns nullptr when RocksDB refuses a snapshot.
-  // Caller must hold epoch_mutex (same open/vacuum atomicity as above).
+  // and by the as_of cache. `durable_oldest_readable` is the published retention
+  // boundary the epoch reports (not the effective pending boundary used for
+  // validation). Returns nullptr when RocksDB refuses a snapshot. Caller must
+  // hold epoch_mutex (same open/vacuum atomicity as above).
   SnapshotEpoch* CreateUncachedEpochLocked(
       const std::shared_ptr<FactStoreImpl>& self, CommitSeq seq,
-      CommitSeq oldest_readable);
+      CommitSeq durable_oldest_readable);
   // Smallest sequence a new epoch may be opened at. It is the durable retention
   // boundary, raised by the target of an in-flight Vacuum that has already
   // scanned the epoch registry but has not published its durable boundary yet.
   // Caller must hold epoch_mutex. This is the reader-side half of the
   // open/vacuum handshake (see Vacuum).
   uint64_t EffectiveOldestReadableLocked() const;
+  // Durable retention boundary, excluding an in-flight Vacuum reservation. This
+  // is the value recorded on newly created snapshot epochs (and therefore the
+  // value reported by StoreSnapshot::oldest_readable_seq); validation still uses
+  // EffectiveOldestReadableLocked. Recording the published value keeps a failed
+  // Vacuum (which releases its reservation without publishing) from making an
+  // already-open or subsequently opened snapshot look expired to
+  // ValidatePreparedQuery. Caller must hold epoch_mutex.
+  CommitSeq PublishedOldestReadableLocked() const;
   // Drops one reference. The last reference of a retired epoch marks it DEAD,
   // unlinks it, releases its lease, and frees its memory once the lock-free
   // pin-attempt protocol proves no reader can still reach it.
@@ -588,6 +605,15 @@ class FactStoreImpl {
   // close_graveyard until the store is destroyed. Caller must hold epoch_mutex
   // and PinAttemptsTotal() must be zero.
   void CloseEpochsLocked();
+  // Destructor-only teardown variant of CloseEpochsLocked that does not require
+  // a zero reader count: a StoreSnapshot handle may outlive the FactStore that
+  // owns it (Close already reported SnapshotPinned). Every epoch is retired,
+  // unlinked, its payload (RocksDB lease + strong store back-pointer) is
+  // released, and its memory is claimed into close_graveyard so the later
+  // ReleaseEpochRef from those handles is a harmless no-op. The owner/cache
+  // references are dropped first; refs that remain work exactly like the normal
+  // last-reader reclamation. Caller must hold epoch_mutex.
+  void ForceDetachEpochsLocked();
   // Releases every remaining epoch and graveyard entry. Exclusive ownership.
   void DestroyEpochsLocked();
   // Destroys the RocksDB handle and column families while keeping the store
@@ -615,7 +641,8 @@ class FactStoreImpl {
   // store, and must keep the catalog alive (see PublishSchemas).
   void RefreshLiveEpochSchemasLocked(const PropertySchemas* schemas);
   SnapshotEpoch* CreateEpochLocked(const std::shared_ptr<FactStoreImpl>& self,
-                                   CommitSeq seq, CommitSeq oldest_readable);
+                                   CommitSeq seq,
+                                   CommitSeq durable_oldest_readable);
   void RetireCurrentEpochLocked();
   void DropOwnerReferenceLocked(SnapshotEpoch* epoch);
   // Caller observed the reference count fall to zero. Caller must hold
@@ -678,6 +705,10 @@ uint32_t FactStore::FastPinAttemptsTotal() const {
     total += counter.value.load(std::memory_order_seq_cst);
   }
   return total;
+}
+
+uint32_t FactStore::FastPinAttemptsSkippedForTesting() const {
+  return fast_pin_attempts_skipped_.load(std::memory_order_acquire);
 }
 
 FactStore::NonEpochUseGuard::~NonEpochUseGuard() {
@@ -745,6 +776,9 @@ struct SnapshotEpoch {
   // versions stay alive in FactStoreImpl::retired_schemas until destruction.
   std::atomic<const FactStoreImpl::PropertySchemas*> schemas{nullptr};
   CommitSeq seq;
+  // Published durable retention boundary captured when the epoch was created.
+  // It intentionally excludes an in-flight Vacuum reservation so a failed
+  // Vacuum cannot make this epoch look expired to ValidatePreparedQuery.
   CommitSeq oldest_readable;
   std::atomic<uint32_t> refs{0};
   // True once the epoch is detached from the current publication: retired by a
@@ -935,7 +969,7 @@ void FactStoreImpl::PublishVisible(CommitSeq sequence) {
 
 SnapshotEpoch* FactStoreImpl::CreateEpochLocked(
     const std::shared_ptr<FactStoreImpl>& self, CommitSeq seq,
-    CommitSeq oldest_readable) {
+    CommitSeq durable_oldest_readable) {
   const rocksdb::Snapshot* raw = db != nullptr ? db->GetSnapshot() : nullptr;
   if (raw == nullptr) return nullptr;
   auto epoch = std::make_unique<SnapshotEpoch>();
@@ -945,7 +979,7 @@ SnapshotEpoch* FactStoreImpl::CreateEpochLocked(
   epoch->schemas.store(current_schemas.load(std::memory_order_acquire),
                        std::memory_order_relaxed);
   epoch->seq = seq;
-  epoch->oldest_readable = oldest_readable;
+  epoch->oldest_readable = durable_oldest_readable;
   // The returned owner reference: the store's current reference, or the
   // caller's reference for a one-off epoch.
   epoch->refs.store(1, std::memory_order_relaxed);
@@ -962,6 +996,11 @@ uint64_t FactStoreImpl::EffectiveOldestReadableLocked() const {
   return std::max(durable, pending_vacuum_oldest);
 }
 
+CommitSeq FactStoreImpl::PublishedOldestReadableLocked() const {
+  return CommitSeq{
+      published_oldest_readable_seq.load(std::memory_order_acquire)};
+}
+
 SnapshotEpoch* FactStoreImpl::PinCurrentEpochLocked(
     const std::shared_ptr<FactStoreImpl>& self) {
   // Read the watermark under the epoch lock so a concurrent publish cannot
@@ -976,8 +1015,11 @@ SnapshotEpoch* FactStoreImpl::PinCurrentEpochLocked(
     // Publishes retire under this lock, so this is only a consistency guard.
     RetireCurrentEpochLocked();
   }
+  // Record the *published* boundary, not the effective one: a Vacuum that
+  // reserved a pending target and then fails must not leave the epoch reporting
+  // a boundary it never made durable.
   SnapshotEpoch* published = CreateEpochLocked(
-      self, current, CommitSeq{EffectiveOldestReadableLocked()});
+      self, current, PublishedOldestReadableLocked());
   if (published == nullptr) return nullptr;
   current_epoch = published;
   current_epoch_fast.store(published, std::memory_order_seq_cst);
@@ -990,8 +1032,9 @@ SnapshotEpoch* FactStoreImpl::PinCurrentEpochLocked(
 
 SnapshotEpoch* FactStoreImpl::CreateUncachedEpochLocked(
     const std::shared_ptr<FactStoreImpl>& self, CommitSeq seq,
-    CommitSeq oldest_readable) {
-  SnapshotEpoch* uncached = CreateEpochLocked(self, seq, oldest_readable);
+    CommitSeq durable_oldest_readable) {
+  SnapshotEpoch* uncached =
+      CreateEpochLocked(self, seq, durable_oldest_readable);
   if (uncached == nullptr) return nullptr;
   // A one-off epoch is never published as current and is never pinned by the
   // lock-free path; its owner (a reader or the as_of cache) releases it.
@@ -1111,6 +1154,64 @@ void FactStoreImpl::CloseEpochsLocked() {
       close_graveyard.push_back(current_epoch);
     }
     current_epoch = nullptr;
+  }
+}
+
+void FactStoreImpl::ForceDetachEpochsLocked() {
+  // Destructor-only teardown. Unlike CloseEpochsLocked this must tolerate live
+  // reader references because the FactStore owner is going away while a
+  // StoreSnapshot handle may still exist (Close reported SnapshotPinned). We
+  // release every epoch payload (RocksDB snapshot lease + the strong store
+  // back-reference) so the database handle can actually be closed, but keep the
+  // epoch memory alive in the close graveyard and mark it retired: a later
+  // ReleaseEpochRef from an outliving handle then decrements to zero, takes the
+  // DEAD bit and finds both the payload and the memory already claimed, which is
+  // a no-op instead of a use-after-free or a double free.
+  std::vector<SnapshotEpoch*> owner_held;
+  // as_of cache epochs are registered in retired_epochs as well, but their cache
+  // entry owns one reference. Track them so they are handled exactly once (as
+  // owner-held) and never also as a reader-only epoch.
+  std::unordered_set<SnapshotEpoch*> cache_owned;
+  for (AsOfCacheEntry& entry : as_of_cache) {
+    if (entry.epoch == nullptr) continue;
+    owner_held.push_back(entry.epoch);
+    cache_owned.insert(entry.epoch);
+    entry.epoch = nullptr;
+    entry.seq = CommitSeq{};
+  }
+  // Retired epochs have already dropped their owner reference; only reader
+  // references can keep them alive.
+  std::vector<SnapshotEpoch*> reader_held;
+  for (SnapshotEpoch* epoch : retired_epochs) {
+    if (cache_owned.count(epoch) == 0) reader_held.push_back(epoch);
+  }
+  retired_epochs.clear();
+  if (current_epoch != nullptr) {
+    owner_held.push_back(current_epoch);
+    current_epoch = nullptr;
+    current_epoch_fast.store(nullptr, std::memory_order_seq_cst);
+  }
+  const auto preserve = [this](SnapshotEpoch* epoch) {
+    epoch->retired.store(true, std::memory_order_release);
+    ReleaseEpochPayloadLocked(epoch, /*notify=*/false);
+    if (ClaimEpochMemoryLocked(epoch)) close_graveyard.push_back(epoch);
+  };
+  for (SnapshotEpoch* epoch : owner_held) {
+    const uint32_t previous =
+        epoch->refs.fetch_sub(1, std::memory_order_acq_rel);
+    assert(previous >= 1 && (previous & kEpochDeadBit) == 0);
+    if (previous == 1) {
+      // No reader is left: the normal reclaimer releases the payload, claims the
+      // memory and frees the epoch immediately (or parks it while a pin attempt
+      // drains).
+      ReclaimEpochLocked(epoch);
+    } else {
+      preserve(epoch);
+    }
+  }
+  for (SnapshotEpoch* epoch : reader_held) {
+    assert(EpochRefs(epoch) >= 1 && (EpochRefs(epoch) & kEpochDeadBit) == 0);
+    preserve(epoch);
   }
 }
 
@@ -2129,7 +2230,22 @@ Status FactPrefix::Validate() const {
 }
 
 FactStore::FactStore(FactStoreOptions options) : options_(std::move(options)) {}
-FactStore::~FactStore() { Close().IgnoreError(); }
+FactStore::~FactStore() {
+  // Destruction is the final close and cannot report SnapshotPinned to a caller.
+  // Try the normal close first (unchanged semantics); if a StoreSnapshot still
+  // pins an epoch, force the teardown instead of letting the epoch's strong store
+  // back-reference keep the RocksDB handle, LOCK/WAL files and heavy state alive
+  // after the owner is destroyed.
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (!close_prepared_) {
+    const Status prepared = PrepareCloseLocked();
+    if (!prepared.ok()) {
+      ForceCloseLocked();
+      return;
+    }
+  }
+  FinishCloseLocked().IgnoreError();
+}
 
 Status FactStore::Open() {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -2507,6 +2623,49 @@ Status FactStore::FinishCloseLocked() {
   return Status::OK();
 }
 
+void FactStore::ForceCloseLocked() {
+  if (!impl_) return;
+  // The destructor owns the store: a live StoreSnapshot handle may still pin an
+  // epoch (Close reported SnapshotPinned), but it must not keep the RocksDB
+  // handle, LOCK/WAL files and heavy state alive after the owner is gone.
+  auto store = std::move(impl_);
+  store->accepting_snapshots.store(false, std::memory_order_release);
+  store->accepting_fast.store(false, std::memory_order_seq_cst);
+  fast_impl_.store(nullptr, std::memory_order_seq_cst);
+  // No new arrival can register (accepting_snapshots is off and the fast path is
+  // unpublished); drain only the already-registered windows. Reader-held epoch
+  // references are tolerated below.
+  while (store->snapshot_opens_in_flight.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
+  while (FastPinAttemptsTotal() != 0) {
+    std::this_thread::yield();
+  }
+  while (store->PinAttemptsTotal() != 0) {
+    std::this_thread::yield();
+  }
+  while (non_epoch_users_.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
+  {
+    std::lock_guard<std::mutex> publisher_lock(store->publisher_mutex);
+    {
+      std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
+      // Release and unlink every epoch payload before the RocksDB handle is
+      // destroyed; the epoch memory stays valid for an outliving handle's later
+      // ReleaseEpochRef. Must run while db is still alive (SnapshotLease
+      // destructor releases through it).
+      store->ForceDetachEpochsLocked();
+    }
+    store->DestroyDatabaseHandles();
+    store->ReleaseRetainedStateForClose();
+  }
+  // Do not retain the shell here: a live StoreSnapshot already owns a strong
+  // reference to the store (which keeps the graveyard alive until the last
+  // handle is released); otherwise dropping the local reference destroys the
+  // store and its remaining epoch memory now.
+}
+
 void FactStore::FreeEarlierRetainedShells() {
   for (const std::shared_ptr<FactStoreImpl>& shell : retained_impls_) {
     // A last-reader release may still be inside ReleaseEpochRef: it registered
@@ -2523,6 +2682,13 @@ void FactStore::FreeEarlierRetainedShells() {
 size_t FactStore::RetainedShellCountForTesting() const {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   return retained_impls_.size();
+}
+
+size_t FactStore::SnapshotOpensInFlightForTesting() const {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  return impl_ == nullptr
+             ? 0U
+             : impl_->snapshot_opens_in_flight.load(std::memory_order_acquire);
 }
 
 bool FactStore::RetainedShellsAreInertForTesting() const {
@@ -2568,6 +2734,33 @@ Status FactStore::CreateCheckpoint(const std::string& checkpoint_path) const {
   return FromRocksDb(checkpointed, "create fact store checkpoint");
 }
 
+namespace {
+
+// RAII registration for FactStoreImpl::snapshot_opens_in_flight. Every exit
+// path of an as_of open - including a throwing test observer, a bad_alloc while
+// building a Status, or any future early return - must drop the registration,
+// otherwise a later Close would spin forever in its open drain while holding
+// lifecycle_mutex_. The caller keeps the store alive with a shared_ptr for the
+// whole open, so the guard only touches the atomic counter (constructed after
+// the registration under lifecycle_mutex_; the manual decrement on the
+// accepting_snapshots rejection path happens before the guard exists).
+class SnapshotOpenGuard {
+ public:
+  explicit SnapshotOpenGuard(FactStoreImpl* store) : store_(store) {}
+  ~SnapshotOpenGuard() {
+    if (store_ != nullptr) {
+      store_->snapshot_opens_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    }
+  }
+  SnapshotOpenGuard(const SnapshotOpenGuard&) = delete;
+  SnapshotOpenGuard& operator=(const SnapshotOpenGuard&) = delete;
+
+ private:
+  FactStoreImpl* store_;
+};
+
+}  // namespace
+
 StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const {
   std::shared_ptr<FactStoreImpl> store;
   {
@@ -2585,14 +2778,13 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
       return Status::ShutdownInProgress("snapshot", "fact store is closing");
     }
   }
+  // The registration taken above is released by scope, including on an
+  // exception thrown by a test observer below (see SnapshotOpenGuard). Construct
+  // the guard before the observer so no user/test callback can leak it.
+  const SnapshotOpenGuard open_registration(store.get());
   if (options_.snapshot_open_observer_for_testing) {
     options_.snapshot_open_observer_for_testing();
   }
-  FactStoreImpl* raw_store = store.get();
-  const auto leave_open = [raw_store] {
-    raw_store->snapshot_opens_in_flight.fetch_sub(1,
-                                                   std::memory_order_acq_rel);
-  };
   // Cheap preview: reject clearly invalid requests before taking epoch_mutex.
   // It is not the correctness check; the authoritative boundary re-check and the
   // epoch registration happen in one epoch_mutex critical section below.
@@ -2602,11 +2794,9 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
       std::memory_order_acquire)};
   const CommitSeq requested = options.as_of.value_or(visible_preview);
   if (requested.value < oldest_preview.value) {
-    leave_open();
     return Status::SnapshotExpired("snapshot", "sequence is below retention boundary");
   }
   if (requested.value > visible_preview.value) {
-    leave_open();
     return Status::InvalidArgument("snapshot", "sequence exceeds visible watermark");
   }
   // Test-only window: the retention watermarks have been loaded and the cheap
@@ -2632,12 +2822,10 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
     const CommitSeq sequence = current_request ? visible : requested;
     const CommitSeq boundary{store->EffectiveOldestReadableLocked()};
     if (sequence.value < boundary.value) {
-      leave_open();
       return Status::SnapshotExpired("snapshot",
                                      "sequence is below retention boundary");
     }
     if (sequence.value > visible.value) {
-      leave_open();
       return Status::InvalidArgument("snapshot",
                                      "sequence exceeds visible watermark");
     }
@@ -2648,21 +2836,33 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshot(SnapshotOptions options) const 
       epoch = store->PinCurrentEpochLocked(store);
     } else {
       // Historical as_of reads use a one-off, uncached epoch: they must never
-      // share the current epoch's lease.
-      epoch = store->CreateUncachedEpochLocked(store, sequence, boundary);
+      // share the current epoch's lease. Validation used the effective boundary;
+      // the epoch reports the published one (see PublishedOldestReadableLocked).
+      epoch = store->CreateUncachedEpochLocked(
+          store, sequence, store->PublishedOldestReadableLocked());
     }
   }
   if (epoch == nullptr) {
-    leave_open();
     return Status::IOError("snapshot", "RocksDB refused snapshot");
   }
   // The epoch reference is the only liveness registry read by Vacuum/Close: it
-  // was registered under epoch_mutex before this open is reported finished.
-  leave_open();
+  // was registered under epoch_mutex before this open is reported finished. The
+  // scope guard drops the opens-in-flight registration as the handle is
+  // constructed, so a close can never observe a registered open without its epoch
+  // reference.
   return StoreSnapshot(std::move(store), this, epoch);
 }
 
 StatusOr<StoreSnapshot> FactStore::BeginCurrentSnapshot() const {
+  // No-new-arrivals gate: a null fast_impl_ means PrepareClose already
+  // unpublished the fast path, so registering an attempt here could only feed
+  // the Close drain after it decided to tear down. Skip registration and use the
+  // registered slow path, which reports the closing state. See the invariant
+  // documented at FastPinAttempt in fact_store.h.
+  if (fast_impl_.load(std::memory_order_seq_cst) == nullptr) {
+    fast_pin_attempts_skipped_.fetch_add(1, std::memory_order_relaxed);
+    return BeginSnapshot();
+  }
   {
     // The attempt is registered before the raw store pointer is loaded, and it
     // is dropped again before the slow path below acquires lifecycle_mutex_
@@ -2684,6 +2884,13 @@ StatusOr<StoreSnapshot> FactStore::BeginCurrentSnapshot() const {
 
 StatusOr<StoreSnapshot> FactStore::BeginCurrentSnapshotAt(
     CommitSeq sequence) const {
+  // Same no-new-arrivals gate as BeginCurrentSnapshot: once the fast path is
+  // unpublished (store closing), do not register a pin attempt; the registered
+  // slow path re-validates the watermarks and reports the close state.
+  if (fast_impl_.load(std::memory_order_seq_cst) == nullptr) {
+    fast_pin_attempts_skipped_.fetch_add(1, std::memory_order_relaxed);
+    return BeginSnapshotAtCached(sequence);
+  }
   {
     FastPinAttempt attempt(*this);
     FactStoreImpl* store = fast_impl_.load(std::memory_order_seq_cst);
@@ -2759,14 +2966,13 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshotAtCached(
       return Status::ShutdownInProgress("snapshot", "fact store is closing");
     }
   }
+  // The registration taken above is released by scope, including on an
+  // exception thrown by a test observer below (see SnapshotOpenGuard). Construct
+  // the guard before the observer so no user/test callback can leak it.
+  const SnapshotOpenGuard open_registration(store.get());
   if (options_.snapshot_open_observer_for_testing) {
     options_.snapshot_open_observer_for_testing();
   }
-  FactStoreImpl* raw_store = store.get();
-  const auto leave_open = [raw_store] {
-    raw_store->snapshot_opens_in_flight.fetch_sub(
-        1, std::memory_order_acq_rel);
-  };
   // Cheap preview, then the authoritative boundary re-check and epoch
   // registration under epoch_mutex (see BeginSnapshot for the handshake
   // rationale). The check may not pass here and register later: that window is
@@ -2776,12 +2982,10 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshotAtCached(
   const CommitSeq oldest_preview{store->published_oldest_readable_seq.load(
       std::memory_order_acquire)};
   if (sequence.value < oldest_preview.value) {
-    leave_open();
     return Status::SnapshotExpired("snapshot",
                                    "sequence is below retention boundary");
   }
   if (sequence.value > visible_preview.value) {
-    leave_open();
     return Status::InvalidArgument("snapshot",
                                    "sequence exceeds visible watermark");
   }
@@ -2798,12 +3002,10 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshotAtCached(
         std::memory_order_acquire)};
     const CommitSeq boundary{store->EffectiveOldestReadableLocked()};
     if (sequence.value < boundary.value) {
-      leave_open();
       return Status::SnapshotExpired("snapshot",
                                      "sequence is below retention boundary");
     }
     if (sequence.value > visible.value) {
-      leave_open();
       return Status::InvalidArgument("snapshot",
                                      "sequence exceeds visible watermark");
     }
@@ -2813,15 +3015,16 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshotAtCached(
       epoch = store->PinCurrentEpochLocked(store);
       shared_current = true;
     } else {
-      epoch = store->CreateUncachedEpochLocked(store, sequence, boundary);
+      // Validation used the effective boundary; the epoch reports the durable
+      // published one (see PublishedOldestReadableLocked).
+      epoch = store->CreateUncachedEpochLocked(
+          store, sequence, store->PublishedOldestReadableLocked());
     }
   }
   if (epoch == nullptr) {
-    leave_open();
     return Status::IOError("snapshot", "RocksDB refused snapshot");
   }
   assert(epoch->seq.value == sequence.value);
-  leave_open();
   if (shared_current) {
     return StoreSnapshot(std::move(store), this, epoch);
   }
@@ -4997,6 +5200,35 @@ StatusOr<std::optional<EdgeIdentity>> FactStore::LookupEdgeIdentity(
   return std::optional<EdgeIdentity>{identity};
 }
 
+namespace {
+
+// Owns one Vacuum pending-boundary reservation (FactStoreImpl::
+// pending_vacuum_oldest). It clears the reservation under epoch_mutex on every
+// exit path that does not publish the boundary, including exceptions from the
+// state encoders, the test fault injector, or an allocation failure while
+// building a Status. Without the guard such a failure would leave readers
+// rejecting sequences below a boundary that was never made durable. The guard
+// only holds a raw pointer: Vacuum keeps the store alive with a shared_ptr.
+class PendingVacuumReservation {
+ public:
+  explicit PendingVacuumReservation(FactStoreImpl* store) : store_(store) {}
+  ~PendingVacuumReservation() {
+    if (store_ == nullptr) return;
+    std::lock_guard<std::mutex> epoch_lock(store_->epoch_mutex);
+    store_->pending_vacuum_oldest = 0;
+  }
+  PendingVacuumReservation(const PendingVacuumReservation&) = delete;
+  PendingVacuumReservation& operator=(const PendingVacuumReservation&) = delete;
+  // Phase 2 already published the boundary and cleared the reservation in the
+  // same epoch_mutex critical section; no further clearing is needed.
+  void Dismiss() { store_ = nullptr; }
+
+ private:
+  FactStoreImpl* store_;
+};
+
+}  // namespace
+
 Status FactStore::Vacuum(CommitSeq oldest_readable) {
   std::shared_ptr<FactStoreImpl> store;
   {
@@ -5028,8 +5260,9 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
   // either visible to this scan (and makes the vacuum fail with SnapshotPinned)
   // or observes the reserved target (and reports SnapshotExpired). The target is
   // reserved before the durable write (not after) so readers never have to wait
-  // for disk I/O while holding epoch_mutex; it is cleared iff this call does not
-  // publish the boundary.
+  // for disk I/O while holding epoch_mutex; it is cleared on every path that does
+  // not publish the boundary by the PendingVacuumReservation guard below.
+  PendingVacuumReservation reservation(store.get());
   {
     std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
     const std::optional<uint64_t> oldest_active =
@@ -5039,26 +5272,13 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
     }
     store->pending_vacuum_oldest = oldest_readable.value;
   }
-  const auto clear_pending_boundary = [store] {
-    std::lock_guard<std::mutex> epoch_lock(store->epoch_mutex);
-    store->pending_vacuum_oldest = 0;
-  };
   const Status before_boundary = RunVacuumFaultInjector(
       options_, VacuumFaultPoint::kBeforeBoundaryWrite);
-  if (!before_boundary.ok()) {
-    clear_pending_boundary();
-    return before_boundary;
-  }
+  if (!before_boundary.ok()) return before_boundary;
   const auto state = EncodeVacuumState(VacuumState{oldest_readable});
   const auto watermark = EncodeWatermark(oldest_readable);
-  if (!state.ok()) {
-    clear_pending_boundary();
-    return state.status();
-  }
-  if (!watermark.ok()) {
-    clear_pending_boundary();
-    return watermark.status();
-  }
+  if (!state.ok()) return state.status();
+  if (!watermark.ok()) return watermark.status();
   rocksdb::WriteBatch batch;
   batch.Put(store->meta_cf, EncodeVacuumStateKey(), state.ValueOrDie());
   batch.Put(store->meta_cf, EncodeOldestReadableWatermarkKey(),
@@ -5068,11 +5288,10 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
   const rocksdb::Status written = store->db->Write(options, &batch);
   if (!written.ok()) {
     // The durable boundary was not published, so no cleanup will run and the
-    // older versions are still intact: release the reservation. An indeterminate
-    // result may or may not have advanced the durable watermark; reopen resumes
-    // the persisted vacuum rule either way, so the in-memory reservation is
-    // dropped here too (writes stay blocked by recovery_required).
-    clear_pending_boundary();
+    // older versions are still intact. An indeterminate result may or may not
+    // have advanced the durable watermark; reopen resumes the persisted vacuum
+    // rule either way, so the in-memory reservation is dropped here too (writes
+    // stay blocked by recovery_required). The scope guard clears it.
     const Status status = FromMetadataWriteFailure(written);
     if (status.IsIndeterminate()) store->recovery_required = true;
     return status;
@@ -5089,6 +5308,7 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
                                                std::memory_order_release);
     store->pending_vacuum_oldest = 0;
   }
+  reservation.Dismiss();
   const Status after_boundary = RunVacuumFaultInjector(
       options_, VacuumFaultPoint::kAfterBoundaryWrite);
   if (!after_boundary.ok()) {

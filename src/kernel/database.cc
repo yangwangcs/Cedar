@@ -1961,8 +1961,11 @@ StatusOr<QueryMaintenanceHandle> Database::RefreshQueryStatistics() {
     const auto current = impl_->projection_store->current_manifest();
     if (!current) return Status::NotFound("query statistics", "projection generation is unavailable");
     manifest = std::make_shared<internal::ProjectionManifest>(*current);
-    // The store owns the object; keep a non-owning shared wrapper only for the
-    // worker lifetime. Database shutdown joins the executor before destruction.
+    // The Impl owns the object (its `query_statistics` member) for the whole
+    // database lifetime; Close never resets it. The alias shared_ptr only
+    // extends the Impl's lifetime for the worker, so it must not be treated as
+    // an owner of the statistics object itself. Database shutdown joins the
+    // executor before ~Impl releases the member.
     statistics = std::shared_ptr<internal::QueryStatisticsStore>(
         impl_, impl_->query_statistics.get());
     // FactStore::SchemaFingerprint reads the mutable property catalog, and the

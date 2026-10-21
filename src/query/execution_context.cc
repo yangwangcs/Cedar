@@ -91,6 +91,16 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     projection_store = database->projection_store;
     query_delta = database->query_delta;
     query_statistics = database->query_statistics;
+    // Test-only window fired *while the lifecycle mutex is held*, immediately
+    // after the synchronized reference copy above. It pins the B1 invariant that
+    // the closed/closing check and the capture form one critical section: a
+    // concurrent Close must block on this mutex here, so it cannot detach the
+    // owners between the check and the capture. The observer must not call back
+    // into the database.
+    if (database->query_open_stage_observer_for_testing) {
+      database->query_open_stage_observer_for_testing(
+          "query_bind_state_captured");
+    }
   }
   if (database->query_open_stage_observer_for_testing) {
     database->query_open_stage_observer_for_testing("query_bind_state_acquired");

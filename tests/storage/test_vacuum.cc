@@ -1,11 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cedar/database.h"
@@ -461,6 +464,135 @@ TEST_F(VacuumTest, FailedBoundaryWriteDoesNotLeaveReadersExpired) {
   EXPECT_TRUE(database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}})
                   .status()
                   .IsSnapshotExpired());
+}
+
+// F2 review minor: the pending Vacuum reservation used to be released by hand on
+// the status-return paths only. An exception from the state encoders (or a
+// throwing test hook) between the reservation and the boundary write leaked it,
+// and readers kept reporting SnapshotExpired below a boundary that was never
+// published. The scope guard must clear the reservation during unwinding too.
+TEST_F(VacuumTest, ThrowingBoundaryWriteFaultDoesNotLeaveReadersExpired) {
+  EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
+  EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+  std::atomic<bool> throw_once{true};
+  auto reopened = Database::Open(DatabaseOptions{
+      .path = path_,
+      .vacuum_fault_injector_for_testing = [&throw_once](
+                                               VacuumFaultPoint point) -> Status {
+        if (point == VacuumFaultPoint::kBeforeBoundaryWrite &&
+            throw_once.exchange(false)) {
+          throw std::runtime_error("injected throwing vacuum failure");
+        }
+        return Status::OK();
+      },
+  });
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database_ = std::move(reopened).ConsumeValueOrDie();
+
+  EXPECT_THROW(database_->Vacuum(CommitSeq{2}), std::runtime_error);
+
+  // The durable boundary is still 0, so seq 1 must still open: a leaked
+  // reservation would reject it as below the (unpublished) boundary.
+  {
+    const auto still_readable =
+        database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+    EXPECT_TRUE(still_readable.ok()) << still_readable.status().ToString();
+  }
+  // A later Vacuum still advances the boundary normally.
+  ASSERT_TRUE(database_->Vacuum(CommitSeq{2}).ok());
+  EXPECT_TRUE(database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}})
+                  .status()
+                  .IsSnapshotExpired());
+}
+
+// F2 review minor: a snapshot epoch must record the *published* retention
+// boundary, not the effective boundary that includes a pending Vacuum
+// reservation. Otherwise a Vacuum that reserved a target and then failed before
+// publishing leaves open snapshots reporting a higher boundary, and
+// ValidatePreparedQuery spuriously expires a still-readable prepared query.
+//
+// Deterministic construction: park an as_of reader between its watermark load and
+// its epoch registration, then let a Vacuum reserve its target and park in the
+// pre-boundary-write fault injector. The durable boundary is still 0 while the
+// effective boundary is 2, so the new epoch must report 0 (old code reported 2).
+TEST_F(VacuumTest, FailedVacuumReservationDoesNotRaiseAnOpenSnapshotBoundary) {
+  EXPECT_EQ(CommitVertex(VertexId{1}, ValidTime{1}), CommitSeq{1});
+  EXPECT_EQ(CommitVertex(VertexId{2}, ValidTime{1}), CommitSeq{2});
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  std::atomic<bool> reader_armed{false};
+  std::atomic<bool> reader_parked{false};
+  std::atomic<bool> reader_release{false};
+  std::atomic<bool> vacuum_reserved{false};
+  std::atomic<bool> vacuum_release{false};
+  auto reopened = Database::Open(DatabaseOptions{
+      .path = path_,
+      .vacuum_fault_injector_for_testing =
+          [&](VacuumFaultPoint point) -> Status {
+            if (point != VacuumFaultPoint::kBeforeBoundaryWrite) {
+              return Status::OK();
+            }
+            vacuum_reserved.store(true, std::memory_order_release);
+            while (!vacuum_release.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+            return Status::IOError("test", "injected boundary write failure");
+          },
+      .snapshot_boundary_loaded_observer_for_testing =
+          [&] {
+            if (!reader_armed.load(std::memory_order_acquire)) return;
+            reader_parked.store(true, std::memory_order_release);
+            while (!reader_release.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+          }});
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database_ = std::move(reopened).ConsumeValueOrDie();
+  // Open takes recovery snapshots through the same hook; arm only for the reader.
+  reader_armed.store(true, std::memory_order_release);
+
+  StatusOr<Snapshot> opened = Status::InvalidArgument("test", "not opened");
+  std::thread reader(
+      [&] { opened = database_->BeginSnapshot(SnapshotOptions{CommitSeq{2}}); });
+  const auto reader_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!reader_parked.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < reader_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(reader_parked.load(std::memory_order_acquire));
+
+  Status vacuum_status = Status::OK();
+  std::thread vacuum([&] { vacuum_status = database_->Vacuum(CommitSeq{2}); });
+  const auto vacuum_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!vacuum_reserved.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < vacuum_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(vacuum_reserved.load(std::memory_order_acquire));
+
+  // The Vacuum has reserved its target but has not published anything; finish the
+  // parked open. Its epoch must report the still-durable boundary 0.
+  reader_release.store(true, std::memory_order_release);
+  reader.join();
+  reader_armed.store(false, std::memory_order_release);
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  EXPECT_EQ(opened.ValueOrDie().oldest_readable_seq(), CommitSeq{0})
+      << "an open snapshot recorded a boundary that was never published";
+
+  vacuum_release.store(true, std::memory_order_release);
+  vacuum.join();
+  EXPECT_TRUE(vacuum_status.IsIOError()) << vacuum_status.ToString();
+
+  // The failed Vacuum published nothing, so seq 1 is still readable.
+  opened = StatusOr<Snapshot>(Status::InvalidArgument("test", "released"));
+  const auto still_readable =
+      database_->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  EXPECT_TRUE(still_readable.ok()) << still_readable.status().ToString();
 }
 
 }  // namespace

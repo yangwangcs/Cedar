@@ -299,5 +299,94 @@ TEST_F(QueryLifecycleTest, CloseRacingBindDoesNotDereferenceTornDownQueryState) 
   EXPECT_TRUE(database_->Close().ok());
 }
 
+// B1 synchronized-copy invariant: the earlier regression only proved that a
+// reference taken before a pinned Close keeps the detached owners alive. This
+// test pins the check+capture critical section itself: Bind parks inside
+// Database::Impl::mutex (test-only "query_bind_state_captured" stage) while a
+// concurrent Close must block on that same mutex. Removing that lock (or moving
+// the capture outside it) lets Close race in and finish, so the bounded liveness
+// assertion below fails.
+TEST_F(QueryLifecycleTest, BindCaptureHoldsLifecycleMutexAgainstClose) {
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  std::atomic<bool> bind_captured{false};
+  std::atomic<bool> bind_release{false};
+  DatabaseOptions options;
+  options.path = path_;
+  options.query_open_stage_observer_for_testing = [&](const char* stage) {
+    if (std::string(stage) != "query_bind_state_captured") return;
+    bind_captured.store(true, std::memory_order_release);
+    while (!bind_release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  };
+  auto reopened = Database::Open(std::move(options));
+  ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+  database_ = std::move(reopened).ConsumeValueOrDie();
+
+  auto committed = database_->BeginTransaction();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  ASSERT_TRUE(committed.ValueOrDie()
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{3}}),
+                           ValidTime{1})
+                  .ok());
+  ASSERT_TRUE(committed.ValueOrDie()->Commit().ok());
+
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  auto scan = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(scan.ok());
+  auto query = scan.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto opened_snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(opened_snapshot.ok()) << opened_snapshot.status().ToString();
+  std::optional<Snapshot> snapshot(
+      std::move(opened_snapshot).ConsumeValueOrDie());
+
+  StatusOr<std::string> explained =
+      Status::InvalidArgument("query", "not explained");
+  std::thread explainer([&] {
+    explained = prepared.ValueOrDie().ExplainPhysical(
+        snapshot.value(), QueryOptions{.mode = QueryExecutionMode::kAnalytical});
+  });
+  const auto captured_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!bind_captured.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < captured_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(bind_captured.load(std::memory_order_acquire));
+
+  Status close_status = Status::OK();
+  std::atomic<bool> close_finished{false};
+  std::thread closer([&] {
+    close_status = database_->Close();
+    close_finished.store(true, std::memory_order_release);
+  });
+  // Bounded liveness check: Close must block on the mutex Bind holds while it
+  // captures the derived-state references. A close without that synchronization
+  // fails pinned in milliseconds, so this window discriminates the lock.
+  const auto blocked_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!close_finished.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < blocked_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_FALSE(close_finished.load(std::memory_order_acquire))
+      << "Close ran while Bind held Database::Impl::mutex; the derived-state "
+         "capture is not synchronized with the Close detach";
+
+  bind_release.store(true, std::memory_order_release);
+  explainer.join();
+  closer.join();
+
+  EXPECT_TRUE(explained.ok()) << explained.status().ToString();
+  EXPECT_TRUE(close_status.IsSnapshotPinned()) << close_status.ToString();
+  snapshot.reset();
+  EXPECT_TRUE(database_->Close().ok());
+}
+
 }  // namespace
 }  // namespace cedar

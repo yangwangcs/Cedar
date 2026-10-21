@@ -24,9 +24,23 @@ enum class IsolationLevel : uint8_t { kSnapshot = 1, kStrict = 2 };
 
 struct TransactionOptions {
   IsolationLevel isolation = IsolationLevel::kSnapshot;
-  // Queued-request cancellation deadline for Commit() and CommitAsync(). A
-  // nonzero value is rejected by CommitAsyncPipelined() with InvalidArgument;
-  // that mode has no deadline path and does not fall back to CommitAsync().
+  // Queue-admission/queueing deadline in microseconds for Commit() and
+  // CommitAsync(). Zero disables the deadline.
+  //
+  // Commit(): the deadline bounds only the wait for append admission (the
+  // runtime-pressure gate and queue capacity). Once the request is admitted to
+  // the append pipeline it waits for the terminal durable result without a
+  // deadline: abandoning an in-flight synchronous commit could later commit
+  // after the caller was told it failed, so synchronous admission cancellation
+  // is intentionally not supported.
+  //
+  // CommitAsync(): the deadline cancels a request that is still in the
+  // submission mailbox or the append queue. Once the writer has selected the
+  // request, the call waits for the real WAL/terminal outcome instead of
+  // reporting a failure that may still commit.
+  //
+  // CommitAsyncPipelined() rejects a nonzero deadline with InvalidArgument (that
+  // mode has no deadline path and does not fall back to CommitAsync()).
   uint64_t commit_deadline_us = 0;
 };
 

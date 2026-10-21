@@ -279,9 +279,12 @@ struct DatabaseOptions {
   std::function<void(bool)> kernel_write_observer_for_testing;
   std::function<void(const char*)> shutdown_stage_observer_for_testing;
   // Open-order observer used by recovery and query-planning tests. Names are
-  // authoritative_recovery, query_delta_repaired, derived_loaded, and
-  // query_bind_state_acquired (fired by query planning after it has taken a
-  // synchronized reference to the derived query state).
+  // authoritative_recovery, query_delta_repaired, derived_loaded,
+  // query_bind_state_captured (fired by query planning while Database::Impl::mutex
+  // is still held, immediately after the synchronized reference capture of the
+  // derived query state), and query_bind_state_acquired (fired after that mutex
+  // has been released). Observers must not call back into the database; the
+  // captured stage in particular runs under the lifecycle mutex.
   std::function<void(const char*)> query_open_stage_observer_for_testing;
   // Forwards the storage-level registered non-epoch operation observer. Tests
   // use it to park such an operation (for example SchemaFingerprint) after its

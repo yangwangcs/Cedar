@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <thread>
@@ -1192,6 +1193,109 @@ TEST_F(RocksDbLifecycleTest,
   EXPECT_TRUE(store.Close().ok());
 }
 
+// Scan #6 regression: once PrepareClose unpublishes the fast path, a new
+// BeginCurrentSnapshot/BeginCurrentSnapshotAt must not register a FastPinAttempt.
+// Otherwise a stream of lock-free arrivals could keep Close's attempt drain from
+// observing zero while it holds lifecycle_mutex_; the registered slow path still
+// reports the closing state. Without the gate the skipped counter stays put
+// (red), so this asserts the no-new-arrivals invariant directly.
+TEST_F(RocksDbLifecycleTest, FastPinGateSkipsRegistrationOnceStoreIsClosing) {
+  FactStore store(FactStoreOptions{database_path_});
+  ASSERT_TRUE(store.Open().ok());
+  ASSERT_TRUE(store.Commit(Batch(1, 101)).ok());
+  {
+    const auto current = store.BeginCurrentSnapshot();
+    ASSERT_TRUE(current.ok()) << current.status().ToString();
+  }
+  ASSERT_TRUE(store.PrepareClose().ok());
+  const uint32_t skipped_before = store.FastPinAttemptsSkippedForTesting();
+  {
+    const auto closing = store.BeginCurrentSnapshot();
+    EXPECT_TRUE(closing.status().IsShutdownInProgress())
+        << closing.status().ToString();
+  }
+  EXPECT_GT(store.FastPinAttemptsSkippedForTesting(), skipped_before)
+      << "a fast-pin entry registered after the fast path was unpublished";
+  {
+    const auto closing_at = store.BeginCurrentSnapshotAt(CommitSeq{1});
+    EXPECT_TRUE(closing_at.status().IsShutdownInProgress())
+        << closing_at.status().ToString();
+  }
+  EXPECT_EQ(store.FastPinAttemptsSkippedForTesting(), skipped_before + 2U)
+      << "the at-sequence fast entry did not take the no-new-arrivals gate";
+  ASSERT_TRUE(store.FinishClose().ok());
+}
+
+// Scan #7 regression: a StoreSnapshot that outlives its FactStore used to keep
+// the RocksDB handle (and its LOCK/WAL files) alive through the epoch's strong
+// store_owner back-reference, because the destructor's Close() only reported
+// SnapshotPinned and that error was ignored. The destructor now force-detaches
+// the epoch payloads/leases before destroying the database, keeping the epoch
+// memory valid for the handle's later release. Reopening the same path proves the
+// LOCK was released; ASan/UBSan/LSan exercise the late release.
+TEST_F(RocksDbLifecycleTest, DestructorForceClosesStoreWithOutlivingSnapshot) {
+  auto store = std::make_unique<FactStore>(FactStoreOptions{database_path_});
+  ASSERT_TRUE(store->Open().ok());
+  ASSERT_TRUE(store->Commit(Batch(1, 101)).ok());
+  auto snapshot = store->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  // The pinned handle makes Close report SnapshotPinned; destruction must not be
+  // blocked by that.
+  store.reset();
+
+  auto reopened = std::make_unique<FactStore>(FactStoreOptions{database_path_});
+  const Status reopened_status = reopened->Open();
+  ASSERT_TRUE(reopened_status.ok())
+      << "~FactStore kept the RocksDB handle alive behind the pinned snapshot: "
+      << reopened_status.ToString();
+  {
+    const auto restored = reopened->BeginSnapshot();
+    ASSERT_TRUE(restored.ok()) << restored.status().ToString();
+    const auto event = reopened->Read(
+        restored.ValueOrDie(),
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{101}}).ref(),
+        ValidTime{1000});
+    ASSERT_TRUE(event.ok()) << event.status().ToString();
+    EXPECT_TRUE(event.ValueOrDie().has_value());
+  }
+  // Release the outliving handle after its owner is gone: the force-detached
+  // epoch memory is reclaimed through the store shell kept alive by the handle's
+  // own strong reference, not freed underneath the handle.
+  snapshot = StatusOr<StoreSnapshot>(Status::InvalidArgument("test", "release"));
+  ASSERT_TRUE(reopened->Close().ok());
+}
+
+// Task #9 regression: the as_of open registration used to be released by hand on
+// every return path, so a throwing observer (or an allocation failure) leaked
+// snapshot_opens_in_flight and made every later Close spin forever in its drain.
+// The scope guard must release it on the exception path as well.
+TEST_F(RocksDbLifecycleTest, ThrowingSnapshotObserverDoesNotLeakOpenRegistration) {
+  FactStoreOptions options{database_path_};
+  options.snapshot_open_observer_for_testing = [] {
+    throw std::runtime_error("snapshot observer failure");
+  };
+  auto store = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store->Open().ok());
+  ASSERT_TRUE(store->Commit(Batch(1, 101)).ok());
+  ASSERT_TRUE(store->Commit(Batch(2, 202)).ok());
+
+  EXPECT_THROW(store->BeginSnapshot(SnapshotOptions{CommitSeq{1}}),
+               std::runtime_error);
+  EXPECT_EQ(store->SnapshotOpensInFlightForTesting(), 0U)
+      << "the exception path leaked the as_of open registration; Close would "
+         "spin on it forever";
+  if (store->SnapshotOpensInFlightForTesting() != 0U) {
+    // Only reachable in a deliberately red build without the RAII guard: leak the
+    // store so the invariant failure is reported instead of hanging in Close.
+    store.release();
+    return;
+  }
+  // The same guard covers the historical uncached slow path.
+  EXPECT_THROW(store->BeginCurrentSnapshotAt(CommitSeq{1}), std::runtime_error);
+  EXPECT_EQ(store->SnapshotOpensInFlightForTesting(), 0U);
+  ASSERT_TRUE(store->Close().ok());
+}
+
 // C2 regression: repeated Open/Close on the same FactStore must not accumulate
 // retained closed-store shells, and every retained shell must be inert - no
 // validation caches, write index, identity history, statistics, property
@@ -1514,6 +1618,16 @@ TEST_F(RocksDbLifecycleTest, ConcurrentAsOfOpensAndVacuumStayCorrectOrExpired) {
 
   constexpr int kReaders = 4;
   constexpr int kIterations = 200;
+  // Deterministic non-vacuous pre-vacuum success: the red-test power of this case
+  // comes from a successful in-boundary as_of=1 open, so require one before the
+  // Vacuum can advance the boundary (a defect that expired every open must fail
+  // here, not pass by only observing expiries).
+  {
+    const auto pre_vacuum = store.BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+    ASSERT_TRUE(pre_vacuum.ok()) << pre_vacuum.status().ToString();
+    expect_read(pre_vacuum.ValueOrDie(), 11, "pre-vacuum as_of=1 BeginSnapshot");
+    as_of_one_successes.fetch_add(1, std::memory_order_relaxed);
+  }
   std::vector<std::thread> readers;
   readers.reserve(kReaders);
   for (int reader = 0; reader < kReaders; ++reader) {
@@ -1607,6 +1721,8 @@ TEST_F(RocksDbLifecycleTest, ConcurrentAsOfOpensAndVacuumStayCorrectOrExpired) {
   vacuum.join();
   for (std::thread& reader : readers) reader.join();
 
+  EXPECT_GT(as_of_one_successes.load(std::memory_order_relaxed), 0)
+      << "test never exercised a successful pre-vacuum as_of=1 open";
   EXPECT_TRUE(vacuum_succeeded.load()) << "Vacuum did not advance the boundary";
   EXPECT_TRUE(failures.empty()) << failures.size() << " violation(s); first: "
                                 << (failures.empty() ? "" : failures.front());

@@ -282,7 +282,14 @@ TEST_F(QueryLifecycleTest, CloseRacingBindDoesNotDereferenceTornDownQueryState) 
          std::chrono::steady_clock::now() < entered_deadline) {
     std::this_thread::yield();
   }
-  ASSERT_TRUE(bind_entered.load(std::memory_order_acquire));
+  if (!bind_entered.load(std::memory_order_acquire)) {
+    // Never ASSERT while the executor thread is joinable: a fatal assertion
+    // returns from the test body and std::thread's destructor would call
+    // std::terminate. Unblock the parked hook, join, then fail.
+    bind_release.store(true, std::memory_order_release);
+    executor.join();
+    FAIL() << "Bind did not reach the derived-state acquire stage";
+  }
 
   // The snapshot held by Execute pins the store, so Close must fail with
   // SnapshotPinned. The race under test is the derived query state being
@@ -357,7 +364,14 @@ TEST_F(QueryLifecycleTest, BindCaptureHoldsLifecycleMutexAgainstClose) {
          std::chrono::steady_clock::now() < captured_deadline) {
     std::this_thread::yield();
   }
-  ASSERT_TRUE(bind_captured.load(std::memory_order_acquire));
+  if (!bind_captured.load(std::memory_order_acquire)) {
+    // Joinable-thread safety: release the parked hook and join before failing,
+    // otherwise the fatal assertion returns from the test with a joinable
+    // std::thread local and std::terminate fires instead of a clean failure.
+    bind_release.store(true, std::memory_order_release);
+    explainer.join();
+    FAIL() << "Bind did not reach the in-mutex capture stage";
+  }
 
   Status close_status = Status::OK();
   std::atomic<bool> close_finished{false};
@@ -368,6 +382,13 @@ TEST_F(QueryLifecycleTest, BindCaptureHoldsLifecycleMutexAgainstClose) {
   // Bounded liveness check: Close must block on the mutex Bind holds while it
   // captures the derived-state references. A close without that synchronization
   // fails pinned in milliseconds, so this window discriminates the lock.
+  //
+  // Limitation: this is a bounded *negative* check, not a proof. On a machine
+  // that delays an unsynchronized Close by more than 200 ms (extreme scheduler or
+  // I/O pressure) the window would pass vacuously. What pins the invariant is the
+  // deterministic red evidence (without the lock, Close finished within
+  // milliseconds) together with the pinned-close result asserted below; the
+  // 200 ms bound only rules out a same-window false pass on a healthy machine.
   const auto blocked_deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
   while (!close_finished.load(std::memory_order_acquire) &&

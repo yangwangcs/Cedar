@@ -1265,6 +1265,163 @@ TEST_F(RocksDbLifecycleTest, DestructorForceClosesStoreWithOutlivingSnapshot) {
   ASSERT_TRUE(reopened->Close().ok());
 }
 
+// F4 review (contract) regression: the documented force-detach behavior is that
+// every outliving handle is retired *after* ~FactStore returns. Cover both epoch
+// ownership shapes at once - a lock-free current-epoch handle (owner reference +
+// reader reference, so ForceDetach drops the owner ref and preserves) and an
+// as_of one-off epoch (reader reference only, retired from birth) - and prove the
+// storage handle/LOCK was released by reopening the path before the handles are
+// destroyed. Reads through the detached handles are not covered: the contract at
+// ~FactStore requires destruction to be serialized with handle users.
+TEST_F(RocksDbLifecycleTest, ForceDetachRetiresOutlivingHandlesAfterDestruction) {
+  auto store = std::make_unique<FactStore>(FactStoreOptions{database_path_});
+  ASSERT_TRUE(store->Open().ok());
+  ASSERT_TRUE(store->Commit(Batch(1, 101)).ok());
+  ASSERT_TRUE(store->Commit(Batch(2, 202)).ok());
+  auto current = store->BeginCurrentSnapshot();
+  ASSERT_TRUE(current.ok()) << current.status().ToString();
+  auto historical = store->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(historical.ok()) << historical.status().ToString();
+  std::optional<StoreSnapshot> current_handle(
+      std::move(current).ConsumeValueOrDie());
+  std::optional<StoreSnapshot> historical_handle(
+      std::move(historical).ConsumeValueOrDie());
+  EXPECT_EQ(current_handle->commit_seq(), CommitSeq{2});
+  EXPECT_EQ(historical_handle->commit_seq(), CommitSeq{1});
+
+  // Close cannot succeed while an epoch is pinned; destruction force-detaches
+  // both handles and releases the database handle.
+  store.reset();
+
+  auto reopened = std::make_unique<FactStore>(FactStoreOptions{database_path_});
+  const Status reopened_status = reopened->Open();
+  ASSERT_TRUE(reopened_status.ok())
+      << "~FactStore kept the database handle alive behind a pinned snapshot: "
+      << reopened_status.ToString();
+
+  // Retire the detached handles after the owner is gone, in either order: each
+  // release finds the payload/memory claimed and is a no-op.
+  historical_handle.reset();
+  current_handle.reset();
+  ASSERT_TRUE(reopened->Close().ok());
+}
+
+// F4 review (minor) regression: ForceDetachEpochsLocked used to reclaim an
+// owner-held epoch whose reference count fell to one through
+// ReclaimEpochLocked, which fires the destroyed observer. Teardown must never
+// fire it (the owner and its test observers are going away), so the owner-held
+// previous==1 branch passes notify=false.
+//
+// Construction: the current epoch exists with only the store's owner reference
+// (opened once through the lock-free path, then released) and the store is pinned
+// by a separate as_of epoch, so ForceDetach takes exactly the owner-held
+// previous==1 branch for the current epoch. The old code fired the observer once.
+TEST_F(RocksDbLifecycleTest, ForceDetachDoesNotFireEpochDestroyedObserver) {
+  std::atomic<uint32_t> destroyed{0};
+  FactStoreOptions options{database_path_};
+  options.snapshot_epoch_destroyed_observer_for_testing = [&] {
+    destroyed.fetch_add(1, std::memory_order_relaxed);
+  };
+  auto store = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store->Open().ok());
+  ASSERT_TRUE(store->Commit(Batch(1, 101)).ok());
+  {
+    // Creates the current epoch; releasing the handle leaves only the store's
+    // owner reference (a normal release, so the observer does not fire).
+    const auto current = store->BeginCurrentSnapshot();
+    ASSERT_TRUE(current.ok()) << current.status().ToString();
+  }
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0U);
+  auto historical = store->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(historical.ok()) << historical.status().ToString();
+
+  store.reset();
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0U)
+      << "force-detach fired the epoch-destroyed observer during teardown";
+  // Releasing the outliving handle after the owner is gone must stay silent too
+  // (its payload was already claimed by the force-detach).
+  historical = StatusOr<StoreSnapshot>(Status::InvalidArgument("test", "release"));
+  EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0U);
+}
+
+// F4 review (Important, tolerance) regression: destruction must tolerate a
+// concurrent last-reader release. A release registers a reclaim attempt,
+// decrements the reference count to zero and only then blocks on the epoch lock,
+// so a destructor force-detach that holds that lock can observe a reader-held
+// epoch with a zero count. The old code asserted on the count (Debug abort). The
+// force-detach now claims the payload and the epoch memory for such an epoch, and
+// the blocked reclaimer completes as a no-op (no double free, no destroyed
+// observer after teardown).
+//
+// Deterministic interleaving: the destructor parks inside the force-detach epoch
+// section (test-only observer under epoch_mutex) until the releasing thread has
+// reached the zero-count window (test-only observer after the decrement, before
+// epoch_mutex). Reads through the handle during destruction are not exercised;
+// the contract requires serialization for those.
+TEST_F(RocksDbLifecycleTest, ForceDetachToleratesConcurrentLastReaderRelease) {
+  std::atomic<bool> detach_entered{false};
+  std::atomic<bool> release_decremented{false};
+  std::atomic<bool> release_observer_ran{false};
+  std::atomic<bool> detach_timed_out{false};
+
+  FactStoreOptions options{database_path_};
+  options.force_detach_epochs_observer_for_testing = [&] {
+    detach_entered.store(true, std::memory_order_seq_cst);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!release_decremented.load(std::memory_order_seq_cst)) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        detach_timed_out.store(true, std::memory_order_seq_cst);
+        return;
+      }
+      std::this_thread::yield();
+    }
+  };
+  options.epoch_release_before_reclaim_observer_for_testing = [&] {
+    release_observer_ran.store(true, std::memory_order_seq_cst);
+    // The count is zero and epoch_mutex is held by the destructor: returning
+    // parks this release on the lock, which is the interleaving under test.
+    release_decremented.store(true, std::memory_order_seq_cst);
+  };
+
+  auto store = std::make_unique<FactStore>(std::move(options));
+  ASSERT_TRUE(store->Open().ok());
+  ASSERT_TRUE(store->Commit(Batch(1, 101)).ok());
+  // One-off as_of epoch: its only reference is the handle's, so the handle
+  // release is the last-reader release that races the destructor.
+  auto snapshot = store->BeginSnapshot(SnapshotOptions{CommitSeq{1}});
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  std::optional<StoreSnapshot> outliving(
+      std::move(snapshot).ConsumeValueOrDie());
+
+  std::thread releaser([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!detach_entered.load(std::memory_order_seq_cst)) {
+      if (std::chrono::steady_clock::now() > deadline) return;
+      std::this_thread::yield();
+    }
+    outliving.reset();
+  });
+  std::thread destroyer([&] { store.reset(); });
+  destroyer.join();
+  releaser.join();
+
+  EXPECT_TRUE(release_observer_ran.load(std::memory_order_seq_cst))
+      << "the release never reached the zero-count window under test";
+  EXPECT_FALSE(detach_timed_out.load(std::memory_order_seq_cst))
+      << "the force-detach never observed the parked release";
+  // If the releaser timed out before touching the handle, retire it now (after
+  // the owner is gone) so the test leaves no state behind; this is a no-op when
+  // the releaser already released it.
+  outliving.reset();
+
+  auto reopened = std::make_unique<FactStore>(FactStoreOptions{database_path_});
+  ASSERT_TRUE(reopened->Open().ok())
+      << "the concurrent release kept the database handle alive";
+  ASSERT_TRUE(reopened->Close().ok());
+}
+
 // Task #9 regression: the as_of open registration used to be released by hand on
 // every return path, so a throwing observer (or an allocation failure) leaked
 // snapshot_opens_in_flight and made every later Close spin forever in its drain.

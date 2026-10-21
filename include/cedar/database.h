@@ -400,14 +400,21 @@ class Database {
 
   // Destroys the database (attempting a normal Close first). A Snapshot handle
   // that still pins a storage epoch at destruction is force-detached: its epoch
-  // payload (the storage-engine snapshot lease and the store back-reference) is
+  // payload (the storage snapshot lease and the store back-reference) is
   // released and the storage handles are destroyed, so it cannot keep the
-  // database (LOCK/WAL) open. Such a handle must only be destroyed after the
-  // Database is gone and must never be read (or otherwise used) after that
-  // point; destroying it afterwards is safe and is the required way to retire
-  // it. The normal path - Close() before destruction, or destruction with no
-  // outliving handle - is unchanged. See FactStore::~FactStore for the
-  // storage-level contract.
+  // database's on-disk open state alive.
+  //
+  // Serialization contract (required for every outliving handle): destruction
+  // must be serialized with every user of the Snapshot. While the Database is
+  // being destroyed, no thread may read through the Snapshot (Get/Exists/Multi*/
+  // Scan*/EventScan/StateScan, canonical_reader/adjacency_index), inspect it
+  // (commit_seq/oldest_readable_seq), or release/destroy it: a read goes through
+  // the payload and state destroyed here. Destroy the Database, wait for its
+  // destruction to finish, then destroy the Snapshot handle; destroying it
+  // afterwards is safe and is the required way to retire it. Using it
+  // concurrently with destruction is not supported. The normal path - Close()
+  // before destruction, or destruction with no outliving handle - is unchanged.
+  // See FactStore::~FactStore for the storage-level contract.
   ~Database();
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;

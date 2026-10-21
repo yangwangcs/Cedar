@@ -563,7 +563,14 @@ TEST_F(VacuumTest, FailedVacuumReservationDoesNotRaiseAnOpenSnapshotBoundary) {
          std::chrono::steady_clock::now() < reader_deadline) {
     std::this_thread::yield();
   }
-  ASSERT_TRUE(reader_parked.load(std::memory_order_acquire));
+  if (!reader_parked.load(std::memory_order_acquire)) {
+    // Joinable-thread safety: never ASSERT while the reader thread exists. A
+    // fatal assertion would return from the test body and std::thread's
+    // destructor would call std::terminate; release the hook, join, then fail.
+    reader_release.store(true, std::memory_order_release);
+    reader.join();
+    FAIL() << "the as_of reader never parked in the boundary window";
+  }
 
   Status vacuum_status = Status::OK();
   std::thread vacuum([&] { vacuum_status = database_->Vacuum(CommitSeq{2}); });
@@ -573,19 +580,28 @@ TEST_F(VacuumTest, FailedVacuumReservationDoesNotRaiseAnOpenSnapshotBoundary) {
          std::chrono::steady_clock::now() < vacuum_deadline) {
     std::this_thread::yield();
   }
-  ASSERT_TRUE(vacuum_reserved.load(std::memory_order_acquire));
+  if (!vacuum_reserved.load(std::memory_order_acquire)) {
+    // Release both parked hooks and join both threads before failing so the test
+    // fails cleanly instead of terminating on a joinable std::thread.
+    reader_release.store(true, std::memory_order_release);
+    vacuum_release.store(true, std::memory_order_release);
+    reader.join();
+    vacuum.join();
+    FAIL() << "the Vacuum never reserved its boundary target";
+  }
 
   // The Vacuum has reserved its target but has not published anything; finish the
   // parked open. Its epoch must report the still-durable boundary 0.
   reader_release.store(true, std::memory_order_release);
   reader.join();
   reader_armed.store(false, std::memory_order_release);
+  // Let the Vacuum finish before any fatal assertion: it fails with the injected
+  // error before publishing, so seq 1 stays readable.
+  vacuum_release.store(true, std::memory_order_release);
+  vacuum.join();
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   EXPECT_EQ(opened.ValueOrDie().oldest_readable_seq(), CommitSeq{0})
       << "an open snapshot recorded a boundary that was never published";
-
-  vacuum_release.store(true, std::memory_order_release);
-  vacuum.join();
   EXPECT_TRUE(vacuum_status.IsIOError()) << vacuum_status.ToString();
 
   // The failed Vacuum published nothing, so seq 1 is still readable.

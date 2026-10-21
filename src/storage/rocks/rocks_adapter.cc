@@ -477,6 +477,16 @@ class FactStoreImpl {
   // before the previous epoch is retired. Runs under epoch_mutex; the observer
   // must not call back into the store.
   std::function<void()> publish_visible_before_retire_observer_for_testing;
+  // Fired by ForceDetachEpochsLocked at the start of its epoch_mutex critical
+  // section, before the epoch registry is collected. Test-only: lets a regression
+  // test park a concurrent last-reader release in the zero-count window the
+  // destructor force-detach has to tolerate. Must not call back into the store.
+  std::function<void()> force_detach_epochs_observer_for_testing;
+  // Fired by ReleaseEpochRef when the last reference of a retired epoch reaches
+  // zero, after the decrement and before epoch_mutex is taken. Test-only: the
+  // release thread parks there while a destructor force-detach holds epoch_mutex.
+  // Must not call back into the store.
+  std::function<void()> epoch_release_before_reclaim_observer_for_testing;
   RecoveryState recovery_required;
   // One SnapshotEpoch per visible sequence is shared by every reader opened at
   // that sequence. Creation, publication, retirement, and reclamation are
@@ -612,7 +622,12 @@ class FactStoreImpl {
   // released, and its memory is claimed into close_graveyard so the later
   // ReleaseEpochRef from those handles is a harmless no-op. The owner/cache
   // references are dropped first; refs that remain work exactly like the normal
-  // last-reader reclamation. Caller must hold epoch_mutex.
+  // last-reader reclamation. Tolerates a concurrent last-reader release: such a
+  // release can reach a zero count before it blocks on epoch_mutex, so a
+  // reader-held epoch is preserved (payload + memory claimed) without asserting
+  // on the count, and the blocked reclaimer becomes a no-op. Never fires the
+  // destroyed observer (notify=false). Reading a handle concurrently with
+  // destruction is not supported (see ~FactStore). Caller must hold epoch_mutex.
   void ForceDetachEpochsLocked();
   // Releases every remaining epoch and graveyard entry. Exclusive ownership.
   void DestroyEpochsLocked();
@@ -646,8 +661,10 @@ class FactStoreImpl {
   void RetireCurrentEpochLocked();
   void DropOwnerReferenceLocked(SnapshotEpoch* epoch);
   // Caller observed the reference count fall to zero. Caller must hold
-  // epoch_mutex.
-  void ReclaimEpochLocked(SnapshotEpoch* epoch);
+  // epoch_mutex. `notify` fires the destroyed observer through
+  // ReleaseEpochPayloadLocked; teardown paths pass false (contract: epochs torn
+  // down with the store never fire it).
+  void ReclaimEpochLocked(SnapshotEpoch* epoch, bool notify = true);
   void UnlinkEpochLocked(SnapshotEpoch* epoch);
   // Releases the lease and the store shared_ptr exactly once. `notify` fires
   // the destroyed observer; teardown paths pass false (contract).
@@ -899,7 +916,7 @@ void FactStoreImpl::MaybeFreeDeadEpochs() {
   FreeDeadEpochsLocked();
 }
 
-void FactStoreImpl::ReclaimEpochLocked(SnapshotEpoch* epoch) {
+void FactStoreImpl::ReclaimEpochLocked(SnapshotEpoch* epoch, bool notify) {
   // The caller observed the reference count fall to zero, so no reader holds a
   // reference. A lock-free pin that loaded this epoch before it became
   // unreachable may still try to increment the count: the DEAD bit makes that
@@ -909,11 +926,12 @@ void FactStoreImpl::ReclaimEpochLocked(SnapshotEpoch* epoch) {
   if (!epoch->refs.compare_exchange_strong(expected, kEpochDeadBit,
                                            std::memory_order_seq_cst,
                                            std::memory_order_relaxed)) {
-    // A racing reader re-pinned the retired epoch; its own release reclaims it.
+    // A racing reader re-pinned the retired epoch, or a teardown path already
+    // claimed it (DEAD); either way its own path owns the reclamation.
     return;
   }
   UnlinkEpochLocked(epoch);
-  ReleaseEpochPayloadLocked(epoch, /*notify=*/true);
+  ReleaseEpochPayloadLocked(epoch, /*notify=*/notify);
   if (!ClaimEpochMemoryLocked(epoch)) return;
   if (PinAttemptsTotal() == 0) {
     delete epoch;
@@ -1118,6 +1136,15 @@ void FactStoreImpl::ReleaseEpochRef(SnapshotEpoch* epoch) {
     // owner reference keeps the current epoch above zero and every as_of epoch
     // is retired from birth. The reclamation path asserts that invariant.
     assert(epoch->retired.load(std::memory_order_relaxed));
+    if (epoch_release_before_reclaim_observer_for_testing) {
+      // Test-only window: the count is already zero and this thread has not yet
+      // taken epoch_mutex, which is exactly the state a destructor force-detach
+      // must tolerate (see ForceDetachEpochsLocked). Cold path: only the last
+      // reference of a retired epoch reaches here, and it immediately takes
+      // epoch_mutex and releases a snapshot lease. Must not call back into the
+      // store.
+      epoch_release_before_reclaim_observer_for_testing();
+    }
     std::lock_guard<std::mutex> lock(epoch_mutex);
     ReclaimEpochLocked(epoch);
   }
@@ -1167,6 +1194,22 @@ void FactStoreImpl::ForceDetachEpochsLocked() {
   // ReleaseEpochRef from an outliving handle then decrements to zero, takes the
   // DEAD bit and finds both the payload and the memory already claimed, which is
   // a no-op instead of a use-after-free or a double free.
+  //
+  // The claim below also tolerates a *concurrent* last-reader release: such a
+  // release registers its reclaim attempt and decrements the count to zero
+  // before it blocks on epoch_mutex, so a reader-held epoch may already be at
+  // zero by the time this function runs. Claiming payload+memory here makes the
+  // blocked reclaimer a no-op (its ReclaimEpochLocked compare-exchange for the
+  // payload fails, so it neither fires the destroyed observer nor frees the
+  // memory). Reading through a handle concurrently with destruction is still not
+  // supported; that requires the owner/handle serialization documented at
+  // ~FactStore.
+  if (force_detach_epochs_observer_for_testing) {
+    // Test-only window: runs under epoch_mutex, before the registry is collected,
+    // so a regression test can hold a last-reader release in the zero-count
+    // window this function has to tolerate. Must not call back into the store.
+    force_detach_epochs_observer_for_testing();
+  }
   std::vector<SnapshotEpoch*> owner_held;
   // as_of cache epochs are registered in retired_epochs as well, but their cache
   // entry owns one reference. Track them so they are handled exactly once (as
@@ -1203,14 +1246,22 @@ void FactStoreImpl::ForceDetachEpochsLocked() {
     if (previous == 1) {
       // No reader is left: the normal reclaimer releases the payload, claims the
       // memory and frees the epoch immediately (or parks it while a pin attempt
-      // drains).
-      ReclaimEpochLocked(epoch);
+      // drains). Pass notify=false: this is teardown, so the destroyed observer
+      // must not fire (the owner - and possibly its test observers - is going
+      // away).
+      ReclaimEpochLocked(epoch, /*notify=*/false);
     } else {
       preserve(epoch);
     }
   }
   for (SnapshotEpoch* epoch : reader_held) {
-    assert(EpochRefs(epoch) >= 1 && (EpochRefs(epoch) & kEpochDeadBit) == 0);
+    // The count can legitimately be zero here: a last-reader release registers
+    // its attempt, decrements to zero and only then takes epoch_mutex, so it can
+    // be parked behind this critical section. Do not assert on the count (a
+    // Debug-only assert would abort the destructor in that window); claim the
+    // payload and the epoch memory instead. The blocked reclaimer then finds the
+    // payload claimed and the memory owned by the graveyard, and completes as a
+    // harmless no-op.
     preserve(epoch);
   }
 }
@@ -1286,8 +1337,14 @@ void FactStoreImpl::ReleaseRetainedStateForClose() {
   canonical_page_metrics.reset();
   {
     std::lock_guard<std::mutex> lock(retired_schemas_mutex);
-    // No reader is live (close proved that), so no epoch can still be reading
-    // through its cached `schemas` raw pointer; the catalog can be released.
+    // Releasing the catalog is safe for both callers: FinishClose drained every
+    // epoch reference first, and the force-detach path released every epoch
+    // payload under epoch_mutex first, so no *supported* reader can still resolve
+    // its cached `schemas` pointer through the store. A handle that outlives the
+    // force-detach is detached and must not be read (see ~FactStore); the
+    // destruction contract serializes destruction with users of such a handle, so
+    // reading concurrently with this release is a contract violation, not a
+    // supported path.
     property_schemas.reset();
     retired_schemas.clear();
     current_schemas.store(nullptr, std::memory_order_release);
@@ -2357,6 +2414,10 @@ Status FactStore::Open() {
       options_.snapshot_epoch_destroyed_observer_for_testing;
   store->publish_visible_before_retire_observer_for_testing =
       options_.publish_visible_before_retire_observer_for_testing;
+  store->force_detach_epochs_observer_for_testing =
+      options_.force_detach_epochs_observer_for_testing;
+  store->epoch_release_before_reclaim_observer_for_testing =
+      options_.epoch_release_before_reclaim_observer_for_testing;
 
   std::string encoded_format;
   const rocksdb::Status got_format = store->db->Get(
@@ -2637,13 +2698,30 @@ void FactStore::ForceCloseLocked() {
   // The destructor owns the store: a live StoreSnapshot handle may still pin an
   // epoch (Close reported SnapshotPinned), but it must not keep the RocksDB
   // handle, LOCK/WAL files and heavy state alive after the owner is gone.
+  //
+  // Contract (see ~FactStore): destruction must be serialized with the users of
+  // an outliving handle - no thread may read through it while this runs, because
+  // the epoch payload (snapshot lease) and the heavy state are released here.
+  // Releasing the handle itself is tolerated (the last-reader reclamation claims
+  // payload/memory under epoch_mutex and becomes a no-op); this function drains
+  // the in-flight release windows below and ForceDetachEpochsLocked claims every
+  // payload and epoch memory so such a release can neither free nor fire
+  // anything the owner is tearing down.
   auto store = std::move(impl_);
   store->accepting_snapshots.store(false, std::memory_order_release);
   store->accepting_fast.store(false, std::memory_order_seq_cst);
   fast_impl_.store(nullptr, std::memory_order_seq_cst);
   // No new arrival can register (accepting_snapshots is off and the fast path is
   // unpublished); drain only the already-registered windows. Reader-held epoch
-  // references are tolerated below.
+  // references are tolerated below, but a reader may also be *releasing* its
+  // handle concurrently: a last-reader release registers a reclaim attempt before
+  // it decrements and keeps it until after its last access to this store, so it
+  // must be drained before the store's heavy state is released. Unlike a pin
+  // attempt it is not gated by the close (a live handle can start one at any
+  // time), so this drain is a best-effort window closer: the authoritative
+  // argument for a release that starts later is that ForceDetachEpochsLocked
+  // claims every payload and epoch memory under epoch_mutex (see its contract),
+  // making the late reclaimer a no-op on graveyard-owned memory.
   while (store->snapshot_opens_in_flight.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
@@ -2651,6 +2729,9 @@ void FactStore::ForceCloseLocked() {
     std::this_thread::yield();
   }
   while (store->PinAttemptsTotal() != 0) {
+    std::this_thread::yield();
+  }
+  while (store->ReclaimAttemptsTotal() != 0) {
     std::this_thread::yield();
   }
   while (non_epoch_users_.load(std::memory_order_acquire) != 0) {

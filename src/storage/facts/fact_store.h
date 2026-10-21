@@ -95,6 +95,17 @@ struct FactStoreOptions {
   // reader in exactly the window that the open/vacuum handshake closes; it must
   // not call back into FactStore.
   std::function<void()> snapshot_boundary_loaded_observer_for_testing;
+  // Destructor force-detach windows. `force_detach_epochs` fires inside
+  // ForceDetachEpochsLocked at the start of its epoch_mutex critical section;
+  // `epoch_release_before_reclaim` fires in a last-reader release after the
+  // reference count reached zero and before that release takes epoch_mutex. A
+  // test can park one release in the second window while the force-detach holds
+  // the lock, which is the interleaving the destructor must tolerate. Both must
+  // not call back into FactStore; the second one is only reached by the last
+  // reference of a retired epoch (it is not on the current-epoch point-read
+  // release path).
+  std::function<void()> force_detach_epochs_observer_for_testing;
+  std::function<void()> epoch_release_before_reclaim_observer_for_testing;
 };
 
 struct SnapshotWriteDependency {
@@ -468,14 +479,25 @@ class FactStore {
   explicit FactStore(FactStoreOptions options);
   // Destroys the store. Unlike Close(), destruction cannot report
   // SnapshotPinned: a StoreSnapshot handle that still pins an epoch is
-  // force-detached during destruction - its epoch payload (the RocksDB snapshot
-  // lease and the strong store back-reference) is released and the RocksDB
-  // handle is destroyed, while the epoch memory itself is retained until the
-  // handle is gone. Such an outliving handle cannot keep the database (LOCK/WAL)
-  // open and cannot cause a use-after-free, but it is detached from a live
-  // store: it must only be destroyed after the FactStore is gone, and it must
-  // never be read (or otherwise used) after that point. Destroying it afterwards
-  // is safe and is the required way to retire it. The normal path - Close()
+  // force-detached during destruction - its epoch payload (the storage-engine
+  // snapshot lease and the strong store back-reference) is released and the
+  // storage handle is destroyed, while the epoch memory itself is retained until
+  // the handle is gone. Such an outliving handle cannot keep the database
+  // (LOCK/WAL) open, but it is detached from a live store.
+  //
+  // Serialization contract (required for every outliving handle): destruction
+  // must be serialized with every user of the handle. While ~FactStore runs, no
+  // thread may read through the handle (Read*/Scan*/Lookup*), inspect it
+  // (commit_seq/oldest_readable_seq), or release/destroy it: its payload and the
+  // heavy state a read goes through are released here, so concurrent use is a
+  // use-after-free, not a supported interleaving. The supported retirement is
+  // sequential: destroy the FactStore, wait for ~FactStore to return, then
+  // destroy the handle. Releasing the handle afterwards is safe and is the
+  // required way to retire it. The implementation additionally tolerates a
+  // last-reader release that races destruction (the epoch payload and memory are
+  // claimed under the epoch lock, so the late release is a no-op), but that
+  // tolerance does not extend to reads: reading through the handle concurrently
+  // with destruction remains a contract violation. The normal path - Close()
   // before destruction, or destruction with no outliving handle - is unchanged.
   ~FactStore();
 
@@ -787,14 +809,21 @@ class FactStore {
   // No-new-arrivals invariant (drain boundedness): both lock-free entry points
   // read fast_impl_ *before* constructing a FastPinAttempt and skip registration
   // when it is null. PrepareClose clears fast_impl_ before it drains the total,
-  // so once that clear is visible only threads that already passed the gate can
-  // still increment a counter; every later arrival goes straight to the
-  // registered slow path (which reports the closing state) and never touches the
-  // total again. The drain is therefore bounded by a finite set of already
-  // in-flight attempts, not by the arrival rate. An attempt that registers after
-  // the clear still loads null and touches no shell (seq_cst ordering of the
-  // clear, the registration and that load), so shell-lifetime safety does not
-  // depend on the drain having observed zero before the shell is freed.
+  // so for the store that is closing, once that clear is visible only threads
+  // that already passed the gate can still increment a counter; every later
+  // arrival goes straight to the registered slow path (which reports the closing
+  // state) and never touches the total again. The drain is therefore bounded by a
+  // finite set of already in-flight attempts, not by the arrival rate.
+  //
+  // The seq_cst guarantee is one-directional: an attempt that observes a non-null
+  // fast_impl_ registered its counter before the clear in the seq_cst total
+  // order, so the drain is guaranteed to wait for it. The converse does not hold:
+  // an attempt that registers after the clear is not guaranteed to load null (a
+  // pinned close republishes the same store and a later Open publishes a new
+  // one), but such an attempt only touches a store that is open again, never the
+  // shell being torn down. Shell-lifetime safety therefore rests on the forward
+  // direction - observing non-null implies the registration precedes the clear
+  // and is drained - not on the drain observing zero before the shell is freed.
   static constexpr size_t kFastPinShardCount = 32;
   struct alignas(64) FastPinAttemptCounter {
     std::atomic<uint32_t> value{0};

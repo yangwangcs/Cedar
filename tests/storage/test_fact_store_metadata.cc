@@ -268,14 +268,23 @@ TEST_F(FactStoreMetadataTest, FastPathTransactionAllocationDoesNotWaitForPublish
                                      [&] { return writer_entered; }));
   }
 
-  const auto second = store.AllocateTransactionId();
-  ASSERT_TRUE(second.ok()) << second.status().ToString();
-  EXPECT_EQ(second.ValueOrDie().value, 2U);
+  // Bound the fast-path call: a lock regression must fail this test instead of
+  // hanging it. The parked writer is released on both paths so neither future
+  // outlives the store.
+  std::future<StatusOr<TxnId>> second = std::async(
+      std::launch::async, [&] { return store.AllocateTransactionId(); });
+  const std::future_status second_status =
+      second.wait_for(std::chrono::seconds(2));
   {
     std::lock_guard<std::mutex> lock(prewrite_mutex);
     release_writer = true;
   }
   prewrite_cv.notify_all();
+  ASSERT_EQ(second_status, std::future_status::ready)
+      << "fast-path allocation waited behind the parked publisher";
+  const auto second_id = second.get();
+  ASSERT_TRUE(second_id.ok()) << second_id.status().ToString();
+  EXPECT_EQ(second_id.ValueOrDie().value, 2U);
   ASSERT_TRUE(committed.get().ok());
   ASSERT_TRUE(store.Close().ok());
   std::filesystem::remove_all(path);
@@ -289,6 +298,31 @@ TEST_F(FactStoreMetadataTest, KeepsVertexAndEdgeLeasesIndependent) {
   EXPECT_EQ(vertices.ValueOrDie().first_id, 1U);
   EXPECT_EQ(edges.ValueOrDie().first_id, 1U);
   EXPECT_EQ(edges.ValueOrDie().kind, IdKind::kEdge);
+}
+
+TEST_F(FactStoreMetadataTest, RejectsTransactionLeaseWhenIdSpaceIsExhausted) {
+  // The transaction lease-extension guard (rocks_adapter.cc:5057-5059) rejects
+  // a lease whose end would wrap uint64_t. The existing exhaustion test covers
+  // LeaseIds only, so pin the transaction path here: no ID may be handed out
+  // and no durable lease-extension write may happen.
+  ASSERT_TRUE(store_->Close().ok());
+  const auto encoded = EncodeIdAllocatorState(IdAllocatorState{
+      IdKind::kTransaction, std::numeric_limits<uint64_t>::max()});
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  PutMetaRecord(path_, EncodeAllocatorMetaKey(IdKind::kTransaction),
+                encoded.ValueOrDie());
+
+  std::atomic<uint32_t> extension_writes{0};
+  FactStoreOptions options{path_};
+  options.transaction_lease_write_observer_for_testing = [&](bool) {
+    extension_writes.fetch_add(1, std::memory_order_relaxed);
+  };
+  store_ = std::make_unique<FactStore>(options);
+  ASSERT_TRUE(store_->Open().ok());
+
+  const auto id = store_->AllocateTransactionId();
+  EXPECT_TRUE(id.status().IsResourceExhausted()) << id.status().ToString();
+  EXPECT_EQ(extension_writes.load(), 0U);
 }
 
 TEST_F(FactStoreMetadataTest, RejectsLeaseWhenAllocatorIsExhausted) {

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cedar/core/status.h"
@@ -38,6 +39,25 @@ class DecidedEpoch;
 class FactStoreImpl;
 class FactStore;
 struct SnapshotEpoch;
+
+// Counters for one completed reopen validation pass. `phase` points at a
+// process-lifetime string literal, so it remains valid after the callback
+// returns. The observer runs synchronously inside FactStore::Open before the
+// store is published; it must not call back into FactStore.
+struct ReopenValidationPhaseCounters {
+  // "P1_sequence_validation" or "P2_identity_history".
+  std::string_view phase;
+  // Rows the pass consumed: committed sequence records for P1, facts-CF keys
+  // scanned by the P2 identity-history rebuild (0 when the rebuild is skipped).
+  uint64_t records = 0;
+  // Read operations the pass issued against the facts CF / meta CF. A batched
+  // MultiGet counts once, not once per key, so this is the number of read
+  // round trips rather than the number of records validated.
+  uint64_t fact_gets = 0;
+  uint64_t meta_gets = 0;
+  // Wall-clock time of the whole pass.
+  uint64_t elapsed_us = 0;
+};
 
 struct FactStoreOptions {
   std::string path;
@@ -144,6 +164,16 @@ struct FactStoreOptions {
   // are cross-checked; older corruption is detected on read instead.
   bool deep_recovery_validation = true;
   uint64_t recovery_validation_recent_sequences = 4096;
+  // Fires once at the end of each successful reopen validation pass that
+  // FactStore::Open performs: "P1_sequence_validation" and
+  // "P2_identity_history". P2 reports records == 0 when the identity-history
+  // rebuild is skipped (S3). The adjacency rebuild ("P3") runs in
+  // Database::Open after FactStore::Open and is therefore not reported here.
+  // Callbacks are synchronous, run before the store is published, and must not
+  // call back into FactStore. Production callers leave this unset (the check is
+  // a no-op).
+  std::function<void(const ReopenValidationPhaseCounters&)>
+      reopen_validation_counters_for_testing;
 };
 
 struct SnapshotWriteDependency {

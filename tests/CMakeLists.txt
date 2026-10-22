@@ -521,6 +521,18 @@ if(TARGET cedar_kernel_bench)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_kernel_benchmark_csv.cmake)
 endif()
 
+# Reopen validation measurement harness (F9 Task 5). Like the benchmark
+# binaries under benchmarks/, this is built on demand and deliberately not
+# registered with ctest: it creates a ~640k-fact database, so running it as
+# part of the default suite would be both slow and unbounded. Invoke it
+# directly, e.g.:
+#   DB_PATH=/tmp/reopen640k DEEP=1 tests/reopen_validation_benchmark
+add_executable(reopen_validation_benchmark
+    performance/test_reopen_validation_benchmark.cc)
+target_include_directories(reopen_validation_benchmark
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(reopen_validation_benchmark PRIVATE cedar_core)
+
 if(TARGET cedar_radix_memtable_bench)
   add_test(NAME RadixBenchmarkCsvContract COMMAND ${CMAKE_COMMAND}
       -DCEDAR_RADIX_BENCHMARK=$<TARGET_FILE:cedar_radix_memtable_bench>

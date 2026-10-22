@@ -510,6 +510,9 @@ class FactStoreImpl {
   // Reopen fact cross-check policy; see FactStoreOptions.
   bool deep_recovery_validation = true;
   uint64_t recovery_validation_recent_sequences = 4096;
+  // Reports one completed reopen validation pass; see FactStoreOptions.
+  std::function<void(const ReopenValidationPhaseCounters&)>
+      reopen_validation_counters_for_testing;
   std::function<void()> snapshot_epoch_created_observer_for_testing;
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
   // Fired by PublishVisible after the new visible watermark is stored and
@@ -2064,7 +2067,8 @@ Status LoadPropertySchemas(FactStoreImpl* store) {
 // batches by ValidateSequenceOutcomeBatch; see ValidateCommittedSequences.
 Status ValidateSequenceRecordContent(FactStoreImpl* store, CommitSeq commit_seq,
                                      const SequenceRecordView& sequence,
-                                     bool require_facts) {
+                                     bool require_facts,
+                                     uint64_t* fact_gets) {
   if (sequence.commit_seq != commit_seq) {
     return Status::Corruption("fact store",
                               "sequence record has wrong commit sequence");
@@ -2083,6 +2087,7 @@ Status ValidateSequenceRecordContent(FactStoreImpl* store, CommitSeq commit_seq,
                                 "sequence contains invalid fact key");
     }
     if (!require_facts) continue;
+    if (fact_gets != nullptr) ++*fact_gets;
     std::string encoded_fact;
     const rocksdb::Status got_fact = store->db->Get(
         rocksdb::ReadOptions(), store->facts_cf,
@@ -2105,8 +2110,10 @@ Status ValidateSequenceRecordContent(FactStoreImpl* store, CommitSeq commit_seq,
 Status ValidateSequenceOutcomeBatch(FactStoreImpl* store,
                                     const std::vector<std::string>& keys,
                                     const std::vector<TxnId>& txn_ids,
-                                    const std::vector<CommitSeq>& commit_seqs) {
+                                    const std::vector<CommitSeq>& commit_seqs,
+                                    uint64_t* meta_gets) {
   if (keys.empty()) return Status::OK();
+  if (meta_gets != nullptr) ++*meta_gets;
   std::vector<rocksdb::Slice> slices;
   slices.reserve(keys.size());
   for (const std::string& key : keys) slices.emplace_back(key);
@@ -2130,9 +2137,37 @@ Status ValidateSequenceOutcomeBatch(FactStoreImpl* store,
   return Status::OK();
 }
 
+// Reports one completed reopen validation pass to the test-only observer. The
+// hook is a no-op when unset and never calls back into the store itself.
+void ReportReopenValidationPhase(
+    FactStoreImpl* store, std::string_view phase, uint64_t records,
+    uint64_t fact_gets, uint64_t meta_gets,
+    std::chrono::steady_clock::time_point started) {
+  if (!store->reopen_validation_counters_for_testing) return;
+  ReopenValidationPhaseCounters counters;
+  counters.phase = phase;
+  counters.records = records;
+  counters.fact_gets = fact_gets;
+  counters.meta_gets = meta_gets;
+  counters.elapsed_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
+  store->reopen_validation_counters_for_testing(counters);
+}
+
 Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
                                   CommitSeq oldest_readable_seq) {
-  if (visible_seq.value == 0) return Status::OK();
+  const auto phase_started = std::chrono::steady_clock::now();
+  const auto report_phase = [&](uint64_t records, uint64_t fact_gets,
+                                uint64_t meta_gets) {
+    ReportReopenValidationPhase(store, "P1_sequence_validation", records,
+                                fact_gets, meta_gets, phase_started);
+  };
+  if (visible_seq.value == 0) {
+    report_phase(0, 0, 0);
+    return Status::OK();
+  }
   rocksdb::ReadOptions options;
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->meta_cf));
@@ -2160,6 +2195,8 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   outcome_keys.reserve(kOutcomeBatch);
   outcome_txn_ids.reserve(kOutcomeBatch);
   outcome_commit_seqs.reserve(kOutcomeBatch);
+  uint64_t fact_gets = 0;
+  uint64_t meta_gets = 0;
   uint64_t expected = 1;
   for (iterator->Seek(kSequenceMetaPrefix);
        iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix) &&
@@ -2182,7 +2219,8 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     const bool require_facts = store->deep_recovery_validation ||
                                expected >= fact_validation_floor;
     const Status valid = ValidateSequenceRecordContent(
-        store, CommitSeq{expected}, sequence.ValueOrDie(), require_facts);
+        store, CommitSeq{expected}, sequence.ValueOrDie(), require_facts,
+        &fact_gets);
     if (!valid.ok()) return valid;
     auto transaction_key = EncodeTransactionMetaKey(sequence.ValueOrDie().txn_id);
     if (!transaction_key.ok()) return transaction_key.status();
@@ -2191,7 +2229,8 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     outcome_commit_seqs.push_back(CommitSeq{expected});
     if (outcome_keys.size() == kOutcomeBatch) {
       const Status outcomes = ValidateSequenceOutcomeBatch(
-          store, outcome_keys, outcome_txn_ids, outcome_commit_seqs);
+          store, outcome_keys, outcome_txn_ids, outcome_commit_seqs,
+          &meta_gets);
       if (!outcomes.ok()) return outcomes;
       outcome_keys.clear();
       outcome_txn_ids.clear();
@@ -2199,7 +2238,7 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     }
   }
   const Status outcomes = ValidateSequenceOutcomeBatch(
-      store, outcome_keys, outcome_txn_ids, outcome_commit_seqs);
+      store, outcome_keys, outcome_txn_ids, outcome_commit_seqs, &meta_gets);
   if (!outcomes.ok()) return outcomes;
   if (!iterator->status().ok()) {
     return FromRocksDb(iterator->status(), "iterate durable sequence records");
@@ -2210,6 +2249,7 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   if (iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix)) {
     return Status::Corruption("fact store", "sequence exceeds visible watermark");
   }
+  report_phase(expected - 1, fact_gets, meta_gets);
   return Status::OK();
 }
 
@@ -2545,6 +2585,8 @@ Status FactStore::Open() {
   store->deep_recovery_validation = options_.deep_recovery_validation;
   store->recovery_validation_recent_sequences =
       std::max<uint64_t>(1, options_.recovery_validation_recent_sequences);
+  store->reopen_validation_counters_for_testing =
+      options_.reopen_validation_counters_for_testing;
   store->snapshot_epoch_created_observer_for_testing =
       options_.snapshot_epoch_created_observer_for_testing;
   store->snapshot_epoch_destroyed_observer_for_testing =
@@ -2691,6 +2733,8 @@ Status FactStore::Open() {
   // filter would break the no-false-negative contract: the write path would
   // skip the canonical read that detects prior versions of an existing identity,
   // and point reads of that identity would return no facts at all.
+  const auto identity_phase_started = std::chrono::steady_clock::now();
+  uint64_t identity_records = 0;
   bool skip_identity_history_rebuild =
       options_.identity_history_skip_rebuild_for_testing;
   if (!skip_identity_history_rebuild) {
@@ -2713,11 +2757,17 @@ Status FactStore::Open() {
       const auto decoded = DecodeFactKey(iterator->key().ToString());
       if (!decoded.ok()) return decoded.status();
       store->identity_history->Publish(decoded.ValueOrDie().ref);
+      ++identity_records;
     }
     if (!iterator->status().ok()) {
       return FromRocksDb(iterator->status(), "scan fact identities");
     }
   }
+  // S3: a skipped rebuild reports records == 0; the elapsed time still covers
+  // the capacity decision, so the two outcomes stay comparable.
+  ReportReopenValidationPhase(store.get(), "P2_identity_history",
+                              identity_records, 0, 0,
+                              identity_phase_started);
   impl_ = std::move(store);
   fast_impl_.store(impl_.get(), std::memory_order_seq_cst);
   return Status::OK();

@@ -166,6 +166,22 @@ StoreCommitBatch VertexStateBatch(TxnId txn_id, VertexId vertex_id,
       false};
 }
 
+// Commits `fact_count` distinct vertex identities in one transaction. Reopen
+// validation consumes the sequence record once and then cross-checks one fact
+// per identity, which lets a counter test distinguish sequence records from
+// fact reads (and a bounded window from the full history).
+StoreCommitBatch VertexFactsBatch(TxnId txn_id, uint64_t first_vertex,
+                                  uint64_t fact_count, uint64_t valid_from) {
+  StoreCommitBatch batch{txn_id, valid_from, {}, {}, {}, {}, false};
+  batch.mutations.reserve(fact_count);
+  for (uint64_t index = 0; index < fact_count; ++index) {
+    batch.mutations.push_back(PendingFactMutation{
+        EntityFact::Vertex(VertexRef{PartId{0}, first_vertex + index}).ref(),
+        ValidTime{valid_from}, FactOperation::kPut, 0, std::nullopt});
+  }
+  return batch;
+}
+
 class FactStoreMetadataTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -1205,6 +1221,99 @@ TEST_F(FactStoreMetadataTest,
   EXPECT_TRUE(status.IsCorruption()) << status.ToString();
   EXPECT_NE(status.ToString().find("missing fact"), std::string::npos)
       << status.ToString();
+}
+
+// F9 Task 5: reopen observability. Each completed validation pass reports its
+// own counters, so the deep and bounded policies can be compared from the
+// observer instead of inferred from wall time. P1 consumes one record per
+// committed sequence and issues one outcome MultiGet per <=1024 sequences; the
+// fact Gets it issues are the whole fact set under deep validation and only the
+// recent-window slice under bounded validation.
+TEST_F(FactStoreMetadataTest, ReopenValidationCountersReportPhasesAndWindow) {
+  constexpr uint64_t kTransactions = 3;
+  constexpr uint64_t kFactsPerTransaction = 4;
+  constexpr uint64_t kFacts = kTransactions * kFactsPerTransaction;
+  for (uint64_t index = 1; index <= kTransactions; ++index) {
+    const uint64_t first_vertex = (index - 1) * kFactsPerTransaction + 1;
+    ASSERT_TRUE(store_
+                    ->Commit(VertexFactsBatch(TxnId{index}, first_vertex,
+                                              kFactsPerTransaction, 10 + index))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+
+  std::vector<ReopenValidationPhaseCounters> phases;
+  const auto collect = [&phases](
+                           const ReopenValidationPhaseCounters& counters) {
+    phases.push_back(counters);
+  };
+
+  FactStoreOptions deep{path_};
+  deep.reopen_validation_counters_for_testing = collect;
+  store_ = std::make_unique<FactStore>(deep);
+  ASSERT_TRUE(store_->Open().ok());
+  ASSERT_TRUE(store_->Close().ok());
+  ASSERT_EQ(phases.size(), 2U);
+  EXPECT_EQ(phases[0].phase, "P1_sequence_validation");
+  EXPECT_EQ(phases[0].records, kTransactions);
+  EXPECT_EQ(phases[0].fact_gets, kFacts);
+  EXPECT_EQ(phases[0].meta_gets, 1U);
+  EXPECT_EQ(phases[1].phase, "P2_identity_history");
+  EXPECT_EQ(phases[1].records, kFacts);
+  EXPECT_EQ(phases[1].fact_gets, 0U);
+  EXPECT_EQ(phases[1].meta_gets, 0U);
+
+  phases.clear();
+  FactStoreOptions bounded{path_};
+  bounded.deep_recovery_validation = false;
+  bounded.recovery_validation_recent_sequences = 2;
+  bounded.reopen_validation_counters_for_testing = collect;
+  store_ = std::make_unique<FactStore>(bounded);
+  ASSERT_TRUE(store_->Open().ok());
+  ASSERT_TRUE(store_->Close().ok());
+  ASSERT_EQ(phases.size(), 2U);
+  EXPECT_EQ(phases[0].phase, "P1_sequence_validation");
+  EXPECT_EQ(phases[0].records, kTransactions);
+  // visible(3) - recent(2) + 1 = 2, so only sequences 2 and 3 cross-check facts.
+  EXPECT_EQ(phases[0].fact_gets, 2 * kFactsPerTransaction);
+  EXPECT_EQ(phases[0].meta_gets, 1U);
+  EXPECT_EQ(phases[1].phase, "P2_identity_history");
+  EXPECT_EQ(phases[1].records, kFacts);
+}
+
+// F9 Task 5: counters describe one Open, not a process-lifetime total. Two
+// consecutive reopens must each report the same per-open counts instead of
+// accumulating the previous open's numbers.
+TEST_F(FactStoreMetadataTest, ReopenValidationCountersResetBetweenOpens) {
+  constexpr uint64_t kTransactions = 3;
+  for (uint64_t index = 1; index <= kTransactions; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index},
+                                              10 + index))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+
+  std::vector<ReopenValidationPhaseCounters> phases;
+  FactStoreOptions options{path_};
+  options.reopen_validation_counters_for_testing =
+      [&phases](const ReopenValidationPhaseCounters& counters) {
+        phases.push_back(counters);
+      };
+  for (int open = 0; open < 2; ++open) {
+    store_ = std::make_unique<FactStore>(options);
+    ASSERT_TRUE(store_->Open().ok());
+    ASSERT_TRUE(store_->Close().ok());
+  }
+  ASSERT_EQ(phases.size(), 4U);
+  for (size_t offset = 0; offset < phases.size(); offset += 2) {
+    EXPECT_EQ(phases[offset].phase, "P1_sequence_validation");
+    EXPECT_EQ(phases[offset].records, kTransactions);
+    EXPECT_EQ(phases[offset].fact_gets, kTransactions);
+    EXPECT_EQ(phases[offset].meta_gets, 1U);
+    EXPECT_EQ(phases[offset + 1].phase, "P2_identity_history");
+    EXPECT_EQ(phases[offset + 1].records, kTransactions);
+  }
 }
 
 }  // namespace

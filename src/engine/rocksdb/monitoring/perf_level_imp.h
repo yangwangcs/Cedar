@@ -9,6 +9,14 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-extern thread_local PerfLevel perf_level;
+// Inline (rather than extern) so that every translation unit sees the
+// constant initializer.  With only an extern declaration, GCC emits a weak
+// reference to the thread-local init function in every TU that reads the
+// variable; because the defining TU constant-initializes it, no init function
+// exists and the weak reference stays undefined.  When the linker relaxes the
+// TLS address computation, UBSan can then mistake the stale guard condition
+// for a null pointer load (see PerfStepTimer).  Making the definition visible
+// avoids the external TLS init guard entirely without changing semantics.
+inline thread_local PerfLevel perf_level = kEnableCount;
 
 }  // namespace ROCKSDB_NAMESPACE

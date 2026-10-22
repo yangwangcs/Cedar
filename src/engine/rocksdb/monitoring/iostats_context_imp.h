@@ -9,7 +9,14 @@
 
 #if !defined(NIOSTATS_CONTEXT)
 namespace ROCKSDB_NAMESPACE {
-extern thread_local IOStatsContext iostats_context;
+// Inline (rather than extern) so that every translation unit sees the
+// definition.  With only an extern declaration, GCC emits a reference to the
+// thread-local init function in every TU and computes the address through the
+// GOT; the linker may then relax that address computation in a way that leaves
+// a UBSan null-pointer check testing unrelated flags.  Defining it here uses a
+// direct thread-local offset and keeps the check correct without changing
+// semantics.
+inline thread_local IOStatsContext iostats_context;
 }  // namespace ROCKSDB_NAMESPACE
 
 // increment a specific counter by the specified value

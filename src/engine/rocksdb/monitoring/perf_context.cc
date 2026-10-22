@@ -174,8 +174,11 @@ struct PerfContextInt {
 // Should not be used because the counters are not thread-safe.
 // Put here just to make get_perf_context() simple without ifdef.
 PerfContext perf_context;
-#else
+#elif defined(OS_SOLARIS)
 thread_local PerfContext perf_context;
+#else
+// perf_context is defined inline in perf_context_imp.h so that its definition
+// is visible to every TU (see the comment there).
 #endif
 
 PerfContext* get_perf_context() {

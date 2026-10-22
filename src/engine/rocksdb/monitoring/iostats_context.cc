@@ -15,7 +15,8 @@ namespace ROCKSDB_NAMESPACE {
 // Put here just to make get_iostats_context() simple without ifdef.
 static IOStatsContext iostats_context;
 #else
-thread_local IOStatsContext iostats_context;
+// iostats_context is defined inline in iostats_context_imp.h so that its
+// definition is visible to every TU (see the comment there).
 #endif
 
 IOStatsContext* get_iostats_context() { return &iostats_context; }

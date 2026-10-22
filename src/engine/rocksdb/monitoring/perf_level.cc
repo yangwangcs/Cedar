@@ -10,7 +10,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-thread_local PerfLevel perf_level = kEnableCount;
+// perf_level is defined inline in perf_level_imp.h so that its constant
+// initializer is visible to every TU (see the comment there).
 
 void SetPerfLevel(PerfLevel level) {
   assert(level > kUninitialized);

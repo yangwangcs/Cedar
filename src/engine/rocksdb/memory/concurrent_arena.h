@@ -98,7 +98,11 @@ class ConcurrentArena : public Allocator {
     Shard() : free_begin_(nullptr), allocated_and_unused_(0) {}
   };
 
-  static thread_local size_t tls_cpuid;
+  // Inline (rather than only declared here and defined in the .cc) so that
+  // every TU reading it uses a direct thread-local offset instead of an
+  // external TLS access that the linker may relax into a UBSan-visible
+  // null-pointer check with stale flags.  See monitoring/perf_context_imp.h.
+  inline static thread_local size_t tls_cpuid = 0;
 
   char padding0[56] ROCKSDB_FIELD_UNUSED;
 

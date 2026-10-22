@@ -16,7 +16,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-thread_local size_t ConcurrentArena::tls_cpuid = 0;
+// ConcurrentArena::tls_cpuid is defined inline in concurrent_arena.h so that
+// every TU sees the definition (see the comment there).
 
 namespace {
 // If the shard block size is too large, in the worst case, every core

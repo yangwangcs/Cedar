@@ -16,7 +16,14 @@ extern PerfContext perf_context;
 extern thread_local PerfContext perf_context_;
 #define perf_context (*get_perf_context())
 #else
-extern thread_local PerfContext perf_context;
+// Inline (rather than extern) so that every translation unit sees the
+// definition.  With only an extern declaration, GCC emits a reference to the
+// thread-local init function in every TU and computes the address through the
+// GOT; the linker may then relax that address computation in a way that leaves
+// a UBSan null-pointer check testing unrelated flags (seen as "member access
+// within null pointer of type 'PerfContext'").  Defining it here uses a direct
+// thread-local offset and keeps the check correct without changing semantics.
+inline thread_local PerfContext perf_context;
 #endif
 #endif
 

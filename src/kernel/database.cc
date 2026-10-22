@@ -1352,7 +1352,9 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
   auto request = std::make_shared<AppendCommitRequest>();
   request->batch = std::move(batch);
   request->txn_id = request->batch.txn_id;
-  request->estimated_bytes = internal::EstimateCommitBatchBytes(request->batch);
+  request->estimated_bytes =
+      internal::EstimateCommitBatchBytes(request->batch,
+                                         sequence_record_format);
   request->preflight_footprint = internal::BuildCommitFootprint(request->batch);
   request->enqueued_at = std::chrono::steady_clock::now();
   if (request->estimated_bytes > append_commit_max_batch_bytes) {
@@ -1581,7 +1583,9 @@ Status Database::Impl::SubmitAsyncCommit(
   auto request = std::make_shared<AppendCommitRequest>();
   request->batch = std::move(batch);
   request->txn_id = request->batch.txn_id;
-  request->estimated_bytes = internal::EstimateCommitBatchBytes(request->batch);
+  request->estimated_bytes =
+      internal::EstimateCommitBatchBytes(request->batch,
+                                         sequence_record_format);
   request->preflight_footprint = internal::BuildCommitFootprint(request->batch);
   request->enqueued_at = std::chrono::steady_clock::now();
   if (request->estimated_bytes > append_commit_max_batch_bytes) {
@@ -1842,6 +1846,11 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   auto impl = std::make_shared<Impl>(std::move(options));
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
+  // The effective sequence format is fixed for this open: the durable marker
+  // (when present) wins over DatabaseOptions::meta_sequence_format. Cache it for
+  // queue admission and group planning so estimates reserve the record the
+  // writer actually emits.
+  impl->sequence_record_format = impl->store.EffectiveSequenceRecordFormat();
   // Build the Cedar-owned adjacency cache from the authoritative fact lane at
   // open. QueryDelta supplies the newer commit tail at query time. A failed
   // rebuild is never silent: it is logged, reported through the test observer,

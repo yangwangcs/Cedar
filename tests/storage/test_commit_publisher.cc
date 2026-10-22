@@ -303,15 +303,51 @@ TEST_F(CommitPublisherTest, EstimateCommitBatchBytesMatchesEncodedBatchWithinTol
 
   for (const auto& [name, batch] : cases) {
     SCOPED_TRACE(name);
-    const std::vector<const StoreCommitBatch*> group{&batch};
-    const size_t actual = EncodeGroup(group, CommitSeq{1}).GetDataSize();
-    const size_t estimate = EstimateCommitBatchBytes(batch);
-    EXPECT_GE(estimate, actual);
-    // The calibrated estimator may only carry a small absolute safety margin
-    // over the real encoder; the former 2x reservation is not allowed back.
-    EXPECT_LE(estimate - actual, actual / 64 + 512) << "estimate=" << estimate
-                                                    << " actual=" << actual;
+    for (uint32_t format :
+         {kMetaSequenceFormatV1, kMetaSequenceFormatV2}) {
+      SCOPED_TRACE(::testing::Message() << "format=" << format);
+      const std::vector<const StoreCommitBatch*> group{&batch};
+      const size_t actual =
+          EncodeGroup(group, CommitSeq{1}, format).GetDataSize();
+      const size_t estimate = EstimateCommitBatchBytes(batch, format);
+      EXPECT_GE(estimate, actual);
+      // The calibrated estimator may only carry a small absolute safety margin
+      // over the real encoder; the former 2x reservation is not allowed back.
+      EXPECT_LE(estimate - actual, actual / 64 + 512)
+          << "estimate=" << estimate << " actual=" << actual;
+    }
   }
+}
+
+TEST_F(CommitPublisherTest, EstimateSequenceRecordBytesMatchesBothEncoders) {
+  for (size_t fact_count : {size_t{1}, size_t{5}, size_t{182}}) {
+    SCOPED_TRACE(::testing::Message() << "facts=" << fact_count);
+    SequenceRecord record{CommitSeq{7}, TxnId{9}, 11, {}};
+    record.fact_keys.reserve(fact_count);
+    for (size_t index = 0; index < fact_count; ++index) {
+      record.fact_keys.push_back(EncodeFactKey(
+          EntityFact::Vertex(VertexRef{PartId{0}, VertexId{index + 1}}).ref(),
+          ValidTime{10}, CommitSeq{7}));
+    }
+    const auto v1 = EncodeSequenceRecord(record);
+    ASSERT_TRUE(v1.ok()) << v1.status().ToString();
+    EXPECT_EQ(EstimateSequenceRecordBytes(kMetaSequenceFormatV1, fact_count),
+              v1.ValueOrDie().size());
+    const auto v2 = EncodeSequenceRecordV2(record);
+    ASSERT_TRUE(v2.ok()) << v2.status().ToString();
+    EXPECT_EQ(EstimateSequenceRecordBytes(kMetaSequenceFormatV2, fact_count),
+              v2.ValueOrDie().size());
+    // v2 replaces each duplicated 32-byte canonical key with a 23-byte
+    // descriptor and drops the 8-byte commit_seq from the payload (it is the
+    // record key), i.e. exactly 6 + 9 bytes per fact.
+    EXPECT_EQ(v1.ValueOrDie().size() - v2.ValueOrDie().size(),
+              6U + 9U * fact_count);
+  }
+  // The format parameter defaults to v1 so existing callers keep byte-identical
+  // estimates.
+  const StoreCommitBatch batch = ForecastBatch(3, 500, 4);
+  EXPECT_EQ(EstimateCommitBatchBytes(batch),
+            EstimateCommitBatchBytes(batch, kMetaSequenceFormatV1));
 }
 
 TEST_F(CommitPublisherTest, ForecastGroupAtTwoMebibyteCapIsNotCutEarly) {

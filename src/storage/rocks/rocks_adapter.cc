@@ -4687,7 +4687,8 @@ StatusOr<StoreCommitResult> FactStore::CommitGrouped(
     bool sync) {
   const Status valid = batch.Validate();
   if (!valid.ok()) return valid;
-  if (internal::EstimateCommitBatchBytes(batch) >
+  if (internal::EstimateCommitBatchBytes(
+          batch, EffectiveSequenceRecordFormat()) >
       options_.group_commit_max_batch_bytes) {
     return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
   }
@@ -4900,7 +4901,8 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
     bool sync) {
   const Status valid = batch.Validate();
   if (!valid.ok()) return valid;
-  if (internal::EstimateCommitBatchBytes(batch) >
+  if (internal::EstimateCommitBatchBytes(
+          batch, EffectiveSequenceRecordFormat()) >
       options_.group_commit_max_batch_bytes) {
     return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
   }
@@ -5093,7 +5095,8 @@ StatusOr<StoreCommitResult> FactStore::CommitWithWalCallbackDirect(
     void* callback_context) {
   const Status valid = batch.Validate();
   if (!valid.ok()) return valid;
-  if (internal::EstimateCommitBatchBytes(batch) >
+  if (internal::EstimateCommitBatchBytes(
+          batch, EffectiveSequenceRecordFormat()) >
       options_.group_commit_max_batch_bytes) {
     return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
   }
@@ -5265,8 +5268,10 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
     const StoreCommitBatch& batch = request.batch;
     Status validation = batch.Validate();
     bool may_persist_abort = request.persist_async_abort;
-    if (validation.ok() && internal::EstimateCommitBatchBytes(batch) >
-                               options.group_commit_max_batch_bytes) {
+    if (validation.ok() &&
+        internal::EstimateCommitBatchBytes(batch,
+                                           store->meta_sequence_format) >
+            options.group_commit_max_batch_bytes) {
       validation = Status::ResourceExhausted(
           "commit", "encoded batch exceeds hard byte limit");
     }
@@ -5562,7 +5567,8 @@ FactStore::DecideIndependentAppendGroup(
     (void)required_snapshot_seq;
     const Status validation = batch.Validate();
     if (!validation.ok()) return validation;
-    if (internal::EstimateCommitBatchBytes(batch) >
+    if (internal::EstimateCommitBatchBytes(batch,
+                                           store->meta_sequence_format) >
         options_.group_commit_max_batch_bytes) {
       return Status::ResourceExhausted(
           "commit", "encoded batch exceeds hard byte limit");
@@ -6179,6 +6185,12 @@ CommitSeq FactStore::visible_seq() const {
   if (!store) return CommitSeq{};
   std::lock_guard<std::mutex> lock(store->publisher_mutex);
   return store->visible_seq;
+}
+
+uint32_t FactStore::EffectiveSequenceRecordFormat() const {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (impl_) return impl_->meta_sequence_format;
+  return options_.meta_sequence_format;
 }
 
 StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(

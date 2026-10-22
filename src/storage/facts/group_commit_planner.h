@@ -48,7 +48,18 @@ class CommitConflictIndex {
 };
 
 CommitFootprint BuildCommitFootprint(const StoreCommitBatch& batch);
-size_t EstimateCommitBatchBytes(const StoreCommitBatch& batch);
+// Encoded value bytes of one committed sequence record (meta header, payload,
+// and checksum) for the store's effective record format. v1 carries one 32-byte
+// canonical fact key per fact; v2 carries a 23-byte descriptor instead, which is
+// exactly the 6 + 9 * fact_key_count difference between the two formats.
+// Exposed so admission tests can compare the estimator against the encoders and
+// so EstimateCommitBatchBytes cannot drift from EncodeSequenceRecord*, which
+// reserves the same record in the assembled WriteBatch.
+size_t EstimateSequenceRecordBytes(uint32_t sequence_format,
+                                   size_t fact_key_count);
+size_t EstimateCommitBatchBytes(
+    const StoreCommitBatch& batch,
+    uint32_t sequence_format = kMetaSequenceFormatV1);
 bool CanSharePhysicalWrite(const CommitFootprint& left,
                            const CommitFootprint& right);
 bool CanUseAppendFastPath(const StoreCommitBatch& batch);

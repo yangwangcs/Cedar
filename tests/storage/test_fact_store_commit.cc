@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "storage/facts/fact_store.h"
+#include "storage/facts/group_commit_planner.h"
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
 #include "storage/rocks/decided_epoch.h"
@@ -923,6 +924,71 @@ TEST_F(FactStoreCommitTest,
   EXPECT_EQ(as_of.ValueOrDie()->commit_seq, CommitSeq{2})
       << "as_of read used the older epoch that was still current";
   EXPECT_EQ(as_of.ValueOrDie()->value, std::optional<Value>{Value::Int64(22)});
+}
+
+// F13: admission must reserve the sequence record the writer actually emits.
+// This batch of property facts encodes to 2,068,149 bytes in meta sequence v2
+// (under the default 2 MiB group cap) but its v1-based estimate is 2,112,630
+// (over the cap): a format-unaware admission rejects it before encoding.
+TEST_F(FactStoreCommitTest, NearTwoMiBCapV2BatchIsNotPreRejected) {
+  constexpr size_t kFactCount = 4000;
+  constexpr size_t kPayloadBytes = 442;
+  constexpr uint64_t kByteCap = 2ULL * 1024ULL * 1024ULL;
+  StoreCommitBatch batch{TxnId{1}, 10, {}, {}, {}, {}, false};
+  batch.mutations.reserve(kFactCount);
+  for (size_t index = 0; index < kFactCount; ++index) {
+    batch.mutations.push_back(PendingFactMutation{
+        PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{index + 1}},
+                             PropertyId{1})
+            .ref(),
+        ValidTime{10}, FactOperation::kPut, /*schema_epoch=*/1,
+        Value::String(std::string(kPayloadBytes, 'x'))});
+  }
+  const size_t v1_estimate = internal::EstimateCommitBatchBytes(batch);
+  const size_t v2_estimate = internal::EstimateCommitBatchBytes(
+      batch, kMetaSequenceFormatV2);
+  ASSERT_GT(v1_estimate, kByteCap);
+  ASSERT_LE(v2_estimate, kByteCap);
+  ASSERT_LT(v2_estimate, v1_estimate);
+
+  const std::string path = path_ + "/format_v2_cap";
+  FactStoreOptions options;
+  options.path = path;
+  options.meta_sequence_format = kMetaSequenceFormatV2;
+  options.group_commit_max_batch_bytes = kByteCap;
+  FactStore store(options);
+  ASSERT_TRUE(store.Open().ok());
+  EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
+  const auto committed = store.Commit(batch);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().commit_seq, CommitSeq{1});
+  ASSERT_TRUE(store.Close().ok());
+}
+
+// F13: the effective record format follows the durable marker (which wins) and
+// the configured option, and is stable for the open store.
+TEST_F(FactStoreCommitTest, EffectiveSequenceRecordFormatTracksMarkerAndOption) {
+  EXPECT_EQ(store_->EffectiveSequenceRecordFormat(), kMetaSequenceFormatV1);
+
+  const std::string path = path_ + "/format_marker";
+  {
+    FactStoreOptions options;
+    options.path = path;
+    options.meta_sequence_format = kMetaSequenceFormatV2;
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
+  }
+  {
+    // The durable marker is authoritative: reopening while the option asks for
+    // v1 still writes (and reports) v2.
+    FactStoreOptions options;
+    options.path = path;
+    options.meta_sequence_format = kMetaSequenceFormatV1;
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
+  }
 }
 
 }  // namespace

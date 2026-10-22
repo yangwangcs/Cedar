@@ -425,6 +425,11 @@ class Database::Impl {
   uint64_t append_commit_window_us = 0;
   uint64_t predicted_preflight_min_bytes = 0;
   uint64_t append_commit_max_batch_bytes = 2ULL * 1024ULL * 1024ULL;
+  // Effective meta sequence record format, resolved once when Database::Open
+  // succeeds (the durable marker wins over the configured option). Queue
+  // admission and group planning reserve the sequence record the writer will
+  // actually emit instead of always assuming v1.
+  uint32_t sequence_record_format = kMetaSequenceFormatV1;
   uint32_t append_commit_max_queue_requests = 1024;
   uint64_t append_commit_max_queue_bytes = 16ULL * 1024ULL * 1024ULL;
   // Accessed only by the ordered append worker. Runtime pressure remains

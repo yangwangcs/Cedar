@@ -894,6 +894,13 @@ class FactStore {
   // deleted.
   Status Vacuum(CommitSeq oldest_readable);
   CommitSeq visible_seq() const;
+  // Effective meta sequence writer format of this store: resolved by Open from
+  // the durable format marker (which wins) and FactStoreOptions::
+  // meta_sequence_format, and fixed for the lifetime of the open store. When
+  // the store is closed this reports the configured option instead. Admission
+  // and group planning use it so estimates reserve the record the writer
+  // actually emits instead of always assuming v1.
+  uint32_t EffectiveSequenceRecordFormat() const;
   StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(
       TxnId txn_id) const;
   StatusOr<std::optional<StoreAsyncCommitResult>> ResolveAsyncTransaction(

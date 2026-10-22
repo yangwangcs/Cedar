@@ -25,6 +25,7 @@
 
 #include "cedar/database.h"
 #include "storage/facts/fact_store.h"
+#include "storage/facts/group_commit_planner.h"
 #include "kernel/database_impl.h"
 #include "kernel/epoch_completion.h"
 
@@ -1734,6 +1735,81 @@ TEST(KernelGroupCommitTest, RejectsEncodedBatchBeforeDurableWrite) {
   EXPECT_EQ(physical_writes.load(), 0U);
   ASSERT_TRUE(database->Close().ok());
   std::filesystem::remove_all(pattern);
+}
+
+// F13: kernel queue admission must reserve the sequence-record format the store
+// actually writes. This transaction's v2 estimate fits the configured byte cap
+// while its v1 estimate (the old behavior) does not, so a v2 database admits it
+// and a v1 database at the same cap still rejects it before any write.
+TEST(KernelGroupCommitTest, FormatAwareAdmissionAdmitsV2BatchThatV1WouldReject) {
+  constexpr size_t kFactCount = 64;
+  StoreCommitBatch equivalent{TxnId{1}, 10, {}, {}, {}, {}, true};
+  equivalent.mutations.reserve(kFactCount);
+  for (size_t index = 0; index < kFactCount; ++index) {
+    equivalent.mutations.push_back(PendingFactMutation{
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{index + 1}}).ref(),
+        ValidTime{10}, FactOperation::kPut, 0, std::nullopt});
+  }
+  const size_t v1_estimate = internal::EstimateCommitBatchBytes(equivalent);
+  const size_t v2_estimate =
+      internal::EstimateCommitBatchBytes(equivalent, kMetaSequenceFormatV2);
+  ASSERT_GT(v1_estimate, v2_estimate);
+  const uint64_t byte_cap = v2_estimate + (v1_estimate - v2_estimate) / 2;
+  ASSERT_LE(v2_estimate, byte_cap);
+  ASSERT_GT(v1_estimate, byte_cap);
+
+  const auto commit_facts = [byte_cap](uint32_t format,
+                                       const std::string& path) {
+    auto opened = Database::Open(DatabaseOptions{
+        .path = path,
+        .group_commit_max_batch_bytes = byte_cap,
+        .meta_sequence_format = format});
+    if (!opened.ok()) return std::pair<bool, Status>{false, opened.status()};
+    std::unique_ptr<Database> database =
+        std::move(opened).ConsumeValueOrDie();
+    auto transaction = database->BeginTransaction();
+    if (!transaction.ok()) {
+      database->Close().IgnoreError();
+      return std::pair<bool, Status>{false, transaction.status()};
+    }
+    for (size_t index = 0; index < kFactCount; ++index) {
+      const Status asserted = transaction.ValueOrDie()->Assert(
+          EntityFact::Vertex(VertexRef{PartId{0}, VertexId{index + 1}}),
+          ValidTime{10});
+      if (!asserted.ok()) {
+        database->Close().IgnoreError();
+        return std::pair<bool, Status>{false, asserted};
+      }
+    }
+    const auto committed = transaction.ValueOrDie()->Commit();
+    database->Close().IgnoreError();
+    if (!committed.ok()) {
+      return std::pair<bool, Status>{false, committed.status()};
+    }
+    if (committed.ValueOrDie().outcome != CommitOutcome::kCommitted) {
+      return std::pair<bool, Status>{false, committed.ValueOrDie().status};
+    }
+    return std::pair<bool, Status>{true, Status::OK()};
+  };
+
+  {
+    char pattern[] = "/tmp/cedar_kernel_v2_admission_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    const std::string path = pattern;
+    const auto [committed, status] = commit_facts(kMetaSequenceFormatV2, path);
+    EXPECT_TRUE(committed) << status.ToString();
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    std::filesystem::remove_all(path);
+  }
+  {
+    char pattern[] = "/tmp/cedar_kernel_v1_admission_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    const std::string path = pattern;
+    const auto [committed, status] = commit_facts(kMetaSequenceFormatV1, path);
+    EXPECT_FALSE(committed);
+    EXPECT_TRUE(status.IsResourceExhausted()) << status.ToString();
+    std::filesystem::remove_all(path);
+  }
 }
 
 TEST(KernelGroupCommitTest, RejectsAdmissionWhenPendingQueueIsFull) {

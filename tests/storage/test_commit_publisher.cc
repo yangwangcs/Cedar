@@ -57,7 +57,8 @@ class CommitPublisherTest : public ::testing::Test {
   // the visible-watermark record the group write appends, and returns the real
   // RocksDB WriteBatch.
   rocksdb::WriteBatch EncodeGroup(
-      const std::vector<const StoreCommitBatch*>& batches, CommitSeq base) {
+      const std::vector<const StoreCommitBatch*>& batches, CommitSeq base,
+      uint32_t sequence_format = kMetaSequenceFormatV1) {
     rocksdb::WriteBatch write_batch;
     CommitSeq sequence = base;
     for (const StoreCommitBatch* batch : batches) {
@@ -69,7 +70,7 @@ class CommitPublisherTest : public ::testing::Test {
       }
       const Status appended = AppendCandidateToWriteBatch(
           CandidateCommit{batch, sequence, std::move(fact_keys)}, handles_[1],
-          handles_[2], &write_batch);
+          handles_[2], sequence_format, &write_batch);
       EXPECT_TRUE(appended.ok()) << appended.ToString();
       ++sequence.value;
     }
@@ -117,7 +118,7 @@ TEST_F(CommitPublisherTest, AppendsAllFactsAndMetadataForOneCandidate) {
 
   ASSERT_TRUE(AppendCandidateToWriteBatch(
                   CandidateCommit{&batch, sequence, fact_keys}, handles_[1],
-                  handles_[2], &write_batch)
+                  handles_[2], kMetaSequenceFormatV1, &write_batch)
                   .ok());
   ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &write_batch).ok());
 
@@ -167,7 +168,7 @@ TEST_F(CommitPublisherTest, AppendsAuthoritativeEdgeIdentityFactBesideRoutingMet
 
   ASSERT_TRUE(AppendCandidateToWriteBatch(
                   CandidateCommit{&batch, sequence, fact_keys}, handles_[1],
-                  handles_[2], &write_batch)
+                  handles_[2], kMetaSequenceFormatV1, &write_batch)
                   .ok());
   ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &write_batch).ok());
 
@@ -196,6 +197,34 @@ TEST_F(CommitPublisherTest, AppendsAuthoritativeEdgeIdentityFactBesideRoutingMet
   EXPECT_EQ(sequence_record.ValueOrDie().fact_keys, expected_fact_keys);
 }
 
+TEST_F(CommitPublisherTest,
+       V2SequenceRecordDropsNineBytesPerFactAndFitsTheExactByteCap) {
+  const StoreCommitBatch batch = ForecastBatch(42, 500, 7);
+  const rocksdb::WriteBatch v1 =
+      EncodeGroup({&batch}, CommitSeq{1}, kMetaSequenceFormatV1);
+  rocksdb::WriteBatch v2 =
+      EncodeGroup({&batch}, CommitSeq{1}, kMetaSequenceFormatV2);
+  // v1 sequence payload is 28 + 32N; v2 is 22 + 23N. The record, and therefore
+  // the assembled WriteBatch, shrinks by exactly 6 + 9 bytes per fact.
+  EXPECT_EQ(v1.GetDataSize() - v2.GetDataSize(), 6U + 9U * 7U);
+  // The generic guard measures the real encoded batch, so the smaller record is
+  // accepted at the exact hard cap instead of being over-counted.
+  EXPECT_TRUE(CheckCommittedBatchSize(v2, v2.GetDataSize()).ok());
+
+  ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &v2).ok());
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  std::string encoded_sequence;
+  ASSERT_TRUE(db_->Get(rocksdb::ReadOptions(), handles_[2],
+                       sequence_key.ValueOrDie(), &encoded_sequence)
+                  .ok());
+  ASSERT_GE(encoded_sequence.size(), 2U);
+  EXPECT_EQ(static_cast<uint8_t>(encoded_sequence[1]), 9);  // kSequenceV2
+  const auto decoded = DecodeSequenceRecord(encoded_sequence, CommitSeq{1});
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  EXPECT_EQ(decoded.ValueOrDie().fact_keys.size(), 7U);
+}
+
 TEST_F(CommitPublisherTest, RejectsDuplicateCanonicalFactKeysBeforeWriting) {
   const StoreCommitBatch batch{
       TxnId{9}, 19,
@@ -212,7 +241,7 @@ TEST_F(CommitPublisherTest, RejectsDuplicateCanonicalFactKeysBeforeWriting) {
 
   const Status status = AppendCandidateToWriteBatch(
       CandidateCommit{&batch, sequence, {key, key}}, handles_[1], handles_[2],
-      &write_batch);
+      kMetaSequenceFormatV1, &write_batch);
   EXPECT_FALSE(status.ok());
   EXPECT_EQ(write_batch.Count(), 0U);
 }

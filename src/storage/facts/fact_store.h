@@ -174,6 +174,24 @@ struct FactStoreOptions {
   // a no-op).
   std::function<void(const ReopenValidationPhaseCounters&)>
       reopen_validation_counters_for_testing;
+  // Opt-in writer format for newly committed sequence records (F10 Task 10).
+  // 1 (default) keeps the v1 `kSequence` encoding byte-identical to today; 2
+  // writes compact `kSequenceV2` records and durably records format 2 in the
+  // meta-CF format marker during Open, before any commit is accepted. The
+  // marker wins on reopen: a database that recorded 2 keeps writing v2 even
+  // when a later open passes 1. The value is validated by Open;
+  // commits never change the format.
+  uint32_t meta_sequence_format = kMetaSequenceFormatV1;
+  // Fires immediately before Open writes the durable format marker (only when
+  // the effective writer is v2 and the marker is absent or older) with the
+  // RocksDB Sync flag, which is always true because the marker must reach the
+  // WAL before any v2 record. Must not call back into FactStore.
+  std::function<void(bool)> meta_sequence_format_marker_write_observer_for_testing;
+  // Test-only failure injection for the durable marker write. A non-OK result
+  // fails Open with that status and leaves the marker unwritten; no v2 record
+  // can exist at that point because no commit has been accepted.
+  std::function<Status()>
+      meta_sequence_format_marker_write_fault_injector_for_testing;
 };
 
 struct SnapshotWriteDependency {

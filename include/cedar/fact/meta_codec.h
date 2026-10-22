@@ -18,6 +18,14 @@ namespace cedar {
 
 enum class IdKind : uint8_t { kVertex = 1, kEdge = 2, kTransaction = 3 };
 
+// Values of the durable meta sequence-format marker (see
+// EncodeSequenceFormatKey). 1 keeps writing v1 `kSequence` records; 2 enables
+// the compact v2a `kSequenceV2` writer. The marker is a one-way upgrade: an
+// open that observes 2 keeps writing v2 even when the caller asks for 1. Any
+// other marker value is rejected at open as Corruption.
+inline constexpr uint32_t kMetaSequenceFormatV1 = 1;
+inline constexpr uint32_t kMetaSequenceFormatV2 = 2;
+
 struct IdAllocatorState {
   IdKind kind = IdKind::kVertex;
   uint64_t next_id = 0;
@@ -98,6 +106,16 @@ StatusOr<std::string> EncodeSequenceMetaKey(CommitSeq commit_seq);
 std::string EncodeVisibleWatermarkKey();
 std::string EncodeOldestReadableWatermarkKey();
 std::string EncodeVacuumStateKey();
+// Durable meta sequence-format marker key ("format/sequence-record-format").
+// The marker is an ordinary framed meta record whose 4-byte big-endian payload
+// is a kMetaSequenceFormat* value. It is written with Sync=true by an open that
+// opts into format 2, before that store accepts any commit, so a crash can
+// never leave a v2 record behind a database that would reopen as v1.
+std::string EncodeSequenceFormatKey();
+// Encodes the marker payload (the raw format value; open rejects unsupported
+// values) with the standard meta framing and CRC32C.
+StatusOr<std::string> EncodeSequenceFormat(uint32_t format);
+StatusOr<uint32_t> DecodeSequenceFormat(const std::string& encoded);
 
 StatusOr<std::string> EncodeSystemIdentity(const SystemIdentity& identity);
 StatusOr<SystemIdentity> DecodeSystemIdentity(const std::string& encoded);

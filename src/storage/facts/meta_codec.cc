@@ -32,6 +32,9 @@ enum class MetaRecordKind : uint8_t {
   // kMetaVersion bump: the framing, CRC and meta version stay identical so an
   // old record and a v2 record can live in the same meta CF.
   kSequenceV2 = 9,
+  // Durable opt-in marker recording the meta sequence record format the
+  // database has been upgraded to (payload: a kMetaSequenceFormat* value).
+  kSequenceFormat = 10,
 };
 
 // v2a sequence payload: payload_version + fact_key_version + txn_id +
@@ -465,6 +468,28 @@ std::string EncodeOldestReadableWatermarkKey() {
 }
 
 std::string EncodeVacuumStateKey() { return "vacuum/state"; }
+
+std::string EncodeSequenceFormatKey() {
+  return "format/sequence-record-format";
+}
+
+StatusOr<std::string> EncodeSequenceFormat(uint32_t format) {
+  std::string payload;
+  AppendU32(&payload, format);
+  return EncodeRecord(MetaRecordKind::kSequenceFormat, payload);
+}
+
+StatusOr<uint32_t> DecodeSequenceFormat(const std::string& encoded) {
+  const auto payload = DecodeRecord(MetaRecordKind::kSequenceFormat, encoded);
+  if (!payload.ok()) return payload.status();
+  size_t offset = 0;
+  uint32_t format = 0;
+  if (!ReadU32(payload.ValueOrDie(), &offset, &format) || offset != 4) {
+    return Status::Corruption("sequence format",
+                              "invalid sequence format marker record");
+  }
+  return format;
+}
 
 StatusOr<std::string> EncodeSystemIdentity(const SystemIdentity& identity) {
   const Status valid = identity.Validate();

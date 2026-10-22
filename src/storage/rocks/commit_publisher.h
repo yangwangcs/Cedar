@@ -23,9 +23,14 @@ struct CandidateCommit {
   std::vector<std::string> fact_keys;
 };
 
+// Appends one candidate transaction to `write_batch`. `sequence_format` is the
+// store's effective meta sequence format (kMetaSequenceFormatV1 or
+// kMetaSequenceFormatV2); it selects the committed sequence record encoding
+// while the transaction-outcome record and every other write stay unchanged.
 Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
                                    rocksdb::ColumnFamilyHandle* facts_cf,
                                    rocksdb::ColumnFamilyHandle* meta_cf,
+                                   uint32_t sequence_format,
                                    rocksdb::WriteBatch* write_batch);
 
 // Rejects a fully assembled group WriteBatch whose real encoded size exceeds

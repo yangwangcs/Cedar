@@ -15,7 +15,9 @@
 #include <vector>
 
 #include "storage/facts/fact_store.h"
+#include "storage/rocks/rocksdb_config.h"
 #include "cedar/core/crc32c.h"
+#include "cedar/database.h"
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
 
@@ -99,23 +101,35 @@ struct RawFactDatabase {
   }
 };
 
+// Raw DB access for fact mutations and meta reads in reopen tests. Opening with
+// a vanilla table factory works while every fact row still lives in the WAL or
+// memtable, but a facts SST flushed by Cedar uses the Cedar Parquet table
+// factory, so mirror Cedar's column-family options here. The flush-suppression
+// flags keep this inspection from rewriting the files the next Cedar open sees.
 bool OpenRawFactDatabase(const std::string& path, RawFactDatabase* out) {
-  rocksdb::Options options;
+  FactStoreOptions store_options;
+  store_options.path = path;
+  std::shared_ptr<rocksdb::Cache> cache;
+  rocksdb::Options options = internal::MakeRocksDbOptions(
+      store_options, /*is_new_database=*/false, /*resolved=*/nullptr, &cache);
   options.create_if_missing = false;
+  options.create_missing_column_families = false;
   options.atomic_flush = true;
   options.avoid_flush_during_shutdown = true;
   options.avoid_flush_during_recovery = true;
-  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
-  descriptors.emplace_back(rocksdb::kDefaultColumnFamilyName,
-                           rocksdb::ColumnFamilyOptions(options));
-  rocksdb::ColumnFamilyOptions facts_options(options);
-  facts_options.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
-      rocksdb::NewFixedPrefixTransform(12));
-  descriptors.emplace_back("facts", std::move(facts_options));
-  descriptors.emplace_back("meta", rocksdb::ColumnFamilyOptions(options));
-  return rocksdb::DB::Open(options, path, descriptors, &out->handles,
-                           &out->database)
-      .ok();
+  auto page_metrics =
+      std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
+  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
+      internal::MakeRocksDbColumnFamilyDescriptors(
+          store_options, options, /*resolved=*/nullptr, {cache, page_metrics});
+  const rocksdb::Status opened = rocksdb::DB::Open(options, path, descriptors,
+                                                   &out->handles,
+                                                   &out->database);
+  if (!opened.ok()) {
+    ADD_FAILURE() << "raw open failed: " << opened.ToString();
+    return false;
+  }
+  return true;
 }
 
 std::string ReadFactKeyFromSequenceRecord(const std::string& path,
@@ -1671,6 +1685,428 @@ TEST_F(FactStoreMetadataTest, ReopenAndReadSequenceAcceptMixedV1AndV2Records) {
   ASSERT_TRUE(range.ok()) << range.status().ToString();
   ASSERT_EQ(range.ValueOrDie().size(), 2U);
   EXPECT_EQ(range.ValueOrDie()[1], expected);
+}
+
+// ---------------------------------------------------------------------------
+// Meta sequence format marker + opt-in v2 writer (F10 Task 10)
+// ---------------------------------------------------------------------------
+// `MetaRecordKind` stays private to meta_codec.cc; these tests pin the on-disk
+// kind bytes the same way the v1/v2 codec tests pin payload offsets.
+constexpr uint8_t kRawSequenceRecordKindV1 = 7;
+constexpr uint8_t kRawSequenceRecordKindV2 = 9;
+constexpr uint8_t kRawSequenceFormatMarkerKind = 10;
+constexpr size_t kRawMetaRecordHeaderBytes = 6;
+constexpr size_t kRawMetaRecordChecksumBytes = 4;
+constexpr size_t kSequenceV2FixedPayloadBytes = 1 + 1 + 8 + 8 + 4;  // 22
+constexpr size_t kSequenceV2DescriptorBytes = 4 + 1 + 2 + 8 + 8;    // 23
+
+uint8_t RawMetaRecordKind(const std::string& encoded) {
+  EXPECT_GE(encoded.size(), 2U);
+  return encoded.size() < 2U ? 0 : static_cast<uint8_t>(encoded[1]);
+}
+
+std::optional<std::string> ReadMetaRecordIfPresent(const std::string& path,
+                                                   const std::string& key) {
+  RawFactDatabase raw;
+  if (!OpenRawFactDatabase(path, &raw)) {
+    ADD_FAILURE() << "failed to open raw database";
+    return std::nullopt;
+  }
+  std::string encoded;
+  const rocksdb::Status got = raw.database->Get(
+      rocksdb::ReadOptions(), raw.handles[2], key, &encoded);
+  if (got.IsNotFound()) return std::nullopt;
+  if (!got.ok()) {
+    ADD_FAILURE() << got.ToString();
+    return std::nullopt;
+  }
+  return encoded;
+}
+
+std::string ReadMetaRecord(const std::string& path, const std::string& key) {
+  const auto encoded = ReadMetaRecordIfPresent(path, key);
+  EXPECT_TRUE(encoded.has_value()) << "missing meta record: " << key;
+  return encoded.value_or(std::string());
+}
+
+FactStoreOptions StoreOptionsAt(const std::string& path, uint32_t format) {
+  FactStoreOptions options;
+  options.path = path;
+  options.meta_sequence_format = format;
+  return options;
+}
+
+TEST(FactStoreMetaSequenceFormatCodecTest,
+     RoundTripsFormatMarkersAndRejectsCorruptFraming) {
+  // The marker key is part of the durable format contract.
+  EXPECT_EQ(EncodeSequenceFormatKey(), "format/sequence-record-format");
+  for (uint32_t format : {kMetaSequenceFormatV1, kMetaSequenceFormatV2}) {
+    SCOPED_TRACE(::testing::Message() << "format=" << format);
+    const auto encoded = EncodeSequenceFormat(format);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    EXPECT_EQ(RawMetaRecordKind(encoded.ValueOrDie()),
+              kRawSequenceFormatMarkerKind);
+    // Payload is exactly format(4 BE) + the standard 6-byte meta header and
+    // 4-byte CRC32C trailer.
+    EXPECT_EQ(encoded.ValueOrDie().size(), 14U);
+    const auto decoded = DecodeSequenceFormat(encoded.ValueOrDie());
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(decoded.ValueOrDie(), format);
+  }
+
+  const auto encoded = EncodeSequenceFormat(kMetaSequenceFormatV2);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  const std::string bytes = encoded.ValueOrDie();
+
+  // Re-tagging the record as a sequence record must not decode as a marker.
+  std::string wrong_kind = bytes;
+  SetMetaRecordKind(&wrong_kind, kRawSequenceRecordKindV2);
+  EXPECT_TRUE(DecodeSequenceFormat(wrong_kind).status().IsCorruption());
+
+  // A corrupted CRC fails before the payload is trusted.
+  std::string bad_crc = bytes;
+  bad_crc.back() = static_cast<char>(bad_crc.back() ^ 0x01);
+  EXPECT_TRUE(DecodeSequenceFormat(bad_crc).status().IsCorruption());
+
+  // Truncated framing.
+  EXPECT_TRUE(DecodeSequenceFormat(bytes.substr(0, bytes.size() - 2))
+                  .status()
+                  .IsCorruption());
+
+  // A structurally valid record whose payload is not exactly four bytes is
+  // still corruption (length header disagrees with the framing).
+  std::string extra_payload = bytes;
+  extra_payload.insert(extra_payload.end() - 4, 1, '\0');
+  RewriteMetaChecksum(&extra_payload);
+  EXPECT_TRUE(DecodeSequenceFormat(extra_payload).status().IsCorruption());
+}
+
+TEST_F(FactStoreMetadataTest,
+       OptInWriterWritesDurableMarkerAndV2RecordsOnFreshDatabase) {
+  const std::string path = path_ + "/fresh_v2";
+  std::atomic<uint32_t> marker_writes{0};
+  std::atomic<bool> marker_sync{false};
+  {
+    FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV2);
+    options.meta_sequence_format_marker_write_observer_for_testing =
+        [&](bool sync) {
+          marker_writes.fetch_add(1, std::memory_order_relaxed);
+          marker_sync.store(sync, std::memory_order_relaxed);
+        };
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    // The opt-in upgrade records the marker once, with Sync=true, before the
+    // store accepts commits.
+    EXPECT_EQ(marker_writes.load(), 1U);
+    EXPECT_TRUE(marker_sync.load());
+    ASSERT_TRUE(store.Commit(VertexFactsBatch(TxnId{1}, 100, 3, 10)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  const std::string marker = ReadMetaRecord(path, EncodeSequenceFormatKey());
+  ASSERT_FALSE(marker.empty());
+  EXPECT_EQ(RawMetaRecordKind(marker), kRawSequenceFormatMarkerKind);
+  const auto decoded_marker = DecodeSequenceFormat(marker);
+  ASSERT_TRUE(decoded_marker.ok()) << decoded_marker.status().ToString();
+  EXPECT_EQ(decoded_marker.ValueOrDie(), kMetaSequenceFormatV2);
+
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  const std::string record = ReadMetaRecord(path, sequence_key.ValueOrDie());
+  ASSERT_FALSE(record.empty());
+  EXPECT_EQ(RawMetaRecordKind(record), kRawSequenceRecordKindV2);
+  // v2 record: 6-byte header + 22-byte fixed payload + N x 23 + 4-byte CRC.
+  EXPECT_EQ(record.size(), kRawMetaRecordHeaderBytes +
+                               kSequenceV2FixedPayloadBytes +
+                               3 * kSequenceV2DescriptorBytes +
+                               kRawMetaRecordChecksumBytes);
+
+  const auto decoded = DecodeSequenceRecord(record, CommitSeq{1});
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  EXPECT_EQ(decoded.ValueOrDie().commit_seq, CommitSeq{1});
+  EXPECT_EQ(decoded.ValueOrDie().txn_id, TxnId{1});
+  EXPECT_EQ(decoded.ValueOrDie().system_hlc, 10U);
+  ASSERT_EQ(decoded.ValueOrDie().fact_keys.size(), 3U);
+  for (uint64_t index = 0; index < 3; ++index) {
+    EXPECT_EQ(decoded.ValueOrDie().fact_keys[index],
+              EncodeFactKey(
+                  EntityFact::Vertex(
+                      VertexRef{PartId{0}, VertexId{100 + index}})
+                      .ref(),
+                  ValidTime{10}, CommitSeq{1}));
+  }
+}
+
+TEST_F(FactStoreMetadataTest,
+       DefaultV1WriterWritesNoMarkerAndKeepsV1RecordBytes) {
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Close().ok());
+
+  // No opt-in: no marker record, exactly today's v1 meta layout.
+  EXPECT_FALSE(
+      ReadMetaRecordIfPresent(path_, EncodeSequenceFormatKey()).has_value());
+
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  const std::string record = ReadMetaRecord(path_, sequence_key.ValueOrDie());
+  ASSERT_FALSE(record.empty());
+  EXPECT_EQ(RawMetaRecordKind(record), kRawSequenceRecordKindV1);
+
+  // Byte-identity: the default path still emits the pre-v2 encoder output,
+  // 6-byte header + 28-byte fixed payload + one 32-byte key + 4-byte CRC.
+  const std::string fact_key =
+      EncodeFactKey(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
+                    ValidTime{10}, CommitSeq{1});
+  const auto expected = EncodeSequenceRecord(
+      SequenceRecord{CommitSeq{1}, TxnId{1}, 10, {fact_key}});
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+  EXPECT_EQ(record, expected.ValueOrDie());
+  EXPECT_EQ(record.size(), 38U + 32U);
+}
+
+TEST_F(FactStoreMetadataTest,
+       ReopenWithV1OptionKeepsWritingV2FromDurableMarker) {
+  const std::string path = path_ + "/marker_authoritative";
+  {
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV2));
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  std::atomic<uint32_t> marker_writes{0};
+  {
+    // The option asks for v1, but the durable marker says 2: the format is a
+    // one-way door and the store keeps writing v2 without rewriting the marker.
+    FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV1);
+    options.meta_sequence_format_marker_write_observer_for_testing =
+        [&](bool) { marker_writes.fetch_add(1, std::memory_order_relaxed); };
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(marker_writes.load(), 0U);
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 20)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  const auto decoded_marker =
+      DecodeSequenceFormat(ReadMetaRecord(path, EncodeSequenceFormatKey()));
+  ASSERT_TRUE(decoded_marker.ok()) << decoded_marker.status().ToString();
+  EXPECT_EQ(decoded_marker.ValueOrDie(), kMetaSequenceFormatV2);
+  for (uint64_t sequence = 1; sequence <= 2; ++sequence) {
+    const auto key = EncodeSequenceMetaKey(CommitSeq{sequence});
+    ASSERT_TRUE(key.ok()) << key.status().ToString();
+    EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, key.ValueOrDie())),
+              kRawSequenceRecordKindV2)
+        << "sequence " << sequence;
+  }
+
+  // All reads and reopen validation still pass on the v2 history.
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    {
+      const auto snapshot = store.BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+      const auto seq1 =
+          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
+      ASSERT_TRUE(seq1.ok()) << seq1.status().ToString();
+      EXPECT_EQ(seq1.ValueOrDie().fact_keys.size(), 1U);
+      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
+                                                 CommitSeq{1}, CommitSeq{2});
+      ASSERT_TRUE(range.ok()) << range.status().ToString();
+      EXPECT_EQ(range.ValueOrDie().size(), 2U);
+    }
+    ASSERT_TRUE(store.Close().ok());
+  }
+}
+
+TEST_F(FactStoreMetadataTest,
+       MixedV1HistoryThenV2EnableWritesReadsAndKernelRecovers) {
+  const std::string path = path_ + "/mixed_v1_v2";
+  // v1 history.
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+  // Opt-in upgrade: only new records are v2; the v1 history stays untouched.
+  {
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV2));
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 20)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  const auto marker =
+      DecodeSequenceFormat(ReadMetaRecord(path, EncodeSequenceFormatKey()));
+  ASSERT_TRUE(marker.ok()) << marker.status().ToString();
+  EXPECT_EQ(marker.ValueOrDie(), kMetaSequenceFormatV2);
+  const auto seq1_key = EncodeSequenceMetaKey(CommitSeq{1});
+  const auto seq2_key = EncodeSequenceMetaKey(CommitSeq{2});
+  ASSERT_TRUE(seq1_key.ok());
+  ASSERT_TRUE(seq2_key.ok());
+  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq1_key.ValueOrDie())),
+            kRawSequenceRecordKindV1);
+  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq2_key.ValueOrDie())),
+            kRawSequenceRecordKindV2);
+
+  // Default-policy reopen (option stays 1): validation and reads cover both
+  // kinds, and the marker keeps the effective writer at v2.
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    {
+      const auto snapshot = store.BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+      const auto seq1 =
+          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
+      ASSERT_TRUE(seq1.ok()) << seq1.status().ToString();
+      EXPECT_EQ(seq1.ValueOrDie().fact_keys.size(), 1U);
+      const auto seq2 =
+          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{2});
+      ASSERT_TRUE(seq2.ok()) << seq2.status().ToString();
+      EXPECT_EQ(seq2.ValueOrDie().fact_keys.size(), 1U);
+      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
+                                                 CommitSeq{1}, CommitSeq{2});
+      ASSERT_TRUE(range.ok()) << range.status().ToString();
+      EXPECT_EQ(range.ValueOrDie().size(), 2U);
+    }
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{3}, VertexId{3}, 30)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+  const auto seq3_key = EncodeSequenceMetaKey(CommitSeq{3});
+  ASSERT_TRUE(seq3_key.ok());
+  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq3_key.ValueOrDie())),
+            kRawSequenceRecordKindV2);
+
+  // Kernel open on the mixed database: the transaction-ID allocator cold path
+  // rebuilds from v1+v2 sequence records, and the kernel commit itself goes
+  // through the same opt-in v2 writer branch.
+  {
+    DatabaseOptions options;
+    options.path = path;
+    auto opened = Database::Open(std::move(options));
+    ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+    std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
+    auto begun = database->BeginTransaction();
+    ASSERT_TRUE(begun.ok()) << begun.status().ToString();
+    std::unique_ptr<Transaction> transaction =
+        std::move(begun).ConsumeValueOrDie();
+    ASSERT_TRUE(transaction
+                    ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{4}}),
+                             ValidTime{40})
+                    .ok());
+    const auto committed = transaction->Commit();
+    ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+    EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+    ASSERT_TRUE(database->Close().ok());
+  }
+  const auto seq4_key = EncodeSequenceMetaKey(CommitSeq{4});
+  ASSERT_TRUE(seq4_key.ok());
+  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq4_key.ValueOrDie())),
+            kRawSequenceRecordKindV2);
+
+  // Final full reopen: v1 + v2 + kernel-v2 history validates and reads.
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.visible_seq(), CommitSeq{4});
+    {
+      const auto snapshot = store.BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
+                                                 CommitSeq{1}, CommitSeq{4});
+      ASSERT_TRUE(range.ok()) << range.status().ToString();
+      EXPECT_EQ(range.ValueOrDie().size(), 4U);
+    }
+    ASSERT_TRUE(store.Close().ok());
+  }
+}
+
+TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
+  const auto create_v1_database = [this](const std::string& name) {
+    const std::string path = path_ + "/" + name;
+    FactStore store(FactStoreOptions{path});
+    EXPECT_TRUE(store.Open().ok());
+    EXPECT_TRUE(store.Close().ok());
+    return path;
+  };
+  const std::string marker_key = EncodeSequenceFormatKey();
+
+  // Structurally valid marker with a value this binary does not support.
+  {
+    const std::string path = create_v1_database("marker_unsupported");
+    const auto marker = EncodeSequenceFormat(3);
+    ASSERT_TRUE(marker.ok()) << marker.status().ToString();
+    PutMetaRecord(path, marker_key, marker.ValueOrDie());
+    FactStore store(FactStoreOptions{path});
+    const Status opened = store.Open();
+    EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
+    EXPECT_NE(opened.ToString().find("unsupported meta sequence format marker"),
+              std::string::npos)
+        << opened.ToString();
+    if (opened.ok()) EXPECT_TRUE(store.Close().ok());
+  }
+
+  // CRC corruption.
+  {
+    const std::string path = create_v1_database("marker_bad_crc");
+    const auto marker = EncodeSequenceFormat(kMetaSequenceFormatV2);
+    ASSERT_TRUE(marker.ok()) << marker.status().ToString();
+    std::string bytes = marker.ValueOrDie();
+    bytes.back() = static_cast<char>(bytes.back() ^ 0x01);
+    PutMetaRecord(path, marker_key, bytes);
+    FactStore store(FactStoreOptions{path});
+    const Status opened = store.Open();
+    EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
+    if (opened.ok()) EXPECT_TRUE(store.Close().ok());
+  }
+
+  // Truncated framing.
+  {
+    const std::string path = create_v1_database("marker_truncated");
+    const auto marker = EncodeSequenceFormat(kMetaSequenceFormatV2);
+    ASSERT_TRUE(marker.ok()) << marker.status().ToString();
+    const std::string bytes = marker.ValueOrDie();
+    PutMetaRecord(path, marker_key, bytes.substr(0, bytes.size() - 2));
+    FactStore store(FactStoreOptions{path});
+    const Status opened = store.Open();
+    EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
+    if (opened.ok()) EXPECT_TRUE(store.Close().ok());
+  }
+}
+
+TEST_F(FactStoreMetadataTest,
+       MarkerWriteFailureFailsOpenAndLeavesV1DatabaseUsable) {
+  const std::string path = path_ + "/marker_write_failure";
+  FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV2);
+  options.meta_sequence_format_marker_write_fault_injector_for_testing = [] {
+    return Status::IOError("test", "marker write failed");
+  };
+  {
+    FactStore store(options);
+    const Status opened = store.Open();
+    EXPECT_TRUE(opened.IsIOError()) << opened.ToString();
+  }
+  EXPECT_FALSE(
+      ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
+  // No v2 record was written, so the database still opens with the default v1
+  // writer and is unchanged from today's behavior.
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.visible_seq(), CommitSeq{0});
+    ASSERT_TRUE(store.Close().ok());
+  }
+}
+
+TEST_F(FactStoreMetadataTest, UnsupportedWriterOptionIsRejectedByOpen) {
+  const std::string path = path_ + "/invalid_option";
+  FactStoreOptions options = StoreOptionsAt(path, 3);
+  FactStore store(options);
+  const Status opened = store.Open();
+  EXPECT_TRUE(opened.IsInvalidArgument()) << opened.ToString();
 }
 
 }  // namespace

@@ -522,6 +522,10 @@ class FactStoreImpl {
   // Reopen fact cross-check policy; see FactStoreOptions.
   bool deep_recovery_validation = true;
   uint64_t recovery_validation_recent_sequences = 4096;
+  // Effective meta sequence writer format resolved by Open from the durable
+  // format marker and FactStoreOptions::meta_sequence_format. Fixed for the
+  // lifetime of this open store; every commit consults it.
+  uint32_t meta_sequence_format = kMetaSequenceFormatV1;
   // Reports one completed reopen validation pass; see FactStoreOptions.
   std::function<void(const ReopenValidationPhaseCounters&)>
       reopen_validation_counters_for_testing;
@@ -2038,6 +2042,60 @@ Status LoadTransactionAllocatorState(FactStoreImpl* store,
   return Status::OK();
 }
 
+// Reads the durable meta sequence-format marker. std::nullopt means the
+// database predates the marker (every record so far is v1 or was written by a
+// dual-read writer without the opt-in). A marker that fails framing/CRC or
+// records an unsupported format fails Open as Corruption.
+StatusOr<std::optional<uint32_t>> LoadMetaSequenceFormatMarker(
+    FactStoreImpl* store) {
+  std::string encoded;
+  const rocksdb::Status got = store->db->Get(
+      rocksdb::ReadOptions(), store->meta_cf, EncodeSequenceFormatKey(),
+      &encoded);
+  if (got.IsNotFound()) return std::optional<uint32_t>{};
+  if (!got.ok()) {
+    return FromRocksDb(got, "read meta sequence format marker");
+  }
+  const auto decoded = DecodeSequenceFormat(encoded);
+  if (!decoded.ok()) return decoded.status();
+  const uint32_t format = decoded.ValueOrDie();
+  if (format != kMetaSequenceFormatV1 && format != kMetaSequenceFormatV2) {
+    return Status::Corruption(
+        "fact store",
+        "unsupported meta sequence format marker: " + std::to_string(format));
+  }
+  return std::optional<uint32_t>{format};
+}
+
+// Durably records the meta sequence format. Sync=true is the crash-safety
+// contract: Open must not accept a v2 commit until the marker that makes v2
+// authoritative on every later open has reached the WAL. A failed write fails
+// Open; the caller has not accepted any commit yet.
+Status WriteMetaSequenceFormatMarker(FactStoreImpl* store,
+                                     const FactStoreOptions& options,
+                                     uint32_t format) {
+  const auto encoded = EncodeSequenceFormat(format);
+  if (!encoded.ok()) return encoded.status();
+  rocksdb::WriteOptions write_options;
+  write_options.sync = true;
+  if (options.meta_sequence_format_marker_write_observer_for_testing) {
+    options.meta_sequence_format_marker_write_observer_for_testing(
+        write_options.sync);
+  }
+  if (options.meta_sequence_format_marker_write_fault_injector_for_testing) {
+    const Status injected =
+        options.meta_sequence_format_marker_write_fault_injector_for_testing();
+    if (!injected.ok()) return injected;
+  }
+  const rocksdb::Status written =
+      store->db->Put(write_options, store->meta_cf, EncodeSequenceFormatKey(),
+                     encoded.ValueOrDie());
+  if (!written.ok()) {
+    return FromRocksDb(written, "write meta sequence format marker");
+  }
+  return Status::OK();
+}
+
 Status LoadPropertySchemas(FactStoreImpl* store) {
   auto schemas = std::make_shared<FactStoreImpl::PropertySchemas>();
   std::unique_ptr<rocksdb::Iterator> iterator(
@@ -2501,6 +2559,11 @@ Status FactStore::Open() {
   if (options_.path.empty()) {
     return Status::InvalidArgument("fact store", "missing database path");
   }
+  if (options_.meta_sequence_format != kMetaSequenceFormatV1 &&
+      options_.meta_sequence_format != kMetaSequenceFormatV2) {
+    return Status::InvalidArgument(
+        "fact store", "meta sequence format must be 1 (v1) or 2 (v2a)");
+  }
   if (options_.group_commit_max_batch_size == 0 ||
       options_.group_commit_max_batch_size > kMaximumGroupCommitBatchCount) {
     return Status::InvalidArgument("fact store",
@@ -2672,10 +2735,36 @@ Status FactStore::Open() {
     }
     store->visible_seq = visible.ValueOrDie();
     store->oldest_readable_seq = oldest.ValueOrDie();
+  }
+  // Resolve the effective meta sequence writer format before reopen validation
+  // and before the store can accept any commit. The durable marker is
+  // authoritative on reopen: once it records 2, this and every later open write
+  // v2 even if the caller asks for v1. Missing marker + v1 option keeps today's
+  // byte-identical v1 behavior; missing marker + v2 option writes the marker
+  // durably below, before any v2 record can exist.
+  const auto marker = LoadMetaSequenceFormatMarker(store.get());
+  if (!marker.ok()) return marker.status();
+  const std::optional<uint32_t> marker_format = marker.ValueOrDie();
+  const bool marker_is_v2 =
+      marker_format.has_value() && *marker_format == kMetaSequenceFormatV2;
+  store->meta_sequence_format =
+      marker_is_v2 ? kMetaSequenceFormatV2 : options_.meta_sequence_format;
+  if (!is_new_database) {
+    // Marker loaded, then validation: the sequence scanner is dual-read, but the
+    // open contract is that the durable format is known first.
     const Status sequences_valid =
         ValidateCommittedSequences(store.get(), store->visible_seq,
                                    store->oldest_readable_seq);
     if (!sequences_valid.ok()) return sequences_valid;
+  }
+  if (store->meta_sequence_format == kMetaSequenceFormatV2 && !marker_is_v2) {
+    // Opt-in upgrade (or a marker that still records v1): durably record 2
+    // before accepting commits. Sync=true makes a crash-safe ordering guarantee:
+    // no v2 record can be durable without the marker that claims v2.
+    const Status marked =
+        WriteMetaSequenceFormatMarker(store.get(), options_,
+                                      kMetaSequenceFormatV2);
+    if (!marked.ok()) return marked;
   }
   const Status vertex_allocator =
       LoadAllocatorState(store.get(), IdKind::kVertex, &store->vertex_allocator);
@@ -4509,7 +4598,8 @@ StatusOr<StoreCommitResult> FactStore::CommitGrouped(
     const Status appended = internal::AppendCandidateToWriteBatch(
         internal::CandidateCommit{&candidate->batch, commit_seq,
                                   std::move(fact_keys)},
-        store->facts_cf, store->meta_cf, &write_batch);
+        store->facts_cf, store->meta_cf, store->meta_sequence_format,
+        &write_batch);
     if (!appended.ok()) {
       finish_all(appended);
       return appended;
@@ -4712,7 +4802,8 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
   if (!encoded_watermark.ok()) return encoded_watermark.status();
   const Status appended = internal::AppendCandidateToWriteBatch(
       internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-      store->facts_cf, store->meta_cf, &write_batch);
+      store->facts_cf, store->meta_cf, store->meta_sequence_format,
+      &write_batch);
   if (!appended.ok()) return appended;
   write_batch.Put(store->meta_cf, EncodeVisibleWatermarkKey(),
                   encoded_watermark.ValueOrDie());
@@ -4815,7 +4906,8 @@ StatusOr<StoreCommitResult> FactStore::CommitWithWalCallbackDirect(
   rocksdb::WriteBatch write_batch;
   const Status appended = internal::AppendCandidateToWriteBatch(
       internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-      store->facts_cf, store->meta_cf, &write_batch);
+      store->facts_cf, store->meta_cf, store->meta_sequence_format,
+      &write_batch);
   if (!appended.ok()) return appended;
   const auto watermark = EncodeWatermark(commit_seq);
   if (!watermark.ok()) return watermark.status();
@@ -5000,7 +5092,8 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
     }
     const Status appended = internal::AppendCandidateToWriteBatch(
         internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-        store->facts_cf, store->meta_cf, write_batch.get());
+        store->facts_cf, store->meta_cf, store->meta_sequence_format,
+        write_batch.get());
     if (!appended.ok()) return appended;
     ++committed_count;
     group.results.emplace_back(StoreCommitResult{commit_seq, batch.system_hlc});
@@ -5248,7 +5341,8 @@ FactStore::DecideIndependentAppendGroup(
     }
     const Status appended = internal::AppendCandidateToWriteBatch(
         internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-        store->facts_cf, store->meta_cf, write_batch.get());
+        store->facts_cf, store->meta_cf, store->meta_sequence_format,
+        write_batch.get());
     if (!appended.ok()) return appended;
     ++committed_count;
     group.results.emplace_back(StoreCommitResult{commit_seq, batch.system_hlc});

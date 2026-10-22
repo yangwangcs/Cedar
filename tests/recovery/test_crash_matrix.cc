@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <sys/wait.h>
@@ -14,7 +15,9 @@
 
 #include "cedar/database.h"
 #include "cedar/fact/fact_codec.h"
+#include "cedar/fact/meta_codec.h"
 #include "storage/facts/fact_store.h"
+#include "storage/rocks/rocksdb_config.h"
 
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
@@ -113,6 +116,66 @@ void DeleteFactRecord(const std::string& path, const std::string& key) {
   for (rocksdb::ColumnFamilyHandle* handle : handles) {
     database->DestroyColumnFamilyHandle(handle);
   }
+}
+
+// Reads one meta-CF record through a secondary RocksDB handle so recovery tests
+// can inspect the durable sequence-format marker and the raw record kind.
+// Cedar's facts SSTs use the Cedar Parquet table factory, so this inspection
+// uses the same column-family options as FactStore::Open; the flush-suppression
+// flags keep the inspection from rewriting the files recovery will replay.
+std::optional<std::string> ReadRawMetaRecord(const std::string& path,
+                                             const std::string& key) {
+  FactStoreOptions store_options;
+  store_options.path = path;
+  std::shared_ptr<rocksdb::Cache> cache;
+  rocksdb::Options options = internal::MakeRocksDbOptions(
+      store_options, /*is_new_database=*/false, /*resolved=*/nullptr, &cache);
+  options.create_if_missing = false;
+  options.create_missing_column_families = false;
+  options.atomic_flush = true;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  auto page_metrics =
+      std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
+  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
+      internal::MakeRocksDbColumnFamilyDescriptors(
+          store_options, options, /*resolved=*/nullptr, {cache, page_metrics});
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  std::unique_ptr<rocksdb::DB> database;
+  const rocksdb::Status opened =
+      rocksdb::DB::Open(options, path, descriptors, &handles, &database);
+  if (!opened.ok()) {
+    ADD_FAILURE() << opened.ToString();
+    return std::nullopt;
+  }
+  std::string encoded;
+  const rocksdb::Status got = database->Get(rocksdb::ReadOptions(), handles[2],
+                                            key, &encoded);
+  for (rocksdb::ColumnFamilyHandle* handle : handles) {
+    database->DestroyColumnFamilyHandle(handle);
+  }
+  if (got.IsNotFound()) return std::nullopt;
+  if (!got.ok()) {
+    ADD_FAILURE() << got.ToString();
+    return std::nullopt;
+  }
+  return encoded;
+}
+
+// The crash scenario commits through the storage API directly (no kernel
+// transaction) so the opt-in `meta_sequence_format=2` writer, which is a
+// FactStoreOptions setting in this task, is the writer under test.
+StoreCommitBatch VertexStateStoreBatch(TxnId txn_id, uint64_t system_hlc,
+                                       uint64_t vertex_id, uint64_t valid_time) {
+  return StoreCommitBatch{
+      txn_id,
+      system_hlc,
+      {{EntityFact::Vertex(VertexRef{PartId{0}, VertexId{vertex_id}}).ref(),
+        ValidTime{valid_time}, FactOperation::kPut, 0, std::nullopt}},
+      {},
+      {},
+      {},
+      false};
 }
 
 // Kills one committing child process at the requested durable boundary. The
@@ -664,6 +727,93 @@ TEST_F(RecoveryCrashMatrixTest, ReopenResumesVacuumWithoutAnIndependentFactsStor
                         })
                   .ok());
   EXPECT_EQ(events, 2U);
+}
+
+// F10 Task 10: the opt-in v2 writer (marker + kSequenceV2 records) must survive
+// the same post-fsync crash boundary as the v1 writer. The child writes the
+// durable marker during FactStore::Open, commits one transaction, and dies
+// inside the post-write injector; the parent reopens with the default v1 option
+// and must recover, validate, and keep writing v2 from the marker.
+TEST_F(RecoveryCrashMatrixTest,
+       V2WriterRecoversPostFsyncCrashAndKeepsMarkerAuthoritative) {
+#if CEDAR_THREAD_SANITIZER_ENABLED
+  GTEST_SKIP() << "ThreadSanitizer cannot create threads after a multithreaded fork";
+#endif
+  const std::string path = path_ + "/v2_post_fsync";
+  ASSERT_TRUE(std::filesystem::create_directories(path));
+  constexpr int kCrashExitCode = 93;
+  constexpr uint64_t kVertexId = 100;
+  constexpr uint64_t kValidTime = 10;
+  const pid_t child = fork();
+  ASSERT_NE(child, -1);
+  if (child == 0) {
+    FactStoreOptions options;
+    options.path = path;
+    options.meta_sequence_format = kMetaSequenceFormatV2;
+    // Fires after the WAL write/fsync returned: the marker written by Open and
+    // the commit batch are durable, but nothing was published in this process.
+    options.commit_fault_injector_for_testing = [kCrashExitCode]() -> Status {
+      _exit(kCrashExitCode);
+    };
+    FactStore store(options);
+    if (!store.Open().ok()) _exit(2);
+    const auto committed = store.Commit(
+        VertexStateStoreBatch(TxnId{1}, kValidTime, kVertexId, kValidTime));
+    static_cast<void>(committed);
+    _exit(5);
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), kCrashExitCode);
+
+  // The default v1 option still recovers and validates the v2 record: the
+  // marker written before the first v2 commit is authoritative.
+  ExpectFactStoreRecovered(path, kReopenValidationPolicies[0], TxnId{1},
+                           kVertexId, kValidTime, true);
+  const auto marker = ReadRawMetaRecord(path, EncodeSequenceFormatKey());
+  ASSERT_TRUE(marker.has_value());
+  const auto decoded_marker = DecodeSequenceFormat(*marker);
+  ASSERT_TRUE(decoded_marker.ok()) << decoded_marker.status().ToString();
+  EXPECT_EQ(decoded_marker.ValueOrDie(), kMetaSequenceFormatV2);
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  const auto record = ReadRawMetaRecord(path, sequence_key.ValueOrDie());
+  ASSERT_TRUE(record.has_value());
+  ASSERT_GE(record->size(), 2U);
+  EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 9);  // kSequenceV2
+
+  // A post-crash commit continues v2 through the recovered marker, and the next
+  // reopen validates both records.
+  {
+    FactStoreOptions options;
+    options.path = path;
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.Commit(VertexStateStoreBatch(TxnId{2}, 20, 101, 20)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+  const auto seq2_key = EncodeSequenceMetaKey(CommitSeq{2});
+  ASSERT_TRUE(seq2_key.ok()) << seq2_key.status().ToString();
+  const auto record2 = ReadRawMetaRecord(path, seq2_key.ValueOrDie());
+  ASSERT_TRUE(record2.has_value());
+  ASSERT_GE(record2->size(), 2U);
+  EXPECT_EQ(static_cast<uint8_t>((*record2)[1]), 9);  // kSequenceV2
+
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.visible_seq(), CommitSeq{2});
+    {
+      const auto snapshot = store.BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
+                                                 CommitSeq{1}, CommitSeq{2});
+      ASSERT_TRUE(range.ok()) << range.status().ToString();
+      EXPECT_EQ(range.ValueOrDie().size(), 2U);
+    }
+    ASSERT_TRUE(store.Close().ok());
+  }
 }
 
 }  // namespace

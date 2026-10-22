@@ -26,10 +26,16 @@ Status CheckCommittedBatchSize(const rocksdb::WriteBatch& batch,
 Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
                                    rocksdb::ColumnFamilyHandle* facts_cf,
                                    rocksdb::ColumnFamilyHandle* meta_cf,
+                                   uint32_t sequence_format,
                                    rocksdb::WriteBatch* write_batch) {
   if (candidate.batch == nullptr || facts_cf == nullptr || meta_cf == nullptr ||
       write_batch == nullptr) {
     return Status::InvalidArgument("commit publisher", "missing commit output");
+  }
+  if (sequence_format != kMetaSequenceFormatV1 &&
+      sequence_format != kMetaSequenceFormatV2) {
+    return Status::InvalidArgument("commit publisher",
+                                   "unsupported meta sequence format");
   }
   if (candidate.fact_keys.size() != candidate.batch->mutations.size()) {
     return Status::InvalidArgument("commit publisher",
@@ -110,9 +116,14 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
   const auto sequence_key = EncodeSequenceMetaKey(candidate.commit_seq);
   const auto outcome = EncodeTransactionOutcome(TransactionOutcomeRecord{
       candidate.batch->txn_id, candidate.commit_seq, TransactionOutcome::kCommitted});
-  const auto sequence = EncodeSequenceRecord(SequenceRecord{
-      candidate.commit_seq, candidate.batch->txn_id, candidate.batch->system_hlc,
-      std::move(sequence_fact_keys)});
+  SequenceRecord sequence_record{candidate.commit_seq, candidate.batch->txn_id,
+                                 candidate.batch->system_hlc,
+                                 std::move(sequence_fact_keys)};
+  // The only difference between formats is the sequence record encoding: the
+  // transaction outcome, watermarks and facts are byte-identical.
+  const auto sequence = sequence_format == kMetaSequenceFormatV2
+                            ? EncodeSequenceRecordV2(sequence_record)
+                            : EncodeSequenceRecord(sequence_record);
   if (!transaction_key.ok()) return transaction_key.status();
   if (!sequence_key.ok()) return sequence_key.status();
   if (!outcome.ok()) return outcome.status();

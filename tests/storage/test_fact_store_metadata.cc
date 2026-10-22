@@ -84,9 +84,78 @@ void DeleteMetaRecord(const std::string& path, const std::string& key) {
   }
 }
 
+// Raw DB access for fact mutations in reopen-corruption tests. Same vanilla
+// options and column-family layout as the meta helpers above; the prefix
+// extractor only affects iteration, not point deletes.
+struct RawFactDatabase {
+  std::unique_ptr<rocksdb::DB> database;
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+
+  ~RawFactDatabase() {
+    for (rocksdb::ColumnFamilyHandle* handle : handles) {
+      if (database) database->DestroyColumnFamilyHandle(handle);
+    }
+  }
+};
+
+bool OpenRawFactDatabase(const std::string& path, RawFactDatabase* out) {
+  rocksdb::Options options;
+  options.create_if_missing = false;
+  options.atomic_flush = true;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
+  descriptors.emplace_back(rocksdb::kDefaultColumnFamilyName,
+                           rocksdb::ColumnFamilyOptions(options));
+  rocksdb::ColumnFamilyOptions facts_options(options);
+  facts_options.prefix_extractor = std::shared_ptr<const rocksdb::SliceTransform>(
+      rocksdb::NewFixedPrefixTransform(12));
+  descriptors.emplace_back("facts", std::move(facts_options));
+  descriptors.emplace_back("meta", rocksdb::ColumnFamilyOptions(options));
+  return rocksdb::DB::Open(options, path, descriptors, &out->handles,
+                           &out->database)
+      .ok();
+}
+
+std::string ReadFactKeyFromSequenceRecord(const std::string& path,
+                                          CommitSeq commit_seq) {
+  RawFactDatabase raw;
+  if (!OpenRawFactDatabase(path, &raw)) {
+    ADD_FAILURE() << "failed to open raw database";
+    return {};
+  }
+  const auto meta_key = EncodeSequenceMetaKey(commit_seq);
+  if (!meta_key.ok()) {
+    ADD_FAILURE() << meta_key.status().ToString();
+    return {};
+  }
+  std::string encoded;
+  const rocksdb::Status got = raw.database->Get(
+      rocksdb::ReadOptions(), raw.handles[2], meta_key.ValueOrDie(), &encoded);
+  if (!got.ok()) {
+    ADD_FAILURE() << got.ToString();
+    return {};
+  }
+  const auto record = DecodeSequenceRecord(encoded);
+  if (!record.ok() || record.ValueOrDie().fact_keys.empty()) {
+    ADD_FAILURE() << "sequence record has no fact keys";
+    return {};
+  }
+  return record.ValueOrDie().fact_keys.front();
+}
+
+void DeleteFactRecord(const std::string& path, const std::string& key) {
+  RawFactDatabase raw;
+  if (!OpenRawFactDatabase(path, &raw)) {
+    ADD_FAILURE() << "failed to open raw database";
+    return;
+  }
+  ASSERT_TRUE(
+      raw.database->Delete(rocksdb::WriteOptions(), raw.handles[1], key).ok());
+}
+
 StoreCommitBatch VertexStateBatch(TxnId txn_id, VertexId vertex_id,
-                                  uint64_t valid_from) {
-  return StoreCommitBatch{
+                                  uint64_t valid_from) {  return StoreCommitBatch{
       txn_id,
       valid_from,
       {{EntityFact::Vertex(VertexRef{PartId{0}, vertex_id}).ref(),
@@ -1081,6 +1150,60 @@ TEST_F(FactStoreMetadataTest,
   EXPECT_TRUE(status.IsCorruption()) << status.ToString();
   EXPECT_NE(status.ToString().find("outcome and sequence disagree"),
             std::string::npos)
+      << status.ToString();
+}
+
+TEST_F(FactStoreMetadataTest,
+       BoundedValidationSkipsFactsBeforeTheRecentWindow) {
+  constexpr uint64_t kTransactions = 5;
+  for (uint64_t index = 1; index <= kTransactions; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index},
+                                              10 + index))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+  const std::string old_fact =
+      ReadFactKeyFromSequenceRecord(path_, CommitSeq{1});
+  ASSERT_FALSE(old_fact.empty());
+  DeleteFactRecord(path_, old_fact);
+
+  FactStoreOptions bounded{path_};
+  bounded.deep_recovery_validation = false;
+  bounded.recovery_validation_recent_sequences = 2;
+  store_ = std::make_unique<FactStore>(bounded);
+  ASSERT_TRUE(store_->Open().ok());
+  ASSERT_TRUE(store_->Close().ok());
+
+  store_ = std::make_unique<FactStore>(FactStoreOptions{path_});
+  const Status deep = store_->Open();
+  EXPECT_TRUE(deep.IsCorruption()) << deep.ToString();
+  EXPECT_NE(deep.ToString().find("missing fact"), std::string::npos)
+      << deep.ToString();
+}
+
+TEST_F(FactStoreMetadataTest,
+       BoundedValidationStillChecksFactsInsideTheRecentWindow) {
+  constexpr uint64_t kTransactions = 5;
+  for (uint64_t index = 1; index <= kTransactions; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index},
+                                              10 + index))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+  const std::string recent_fact = ReadFactKeyFromSequenceRecord(
+      path_, CommitSeq{kTransactions});
+  ASSERT_FALSE(recent_fact.empty());
+  DeleteFactRecord(path_, recent_fact);
+
+  FactStoreOptions bounded{path_};
+  bounded.deep_recovery_validation = false;
+  bounded.recovery_validation_recent_sequences = 2;
+  store_ = std::make_unique<FactStore>(bounded);
+  const Status status = store_->Open();
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(status.ToString().find("missing fact"), std::string::npos)
       << status.ToString();
 }
 

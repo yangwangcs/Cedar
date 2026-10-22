@@ -137,6 +137,13 @@ struct FactStoreOptions {
   // (0 keeps the production batch of 1024). Small values let tests exercise
   // MultiGet batch boundaries without committing thousands of transactions.
   size_t sequence_validation_outcome_batch_size_for_testing = 0;
+  // Reopen fact cross-check policy. When deep_recovery_validation is true
+  // (default) every fact referenced by a committed sequence is read and
+  // decoded. When false only facts at or above
+  // max(oldest_readable, visible - recovery_validation_recent_sequences + 1)
+  // are cross-checked; older corruption is detected on read instead.
+  bool deep_recovery_validation = true;
+  uint64_t recovery_validation_recent_sequences = 4096;
 };
 
 struct SnapshotWriteDependency {

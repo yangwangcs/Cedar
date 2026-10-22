@@ -507,6 +507,9 @@ class FactStoreImpl {
   // Reopen outcome validation batch size (production 1024). Tests override it
   // to exercise MultiGet batch boundaries with a handful of transactions.
   size_t sequence_validation_outcome_batch_size = 1024;
+  // Reopen fact cross-check policy; see FactStoreOptions.
+  bool deep_recovery_validation = true;
+  uint64_t recovery_validation_recent_sequences = 4096;
   std::function<void()> snapshot_epoch_created_observer_for_testing;
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
   // Fired by PublishVisible after the new visible watermark is stored and
@@ -2140,6 +2143,17 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   std::string expected_key;
   expected_key.reserve(kSequenceMetaKeyBytes);
   const size_t kOutcomeBatch = store->sequence_validation_outcome_batch_size;
+  // The recent-fact cross-check window: facts at or above this floor are read
+  // and decoded; older facts are covered by the Vacuum ordering invariant and
+  // are detected on read. deep_recovery_validation disables the bound.
+  const uint64_t recent_sequences =
+      std::max<uint64_t>(1, store->recovery_validation_recent_sequences);
+  const uint64_t recent_floor =
+      visible_seq.value > recent_sequences
+          ? visible_seq.value - recent_sequences + 1
+          : 1;
+  const uint64_t fact_validation_floor =
+      std::max(oldest_readable_seq.value, recent_floor);
   std::vector<std::string> outcome_keys;
   std::vector<TxnId> outcome_txn_ids;
   std::vector<CommitSeq> outcome_commit_seqs;
@@ -2165,9 +2179,10 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     const auto sequence = DecodeSequenceRecordView(std::string_view(
         iterator->value().data(), iterator->value().size()));
     if (!sequence.ok()) return sequence.status();
+    const bool require_facts = store->deep_recovery_validation ||
+                               expected >= fact_validation_floor;
     const Status valid = ValidateSequenceRecordContent(
-        store, CommitSeq{expected}, sequence.ValueOrDie(),
-        expected >= oldest_readable_seq.value);
+        store, CommitSeq{expected}, sequence.ValueOrDie(), require_facts);
     if (!valid.ok()) return valid;
     auto transaction_key = EncodeTransactionMetaKey(sequence.ValueOrDie().txn_id);
     if (!transaction_key.ok()) return transaction_key.status();
@@ -2527,6 +2542,9 @@ Status FactStore::Open() {
       options_.sequence_validation_outcome_batch_size_for_testing == 0
           ? 1024
           : options_.sequence_validation_outcome_batch_size_for_testing;
+  store->deep_recovery_validation = options_.deep_recovery_validation;
+  store->recovery_validation_recent_sequences =
+      std::max<uint64_t>(1, options_.recovery_validation_recent_sequences);
   store->snapshot_epoch_created_observer_for_testing =
       options_.snapshot_epoch_created_observer_for_testing;
   store->snapshot_epoch_destroyed_observer_for_testing =

@@ -273,6 +273,15 @@ struct DatabaseOptions {
   StorageProfile storage_profile = StorageProfile::kDeveloper;
   ProductionStorageOptions production;
   uint64_t validation_cache_bytes = 8ULL * 1024ULL * 1024ULL;
+  // Opt-in durable writer format for committed meta sequence records (F10).
+  // 1 (default, unchanged) keeps every new `kSequence` record byte-identical to
+  // previous releases; 2 writes compact `kSequenceV2` records and durably
+  // records format 2 in the meta format marker during open, before any commit
+  // is accepted. The marker wins on reopen: a database upgraded to 2 keeps
+  // writing v2 even when a later open leaves this at the default. Format 2 is a
+  // one-way compatibility gate for older binaries; see docs/README.md.
+  // Database::Open rejects values other than 1 or 2.
+  uint32_t meta_sequence_format = 1;
   std::function<void()> validation_scan_observer_for_testing;
   std::function<void()> runtime_sample_observer_for_testing;
   std::function<void(const RuntimeSamplingTiming&)>

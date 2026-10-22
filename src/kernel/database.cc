@@ -1772,6 +1772,11 @@ Status QueryMaintenanceHandle::Await() {
 
 StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (options.path.empty()) return Status::InvalidArgument("database", "missing path");
+  if (options.meta_sequence_format != kMetaSequenceFormatV1 &&
+      options.meta_sequence_format != kMetaSequenceFormatV2) {
+    return Status::InvalidArgument("database",
+                                   "meta sequence format must be 1 or 2");
+  }
   if (options.group_commit_max_batch_size == 0 ||
       options.group_commit_max_batch_size > kMaximumGroupCommitBatchCount) {
     return Status::InvalidArgument("database", "group commit count is outside [1, 512]");

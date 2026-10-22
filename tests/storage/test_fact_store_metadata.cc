@@ -1598,6 +1598,36 @@ TEST(FactStoreMetaCodecSequenceV2Test,
                   .IsCorruption());
 }
 
+// Task 12: the one-way gate's expected failure. A pre-v2 binary cannot decode a
+// `kSequenceV2` record; in a dual-read binary the v1-only entry point must still
+// reject it explicitly instead of guessing commit_seq (which would silently
+// rebuild wrong fact keys). Pin the documented Corruption text and prove v1
+// decoding is not over-rejected, so an operator sees an actionable error rather
+// than a silent downgrade.
+TEST(FactStoreMetaCodecSequenceV2Test,
+     V1OnlyDecoderRejectsV2RecordWithDocumentedCorruption) {
+  const SequenceRecord record = SequenceV2FixtureRecord(3);
+  const auto encoded_v2 = EncodeSequenceRecordV2(record);
+  ASSERT_TRUE(encoded_v2.ok()) << encoded_v2.status().ToString();
+  // Sanity: the same bytes decode once the record key supplies commit_seq.
+  EXPECT_TRUE(
+      DecodeSequenceRecord(encoded_v2.ValueOrDie(), record.commit_seq).ok());
+
+  const auto rejected = DecodeSequenceRecord(encoded_v2.ValueOrDie());
+  ASSERT_FALSE(rejected.ok()) << "v2 must not decode without its commit sequence";
+  EXPECT_TRUE(rejected.status().IsCorruption())
+      << rejected.status().ToString();
+  EXPECT_EQ(rejected.status().ToString(),
+            "Corruption: sequence record: v2 sequence record requires its "
+            "commit sequence");
+
+  // The v1-only path keeps decoding v1 records; the gate is not a generic
+  // sequence-record rejection.
+  const auto encoded_v1 = EncodeSequenceRecord(record);
+  ASSERT_TRUE(encoded_v1.ok()) << encoded_v1.status().ToString();
+  EXPECT_TRUE(DecodeSequenceRecord(encoded_v1.ValueOrDie()).ok());
+}
+
 TEST(FactStoreMetaCodecSequenceV2Test, V2RecordDropsNineBytesPerFact) {
   size_t delta_for_one = 0;
   size_t delta_for_many = 0;

@@ -245,3 +245,161 @@ t10 之前：同样的 100 轮会留下 ~100 个段、线性增长的 WAL（旧�
 - flush 吞吐相对 t7 的 2.6x 提升在打开截断后回落到 ~1.0x（见 8.2）：这是正确性
   成本，用 SetWALTruncationEnabled(false) 可换回吞吐（WAL 不回收）。
 
+## 9. Phase 5（t8）收口验证与最终基准
+
+> 本节由 verifier（t8）追加，是 DoD 的最终验证记录。验证对象：工作树 commit `838b67d`
+> （t2-t10 主体 `21351ae` + t11 blob `577dafb` + UBSan 修复 `838b67d`），干净 out-of-tree
+> Release 构建 `/tmp/t8_release`。基准为 3 次连续运行的中位数（同机仍有 ToDesk / WindowServer /
+> DSH GUI 等后台占用，load ≈ 3–5；绝对值同机可比，跨机不可比）。
+
+### 9.1 全量回归（DoD：11 个 P0 全部有绿测试）
+
+- 干净构建：`cmake -S . -B /tmp/t8_release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_BENCHMARKS=ON` →
+  configure rc=0、build rc=0（无编译错误）。
+- **ctest 126/126 全绿，连跑 2 次**（UB 修复前 6.37 s / 6.13 s；修复后 7.71 s / 6.68 s）。
+- 套件构成（9 个测试可执行文件，126 个用例）：
+
+| 文件 | 用例数 | 覆盖 |
+|---|---|---|
+| tests/test_cedar_key.cc | 20 | CedarKey 32B 布局/编码/比较器（基线既有） |
+| tests/test_descriptor.cc | 15 | Descriptor 8B 编解码（基线既有） |
+| tests/test_cedar_graph_storage.cc | 10 | GraphStorage 冒烟（基线既有） |
+| tests/storage/test_zone_columnar_roundtrip.cc | 13 | 10.1/2.1/2.3/2.9/2.10/2.7/3.1/3.2 列式格式 |
+| tests/storage/test_flush_recovery.cc | 27 | 3.2/3.3/3.4/3.5 + t9 直接写/组提交 + t10 截断 |
+| tests/storage/test_edge_target.cc | 9 | 2.4/2.5/8.1/8.2 target 贯穿与完整 key |
+| tests/storage/test_compaction.cc | 18 | 3.1/9.1/9.2/9.3 + 4.1-4.5 合并与调度 |
+| tests/storage/test_vsl_concurrency.cc | 7 | 1.1 并发插入/版本链 + arena |
+| tests/storage/test_blob.cc | 7 | 3.8/10.2 Blob 写读/压缩/GC |
+
+- P0 对应关系与测试名见 `docs/audit/0.1-storage-audit-2026-10-22.md `11（逐条标注 commit + 测试路径）。
+
+### 9.2 Sanitizer（TSan / ASan / UBSan）
+
+**TSan**（非 fork 套件，`TSAN_OPTIONS='halt_on_error=0 die_after_fork=0'`）：
+test_vsl_concurrency 7/7、test_compaction 18/18、test_blob 7/7、test_cedar_key 20/20、
+test_descriptor 15/15、test_cedar_graph_storage 10/10，共 **77 个用例全部通过，0 条
+ThreadSanitizer 报告**（UB 修复后复跑 vsl 7/7，仍 0 报告）。
+
+**ASan+UBSan**（`-fsanitize=address,undefined -g`，`detect_leaks=0`）：
+- ASan：**0 条 AddressSanitizer 错误**。覆盖 test_blob 7/7、test_zone_columnar_roundtrip 13/13、
+  test_flush_recovery 损坏/截断子集 8/8（TruncatedWalTail / WalTruncatedAfterFlush /
+  CorruptCheckpoint / CheckpointWriteFailure / SstSyncFailure / HalfWrittenSst /
+  WalFileNumbersStayMonotonic / WalReplayIsIdempotent）、test_compaction 18/18、test_vsl_concurrency 7/7。
+- UBSan：**修复前发现 2 处产品代码 UB**，已在独立提交 `838b67d` 修复并复验为 0 报告：
+
+| 位置 | UBSan 报告 | 触发面 | 修复 | 复验 |
+|---|---|---|---|---|
+| src/frond/zone_encoder.cc:44 | `left shift of negative value -1` | ZigZag EncodeSigned 对负 delta 左移（时间戳/target/Blob 编码热路径） | 先转 uint64_t 再移位 + 符号掩码，编码字节不变 | blob/compaction/vsl/损坏子集/roundtrip spot 全部 0 报告；21 个 int64 边界值（含 INT64_MIN/MAX）修复前后 Encode/DecodeSigned 字节完全一致 |
+| include/cedar/storage/size_tiered_compaction.h:153 | `1e+27 is outside the range of representable values of type 'unsigned long long'` | capacity_threshold 的 double→uint64 越界转换（仅 size_ratio 极大时；默认 4.0 安全） | 范围检查后饱和到 UINT64_MAX | 默认 size_ratio=4.0 的 L0-L6 阈值逐位不变；仅 size_ratio=1e9 的 L3+ 由 UB 结果变为 UINT64_MAX（语义"该层不按容量触发"不变） |
+
+- 工具限制：`test_flush_recovery`/`test_edge_target`/`test_zone_columnar_roundtrip` 的崩溃注入用
+  `fork()+_exit`，TSan 在 macOS 上对 fork 后状态不可靠（`die_after_fork=0` 只能避免误报，无法
+  提供有意义的内存序断言），因此 TSan 只跑非 fork 套件；fork 场景由 ASan/UBSan + 崩溃注入用例覆盖。
+  另外 TSan/ASan 会显著改变时序，`SstPointReadP99Target` 等性能断言在 sanitizer 构建下可能因
+  机器负载波动而不稳，属于测试工具限制，不计入产品回归。
+
+### 9.3 最终基准：baseline.json → Phase 5 中位数（同机）
+
+命令：`./build/benchmarks/storage_bench --json` 连跑 3 次取中位数；括号内为 (min,max)。
+
+| case / 指标 | baseline | Phase 5 中位数 | Δ | 结论 |
+|---|---|---|---|---|
+| vsl_insert_1t.ops_per_sec | 10.84 M | **12.58 M** (11.73–12.90 M) | +16.1% | 提升 |
+| vsl_insert_1t.ns_per_op | 92.3 | **79.5** (77.5–85.3) | −13.9% | 提升 |
+| vsl_insert_8t.ops_per_sec | 11.41 M | **13.40 M** (12.35–14.14 M) | +17.4% | 提升 |
+| vsl_insert_8t.traversed_rows | 23 | **100,000** | 正确性 | 1.1 修复（不再丢节点） |
+| memtable_getattime.p99_ns | 1,750 | **1,208** (1,042–1,375) | −31.0% | 提升 |
+| memtable_getattime.p50_ns | 292 | 292 | 0% | 持平 |
+| sst_write_read_1.get_hits | 0/16 | **16/16** | 正确性 | 10.1 修复（单行 SST 可读） |
+| sst_write_read_8192.get_p99_ns | 10,125 | **542** (291–666) | −94.6%（**18.7x**） | 目标 ≥5x 达成 |
+| sst_write_read_8192.get_p50_ns | 167 | 166 | −0.6% | 持平 |
+| sst_write_read_8192.open_ms | 0.110 | **0.044** (0.036–0.049) | −60.0% | mmap + 懒解码 |
+| sst_write_read_8192.scan_rows_per_sec | 372.4 M | **394.0 M** (389.3–394.0 M) | +5.8% | 无回归 |
+| sst_write_read_8193.get_p99_ns | 12,875 | **458** (250–458) | −96.4%（**28.1x**） | 目标 ≥5x 达成 |
+| sst_write_read_8193.get_p50_ns | 250 | **84** (83–125) | −66.4% | 提升 |
+| sst_write_read_8193.scan_rows_per_sec | 377.4 M | **395.6 M** (395.6–397.2 M) | +4.8% | 无回归 |
+| compaction_merge_32way.merge_ms | 155.76 | **21.50** (19.15–23.22) | −86.2%（**7.24x**） | 目标 ≥5x 达成 |
+| compaction_merge_32way.merge_rows_per_sec | 410.9 K | **2.976 M** (2.757–3.341 M) | +624% | 提升 |
+| compaction_merge_32way.build_ms（32 文件建文件） | 88.91 | 88.46 (88.33–149.46) | −0.5% | 持平 |
+| 8192 文件体积 | 157,243 B | 265,795 B | +69.0% | **预期成本**：启用持久 EntityIndex（12B/entity）+ 真实 Bloom（审计 2.3/2.10），非布局变更 |
+| 1 行文件 get_p99 | 83 | 83 | 0% | 持平 |
+| 1 行文件 scan_rows_per_sec | 11.9 M | 6.02 M | −49.4% | 计时分辨率噪声（1 行：84 ns→166 ns，总时长 <1 µs） |
+| 1 行文件 open_ms | 0.040 | 0.043 | +7.5% | 计时分辨率噪声（差 3 µs） |
+
+补充目标（来自测试内建断言/独立测量）：
+
+| 目标 | 期望 | 实测 | 结论 |
+|---|---|---|---|
+| VSL 8 线程插入 ≥3x | ≥3x | 100k 行：1.07x（3 次中位数；单次 0.98–1.21x）；1M 行：1.46x（10.80M→15.73M）；t5 报告 1.66x | **未达标，已书面接受**（原因：单跳表 level-0 共享 CAS 竞争；设计 `8 允许记录偏差） |
+| SST 点读 p99 ≥5x | ≥5x | 18.7x（8192 行）/28.1x（8193 行）；测试内建 p99=250 ns（40.5x） | 达成 |
+| 打开 100MB SST 峰值 RSS −50% | <50.2MB | **10.109MB**（100.458MB 文件，测试 LargeSstOpenPeakRssReduced） | 达成（相对旧 reader ≈文件 2x 约 −95%） |
+| 32 路合并 ≥5x | ≥5x | **7.24x**（155.76→21.50 ms） | 达成 |
+| flush 吞吐 ≥1.25x | ≥1.25x | t7 harness（1M 行 × 64 列）：331–340 ms → 128–130 ms = **2.6x**（生产默认，WAL 开启）；本 bench 形状（200k×16）见 `9.5 | 达成 |
+| 全量扫描 O(n²)→O(n) ≥10x | ≥10x | 1M 行 Key+Value **21 ms（≈21 ns/行）**（测试 MillionRowScanIsLinear）；相对 t3 代 9000 行 ≈74 ms 为 ≈400x | 达成 |
+
+### 9.4 t9/t10 追加 case 的最终值（Phase 5 中位数）
+
+| case / 指标 | 值 | 说明 |
+|---|---|---|
+| lsm_put_no_wal_1t.ops_per_sec | 5.17 M（0.193 µs/op） | T2 等价参考线：直接写完全不写 WAL |
+| lsm_put_wal_flush_1t.ops_per_sec | **351.5 K**（2.845 µs/op） | t9 默认 kWrite：append+flush 到 OS，进程崩溃可恢复 |
+| lsm_put_wal_sync_1t.ops_per_sec | 411.5（2.43 ms/op） | SetDirectWriteSync(true)：掉电可恢复 |
+| txn_commit_sync_1t.commits_per_sec | 398.2 | 窗口=0（每提交 1 次 fsync） |
+| txn_commit_group_1t.commits_per_sec | 357.2 | 单线程无可合并对象 |
+| txn_commit_sync_8t.commits_per_sec | 359.5 | 8 线程但串行 fsync |
+| txn_commit_group_8t.commits_per_sec | **2,918.5**（wal_records_per_sync≈7.97） | 组提交：相对 sync_8t **8.1x**（t9 报告 6.5x；口径/负载差异） |
+| flush_wal_truncation_off.flush_ms | 38.9（5.14 M rows/s） | t7 快路径：SST 只 Flush，WAL 不回收（close 后仍 14.6 MB） |
+| flush_wal_truncation_on.flush_ms | **78.1**（2.56 M rows/s） | t10：SST 逐文件 fsync + checkpoint；close 后 WAL **0 B**（14.6 MB→0） |
+| wal_checkpoint_long_run_100r | 段数峰值 2、字节峰值 219 B、11.1 ms/轮、watermark 99 | WAL 目录有界；close 后 1 个空段 |
+
+### 9.5 1M 行口径补充（`--rows=1000000 --memtable-rows=1000000 --merge-rows=31250`）
+
+| case | 值 |
+|---|---|
+| vsl_insert_1t | 10.80 M ops/s（92.6 ns/op），traversed=1,000,000 |
+| vsl_insert_8t | **15.73 M ops/s**（63.6 ns/op），traversed=1,000,000，8T/1T=1.46x |
+| memtable_getattime（1M 行表） | p50 791 ns / p99 2,250 ns |
+| compaction_merge_32way（32×31,250=1M 行） | 227.3 ms，4.40 M rows/s，输出 2 个文件（按 l0_file_size 切分生效） |
+
+### 9.6 偏差与回归说明（书面，DoD 要求）
+
+1. **VSL 8T 目标 3x 未达**（已接受）：100k 行 3 次中位数 8T/1T = 1.07x（单次 0.98–1.21x），
+   1M 行口径 1.46x，t5 报告 1.66x；绝对吞吐相对 baseline 仍 +17.4%。根因是单跳表 level-0 的
+   共享 CAS 竞争（设计约束不允许分片 memtable）；按设计 `8"若 CAS 无法达标则记录偏差"，接受。
+2. **flush 临时内存 −30% 未达**：42.58→41.98 MB（−1.4%，目标 ≤40 MB）：接受（见 `8.5）。
+3. **WAL 截断开启的 flush 成本**：t10 为 22–27ms→70–88ms（200k×16，3.1–3.9x），本次复测
+   38.9→78.1ms（2.0x）；换来 WAL 14.6MB→0 与有界目录。可逆开关 `SetWALTruncationEnabled(false)`。
+4. **SST 文件体积 +69%**（8192 行）：持久 EntityIndex + Bloom 的预期成本，换点读 p99 18–28x
+   和不存在 entity 的高跳过率；使用 v1 header 既有预留字段，未改布局/版本。
+5. **>5% 且方向变差的项**只有两处，均为亚微秒/3µs 级计时噪声（1 行 SST 的 scan 与 open），
+   不构成真实回归；其余指标改善或持平。**没有其他 >5% 回归。**
+6. 遗留未修项（非 P0，见审计 `11.3）：SST CRC64 未实现/未校验（2.6）、zone host-endian 与
+   uint32 偏移 >4GB（2.12/10.9）、GetValue 对内联 int/float 返回空串（10.9）、ZoneMap 只统计
+   最后 block（2.11）、死代码引擎未清理（4.2）。
+
+### 9.7 复现命令
+
+    # Release 全量
+    cmake -S . -B /tmp/t8_release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_BENCHMARKS=ON
+    cmake --build /tmp/t8_release -j8
+    ctest --test-dir /tmp/t8_release -j1            # 126/126
+
+    # TSan（非 fork 套件）
+    cmake -S . -B /tmp/t8_tsan -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON \
+      -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -fno-omit-frame-pointer" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+    cmake --build /tmp/t8_tsan -j8
+    cd /tmp/t8_tsan/tests && TSAN_OPTIONS='halt_on_error=0 die_after_fork=0' \
+      ./test_vsl_concurrency && ./test_compaction && ./test_blob
+
+    # ASan+UBSan（roundtrip / blob / 损坏文件子集）
+    cmake -S . -B /tmp/t8_asan -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+    cmake --build /tmp/t8_asan -j8
+    cd /tmp/t8_asan/tests && ASAN_OPTIONS='detect_leaks=0' \
+      UBSAN_OPTIONS='print_stacktrace=1:halt_on_error=0' ./test_blob && \
+      ./test_zone_columnar_roundtrip
+
+    # 基准（3 次取中位数；本机还有 ToDesk/WindowServer/DSH GUI 后台占用）
+    for i in 1 2 3; do ./build/benchmarks/storage_bench --json > /tmp/bench_$i.json; done

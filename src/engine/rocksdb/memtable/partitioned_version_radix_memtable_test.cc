@@ -18,6 +18,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 #include <gtest/gtest.h>
 
 #include "db/dbformat.h"
@@ -30,19 +34,136 @@
 
 namespace {
 
+// The allocation-counting assertions below observe process-wide heap traffic,
+// so the test replaces every global allocation operator rather than only the
+// scalar forms. AddressSanitizer installs its own interceptors for the
+// nothrow/aligned new forms and gtest allocates each TestSuite through the
+// nothrow form. If any allocation operator is left to ASan while the matching
+// delete calls free(), ASan aborts with "alloc-dealloc-mismatch" when the
+// suite is destroyed. Every entry point below therefore forwards to the same
+// counted allocator and every delete forwards to its matching release, so ASan
+// observes consistent malloc/free pairs and the counters stay meaningful.
 std::atomic<size_t> g_heap_allocations{0};
+
+void* CountedAllocate(std::size_t size, std::size_t alignment) {
+  g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
+  if (size == 0) size = 1;
+  if (alignment < sizeof(void*)) alignment = sizeof(void*);
+  void* result = nullptr;
+#if defined(_WIN32)
+  result = _aligned_malloc(size, alignment);
+#else
+  if (::posix_memalign(&result, alignment, size) != 0) result = nullptr;
+#endif
+  if (result == nullptr) throw std::bad_alloc();
+  return result;
+}
+
+void CountedFree(void* pointer) noexcept {
+#if defined(_WIN32)
+  _aligned_free(pointer);
+#else
+  std::free(pointer);
+#endif
+}
 
 }  // namespace
 
 void* operator new(std::size_t size) {
-  g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
-  if (void* result = std::malloc(size == 0 ? 1 : size)) return result;
-  throw std::bad_alloc();
+  return CountedAllocate(size, alignof(std::max_align_t));
 }
 
-void operator delete(void* pointer) noexcept { std::free(pointer); }
+void* operator new[](std::size_t size) {
+  return CountedAllocate(size, alignof(std::max_align_t));
+}
 
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+  try {
+    return CountedAllocate(size, alignof(std::max_align_t));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+  try {
+    return CountedAllocate(size, alignof(std::max_align_t));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment) {
+  return CountedAllocate(size, static_cast<std::size_t>(alignment));
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+  return CountedAllocate(size, static_cast<std::size_t>(alignment));
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment,
+                   const std::nothrow_t&) noexcept {
+  try {
+    return CountedAllocate(size, static_cast<std::size_t>(alignment));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment,
+                     const std::nothrow_t&) noexcept {
+  try {
+    return CountedAllocate(size, static_cast<std::size_t>(alignment));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void operator delete(void* pointer) noexcept { CountedFree(pointer); }
+
+void operator delete[](void* pointer) noexcept { CountedFree(pointer); }
+
+void operator delete(void* pointer, std::size_t) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete[](void* pointer, std::size_t) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete(void* pointer, const std::nothrow_t&) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete(void* pointer, std::align_val_t) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete[](void* pointer, std::align_val_t) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete(void* pointer, std::align_val_t,
+                     const std::nothrow_t&) noexcept {
+  CountedFree(pointer);
+}
+
+void operator delete[](void* pointer, std::align_val_t,
+                       const std::nothrow_t&) noexcept {
+  CountedFree(pointer);
+}
 
 namespace ROCKSDB_NAMESPACE {
 namespace {

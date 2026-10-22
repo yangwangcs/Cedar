@@ -170,9 +170,33 @@ FactStoreOptions StoreOptionsAt(const std::string& path, uint32_t format) {
   return options;
 }
 
+// Physical placement of a database. Reclamation has to be told both the
+// profile it was written with and, when the WAL lives on a separate device,
+// where that directory is; otherwise RocksDB recovers only the SST state and
+// silently misses every committed record still in the WAL.
+struct DatabaseLayout {
+  StorageProfile storage_profile = StorageProfile::kDeveloper;
+  std::string wal_directory;
+};
+
+FactStoreOptions LayoutOptions(const std::string& path,
+                               const DatabaseLayout& layout) {
+  FactStoreOptions options;
+  options.path = path;
+  options.storage_profile = layout.storage_profile;
+  options.production.wal_directory = layout.wal_directory;
+  if (layout.storage_profile == StorageProfile::kProductionAppend) {
+    // Match the constrained production profile the fact-store tests use so the
+    // test does not derive a budget from the host.
+    options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+  }
+  return options;
+}
+
 // Writes `count` committed v1 sequence records (one vertex fact each).
-void CreateV1History(const std::string& path, size_t count) {
-  FactStore store(FactStoreOptions{path});
+void CreateV1History(const std::string& path, const DatabaseLayout& layout,
+                     size_t count) {
+  FactStore store(LayoutOptions(path, layout));
   ASSERT_TRUE(store.Open().ok());
   for (size_t sequence = 1; sequence <= count; ++sequence) {
     const auto committed = store.Commit(VertexStateBatch(
@@ -184,18 +208,58 @@ void CreateV1History(const std::string& path, size_t count) {
   ASSERT_TRUE(store.Close().ok());
 }
 
+void CreateV1History(const std::string& path, size_t count) {
+  CreateV1History(path, DatabaseLayout{}, count);
+}
+
 // The supported opt-in path: opening with format 2 durably writes the marker
 // before any commit is accepted, then closes without writing new records.
-void EnableV2Writer(const std::string& path) {
-  FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV2));
+void EnableV2Writer(const std::string& path, const DatabaseLayout& layout) {
+  FactStoreOptions options = LayoutOptions(path, layout);
+  options.meta_sequence_format = kMetaSequenceFormatV2;
+  FactStore store(std::move(options));
   ASSERT_TRUE(store.Open().ok());
   ASSERT_TRUE(store.Close().ok());
 }
 
+void EnableV2Writer(const std::string& path) {
+  EnableV2Writer(path, DatabaseLayout{});
+}
+
+std::vector<SequenceRecord> ReadSequencesThroughStore(
+    const std::string& path, const DatabaseLayout& layout, size_t count) {
+  std::vector<SequenceRecord> records;
+  FactStore store(LayoutOptions(path, layout));
+  if (!store.Open().ok()) {
+    ADD_FAILURE() << "open for reading failed";
+    return records;
+  }
+  {
+    const auto snapshot = store.BeginSnapshot();
+    if (!snapshot.ok()) {
+      ADD_FAILURE() << snapshot.status().ToString();
+      return records;
+    }
+    for (size_t sequence = 1; sequence <= count; ++sequence) {
+      const auto read = store.ReadSequence(
+          snapshot.ValueOrDie(), CommitSeq{static_cast<uint64_t>(sequence)});
+      if (!read.ok()) {
+        ADD_FAILURE() << "sequence " << sequence << ": "
+                      << read.status().ToString();
+        return records;
+      }
+      records.push_back(read.ValueOrDie());
+    }
+  }
+  if (!store.Close().ok()) ADD_FAILURE() << "close failed";
+  return records;
+}
+
 void ExpectSequencesReadable(const std::string& path,
+                             const DatabaseLayout& layout,
                              const std::vector<SequenceRecord>& expected) {
   ASSERT_FALSE(expected.empty());
-  FactStore store(FactStoreOptions{path});
+  FactStore store(LayoutOptions(path, layout));
   ASSERT_TRUE(store.Open().ok());
   {
     const auto snapshot = store.BeginSnapshot();
@@ -217,6 +281,11 @@ void ExpectSequencesReadable(const std::string& path,
     }
   }
   ASSERT_TRUE(store.Close().ok());
+}
+
+void ExpectSequencesReadable(const std::string& path,
+                             const std::vector<SequenceRecord>& expected) {
+  ExpectSequencesReadable(path, DatabaseLayout{}, expected);
 }
 
 class MetaV2ReclaimTest : public ::testing::Test {
@@ -434,6 +503,102 @@ TEST_F(MetaV2ReclaimTest, ReclaimsOnlyV1RecordsInMixedDatabase) {
       EXPECT_EQ(before[index].size() - after[index].size(), 6U + 9U * 1U);
     }
   }
+  ExpectSequencesReadable(path, expected);
+}
+
+TEST_F(MetaV2ReclaimTest, ReclaimsProductionProfileWithSeparateWalDevice) {
+  const std::string path = path_ + "/production_custom_wal";
+  const std::string wal_path = path_ + "_wal";
+  ASSERT_TRUE(std::filesystem::create_directory(wal_path));
+  DatabaseLayout layout;
+  layout.storage_profile = StorageProfile::kProductionAppend;
+  layout.wal_directory = wal_path;
+
+  CreateV1History(path, layout, 6);
+  // Capture the expected records before the opt-in open below. Any open that
+  // follows a write recovers the WAL and flushes the recovered memtables into
+  // SSTs (production profile), so reading after EnableV2Writer would persist
+  // the format marker and hide exactly the WAL-residency this test needs.
+  const std::vector<SequenceRecord> expected =
+      ReadSequencesThroughStore(path, layout, 6);
+  ASSERT_EQ(expected.size(), 6U);
+  EnableV2Writer(path, layout);
+
+  // Only the format marker was written after the last open, so it lives on the
+  // separate device: this test also proves the layout is real.
+  bool contains_wal = false;
+  for (const auto& entry : std::filesystem::directory_iterator(wal_path)) {
+    contains_wal = contains_wal || entry.path().extension() == ".log";
+  }
+  ASSERT_TRUE(contains_wal);
+
+  MetaV2ReclaimOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+  options.production.wal_directory = wal_path;
+  MetaV2ReclaimStats stats;
+  const Status reclaimed = ReclaimSequenceRecordsV2(path, options, &stats);
+  ASSERT_TRUE(reclaimed.ok()) << reclaimed.ToString();
+  EXPECT_EQ(stats.scanned, 6U);
+  EXPECT_EQ(stats.rewritten, 6U);
+  EXPECT_EQ(stats.already_v2, 0U);
+  EXPECT_EQ(stats.bytes_before - stats.bytes_after, 6U * (6U + 9U * 1U));
+
+  // Only an open with the same profile and WAL directory recovers the rewritten
+  // records; this is the reopen the option exists to make green.
+  ExpectSequencesReadable(path, layout, expected);
+
+  // A second run sees the already-reclaimed records through the same layout.
+  MetaV2ReclaimStats second_stats;
+  const Status second = ReclaimSequenceRecordsV2(path, options, &second_stats);
+  ASSERT_TRUE(second.ok()) << second.ToString();
+  EXPECT_EQ(second_stats.scanned, 6U);
+  EXPECT_EQ(second_stats.rewritten, 0U);
+  EXPECT_EQ(second_stats.already_v2, 6U);
+  EXPECT_EQ(second_stats.bytes_before, stats.bytes_after);
+  ExpectSequencesReadable(path, layout, expected);
+}
+
+TEST_F(MetaV2ReclaimTest, RejectsRelativeWalDirectoryWithoutWriting) {
+  const std::string path = path_ + "/relative_wal";
+  CreateV1History(path, 4);
+  EnableV2Writer(path);
+  const std::vector<SequenceRecord> expected =
+      ReadSequencesThroughStore(path, DatabaseLayout{}, 4);
+  ASSERT_EQ(expected.size(), 4U);
+
+  MetaV2ReclaimOptions options;
+  options.production.wal_directory = "wal/outside/database";
+  MetaV2ReclaimStats stats;
+  const Status refused = ReclaimSequenceRecordsV2(path, options, &stats);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(refused.IsInvalidArgument()) << refused.ToString();
+  EXPECT_EQ(stats.scanned, 0U);
+  EXPECT_EQ(stats.rewritten, 0U);
+  EXPECT_EQ(stats.bytes_before, 0U);
+  EXPECT_EQ(stats.bytes_after, 0U);
+  ExpectSequencesReadable(path, expected);
+}
+
+TEST_F(MetaV2ReclaimTest, RejectsProductionProfileThatCannotOpenLikeTheDatabase) {
+  const std::string path = path_ + "/invalid_production_profile";
+  CreateV1History(path, 4);
+  EnableV2Writer(path);
+  const std::vector<SequenceRecord> expected =
+      ReadSequencesThroughStore(path, DatabaseLayout{}, 4);
+  ASSERT_EQ(expected.size(), 4U);
+
+  MetaV2ReclaimOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  // Below the 1 GiB lower bound; a reclaim that silently fell back to the
+  // Developer profile would accept it.
+  options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL;
+  MetaV2ReclaimStats stats;
+  const Status refused = ReclaimSequenceRecordsV2(path, options, &stats);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(refused.IsInvalidArgument()) << refused.ToString();
+  EXPECT_EQ(stats.scanned, 0U);
+  EXPECT_EQ(stats.rewritten, 0U);
   ExpectSequencesReadable(path, expected);
 }
 

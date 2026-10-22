@@ -10,6 +10,7 @@
 #include <string>
 
 #include "cedar/core/status.h"
+#include "cedar/storage_options.h"
 
 namespace cedar {
 
@@ -33,6 +34,21 @@ struct MetaV2ReclaimOptions {
   // callback simulates an abrupt stop; the committed batches remain and a later
   // run resumes from the first v1 record.
   std::function<void(size_t batch_index)> fault_for_testing;
+  // Storage profile the database was written with. Reclamation opens the
+  // database with the same profile so the facts and meta column families are
+  // recovered with their production table, memtable and WAL configuration. The
+  // default keeps the historical Developer-profile open, so existing callers
+  // and databases are unaffected.
+  StorageProfile storage_profile = StorageProfile::kDeveloper;
+  // Production-profile capacities and WAL placement, forwarded exactly like
+  // FactStoreOptions::production. `wal_directory` is honored for every profile
+  // (including the default) because it describes where the database's WAL
+  // physically lives, not a capacity: a non-empty value must be an absolute
+  // path. Without it, an offline open of a database whose WAL is on a separate
+  // device recovers only the flushed SST state and silently misses every
+  // WAL-resident commit, including unflushed sequence records and the format
+  // marker.
+  ProductionStorageOptions production;
 };
 
 // Accounting for one ReclaimSequenceRecordsV2 call. On a marker/format error the
@@ -60,6 +76,14 @@ struct MetaV2ReclaimStats {
 // already locked. The database must have been upgraded through the supported
 // opt-in path first: if the durable meta sequence format marker is missing or
 // does not record format 2, the call fails before writing anything.
+//
+// The offline open uses options.storage_profile and options.production, so a
+// database whose layout differs from the Developer default (for example a
+// production database whose WAL lives on a separate device) is recovered
+// exactly like a Cedar process recovers it. Callers must pass the database's
+// actual layout: a WAL-only format marker fails the format gate, and
+// WAL-resident records are invisible to an open that does not name the WAL
+// directory.
 //
 // Records are rewritten per atomic batch of at most options.batch_records
 // entries. A stopped or crashed run leaves a consistent mixed database

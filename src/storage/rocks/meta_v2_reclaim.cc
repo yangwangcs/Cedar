@@ -4,6 +4,7 @@
 #include "cedar/fact/meta_v2_reclaim.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -45,7 +46,10 @@ Status FromEngineStatus(const rocksdb::Status& status, const char* context) {
 // Owns the engine handles for the duration of one offline reclamation. The
 // database is opened with Cedar's storage configuration so an existing facts
 // column family (Cedar Parquet) can be recovered even though reclamation only
-// reads and rewrites the meta column family.
+// reads and rewrites the meta column family. The caller supplies the storage
+// profile and WAL placement of the database being reclaimed: recovering a
+// database whose WAL lives on a separate device without that directory would
+// silently miss every WAL-resident record, including the format marker.
 struct ReclaimDatabase {
   std::unique_ptr<rocksdb::DB> db;
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
@@ -59,14 +63,42 @@ struct ReclaimDatabase {
   }
 };
 
-Status OpenReclaimDatabase(const std::string& db_path, ReclaimDatabase* out) {
+Status ValidateReclaimWalDirectory(const std::string& wal_directory) {
+  if (wal_directory.empty()) return Status::OK();
+  // Rules that FactStore applies to WAL placement (production-profile device
+  // requirements, relative paths) must hold for the offline open as well.
+  if (!std::filesystem::path(wal_directory).is_absolute()) {
+    return Status::InvalidArgument("meta v2 reclaim",
+                                   "WAL directory must be absolute");
+  }
+  return Status::OK();
+}
+
+Status OpenReclaimDatabase(const std::string& db_path,
+                           const MetaV2ReclaimOptions& reclaim_options,
+                           ReclaimDatabase* out) {
   FactStoreOptions store_options;
   store_options.path = db_path;
+  store_options.storage_profile = reclaim_options.storage_profile;
+  store_options.production = reclaim_options.production;
+  const Status wal_placement = internal::ValidateProductionWalPlacement(store_options);
+  if (!wal_placement.ok()) return wal_placement;
+  const auto resolved_profile = internal::ResolveStorageProfile(store_options);
+  if (!resolved_profile.ok()) return resolved_profile.status();
+  const internal::ResolvedStorageProfile* resolved_ptr =
+      UsesCedarKernelProfile(store_options.storage_profile)
+          ? &resolved_profile.ValueOrDie()
+          : nullptr;
   std::shared_ptr<rocksdb::Cache> cache;
   rocksdb::Options options = internal::MakeRocksDbOptions(
-      store_options, /*is_new_database=*/false, /*resolved=*/nullptr, &cache);
+      store_options, /*is_new_database=*/false, resolved_ptr, &cache);
   options.create_if_missing = false;
   options.create_missing_column_families = false;
+  // The WAL directory describes where the database physically keeps its log,
+  // not a profile capacity, so honor it for every profile - including the
+  // default Developer profile, whose engine options never place a WAL outside
+  // the database directory. An empty value keeps the historical behavior.
+  options.wal_dir = reclaim_options.production.wal_directory;
   // Reclamation must not rewrite the files the next Cedar open sees. Recovered
   // memtables stay in the WAL-backed memtable instead of being flushed through
   // this inspection configuration.
@@ -77,7 +109,7 @@ Status OpenReclaimDatabase(const std::string& db_path, ReclaimDatabase* out) {
       std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
   std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
       internal::MakeRocksDbColumnFamilyDescriptors(
-          store_options, options, /*resolved=*/nullptr, {cache, page_metrics});
+          store_options, options, resolved_ptr, {cache, page_metrics});
   const rocksdb::Status opened = rocksdb::DB::Open(
       options, db_path, descriptors, &out->handles, &out->db);
   if (!opened.ok()) return FromEngineStatus(opened, "open meta v2 reclaim");
@@ -185,9 +217,12 @@ Status ReclaimSequenceRecordsV2(const std::string& db_path,
     return Status::InvalidArgument("meta v2 reclaim",
                                    "batch_records must be positive");
   }
+  const Status wal_directory =
+      ValidateReclaimWalDirectory(options.production.wal_directory);
+  if (!wal_directory.ok()) return wal_directory;
 
   ReclaimDatabase database;
-  const Status opened = OpenReclaimDatabase(db_path, &database);
+  const Status opened = OpenReclaimDatabase(db_path, options, &database);
   if (!opened.ok()) return opened;
 
   // Reclamation is only meaningful for a database whose durable marker already

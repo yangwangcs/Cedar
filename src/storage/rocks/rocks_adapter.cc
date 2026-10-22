@@ -504,6 +504,9 @@ class FactStoreImpl {
   // S1: reports the source of every committed sequence record consumed by
   // reopen validation. See FactStoreOptions for the contract.
   std::function<void(bool)> sequence_validation_read_source_observer_for_testing;
+  // Reopen outcome validation batch size (production 1024). Tests override it
+  // to exercise MultiGet batch boundaries with a handful of transactions.
+  size_t sequence_validation_outcome_batch_size = 1024;
   std::function<void()> snapshot_epoch_created_observer_for_testing;
   std::function<void()> snapshot_epoch_destroyed_observer_for_testing;
   // Fired by PublishVisible after the new visible watermark is stored and
@@ -2052,12 +2055,13 @@ Status LoadPropertySchemas(FactStoreImpl* store) {
 // production dataset. The transaction outcome record is still read: it lives
 // under a different key, and its *existence* is what this check pins, which the
 // sequence record cannot prove.
-Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq,
-                                 std::string_view encoded_sequence,
-                                 bool require_facts) {
-  const auto sequence_view = DecodeSequenceRecordView(encoded_sequence);
-  if (!sequence_view.ok()) return sequence_view.status();
-  const SequenceRecordView& sequence = sequence_view.ValueOrDie();
+// Validates one committed sequence record from the bytes the reopen scan
+// already holds (structure, embedded fact keys and, within the retention
+// window, the facts themselves). The transaction outcome is validated in
+// batches by ValidateSequenceOutcomeBatch; see ValidateCommittedSequences.
+Status ValidateSequenceRecordContent(FactStoreImpl* store, CommitSeq commit_seq,
+                                     const SequenceRecordView& sequence,
+                                     bool require_facts) {
   if (sequence.commit_seq != commit_seq) {
     return Status::Corruption("fact store",
                               "sequence record has wrong commit sequence");
@@ -2065,21 +2069,6 @@ Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq,
   const Status structure = sequence.Validate();
   if (!structure.ok()) {
     return Status::Corruption("sequence record", structure.ToString());
-  }
-  const auto transaction_key = EncodeTransactionMetaKey(sequence.txn_id);
-  if (!transaction_key.ok()) return transaction_key.status();
-  std::string encoded_outcome;
-  const rocksdb::Status got_outcome = store->db->Get(
-      rocksdb::ReadOptions(), store->meta_cf, transaction_key.ValueOrDie(),
-      &encoded_outcome);
-  if (!got_outcome.ok()) {
-    return Status::Corruption("fact store", "sequence record is missing outcome");
-  }
-  const auto outcome = DecodeTransactionOutcome(encoded_outcome);
-  if (!outcome.ok()) return outcome.status();
-  if (outcome.ValueOrDie().txn_id != sequence.txn_id ||
-      outcome.ValueOrDie().commit_seq != commit_seq) {
-    return Status::Corruption("fact store", "outcome and sequence disagree");
   }
   for (uint32_t index = 0; index < sequence.fact_count; ++index) {
     const std::string_view fact_key = sequence.identities.substr(
@@ -2107,6 +2096,37 @@ Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq,
   return Status::OK();
 }
 
+// Batch of outcome checks: one MultiGet per 1024 committed sequences replaces
+// one meta-CF Get per sequence (42.5M Gets per reopen on the production
+// dataset).
+Status ValidateSequenceOutcomeBatch(FactStoreImpl* store,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<TxnId>& txn_ids,
+                                    const std::vector<CommitSeq>& commit_seqs) {
+  if (keys.empty()) return Status::OK();
+  std::vector<rocksdb::Slice> slices;
+  slices.reserve(keys.size());
+  for (const std::string& key : keys) slices.emplace_back(key);
+  std::vector<rocksdb::PinnableSlice> values(keys.size());
+  std::vector<rocksdb::Status> statuses(keys.size());
+  store->db->MultiGet(rocksdb::ReadOptions(), store->meta_cf, keys.size(),
+                      slices.data(), values.data(), statuses.data());
+  for (size_t index = 0; index < keys.size(); ++index) {
+    if (!statuses[index].ok()) {
+      return Status::Corruption("fact store",
+                                "sequence record is missing outcome");
+    }
+    const auto outcome = DecodeTransactionOutcome(
+        std::string(values[index].data(), values[index].size()));
+    if (!outcome.ok()) return outcome.status();
+    if (outcome.ValueOrDie().txn_id != txn_ids[index] ||
+        outcome.ValueOrDie().commit_seq != commit_seqs[index]) {
+      return Status::Corruption("fact store", "outcome and sequence disagree");
+    }
+  }
+  return Status::OK();
+}
+
 Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
                                   CommitSeq oldest_readable_seq) {
   if (visible_seq.value == 0) return Status::OK();
@@ -2119,6 +2139,13 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   // Get the old loop issued per sequence.
   std::string expected_key;
   expected_key.reserve(kSequenceMetaKeyBytes);
+  const size_t kOutcomeBatch = store->sequence_validation_outcome_batch_size;
+  std::vector<std::string> outcome_keys;
+  std::vector<TxnId> outcome_txn_ids;
+  std::vector<CommitSeq> outcome_commit_seqs;
+  outcome_keys.reserve(kOutcomeBatch);
+  outcome_txn_ids.reserve(kOutcomeBatch);
+  outcome_commit_seqs.reserve(kOutcomeBatch);
   uint64_t expected = 1;
   for (iterator->Seek(kSequenceMetaPrefix);
        iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix) &&
@@ -2135,13 +2162,30 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
       // when it returned NotFound.
       return Status::Corruption("fact store", "missing durable sequence record");
     }
-    const Status valid = ValidateCommittedSequence(
-        store, CommitSeq{expected},
-        std::string_view(iterator->value().data(),
-                         iterator->value().size()),
+    const auto sequence = DecodeSequenceRecordView(std::string_view(
+        iterator->value().data(), iterator->value().size()));
+    if (!sequence.ok()) return sequence.status();
+    const Status valid = ValidateSequenceRecordContent(
+        store, CommitSeq{expected}, sequence.ValueOrDie(),
         expected >= oldest_readable_seq.value);
     if (!valid.ok()) return valid;
+    auto transaction_key = EncodeTransactionMetaKey(sequence.ValueOrDie().txn_id);
+    if (!transaction_key.ok()) return transaction_key.status();
+    outcome_keys.push_back(transaction_key.ConsumeValueOrDie());
+    outcome_txn_ids.push_back(sequence.ValueOrDie().txn_id);
+    outcome_commit_seqs.push_back(CommitSeq{expected});
+    if (outcome_keys.size() == kOutcomeBatch) {
+      const Status outcomes = ValidateSequenceOutcomeBatch(
+          store, outcome_keys, outcome_txn_ids, outcome_commit_seqs);
+      if (!outcomes.ok()) return outcomes;
+      outcome_keys.clear();
+      outcome_txn_ids.clear();
+      outcome_commit_seqs.clear();
+    }
   }
+  const Status outcomes = ValidateSequenceOutcomeBatch(
+      store, outcome_keys, outcome_txn_ids, outcome_commit_seqs);
+  if (!outcomes.ok()) return outcomes;
   if (!iterator->status().ok()) {
     return FromRocksDb(iterator->status(), "iterate durable sequence records");
   }
@@ -2479,6 +2523,10 @@ Status FactStore::Open() {
       options_.validation_scan_observer_for_testing;
   store->sequence_validation_read_source_observer_for_testing =
       options_.sequence_validation_read_source_observer_for_testing;
+  store->sequence_validation_outcome_batch_size =
+      options_.sequence_validation_outcome_batch_size_for_testing == 0
+          ? 1024
+          : options_.sequence_validation_outcome_batch_size_for_testing;
   store->snapshot_epoch_created_observer_for_testing =
       options_.snapshot_epoch_created_observer_for_testing;
   store->snapshot_epoch_destroyed_observer_for_testing =

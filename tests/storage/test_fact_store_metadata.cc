@@ -1040,5 +1040,49 @@ TEST(FactStoreMetaCodecSequenceViewTest,
   EXPECT_FALSE(length_view.Validate().ok());
 }
 
+TEST_F(FactStoreMetadataTest,
+       RejectsMissingOutcomeAtOutcomeValidationBatchBoundary) {
+  constexpr uint64_t kSequenceCount = 5;
+  for (uint64_t index = 1; index <= kSequenceCount; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index}, 10))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+  const auto outcome_key = EncodeTransactionMetaKey(TxnId{kSequenceCount});
+  ASSERT_TRUE(outcome_key.ok()) << outcome_key.status().ToString();
+  DeleteMetaRecord(path_, outcome_key.ValueOrDie());
+
+  FactStoreOptions options{path_};
+  options.sequence_validation_outcome_batch_size_for_testing = 4;
+  store_ = std::make_unique<FactStore>(options);
+  const Status status = store_->Open();
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(status.ToString().find("missing outcome"), std::string::npos)
+      << status.ToString();
+}
+
+TEST_F(FactStoreMetadataTest,
+       RejectsOutcomeDisagreementInsideOutcomeBatch) {
+  for (uint64_t index = 1; index <= 3; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index}, 10))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+  const auto outcome_key = EncodeTransactionMetaKey(TxnId{2});
+  ASSERT_TRUE(outcome_key.ok()) << outcome_key.status().ToString();
+  const auto wrong_outcome = EncodeTransactionOutcome(TransactionOutcomeRecord{
+      TxnId{2}, CommitSeq{3}, TransactionOutcome::kCommitted});
+  ASSERT_TRUE(wrong_outcome.ok()) << wrong_outcome.status().ToString();
+  PutMetaRecord(path_, outcome_key.ValueOrDie(), wrong_outcome.ValueOrDie());
+
+  const Status status = store_->Open();
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(status.ToString().find("outcome and sequence disagree"),
+            std::string::npos)
+      << status.ToString();
+}
+
 }  // namespace
 }  // namespace cedar

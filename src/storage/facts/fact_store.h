@@ -133,6 +133,10 @@ struct FactStoreOptions {
   // path leaves the filter in its always-true state on a small database.
   // Production takes the capacity decision from the facts CF estimate.
   bool identity_history_skip_rebuild_for_testing = false;
+  // Test-only override of the reopen transaction-outcome validation batch size
+  // (0 keeps the production batch of 1024). Small values let tests exercise
+  // MultiGet batch boundaries without committing thousands of transactions.
+  size_t sequence_validation_outcome_batch_size_for_testing = 0;
 };
 
 struct SnapshotWriteDependency {

@@ -8,6 +8,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -70,6 +71,20 @@ inline bool EncodeCedarParquetNumericIndexValueFromLittleEndian(
   return true;
 }
 inline constexpr size_t kCedarParquetV2SortKeyBytes = 40;
+// Transient prefix-seek key encoding for the Cedar Parquet seek path.
+//
+// A bounded family/partition scan has to seek to a user-key prefix such as
+// [version][part][family] without materializing a canonical 32-byte fact key.
+// A raw short user key is ambiguous with a complete internal key, so prefix
+// seeks carry a dedicated marker in a fixed 32-byte user key shaped as
+//   [0x04][prefix length][prefix bytes][zero padding].
+// DBIter appends the usual 8-byte internal-key trailer when a caller seeks a
+// user key, which the seek path tolerates. These keys are transient: they never
+// enter a WriteBatch or a table, so the persisted format is unchanged.
+inline constexpr uint8_t kCedarParquetPrefixSeek = 0x04;
+// Prefix seeks only address the version/partition/family header of a fact key.
+// Keep the encoded prefix short enough to leave room for the fixed padding.
+inline constexpr size_t kCedarParquetMaximumPrefixSeekBytes = 12;
 // Scan workers decode whole projected row groups before the caller merges
 // their results. Keep this bound small so a malformed or untrusted scan spec
 // cannot turn a read into unbounded thread or retained-batch allocation.
@@ -208,6 +223,17 @@ Status DecodeCedarParquetMaterializedFact(
 
 Status EncodeCedarParquetSortKey(const Slice& internal_key,
                                  std::string* sort_key);
+// Prefix-seek key codec. See kCedarParquetPrefixSeek for the transient wire
+// shape. Returns a kCedarParquetV2UserKeyBytes-byte key, or an empty string
+// when the prefix is empty or longer than
+// kCedarParquetMaximumPrefixSeekBytes.
+bool IsCedarParquetPrefixSeekKey(const Slice& internal_key);
+std::string EncodeCedarParquetPrefixSeekKey(std::string_view prefix);
+// Recognizes a prefix-seek key in `internal_key`, which may or may not carry a
+// trailing 8-byte internal-key trailer. Returns NotFound when the marker is
+// absent and Corruption when the encoding is malformed.
+Status DecodeCedarParquetPrefixSeekKey(const Slice& internal_key,
+                                       std::string_view* prefix);
 Status DecodeCedarParquetSortKey(const Slice& sort_key,
                                  std::string* internal_key);
 // Allocation-free variant for readers that need a borrowed 40-byte internal key

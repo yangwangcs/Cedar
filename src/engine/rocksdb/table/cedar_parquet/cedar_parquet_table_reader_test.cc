@@ -1,6 +1,7 @@
 // Copyright 2026 The Cedar Authors
 // Licensed under the Apache License, Version 2.0.
 
+#include <algorithm>
 #include <string>
 #include <fstream>
 #include <limits>
@@ -23,6 +24,7 @@
 #include "table/cedar_parquet/parquet_plain_page.h"
 #include "table/multiget_context.h"
 #include "util/crc32c.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 namespace {
@@ -175,6 +177,60 @@ std::unique_ptr<CedarParquetTableReader> OpenExisting(
       comparator, std::move(file), file_size, options, &reader);
   EXPECT_TRUE(status.ok()) << status.ToString();
   return reader;
+}
+
+void PutBigEndian32(std::string* destination, size_t offset, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    (*destination)[offset++] = static_cast<char>(value >> shift);
+  }
+}
+
+// State-family fact key: [version=2][part][family][property=0][entity]
+// [~valid_from][~commit_seq]. Entity ids in tests are unique, so bytewise user
+// key order matches creation order after sorting.
+std::string V2FactInternalKey(uint32_t part, uint8_t family, uint64_t entity,
+                              uint64_t valid_from, uint64_t cedar_commit_seq,
+                              SequenceNumber sequence) {
+  std::string user_key(32, '\0');
+  user_key[0] = 2;
+  PutBigEndian32(&user_key, 1, part);
+  user_key[5] = static_cast<char>(family);
+  StoreBigEndian64(&user_key, 8, entity);
+  StoreBigEndian64(&user_key, 16, ~valid_from);
+  StoreBigEndian64(&user_key, 24, ~cedar_commit_seq);
+  std::string internal_key;
+  AppendInternalKey(&internal_key,
+                    ParsedInternalKey(user_key, sequence, kTypeValue));
+  return internal_key;
+}
+
+// Builds the internal key the database layer hands to the table iterator for a
+// user-key seek: the encoded prefix-seek user key plus the usual 8-byte
+// internal-key trailer.
+std::string PrefixSeekInternalKey(std::string_view prefix,
+                                  SequenceNumber sequence = kMaxSequenceNumber) {
+  const std::string encoded = EncodeCedarParquetPrefixSeekKey(prefix);
+  EXPECT_EQ(encoded.size(), kCedarParquetV2UserKeyBytes);
+  std::string internal_key;
+  AppendInternalKey(&internal_key,
+                    ParsedInternalKey(Slice(encoded), sequence,
+                                      kValueTypeForSeek));
+  return internal_key;
+}
+
+// Position a prefix seek must reach: the first key whose user key is at or
+// after the zero-padded minimal user key of the prefix range. Returns
+// keys.size() when every key sorts before the prefix.
+size_t ExpectedPrefixSeekIndex(const std::vector<std::string>& keys,
+                               std::string_view prefix) {
+  std::string minimal(prefix);
+  minimal.resize(kCedarParquetV2UserKeyBytes, '\0');
+  for (size_t index = 0; index < keys.size(); ++index) {
+    if (keys[index].compare(0, kCedarParquetV2UserKeyBytes, minimal) >= 0) {
+      return index;
+    }
+  }
+  return keys.size();
 }
 
 TEST(CedarParquetTableReaderTest, IteratesAndSeeksAcrossBoundedRowGroups) {
@@ -2037,6 +2093,207 @@ TEST(CedarParquetTableReaderTest, ReverseIterationReturnsMatchingValues) {
     iterator->Prev();
   }
   EXPECT_FALSE(iterator->Valid());
+}
+
+TEST(CedarParquetTableReaderTest, PrefixSeekStartsAtEachPrefixRange) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys;
+  SequenceNumber sequence = 1;
+  for (uint32_t part : {0U, 2U, 7U}) {
+    for (uint8_t family : {1U, 4U}) {
+      for (uint64_t entity : {1ULL, 3ULL, 5ULL}) {
+        keys.push_back(V2FactInternalKey(part, family, entity,
+                                         /*valid_from=*/0,
+                                         /*cedar_commit_seq=*/1, sequence++));
+      }
+    }
+  }
+  std::sort(keys.begin(), keys.end());
+  const std::vector<std::string> values(keys.size(), StateFactValue());
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+
+  // Prefix lengths one through twelve cover the version byte, the partition,
+  // the family, the property word, and the high entity bytes.
+  for (size_t length = 1; length <= kCedarParquetMaximumPrefixSeekBytes;
+       ++length) {
+    std::vector<std::string> prefixes;
+    for (const std::string& key : keys) {
+      std::string prefix = key.substr(0, length);
+      if (std::find(prefixes.begin(), prefixes.end(), prefix) ==
+          prefixes.end()) {
+        prefixes.push_back(std::move(prefix));
+      }
+    }
+    ASSERT_FALSE(prefixes.empty()) << "length " << length;
+    for (const std::string& prefix : prefixes) {
+      const size_t expected = ExpectedPrefixSeekIndex(keys, prefix);
+      ASSERT_LT(expected, keys.size()) << "length " << length;
+      iterator->Seek(PrefixSeekInternalKey(prefix));
+      ASSERT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+      ASSERT_TRUE(iterator->Valid()) << "length " << length;
+      EXPECT_EQ(iterator->key().ToString(), keys[expected])
+          << "length " << length;
+      EXPECT_EQ(iterator->value().ToString(), values[expected]);
+    }
+  }
+}
+
+TEST(CedarParquetTableReaderTest, PrefixSeekWithoutMatchesPositionsAtNextRange) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys;
+  SequenceNumber sequence = 1;
+  for (uint32_t part : {0U, 2U}) {
+    for (uint64_t entity : {1ULL, 2ULL}) {
+      keys.push_back(V2FactInternalKey(part, /*family=*/1, entity,
+                                       /*valid_from=*/0,
+                                       /*cedar_commit_seq=*/1, sequence++));
+    }
+  }
+  std::sort(keys.begin(), keys.end());
+  const std::vector<std::string> values(keys.size(), StateFactValue());
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+
+  // Partition 1 holds no rows, so the seek has to land on partition 2's first
+  // key rather than at the end of the table.
+  std::string missing(5, '\0');
+  missing[0] = 2;
+  PutBigEndian32(&missing, 1, 1);
+  const size_t expected = ExpectedPrefixSeekIndex(keys, missing);
+  ASSERT_LT(expected, keys.size());
+  EXPECT_EQ(static_cast<uint8_t>(keys[expected][1]), 0);
+  EXPECT_EQ(static_cast<uint8_t>(keys[expected][4]), 2);
+  iterator->Seek(PrefixSeekInternalKey(missing));
+  ASSERT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+  ASSERT_TRUE(iterator->Valid());
+  EXPECT_EQ(iterator->key().ToString(), keys[expected]);
+
+  // A prefix past the last partition has no match and leaves a healthy,
+  // invalid iterator at the end of the table.
+  std::string beyond(5, '\0');
+  beyond[0] = 2;
+  PutBigEndian32(&beyond, 1, 9);
+  EXPECT_EQ(ExpectedPrefixSeekIndex(keys, beyond), keys.size());
+  iterator->Seek(PrefixSeekInternalKey(beyond));
+  EXPECT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+  EXPECT_FALSE(iterator->Valid());
+}
+
+TEST(CedarParquetTableReaderTest, PrefixSeekRejectsMalformedEncoding) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  const std::vector<std::string> keys = {V2FactInternalKey(
+      0, 1, 1, 0, 1, 1)};
+  const std::vector<std::string> values(keys.size(), StateFactValue());
+  std::unique_ptr<CedarParquetTableReader> reader = BuildAndOpen(
+      keys, values, immutable_options, mutable_options, comparator);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+
+  std::string encoded = EncodeCedarParquetPrefixSeekKey("ab");
+  ASSERT_EQ(encoded.size(), kCedarParquetV2UserKeyBytes);
+  encoded[1] = '\0';  // Prefix seek marker with a zero-length prefix.
+  std::string target;
+  AppendInternalKey(&target,
+                    ParsedInternalKey(Slice(encoded), kMaxSequenceNumber,
+                                      kValueTypeForSeek));
+  iterator->Seek(target);
+  EXPECT_TRUE(iterator->status().IsCorruption())
+      << iterator->status().ToString();
+  EXPECT_FALSE(iterator->Valid());
+}
+
+TEST(CedarParquetTableReaderTest,
+     PrefixSeekMatchesFullScanOnRandomizedFacts) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  constexpr size_t kFactCount = 10000;
+  constexpr size_t kQueryCount = 128;
+  Random random(0x5eed5eed);
+  std::vector<std::string> keys;
+  keys.reserve(kFactCount);
+  for (size_t index = 0; index < kFactCount; ++index) {
+    // Even partitions only, so odd-partition prefixes have no match and land
+    // on the following range.
+    const uint32_t part = 2U * static_cast<uint32_t>(random.Uniform(3));
+    const uint8_t family = random.OneIn(2) ? 1 : 4;
+    const uint64_t valid_from = random.Next() % 4096;
+    const uint64_t commit_seq = 1 + random.Next() % 1000000;
+    keys.push_back(V2FactInternalKey(part, family, /*entity=*/index + 1,
+                                     valid_from, commit_seq,
+                                     static_cast<SequenceNumber>(index + 1)));
+  }
+  std::sort(keys.begin(), keys.end());
+  const std::vector<std::string> values(kFactCount, StateFactValue());
+  std::unique_ptr<CedarParquetTableReader> reader =
+      BuildAndOpen(keys, values, immutable_options, mutable_options, comparator,
+                   /*row_group_max_rows=*/512, /*page_max_rows=*/128,
+                   /*row_group_max_bytes=*/64ULL * 1024ULL * 1024ULL);
+  ASSERT_NE(reader, nullptr);
+  std::unique_ptr<InternalIterator> iterator(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+
+  // The reference is a complete table scan.
+  size_t scanned = 0;
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    ASSERT_LT(scanned, keys.size());
+    ASSERT_EQ(iterator->key().ToString(), keys[scanned]) << "scan " << scanned;
+    ++scanned;
+  }
+  ASSERT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+  ASSERT_EQ(scanned, keys.size());
+
+  for (size_t query = 0; query < kQueryCount; ++query) {
+    const std::string& source = keys[random.Uniform(kFactCount)];
+    const size_t length =
+        1 + random.Uniform(kCedarParquetMaximumPrefixSeekBytes);
+    std::string prefix = source.substr(0, length);
+    if (query % 4 == 3) {
+      // Exercise positions that are not the start of an existing prefix:
+      // odd partitions have no rows, and 0xff is past the last partition.
+      const uint32_t part =
+          query % 8 == 7 ? 0xffU : 1U + 2U * static_cast<uint32_t>(random.Uniform(2));
+      prefix.assign(5, '\0');
+      prefix[0] = 2;
+      PutBigEndian32(&prefix, 1, part);
+      if (random.OneIn(2)) prefix.push_back(static_cast<char>(1));
+    }
+    const size_t expected = ExpectedPrefixSeekIndex(keys, prefix);
+    iterator->Seek(PrefixSeekInternalKey(prefix));
+    ASSERT_TRUE(iterator->status().ok()) << iterator->status().ToString();
+    if (expected == keys.size()) {
+      EXPECT_FALSE(iterator->Valid()) << "query " << query;
+      continue;
+    }
+    ASSERT_TRUE(iterator->Valid()) << "query " << query;
+    EXPECT_EQ(iterator->key().ToString(), keys[expected]) << "query " << query;
+    // Continuing the bounded scan yields the same rows as the full scan.
+    for (size_t offset = 1; offset <= 4 && expected + offset < keys.size();
+         ++offset) {
+      iterator->Next();
+      ASSERT_TRUE(iterator->Valid())
+          << "query " << query << " offset " << offset;
+      EXPECT_EQ(iterator->key().ToString(), keys[expected + offset]);
+    }
+  }
 }
 
 }  // namespace

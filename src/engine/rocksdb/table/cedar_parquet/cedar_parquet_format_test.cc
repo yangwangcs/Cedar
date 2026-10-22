@@ -258,5 +258,76 @@ TEST(CedarParquetFormatTest, RejectsUnsupportedPageCompressionCodec) {
   EXPECT_TRUE(options.Validate().IsInvalidArgument());
 }
 
+TEST(CedarParquetFormatTest, PrefixSeekKeyEncodesMarkerLengthAndPadding) {
+  for (size_t length = 1; length <= kCedarParquetMaximumPrefixSeekBytes;
+       ++length) {
+    std::string prefix(length, '\0');
+    for (size_t index = 0; index < length; ++index) {
+      prefix[index] = static_cast<char>(0x30 + index);
+    }
+    const std::string encoded = EncodeCedarParquetPrefixSeekKey(prefix);
+    ASSERT_EQ(encoded.size(), kCedarParquetV2UserKeyBytes) << "length " << length;
+    EXPECT_EQ(static_cast<uint8_t>(encoded[0]), kCedarParquetPrefixSeek);
+    EXPECT_EQ(static_cast<size_t>(static_cast<uint8_t>(encoded[1])), length);
+    EXPECT_EQ(encoded.substr(2, length), prefix);
+    EXPECT_EQ(encoded.substr(2 + length),
+              std::string(kCedarParquetV2UserKeyBytes - 2 - length, '\0'));
+    EXPECT_TRUE(IsCedarParquetPrefixSeekKey(Slice(encoded)));
+
+    std::string_view decoded;
+    ASSERT_TRUE(DecodeCedarParquetPrefixSeekKey(Slice(encoded), &decoded).ok());
+    EXPECT_EQ(std::string(decoded), prefix);
+
+    // The seek path also sees the key as an internal key: DBIter appends the
+    // usual 8-byte internal-key trailer before handing it to the table.
+    std::string internal_key;
+    AppendInternalKey(&internal_key,
+                      ParsedInternalKey(Slice(encoded), kMaxSequenceNumber,
+                                        kValueTypeForSeek));
+    ASSERT_TRUE(
+        DecodeCedarParquetPrefixSeekKey(Slice(internal_key), &decoded).ok());
+    EXPECT_EQ(std::string(decoded), prefix);
+    // Prefix seek keys are transient and must never become a persisted row.
+    std::string sort_key;
+    EXPECT_TRUE(EncodeCedarParquetSortKey(internal_key, &sort_key).IsCorruption());
+  }
+}
+
+TEST(CedarParquetFormatTest, RejectsMalformedPrefixSeekKeys) {
+  EXPECT_TRUE(EncodeCedarParquetPrefixSeekKey("").empty());
+  EXPECT_TRUE(
+      EncodeCedarParquetPrefixSeekKey(
+          std::string(kCedarParquetMaximumPrefixSeekBytes + 1, 'p'))
+          .empty());
+  EXPECT_FALSE(IsCedarParquetPrefixSeekKey(Slice()));
+  EXPECT_FALSE(IsCedarParquetPrefixSeekKey(Slice("x")));
+  std::string_view decoded;
+  EXPECT_TRUE(
+      DecodeCedarParquetPrefixSeekKey(Slice("x"), &decoded).IsNotFound());
+
+  const std::string encoded = EncodeCedarParquetPrefixSeekKey("abcdef");
+  ASSERT_EQ(encoded.size(), kCedarParquetV2UserKeyBytes);
+
+  const std::string truncated = encoded.substr(0, kCedarParquetV2UserKeyBytes - 1);
+  EXPECT_TRUE(
+      DecodeCedarParquetPrefixSeekKey(Slice(truncated), &decoded).IsCorruption());
+
+  std::string zero_length = encoded;
+  zero_length[1] = '\0';
+  EXPECT_TRUE(
+      DecodeCedarParquetPrefixSeekKey(Slice(zero_length), &decoded).IsCorruption());
+
+  std::string long_length = encoded;
+  long_length[1] =
+      static_cast<char>(kCedarParquetMaximumPrefixSeekBytes + 1);
+  EXPECT_TRUE(
+      DecodeCedarParquetPrefixSeekKey(Slice(long_length), &decoded).IsCorruption());
+
+  std::string nonzero_padding = encoded;
+  nonzero_padding.back() = 'x';
+  EXPECT_TRUE(DecodeCedarParquetPrefixSeekKey(Slice(nonzero_padding), &decoded)
+                  .IsCorruption());
+}
+
 }  // namespace
 }  // namespace ROCKSDB_NAMESPACE::cedar_parquet

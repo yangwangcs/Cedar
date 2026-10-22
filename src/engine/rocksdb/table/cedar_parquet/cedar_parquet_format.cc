@@ -90,6 +90,46 @@ Status CedarParquetTableOptions::Validate() const {
   return Status::OK();
 }
 
+bool IsCedarParquetPrefixSeekKey(const Slice& internal_key) {
+  return !internal_key.empty() &&
+         static_cast<uint8_t>(internal_key[0]) == kCedarParquetPrefixSeek;
+}
+
+std::string EncodeCedarParquetPrefixSeekKey(std::string_view prefix) {
+  if (prefix.empty() || prefix.size() > kCedarParquetMaximumPrefixSeekBytes) {
+    return {};
+  }
+  std::string encoded(kCedarParquetV2UserKeyBytes, '\0');
+  encoded[0] = static_cast<char>(kCedarParquetPrefixSeek);
+  encoded[1] = static_cast<char>(prefix.size());
+  std::memcpy(encoded.data() + 2, prefix.data(), prefix.size());
+  return encoded;
+}
+
+Status DecodeCedarParquetPrefixSeekKey(const Slice& internal_key,
+                                       std::string_view* prefix) {
+  if (prefix == nullptr) {
+    return Status::InvalidArgument("Cedar Parquet prefix-seek output is null");
+  }
+  if (!IsCedarParquetPrefixSeekKey(internal_key)) {
+    return Status::NotFound("Cedar Parquet prefix-seek marker is absent");
+  }
+  if (internal_key.size() < kCedarParquetV2UserKeyBytes) {
+    return Status::Corruption("truncated Cedar Parquet prefix-seek key");
+  }
+  const size_t length = static_cast<uint8_t>(internal_key[1]);
+  if (length == 0 || length > kCedarParquetMaximumPrefixSeekBytes) {
+    return Status::Corruption("invalid Cedar Parquet prefix-seek length");
+  }
+  for (size_t index = 2 + length; index < kCedarParquetV2UserKeyBytes; ++index) {
+    if (internal_key[index] != '\0') {
+      return Status::Corruption("invalid Cedar Parquet prefix-seek padding");
+    }
+  }
+  *prefix = std::string_view(internal_key.data() + 2, length);
+  return Status::OK();
+}
+
 Status EncodeCedarParquetSortKey(const Slice& internal_key,
                                  std::string* sort_key) {
   ParsedInternalKey parsed;

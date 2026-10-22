@@ -107,6 +107,22 @@ Status ReadExact(const RandomAccessFileReader* file, uint64_t offset, size_t siz
 
 Status MakeCedarParquetSeekKey(const Slice& key, std::string* sort_key,
                                bool* is_prefix) {
+  if (IsCedarParquetPrefixSeekKey(key)) {
+    // Explicit user-key prefix seek. Bounded family/partition scans use this
+    // instead of synthesizing a short internal key, which the sort-key codec
+    // cannot distinguish from a complete fact key. DBIter may already have
+    // appended the 8-byte internal-key trailer; the decoder ignores it.
+    std::string_view prefix;
+    Status status = DecodeCedarParquetPrefixSeekKey(key, &prefix);
+    if (!status.ok()) return status;
+    // Position at the first row of the prefix range: the prefix is the
+    // smallest 32-byte user key with that prefix once zero-padded, and the
+    // smallest inverted sequence/type trailer is all zero bytes.
+    sort_key->assign(kCedarParquetV2SortKeyBytes, '\0');
+    std::memcpy(sort_key->data(), prefix.data(), prefix.size());
+    *is_prefix = true;
+    return Status::OK();
+  }
   if (key.size() > 8 && key.size() < kCedarParquetV2UserKeyBytes &&
       static_cast<uint8_t>(key[0]) == 2) {
     sort_key->assign(key.data(), key.size() - 8);

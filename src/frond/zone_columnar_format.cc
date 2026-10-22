@@ -16,8 +16,10 @@
 
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <tuple>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -130,52 +132,76 @@ class SimpleSSTBlobManager {
     return Status::OK();
   }
 
-  std::optional<Descriptor::BlobRef> WriteBlob(const Slice& data) {
-    if (!writer_) return std::nullopt;
-    if (data.size() <= 6) return std::nullopt;  // 小值内联
+  // Task 3.6：写 Blob entry。失败返回错误（不再静默返回 nullopt）。
+  // 约束：4B < size <= 60MB（Descriptor::BlobRef.size_kb 是 uint16）。
+  Status WriteBlob(const Slice& data, Descriptor::BlobRef* out_ref) {
+    if (!writer_) {
+      return Status::IOError("SimpleSSTBlobManager", "not opened for write");
+    }
+    if (out_ref == nullptr) {
+      return Status::InvalidArgument("SimpleSSTBlobManager", "null out_ref");
+    }
+    if (data.size() <= 4) {
+      return Status::InvalidArgument("SimpleSSTBlobManager",
+                                     "value <= 4B should be inlined");
+    }
+    constexpr size_t kMaxBlobBytes = 60ull * 1024 * 1024;
+    if (data.size() > kMaxBlobBytes) {
+      return Status::InvalidArgument(
+          "SimpleSSTBlobManager",
+          "value exceeds 60MB Blob limit (size_kb is uint16)");
+    }
 
     uint32_t offset = 0;
     Status s = writer_->Append(data, &offset);
-    if (!s.ok()) return std::nullopt;
-
-    uint32_t aligned_size = ((4 + data.size() + 4095) / 4096) * 4096;
-    uint16_t size_kb = static_cast<uint16_t>(aligned_size / 1024);
-    uint8_t checksum = ComputeChecksum(data);
-
-    return Descriptor::BlobRef{offset, size_kb, checksum};
-  }
-
-  Status ReadBlob(uint32_t offset, uint16_t size_kb, std::string* out_data) {
-    if (!reader_) return Status::IOError("SimpleSSTBlobManager", "not opened for read");
-
-    uint32_t read_size = size_kb * 1024;
-    std::vector<char> buffer(read_size);
-
-    Status s = reader_->Read(offset, read_size, buffer.data());
     if (!s.ok()) return s;
 
-    uint32_t actual_size = *reinterpret_cast<uint32_t*>(buffer.data());
-    out_data->assign(buffer.data() + 4, actual_size);
+    const uint32_t aligned_size =
+        static_cast<uint32_t>(((4 + data.size() + 4095) / 4096) * 4096);
+    const uint32_t kb = aligned_size / 1024;
+    if (kb == 0 || kb > 0xFFFFu) {
+      return Status::InvalidArgument("SimpleSSTBlobManager",
+                                     "aligned size does not fit uint16 size_kb");
+    }
+    out_ref->offset = offset;
+    out_ref->size_kb = static_cast<uint16_t>(kb);
+    out_ref->checksum = ComputeBlobChecksum(data);
     return Status::OK();
   }
 
-  Status ReadBlobs(const std::vector<std::pair<uint32_t, uint16_t>>& offsets_sizes,
+  Status Sync() {
+    if (!writer_) return Status::OK();
+    return writer_->Sync();
+  }
+
+  uint64_t FileSize() const { return writer_ ? writer_->FileSize() : 0; }
+  uint32_t EntryCount() const { return writer_ ? writer_->EntryCount() : 0; }
+
+  // Task 3.6：读取 Blob entry 并校验长度/对齐/checksum（修正审计 10.2 的二次剥离）。
+  Status ReadBlob(uint32_t offset, uint16_t size_kb, uint8_t checksum,
+                  std::string* out_data) {
+    if (!reader_) return Status::IOError("SimpleSSTBlobManager", "not opened for read");
+    return reader_->ReadEntry(offset, size_kb, checksum, out_data);
+  }
+
+  Status ReadBlobs(const std::vector<std::tuple<uint32_t, uint16_t, uint8_t>>& refs,
                    std::vector<std::string>* out_datas) {
     if (!reader_) return Status::IOError("SimpleSSTBlobManager", "not opened for read");
 
     std::vector<uint32_t> offsets;
-    offsets.reserve(offsets_sizes.size());
-    for (const auto& [offset, _] : offsets_sizes) {
+    offsets.reserve(refs.size());
+    for (const auto& [offset, size_kb, checksum] : refs) {
+      (void)size_kb;
+      (void)checksum;
       offsets.push_back(offset);
     }
     reader_->Prefetch(offsets);
 
     out_datas->clear();
-    out_datas->reserve(offsets_sizes.size());
-
-    for (const auto& [offset, size_kb] : offsets_sizes) {
+    out_datas->reserve(refs.size());
+    for (const auto& [offset, size_kb, checksum] : refs) {
       std::string data;
-      Status s = ReadBlob(offset, size_kb, &data);
+      Status s = ReadBlob(offset, size_kb, checksum, &data);
       if (!s.ok()) return s;
       out_datas->push_back(std::move(data));
     }
@@ -187,15 +213,6 @@ class SimpleSSTBlobManager {
   }
 
  private:
-  static uint8_t ComputeChecksum(const Slice& data) {
-    uint8_t checksum = 0;
-    for (size_t i = 0; i < data.size(); ++i) {
-      checksum ^= static_cast<uint8_t>(data[i]);
-      checksum = (checksum << 1) | (checksum >> 7);
-    }
-    return checksum;
-  }
-
   std::string db_path_;
   uint32_t sst_id_;
   std::unique_ptr<BlobFileWriter> writer_;
@@ -684,6 +701,28 @@ ZoneColumnarSstBuilder::~ZoneColumnarSstBuilder() {
   if (!closed_) {
     Abandon();
   }
+  if (!finished_ok_) {
+    // Task 3.6：SST 未成功提交 → 本次写出的 Blob 是孤儿，删除它。
+    DiscardBlob();
+  }
+}
+
+// Task 3.6：删除本次构建产生的 Blob 文件（SST 失败时避免悬空/孤儿 blob）。
+void ZoneColumnarSstBuilder::DiscardBlob() {
+  if (!blob_written_) return;
+  if (blob_manager_) {
+    blob_manager_->Close();
+    blob_manager_.reset();
+  }
+  if (!db_path_.empty() && file_number_ > 0) {
+    std::error_code ec;
+    std::filesystem::remove(db_path_ + "/sst_" + std::to_string(file_number_) +
+                                ".blob",
+                            ec);
+  }
+  blob_written_ = false;
+  blob_file_number_ = 0;
+  blob_file_size_ = 0;
 }
 
 void ZoneColumnarSstBuilder::Add(const CedarKey& key, const Descriptor& descriptor) {
@@ -732,57 +771,61 @@ void ZoneColumnarSstBuilder::Add(const CedarKey& key, const Descriptor& descript
   }
 }
 
-void ZoneColumnarSstBuilder::AddValue(const CedarKey& key, const Slice& raw_value) {
-  if (closed_) return;
-
-  Descriptor desc;
-
-  if (raw_value.size() <= 6) {
-    // 小值内联存储
-    // 使用 InlineShortStr 或内联整数
-    auto opt_desc = Descriptor::InlineShortStr(column_id_, raw_value);
-    if (opt_desc.has_value()) {
-      desc = *opt_desc;
-    } else {
-      desc = Descriptor();  // Fallback to empty/tombstone
-    }
-  } else if (enable_blob_ && !db_path_.empty() && file_number_ > 0) {
-    // 大值存储到 Blob 文件
-    if (!blob_manager_) {
-      blob_manager_ = std::make_unique<SimpleSSTBlobManager>(db_path_, file_number_);
-      Status s = blob_manager_->OpenForWrite();
-      if (!s.ok()) {
-        // Blob 初始化失败，回退到内联空值
-        desc = Descriptor();
-        Add(key, desc);
-        return;
-      }
-    }
-
-    // 写入 Blob
-    auto ref = blob_manager_->WriteBlob(raw_value);
-    if (ref.has_value()) {
-      // 创建 Blob 引用 Descriptor
-      desc = Descriptor::MakeBlobRef(ref->offset, ref->size_kb, ref->checksum);
-    } else {
-      // Blob 写入失败，回退到内联空值
-      desc = Descriptor();
-    }
-  } else {
-    // Blob 不可用，尝试内联（如果值 <= 4B）否则空值
-    if (raw_value.size() <= 4) {
-      auto opt_desc = Descriptor::InlineShortStr(column_id_, raw_value);
-      if (opt_desc.has_value()) {
-        desc = *opt_desc;
-      } else {
-        desc = Descriptor();
-      }
-    } else {
-      desc = Descriptor();  // 空值标记
-    }
+Status ZoneColumnarSstBuilder::AddValue(const CedarKey& key,
+                                        const Slice& raw_value) {
+  if (closed_) {
+    return Status::IOError("ZoneColumnarSstBuilder::AddValue", "builder closed");
   }
 
-  Add(key, desc);
+  // Task 3.6（设计 §10.2）：<=4B 内联；4B < len <= 60MB 走 Blob；>60MB 拒绝。
+  // 任何失败都返回错误，绝不写 Tombstone 静默降级（审计 3.8/10.2）。
+  constexpr size_t kInlineMaxBytes = 4;
+  constexpr size_t kMaxBlobBytes = 60ull * 1024 * 1024;
+
+  if (raw_value.size() <= kInlineMaxBytes) {
+    auto inline_desc = Descriptor::InlineShortStr(column_id_, raw_value);
+    if (!inline_desc.has_value()) {
+      return Status::Corruption("ZoneColumnarSstBuilder::AddValue",
+                                "inline encode failed for <=4B value");
+    }
+    Add(key, *inline_desc);
+    return Status::OK();
+  }
+
+  if (raw_value.size() > kMaxBlobBytes) {
+    return Status::InvalidArgument(
+        "ZoneColumnarSstBuilder::AddValue",
+        "value exceeds 60MB Blob limit (Descriptor::BlobRef.size_kb is uint16)");
+  }
+  if (!enable_blob_ || db_path_.empty()) {
+    return Status::InvalidArgument(
+        "ZoneColumnarSstBuilder::AddValue",
+        "blob storage disabled (builder needs db_path for >4B values)");
+  }
+  if (file_number_ == 0) {
+    return Status::InvalidArgument(
+        "ZoneColumnarSstBuilder::AddValue",
+        "SetFileNumber() must be called before writing Blob values");
+  }
+
+  if (!blob_manager_) {
+    blob_manager_ = std::make_unique<SimpleSSTBlobManager>(db_path_, file_number_);
+    Status s = blob_manager_->OpenForWrite();
+    if (!s.ok()) {
+      blob_manager_.reset();
+      return s;
+    }
+    blob_file_number_ = file_number_;
+  }
+
+  Descriptor::BlobRef ref{};
+  Status s = blob_manager_->WriteBlob(raw_value, &ref);
+  if (!s.ok()) {
+    return s;
+  }
+  blob_written_ = true;
+  Add(key, Descriptor::MakeBlobRef(ref.offset, ref.size_kb, ref.checksum));
+  return Status::OK();
 }
 
 Status ZoneColumnarSstBuilder::FlushBlock() {
@@ -969,15 +1012,24 @@ Status ZoneColumnarSstBuilder::Finish() {
   if (!s.ok()) return s;
   file_size_ += header_buf.size();
 
+  // Task 3.6（设计 §10.2 写入顺序）：Blob 先 Sync，SST 才是提交点。
+  // 任何一步失败都不产生"已提交但引用丢失"的状态；析构/Abandon 会清理 Blob。
+  if (blob_manager_) {
+    s = blob_manager_->Sync();
+    if (!s.ok()) return s;
+  }
+
   s = file_->Sync();
   if (!s.ok()) return s;
 
-  // 同步 Blob 文件（如果启用了 Blob 存储）
+  // Blob 记录最终大小（写入 ZoneSstMeta.blob_file_size），然后关闭句柄。
   if (blob_manager_) {
+    blob_file_size_ = blob_manager_->FileSize();
     s = blob_manager_->Close();
     if (!s.ok()) return s;
   }
 
+  finished_ok_ = true;
   return Status::OK();
 }
 
@@ -1101,14 +1153,42 @@ Status ZoneColumnarSstBuilder::WriteFooter() {
 void ZoneColumnarSstBuilder::Abandon() {
   closed_ = true;
   status_ = Status::IOError("ZoneColumnarSstBuilder: abandoned");
+  DiscardBlob();
 }
 
 // =============================================================================
 // ZoneColumnarSstReader 实现
 // =============================================================================
 
+// Task 3.6：从 SST 路径推导 db 目录（Blob 与 SST 同目录：sst_<n>.blob）。
+std::string ZoneColumnarSstReader::DeriveDbPath(const std::string& sst_path) {
+  const size_t slash = sst_path.find_last_of('/');
+  if (slash == std::string::npos) return std::string();  // 相对文件名：无目录
+  if (slash == 0) return "/";
+  return sst_path.substr(0, slash);
+}
+
+uint64_t ZoneColumnarSstReader::ParseFileNumberFromPath(
+    const std::string& sst_path) {
+  const size_t slash = sst_path.find_last_of('/');
+  const std::string base =
+      slash == std::string::npos ? sst_path : sst_path.substr(slash + 1);
+  const size_t dot = base.find('.');
+  const std::string digits = base.substr(0, dot);
+  if (digits.empty()) return 0;
+  uint64_t value = 0;
+  for (char c : digits) {
+    if (c < '0' || c > '9') return 0;
+    value = value * 10 + static_cast<uint64_t>(c - '0');
+  }
+  return value;
+}
+
 ZoneColumnarSstReader::ZoneColumnarSstReader(const std::string& file_path)
     : file_path_(file_path),
+      // Task 3.6：默认从 SST 路径推导 db 目录，不再依赖调用方 SetDbPath。
+      db_path_(DeriveDbPath(file_path)),
+      blob_file_number_(ParseFileNumberFromPath(file_path)),
       owns_buffer_(true) {
 }
 
@@ -1195,6 +1275,11 @@ Status ZoneColumnarSstReader::Open() {
     has_entity_index_ = false;
     entity_index_slice_ = Slice();
     entity_index_count_ = 0;
+  }
+
+  // Task 3.6：Blob 文件名中的 sst 号：优先路径（<n>.frond），footer 兜底。
+  if (blob_file_number_ == 0) {
+    blob_file_number_ = footer_.file_number;
   }
 
   opened_ = true;
@@ -1446,96 +1531,122 @@ void ZoneColumnarSstReader::Close() {
 // Blob 读取支持
 // =============================================================================
 
+// Task 3.6：确保 Blob 读管理器可用；db_path 缺失/打开失败返回错误。
+Status ZoneColumnarSstReader::EnsureBlobManagerForRead() const {
+  if (blob_manager_) return Status::OK();
+  if (db_path_.empty()) {
+    return Status::InvalidArgument(
+        "ZoneColumnarSstReader",
+        "cannot locate blob: db_path is empty (construct reader from a file path "
+        "or call SetDbPath)");
+  }
+  const uint64_t sst_id = BlobFileNumberForRead();
+  if (sst_id == 0) {
+    return Status::InvalidArgument("ZoneColumnarSstReader",
+                                   "cannot determine blob file number");
+  }
+  blob_manager_ = std::make_unique<SimpleSSTBlobManager>(
+      db_path_, static_cast<uint32_t>(sst_id));
+  return blob_manager_->OpenForRead();
+}
+
+uint64_t ZoneColumnarSstReader::BlobFileNumberForRead() const {
+  return blob_file_number_ != 0 ? blob_file_number_ : footer_.file_number;
+}
+
+Status ZoneColumnarSstReader::ReadBlobValue(const Descriptor& desc,
+                                            std::string* out_value) const {
+  if (out_value == nullptr) {
+    return Status::InvalidArgument("ZoneColumnarSstReader::ReadBlobValue",
+                                   "null output");
+  }
+  if (!desc.IsBlobRef()) {
+    return Status::InvalidArgument("ZoneColumnarSstReader::ReadBlobValue",
+                                   "descriptor is not a BlobRef");
+  }
+  const auto ref = desc.GetBlobRef();
+  Status s = EnsureBlobManagerForRead();
+  if (!s.ok()) return s;
+  return blob_manager_->ReadBlob(ref.offset, ref.size_kb, ref.checksum, out_value);
+}
+
 Status ZoneColumnarSstReader::GetValue(size_t row_idx, std::string* out_value) const {
   if (!opened_) return Status::IOError("ZoneColumnarSstReader::GetValue", "not opened");
   if (!value_decoder_) return Status::IOError("ZoneColumnarSstReader::GetValue", "no value decoder");
   if (row_idx >= header_.row_count) return Status::InvalidArgument("ZoneColumnarSstReader::GetValue", "invalid row_idx");
+  if (out_value == nullptr) return Status::InvalidArgument("ZoneColumnarSstReader::GetValue", "null output");
 
   Descriptor desc = value_decoder_->Get(row_idx);
 
   if (desc.IsInline()) {
-    // 内联值：直接返回
-    std::string val = desc.AsInlineShortStr();
-    *out_value = std::move(val);
+    *out_value = desc.AsInlineShortStr();
     return Status::OK();
-  } else if (desc.IsBlobRef()) {
-    // Blob 引用：从 Blob 文件读取
-    auto ref = desc.GetBlobRef();
-
-    // 延迟初始化 BlobFileManager
-    if (!blob_manager_ && !db_path_.empty()) {
-      uint32_t sst_id = static_cast<uint32_t>(footer_.file_number);
-      blob_manager_ = std::make_unique<SimpleSSTBlobManager>(db_path_, sst_id);
-      Status s = blob_manager_->OpenForRead();
-      if (!s.ok()) return s;
-    }
-
-    if (!blob_manager_) {
-      return Status::IOError("ZoneColumnarSstReader::GetValue", "blob not available");
-    }
-
-    return blob_manager_->ReadBlob(ref.offset, ref.size_kb, out_value);
   }
-
-  return Status::OK();  // Tombstone 或空值
+  if (desc.IsBlobRef()) {
+    // Task 3.6：读取并校验（长度/对齐/checksum）；失败向上传播，不返回空串。
+    return ReadBlobValue(desc, out_value);
+  }
+  if (desc.IsTombstone()) {
+    out_value->clear();
+    return Status::OK();  // 墓碑没有值；保留旧语义（不当作错误）
+  }
+  return Status::NotSupported("ZoneColumnarSstReader::GetValue",
+                              "unsupported descriptor kind for raw value read");
 }
-
+// Task 3.6：批量读值。Blob 缺失/db_path 缺失/截断/checksum 错都返回错误
+// （不再静默填空串）；内联值直接返回，墓碑保留空串。
 Status ZoneColumnarSstReader::GetValues(
     const std::vector<size_t>& row_indices,
     std::vector<std::string>* out_values) const {
+  if (out_values == nullptr) {
+    return Status::InvalidArgument("ZoneColumnarSstReader::GetValues", "null output");
+  }
+  if (!opened_) {
+    return Status::IOError("ZoneColumnarSstReader::GetValues", "not opened");
+  }
+  if (!value_decoder_) {
+    return Status::IOError("ZoneColumnarSstReader::GetValues", "no value decoder");
+  }
+
   out_values->clear();
-  out_values->reserve(row_indices.size());
+  out_values->resize(row_indices.size());
 
-  // 分离内联值和 Blob 引用
-  std::vector<std::pair<size_t, size_t>> blob_refs;  // (row_idx, out_idx)
-
+  // (row_idx, out_idx) pairs for Blob entries
+  std::vector<std::pair<size_t, size_t>> blob_rows;
   for (size_t i = 0; i < row_indices.size(); ++i) {
-    size_t row_idx = row_indices[i];
-
+    const size_t row_idx = row_indices[i];
     if (row_idx >= header_.row_count) {
-      out_values->push_back("");
-      continue;
+      return Status::InvalidArgument("ZoneColumnarSstReader::GetValues",
+                                     "row index out of range");
     }
-
-    Descriptor desc = value_decoder_->Get(row_idx);
-
+    const Descriptor desc = value_decoder_->Get(row_idx);
     if (desc.IsInline()) {
-      out_values->push_back(desc.AsInlineShortStr());
+      (*out_values)[i] = desc.AsInlineShortStr();
     } else if (desc.IsBlobRef()) {
-      // 标记为需要 Blob 读取
-      out_values->push_back("");  // 占位
-      blob_refs.push_back({row_idx, i});
-    } else {
-      out_values->push_back("");  // Tombstone
+      blob_rows.emplace_back(row_idx, i);
+    } else if (!desc.IsTombstone()) {
+      return Status::NotSupported("ZoneColumnarSstReader::GetValues",
+                                  "unsupported descriptor kind");
     }
   }
 
-  // 批量读取 Blobs
-  if (!blob_refs.empty() && !db_path_.empty()) {
-    if (!blob_manager_) {
-      uint32_t sst_id = static_cast<uint32_t>(footer_.file_number);
-      blob_manager_ = std::make_unique<SimpleSSTBlobManager>(db_path_, sst_id);
-      Status s = blob_manager_->OpenForRead();
-      if (!s.ok()) return s;
-    }
+  if (!blob_rows.empty()) {
+    Status s = EnsureBlobManagerForRead();
+    if (!s.ok()) return s;
 
-    std::vector<std::pair<uint32_t, uint16_t>> offsets_sizes;
-    offsets_sizes.reserve(blob_refs.size());
-
-    for (const auto& [row_idx, _] : blob_refs) {
-      Descriptor desc = value_decoder_->Get(row_idx);
-      auto ref = desc.GetBlobRef();
-      offsets_sizes.push_back({ref.offset, ref.size_kb});
+    std::vector<std::tuple<uint32_t, uint16_t, uint8_t>> refs;
+    refs.reserve(blob_rows.size());
+    for (const auto& [row_idx, out_idx] : blob_rows) {
+      (void)out_idx;
+      const auto ref = value_decoder_->Get(row_idx).GetBlobRef();
+      refs.emplace_back(ref.offset, ref.size_kb, ref.checksum);
     }
 
     std::vector<std::string> blob_values;
-    Status s = blob_manager_->ReadBlobs(offsets_sizes, &blob_values);
+    s = blob_manager_->ReadBlobs(refs, &blob_values);
     if (!s.ok()) return s;
-
-    // 回填结果
-    for (size_t i = 0; i < blob_refs.size(); ++i) {
-      size_t out_idx = blob_refs[i].second;
-      (*out_values)[out_idx] = std::move(blob_values[i]);
+    for (size_t i = 0; i < blob_rows.size(); ++i) {
+      (*out_values)[blob_rows[i].second] = std::move(blob_values[i]);
     }
   }
 

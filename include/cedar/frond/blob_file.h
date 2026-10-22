@@ -39,6 +39,10 @@ static constexpr uint32_t kBlobVersion = 1;
 static constexpr uint32_t kBlobBlockSize = 4096;    // 4KB 对齐
 static constexpr uint32_t kBlobHeaderSize = 4096;   // Header 占 1 个 Block
 
+// Blob entry 的 payload 校验（Descriptor::BlobRef.checksum 使用同一算法）。
+// 与 SimpleSSTBlobManager 的历史实现保持一致：XOR + 循环左移 1 位。
+uint8_t ComputeBlobChecksum(const Slice& data);
+
 // Blob 文件 Header
 #pragma pack(push, 1)
 struct BlobHeader {
@@ -51,9 +55,9 @@ struct BlobHeader {
   uint64_t data_size = 0;        // 实际数据总大小（不含 padding）
   uint64_t checksum = 0;         // Header 校验
   uint8_t  reserved2[4056] = {}; // 填充到 4KB (4096 - 40 = 4056)
-  
+
   static constexpr size_t kEncodedSize = 4096;
-  
+
   void EncodeTo(std::string* dst) const;
   Status DecodeFrom(const Slice& input);
 };
@@ -81,30 +85,30 @@ class BlobFileWriter {
 
   // 打开文件（创建或追加）
   Status Open();
-  
+
   // 关闭文件
   Status Close();
-  
+
   // 追加写入数据（自动 4KB 对齐）
   // 返回：写入后的偏移（用于构建 Descriptor）
   Status Append(const Slice& data, uint32_t* out_offset);
-  
+
   // 同步到磁盘
   Status Sync();
-  
+
   // 获取当前文件大小
   uint64_t FileSize() const { return file_size_; }
-  
+
   // 获取写入的 Entry 数量
   uint32_t EntryCount() const { return entry_count_; }
 
  private:
   // 写入 Header
   Status WriteHeader();
-  
+
   // 更新 Header（entry_count 等）
   Status UpdateHeader();
-  
+
   // 对齐写入
   Status WriteAligned(const char* data, size_t size, uint32_t alignment);
 
@@ -131,30 +135,39 @@ class BlobFileReader {
 
   // 打开文件
   Status Open();
-  
+
   // 关闭文件
   void Close();
-  
-  // 读取指定偏移的数据
-  // offset: 4KB 对齐的偏移
-  // size: 要读取的大小（字节）
-  // buffer: 输出缓冲区，需要至少 size 字节
+
+  // 读取指定偏移的数据（底层：4B 长度 + payload；buffer 需 >= size 字节）。
+  // 注意：返回的是 payload（已消费 4B 长度前缀），调用者不得再次剥离。
   Status Read(uint32_t offset, uint32_t size, char* buffer);
-  
+
+  // Task 3.6：读取一个完整 blob entry（修正审计 10.2 的二次剥离）：
+  //   - offset 必须 4KB 对齐；size_kb 必须为 4 的倍数（4KB 对齐的块数）
+  //   - 校验 4B 长度前缀落在 size_kb*1024 范围内、payload 完整读完
+  //   - 校验 payload checksum（与 Descriptor::BlobRef.checksum 同算法）
+  //   - 截断/越界/checksum 不匹配返回 Corruption（不返回部分数据）
+  Status ReadEntry(uint32_t offset, uint16_t size_kb, uint8_t expected_checksum,
+                   std::string* out_data);
+
+  // 只读取 entry 的 payload 长度（诊断/校验用）
+  Status ReadEntryLength(uint32_t offset, uint16_t size_kb, uint32_t* out_length);
+
   // 批量预读（优化顺序扫描）
   // offsets: 要预读的偏移列表（会被排序和合并）
   Status Prefetch(const std::vector<uint32_t>& offsets);
-  
+
   // 获取文件大小
   uint64_t FileSize() const { return file_size_; }
-  
+
   // 获取 Entry 数量
   uint32_t EntryCount() const { return header_.entry_count; }
 
  private:
   // 读取 Header
   Status ReadHeader();
-  
+
   // 验证 Header
   Status ValidateHeader();
 

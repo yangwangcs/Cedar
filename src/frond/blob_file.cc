@@ -42,6 +42,15 @@ static uint64_t ComputeCRC64(const void* data, size_t size) {
   return checksum;
 }
 
+uint8_t ComputeBlobChecksum(const Slice& data) {
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < data.size(); ++i) {
+    checksum ^= static_cast<uint8_t>(data[i]);
+    checksum = static_cast<uint8_t>((checksum << 1) | (checksum >> 7));
+  }
+  return checksum;
+}
+
 // =============================================================================
 // BlobHeader 实现
 // =============================================================================
@@ -49,7 +58,7 @@ static uint64_t ComputeCRC64(const void* data, size_t size) {
 void BlobHeader::EncodeTo(std::string* dst) const {
   dst->resize(kEncodedSize);
   char* buf = &(*dst)[0];
-  
+
   memcpy(buf, &magic, 4);
   memcpy(buf + 4, &version, 4);
   memcpy(buf + 8, &sst_id, 4);
@@ -65,7 +74,7 @@ Status BlobHeader::DecodeFrom(const Slice& input) {
   if (input.size() < kEncodedSize) {
     return Status::Corruption("BlobHeader", "truncated");
   }
-  
+
   const char* buf = input.data();
   memcpy(&magic, buf, 4);
   memcpy(&version, buf + 4, 4);
@@ -75,14 +84,14 @@ Status BlobHeader::DecodeFrom(const Slice& input) {
   memcpy(&reserved1, buf + 20, 4);
   memcpy(&data_size, buf + 24, 8);
   memcpy(&checksum, buf + 32, 8);
-  
+
   if (magic != kBlobMagic) {
     return Status::Corruption("BlobHeader", "invalid magic");
   }
   if (version != kBlobVersion) {
     return Status::Corruption("BlobHeader", "invalid version");
   }
-  
+
   return Status::OK();
 }
 
@@ -101,12 +110,12 @@ BlobFileWriter::~BlobFileWriter() {
 
 Status BlobFileWriter::Open() {
   if (opened_) return Status::OK();
-  
+
   fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd_ < 0) {
     return Status::IOError("BlobFileWriter::Open", strerror(errno));
   }
-  
+
   // 写入初始 Header
   Status s = WriteHeader();
   if (!s.ok()) {
@@ -114,7 +123,7 @@ Status BlobFileWriter::Open() {
     fd_ = -1;
     return s;
   }
-  
+
   file_size_ = kBlobHeaderSize;
   opened_ = true;
   return Status::OK();
@@ -122,15 +131,15 @@ Status BlobFileWriter::Open() {
 
 Status BlobFileWriter::Close() {
   if (!opened_) return Status::OK();
-  
+
   // 更新最终 Header
   UpdateHeader();
-  
+
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
   }
-  
+
   opened_ = false;
   return Status::OK();
 }
@@ -142,15 +151,15 @@ Status BlobFileWriter::WriteHeader() {
   header.entry_count = 0;
   header.data_size = 0;
   header.checksum = 0;
-  
+
   std::string buf;
   header.EncodeTo(&buf);
-  
+
   ssize_t written = ::write(fd_, buf.data(), buf.size());
   if (written != static_cast<ssize_t>(buf.size())) {
     return Status::IOError("BlobFileWriter::WriteHeader", strerror(errno));
   }
-  
+
   return Status::OK();
 }
 
@@ -164,23 +173,23 @@ Status BlobFileWriter::UpdateHeader() {
   std::string header_buf;
   header.EncodeTo(&header_buf);
   header.checksum = ComputeCRC64(header_buf.data(), 40);
-  
+
   // 回到文件开头
   off_t pos = ::lseek(fd_, 0, SEEK_SET);
   if (pos != 0) {
     return Status::IOError("BlobFileWriter::UpdateHeader", strerror(errno));
   }
-  
+
   std::string buf;
   header.EncodeTo(&buf);
   ssize_t written = ::write(fd_, buf.data(), buf.size());
   if (written != static_cast<ssize_t>(buf.size())) {
     return Status::IOError("BlobFileWriter::UpdateHeader", strerror(errno));
   }
-  
+
   // 回到文件末尾
   ::lseek(fd_, file_size_, SEEK_SET);
-  
+
   return Status::OK();
 }
 
@@ -188,10 +197,10 @@ Status BlobFileWriter::Append(const Slice& data, uint32_t* out_offset) {
   if (!opened_) {
     return Status::IOError("BlobFileWriter::Append", "not opened");
   }
-  
+
   // 计算对齐后的偏移（从 Header 后开始）
   uint32_t aligned_offset = AlignUp(file_size_, kBlobBlockSize);
-  
+
   // 回到对齐位置（如果当前位置不对）
   if (static_cast<uint64_t>(::lseek(fd_, 0, SEEK_CUR)) != aligned_offset) {
     off_t pos = ::lseek(fd_, aligned_offset, SEEK_SET);
@@ -199,23 +208,23 @@ Status BlobFileWriter::Append(const Slice& data, uint32_t* out_offset) {
       return Status::IOError("BlobFileWriter::Append", strerror(errno));
     }
   }
-  
+
   // 写入数据大小（4B）+ 实际数据
   uint32_t actual_size = data.size();
   ssize_t written = ::write(fd_, &actual_size, 4);
   if (written != 4) {
     return Status::IOError("BlobFileWriter::Append", strerror(errno));
   }
-  
+
   written = ::write(fd_, data.data(), data.size());
   if (written != static_cast<ssize_t>(data.size())) {
     return Status::IOError("BlobFileWriter::Append", strerror(errno));
   }
-  
+
   // 计算对齐后的大小
   uint32_t total_written = 4 + actual_size;
   uint32_t aligned_size = AlignUp(total_written, kBlobBlockSize);
-  
+
   // 填充到对齐边界
   if (aligned_size > total_written) {
     std::string padding(aligned_size - total_written, 0);
@@ -224,28 +233,28 @@ Status BlobFileWriter::Append(const Slice& data, uint32_t* out_offset) {
       return Status::IOError("BlobFileWriter::Append", strerror(errno));
     }
   }
-  
+
   *out_offset = aligned_offset;
   file_size_ = aligned_offset + aligned_size;
   data_size_ += actual_size;
   entry_count_++;
-  
+
   return Status::OK();
 }
 
 Status BlobFileWriter::Sync() {
   if (!opened_) return Status::OK();
-  
+
   // 更新 Header
   Status s = UpdateHeader();
   if (!s.ok()) return s;
-  
+
   // 同步到磁盘
   int ret = ::fsync(fd_);
   if (ret != 0) {
     return Status::IOError("BlobFileWriter::Sync", strerror(errno));
   }
-  
+
   return Status::OK();
 }
 
@@ -263,12 +272,12 @@ BlobFileReader::~BlobFileReader() {
 
 Status BlobFileReader::Open() {
   if (opened_) return Status::OK();
-  
+
   fd_ = ::open(path_.c_str(), O_RDONLY);
   if (fd_ < 0) {
     return Status::IOError("BlobFileReader::Open", strerror(errno));
   }
-  
+
   // 获取文件大小
   struct stat st;
   if (::fstat(fd_, &st) != 0) {
@@ -277,7 +286,7 @@ Status BlobFileReader::Open() {
     return Status::IOError("BlobFileReader::Open", strerror(errno));
   }
   file_size_ = st.st_size;
-  
+
   // 读取 Header
   Status s = ReadHeader();
   if (!s.ok()) {
@@ -285,19 +294,19 @@ Status BlobFileReader::Open() {
     fd_ = -1;
     return s;
   }
-  
+
   opened_ = true;
   return Status::OK();
 }
 
 void BlobFileReader::Close() {
   if (!opened_) return;
-  
+
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
   }
-  
+
   opened_ = false;
 }
 
@@ -307,42 +316,108 @@ Status BlobFileReader::ReadHeader() {
   if (n != static_cast<ssize_t>(kBlobHeaderSize)) {
     return Status::IOError("BlobFileReader::ReadHeader", strerror(errno));
   }
-  
-  return header_.DecodeFrom(Slice(buf));
+
+  Status s = header_.DecodeFrom(Slice(buf));
+  if (!s.ok()) return s;
+
+  // 校验 Header checksum：写入端是对"checksum=0 的前 40B"计算的 CRC64。
+  BlobHeader check = header_;
+  check.checksum = 0;
+  std::string check_buf;
+  check.EncodeTo(&check_buf);
+  const uint64_t expected = ComputeCRC64(check_buf.data(), 40);
+  if (header_.checksum != expected) {
+    return Status::Corruption("BlobFileReader", "header checksum mismatch");
+  }
+  return Status::OK();
 }
 
 Status BlobFileReader::Read(uint32_t offset, uint32_t size, char* buffer) {
   if (!opened_) {
     return Status::IOError("BlobFileReader::Read", "not opened");
   }
-  
+
   // 读取 4B size + 实际数据
   uint32_t actual_size = 0;
   ssize_t n = ::pread(fd_, &actual_size, 4, offset);
   if (n != 4) {
     return Status::IOError("BlobFileReader::Read", strerror(errno));
   }
-  
+
   // 读取实际数据
   uint32_t to_read = std::min(actual_size, size);
   n = ::pread(fd_, buffer, to_read, offset + 4);
   if (n != static_cast<ssize_t>(to_read)) {
     return Status::IOError("BlobFileReader::Read", strerror(errno));
   }
-  
+
+  return Status::OK();
+}
+
+Status BlobFileReader::ReadEntryLength(uint32_t offset, uint16_t size_kb,
+                                      uint32_t* out_length) {
+  if (!opened_) {
+    return Status::IOError("BlobFileReader::ReadEntryLength", "not opened");
+  }
+  if (offset % kBlobBlockSize != 0) {
+    return Status::Corruption("BlobFileReader", "blob offset not 4KB aligned");
+  }
+  if (size_kb == 0 || size_kb % (kBlobBlockSize / 1024) != 0) {
+    return Status::Corruption("BlobFileReader", "blob size_kb not 4KB aligned");
+  }
+  const uint64_t entry_bytes = static_cast<uint64_t>(size_kb) * 1024;
+  if (static_cast<uint64_t>(offset) + entry_bytes > file_size_) {
+    return Status::Corruption("BlobFileReader", "blob entry out of file bounds");
+  }
+
+  uint32_t actual_size = 0;
+  const ssize_t n = ::pread(fd_, &actual_size, sizeof(actual_size), offset);
+  if (n != static_cast<ssize_t>(sizeof(actual_size))) {
+    return Status::Corruption("BlobFileReader", "truncated blob length prefix");
+  }
+  if (actual_size == 0 || static_cast<uint64_t>(actual_size) + 4 > entry_bytes) {
+    return Status::Corruption("BlobFileReader", "blob length out of entry bounds");
+  }
+  if (out_length != nullptr) *out_length = actual_size;
+  return Status::OK();
+}
+
+Status BlobFileReader::ReadEntry(uint32_t offset, uint16_t size_kb,
+                                 uint8_t expected_checksum,
+                                 std::string* out_data) {
+  if (out_data == nullptr) {
+    return Status::InvalidArgument("BlobFileReader::ReadEntry", "null output");
+  }
+  uint32_t actual_size = 0;
+  Status s = ReadEntryLength(offset, size_kb, &actual_size);
+  if (!s.ok()) return s;
+
+  out_data->resize(actual_size);
+  if (actual_size > 0) {
+    const ssize_t n = ::pread(fd_, &(*out_data)[0], actual_size, offset + 4);
+    if (n != static_cast<ssize_t>(actual_size)) {
+      out_data->clear();
+      return Status::Corruption("BlobFileReader", "truncated blob payload");
+    }
+  }
+
+  if (ComputeBlobChecksum(Slice(*out_data)) != expected_checksum) {
+    out_data->clear();
+    return Status::Corruption("BlobFileReader", "blob checksum mismatch");
+  }
   return Status::OK();
 }
 
 Status BlobFileReader::Prefetch(const std::vector<uint32_t>& offsets) {
   if (!opened_) return Status::OK();
-  
+
   // Linux 预读建议（POSIX_FADV_WILLNEED）
   #ifdef POSIX_FADV_WILLNEED
   for (uint32_t offset : offsets) {
     ::posix_fadvise(fd_, offset, kBlobBlockSize, POSIX_FADV_WILLNEED);
   }
   #endif
-  
+
   return Status::OK();
 }
 

@@ -37,7 +37,7 @@ namespace cedar {
 
 std::string ZoneSstMeta::DebugString() const {
   std::ostringstream oss;
-  oss << "ZoneSstMeta{file=" << file_number 
+  oss << "ZoneSstMeta{file=" << file_number
       << ", level=" << level
       << ", size=" << file_size
       << ", entries=" << num_entries
@@ -60,7 +60,7 @@ std::vector<ZoneSstMeta> LevelState::FindOverlapping(
     bool entity_overlap = !(f.max_entity_id < min_entity || f.min_entity_id > max_entity);
     // 检查 Timestamp 范围重叠
     bool ts_overlap = !(f.max_timestamp < min_ts || f.min_timestamp > max_ts);
-    
+
     if (entity_overlap && ts_overlap) {
       result.push_back(f);
     }
@@ -159,7 +159,7 @@ std::vector<uint64_t> BlobReferenceManager::GetBlobFilesForGC(uint64_t min_waste
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<uint64_t> result;
   uint64_t total_wasted = 0;
-  
+
   for (const auto& [blob_id, info] : blob_infos_) {
     if (info.referencing_ssts.empty()) {
       result.push_back(blob_id);
@@ -178,24 +178,24 @@ Status BlobReferenceManager::SaveToFile(const std::string& path) {
   if (!file) {
     return Status::IOError("BlobReferenceManager", "Cannot open file for writing");
   }
-  
+
   // 写入文件数量
   uint64_t count = blob_infos_.size();
   file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-  
+
   // 写入每个 Blob 文件的信息
   for (const auto& [blob_id, info] : blob_infos_) {
     file.write(reinterpret_cast<const char*>(&blob_id), sizeof(blob_id));
     file.write(reinterpret_cast<const char*>(&info.file_size), sizeof(info.file_size));
-    
+
     uint64_t ref_count = info.referencing_ssts.size();
     file.write(reinterpret_cast<const char*>(&ref_count), sizeof(ref_count));
-    
+
     for (uint64_t sst_id : info.referencing_ssts) {
       file.write(reinterpret_cast<const char*>(&sst_id), sizeof(sst_id));
     }
   }
-  
+
   return file.good() ? Status::OK() : Status::IOError("BlobReferenceManager", "Write failed");
 }
 
@@ -205,32 +205,56 @@ Status BlobReferenceManager::LoadFromFile(const std::string& path) {
   if (!file) {
     return Status::NotFound("BlobReferenceManager", "File not found");
   }
-  
+
   blob_infos_.clear();
-  
+
   uint64_t count;
   file.read(reinterpret_cast<char*>(&count), sizeof(count));
-  
+
   for (uint64_t i = 0; i < count; ++i) {
     uint64_t blob_id;
     file.read(reinterpret_cast<char*>(&blob_id), sizeof(blob_id));
-    
+
     BlobInfo info;
     file.read(reinterpret_cast<char*>(&info.file_size), sizeof(info.file_size));
-    
+
     uint64_t ref_count;
     file.read(reinterpret_cast<char*>(&ref_count), sizeof(ref_count));
-    
+
     for (uint64_t j = 0; j < ref_count; ++j) {
       uint64_t sst_id;
       file.read(reinterpret_cast<char*>(&sst_id), sizeof(sst_id));
       info.referencing_ssts.insert(sst_id);
     }
-    
+
     blob_infos_[blob_id] = std::move(info);
   }
-  
+
   return file.good() ? Status::OK() : Status::IOError("BlobReferenceManager", "Read failed");
+}
+
+std::vector<uint64_t> BlobReferenceManager::TakeUnreferencedBlobs() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<uint64_t> result;
+  for (auto it = blob_infos_.begin(); it != blob_infos_.end();) {
+    if (it->second.referencing_ssts.empty()) {
+      result.push_back(it->first);
+      it = blob_infos_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return result;
+}
+
+void BlobReferenceManager::RemoveBlobFile(uint64_t blob_file_number) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  blob_infos_.erase(blob_file_number);
+}
+
+size_t BlobReferenceManager::TrackedBlobCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return blob_infos_.size();
 }
 
 void BlobReferenceManager::CleanupReferences(const std::unordered_set<uint64_t>& existing_sst_files) {
@@ -257,7 +281,7 @@ void CompactionStats::RecordCompaction(const CompactionTask& task,
   total_input_files.fetch_add(task.input_files.size() + task.overlapping_files.size());
   total_output_files.fetch_add(output_files);
   total_duration_ms.fetch_add(duration_ms);
-  
+
   if (task.input_level < 7) {
     level_compactions[task.input_level].fetch_add(1);
   }
@@ -272,12 +296,12 @@ std::string CompactionStats::Report() const {
   oss << "Total input bytes: " << total_input_bytes.load() << std::endl;
   oss << "Total output bytes: " << total_output_bytes.load() << std::endl;
   oss << "Total duration: " << total_duration_ms.load() << "ms" << std::endl;
-  
+
   if (total_compactions.load() > 0) {
     double avg_duration = static_cast<double>(total_duration_ms.load()) / total_compactions.load();
     oss << "Avg duration: " << std::fixed << std::setprecision(2) << avg_duration << "ms" << std::endl;
   }
-  
+
   oss << "Per-level stats:" << std::endl;
   for (int i = 0; i < 7; ++i) {
     uint64_t count = level_compactions[i].load();
@@ -287,7 +311,7 @@ std::string CompactionStats::Report() const {
       oss << ", output: " << level_output_bytes[i].load() << ")" << std::endl;
     }
   }
-  
+
   return oss.str();
 }
 
@@ -320,18 +344,34 @@ Status SizeTieredCompactionEngine::Open() {
   if (opened_.load()) {
     return Status::OK();
   }
-  
+
   // 创建数据库目录
   if (!std::filesystem::exists(db_path_)) {
     std::filesystem::create_directories(db_path_);
   }
-  
+
   // 加载 MANIFEST
   Status s = LoadManifest();
   if (!s.ok() && !s.IsNotFound()) {
     return s;
   }
-  
+
+  // Task 3.6：启动时重建 Blob 引用（MANIFEST 是持久化权威），并清理孤儿 blob
+  // （崩溃/失败 flush 留下的、没有任何 SST 元数据引用的 sst_<n>.blob）。
+  {
+    std::unordered_set<uint64_t> existing_ssts;
+    {
+      std::lock_guard<std::mutex> lock(levels_mutex_);
+      for (const auto& level : levels_) {
+        for (const auto& f : level.files) {
+          existing_ssts.insert(f.file_number);
+        }
+      }
+    }
+    blob_manager_.CleanupReferences(existing_ssts);
+    CleanupOrphanBlobs();
+  }
+
   // 启动后台合并线程
   if (config_.enable_background_compaction) {
     for (int i = 0; i < config_.compaction_threads; ++i) {
@@ -339,7 +379,7 @@ Status SizeTieredCompactionEngine::Open() {
           &SizeTieredCompactionEngine::BackgroundCompactionThread, this);
     }
   }
-  
+
   opened_.store(true);
   return Status::OK();
 }
@@ -348,10 +388,10 @@ Status SizeTieredCompactionEngine::Close() {
   if (!opened_.load()) {
     return Status::OK();
   }
-  
+
   shutdown_.store(true);
   queue_cv_.notify_all();
-  
+
   // 等待后台线程结束
   for (auto& t : compaction_threads_) {
     if (t.joinable()) {
@@ -371,9 +411,12 @@ Status SizeTieredCompactionEngine::Close() {
     pending_tasks_.swap(empty);
   }
 
-  // 保存 MANIFEST
+  // 保存 MANIFEST（含每个文件的 blob_file_number/blob_file_size）
   Status s = SaveManifest();
-  
+
+  // Task 3.6：关闭路径接入 Blob GC（删除无引用 blob 与孤儿 blob）
+  TriggerBlobGC().IgnoreError();
+
   opened_.store(false);
   return s;
 }
@@ -386,23 +429,23 @@ Status SizeTieredCompactionEngine::AddSSTFile(const ZoneSstMeta& meta) {
   bool needs_scheduling = false;
   {
     std::lock_guard<std::mutex> lock(levels_mutex_);
-    
+
     if (meta.level < 0 || meta.level >= config_.max_levels) {
       return Status::InvalidArgument("SizeTieredCompactionEngine", "Invalid level");
     }
-    
+
     // 检查文件是否已存在
     for (const auto& f : levels_[meta.level].files) {
       if (f.file_number == meta.file_number) {
         return Status::OK();  // 已存在，幂等
       }
     }
-    
+
     levels_[meta.level].files.push_back(meta);
-    
+
     // 更新文件号水位（只前进不后退）；绑定 LsmEngine 的分配器后同样生效
     file_number_allocator_.EnsureAtLeast(meta.file_number + 1);
-    
+
     // 注册 Blob 引用
     if (meta.blob_file_number != 0) {
       blob_manager_.RegisterBlobFile(meta.blob_file_number, meta.blob_file_size);
@@ -418,17 +461,17 @@ Status SizeTieredCompactionEngine::AddSSTFile(const ZoneSstMeta& meta) {
   if (needs_scheduling) {
     ScheduleCompaction();
   }
-  
+
   return Status::OK();
 }
 
 Status SizeTieredCompactionEngine::RemoveSSTFile(uint64_t file_number) {
   std::string sst_path;
   std::string blob_path;
-  
+
   {
     std::lock_guard<std::mutex> lock(levels_mutex_);
-    
+
     for (int level = 0; level < config_.max_levels; ++level) {
       auto& files = levels_[level].files;
       for (auto it = files.begin(); it != files.end(); ++it) {
@@ -437,11 +480,11 @@ Status SizeTieredCompactionEngine::RemoveSSTFile(uint64_t file_number) {
           if (it->blob_file_number != 0) {
             blob_manager_.RemoveReference(it->blob_file_number, file_number);
           }
-          
+
           // 保存路径用于后续删除
           sst_path = it->path;
           blob_path = it->blob_path;
-          
+
           // 从列表移除
           files.erase(it);
           break;
@@ -449,7 +492,7 @@ Status SizeTieredCompactionEngine::RemoveSSTFile(uint64_t file_number) {
       }
     }
   }
-  
+
   // 在锁外删除物理文件
   if (!sst_path.empty()) {
     std::error_code ec;
@@ -459,7 +502,7 @@ Status SizeTieredCompactionEngine::RemoveSSTFile(uint64_t file_number) {
     }
     return Status::OK();
   }
-  
+
   return Status::NotFound("SizeTieredCompactionEngine", "File not found");
 }
 
@@ -482,13 +525,13 @@ std::vector<LevelState> SizeTieredCompactionEngine::GetAllLevels() const {
 
 bool SizeTieredCompactionEngine::NeedsCompaction() const {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
+
   for (int i = 0; i < config_.max_levels - 1; ++i) {
     if (levels_[i].needs_compaction(config_)) {
       return true;
     }
   }
-  
+
   return false;
 }
 
@@ -818,6 +861,8 @@ struct OutputSegment {
   uint64_t max_entity_id = 0;
   uint64_t min_timestamp = UINT64_MAX;
   uint64_t max_timestamp = 0;
+  uint64_t blob_file_number = 0;
+  uint64_t blob_file_size = 0;
   bool finished = false;
 
   // 失败清理：放弃 builder 并关闭句柄（物理文件由调用方删除）。
@@ -903,6 +948,22 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
   options.column_id = column_id;
 
   std::vector<OutputSegment> segments;
+  // Task 3.6：Blob 重写时按来源 SST 缓存 reader（同一输入只打开一次）。
+  std::unordered_map<std::string, std::unique_ptr<ZoneColumnarSstReader>>
+      blob_source_readers;
+  auto read_source_blob = [&](const ZoneSstMeta& source, const Descriptor& ref,
+                              std::string* raw) -> Status {
+    auto& holder = blob_source_readers[source.path];
+    if (!holder) {
+      holder = std::make_unique<ZoneColumnarSstReader>(source.path);
+      Status st = holder->Open();
+      if (!st.ok()) {
+        holder.reset();
+        return st;
+      }
+    }
+    return holder->ReadBlobValue(ref, raw);
+  };
   auto remove_segments = [&]() {
     for (auto& seg : segments) {
       seg.Abandon();
@@ -945,6 +1006,9 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
     OutputSegment& seg = segments.back();
     Status s = seg.builder->Finish();
     seg.finished = true;
+    // Task 3.6：在 builder 销毁前记录 Blob 输出元数据。
+    seg.blob_file_number = seg.builder->HasBlob() ? seg.file_number : 0;
+    seg.blob_file_size = seg.builder->BlobFileSize();
     if (s.ok()) {
       s = seg.file->Close();
     }
@@ -969,7 +1033,10 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
   };
 
   // 归并 sink：把每一行写进当前分段；达到目标行数就先切段再写新行。
-  auto add_row = [&](const CedarKey& key, const Descriptor& value) -> Status {
+  // Task 3.6：输入中的 BlobRef 一律重写到输出 sst_<new>.blob（读原值 → AddValue），
+  // 输出行只引用输出 blob，避免悬空引用。
+  auto add_row = [&](const CedarKey& key, const Descriptor& value,
+                     const ZoneSstMeta& source) -> Status {
     if (segments.empty()) {
       Status s = start_segment();
       if (!s.ok()) {
@@ -988,7 +1055,15 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
     }
 
     OutputSegment& seg = segments.back();
-    seg.builder->Add(key, value);
+    if (value.IsBlobRef()) {
+      std::string raw;
+      Status s = read_source_blob(source, value, &raw);
+      if (!s.ok()) return s;
+      s = seg.builder->AddValue(key, Slice(raw));
+      if (!s.ok()) return s;
+    } else {
+      seg.builder->Add(key, value);
+    }
     ++seg.rows;
     seg.min_entity_id = std::min(seg.min_entity_id, key.entity_id());
     seg.max_entity_id = std::max(seg.max_entity_id, key.entity_id());
@@ -1014,6 +1089,9 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
   // 输出元数据：列/类型来自任务分组，行数/范围来自每段真实写出内容
   std::vector<ZoneSstMeta> output_metas;
   output_metas.reserve(segments.size());
+  // Task 3.6：MANIFEST 提交后再登记的 Blob 引用（file_number → blob_number/size）。
+  std::vector<ZoneSstMeta> blob_refs_to_register;
+  blob_refs_to_register.reserve(segments.size());
   for (const auto& seg : segments) {
     ZoneSstMeta meta;
     meta.file_number = seg.file_number;
@@ -1021,13 +1099,19 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
     meta.file_size = seg.file_size;
     meta.num_entries = seg.rows;
     meta.path = seg.path;
-    meta.blob_path = seg.blob_path;
+    // Task 3.6：只有真正写出 Blob 的段才登记 blob 引用；否则保持空。
+    meta.blob_file_number = seg.blob_file_number;
+    meta.blob_file_size = seg.blob_file_size;
+    meta.blob_path = seg.blob_file_number != 0 ? seg.blob_path : std::string();
     meta.column_id = column_id;
     meta.entity_type = entity_type;
     meta.min_entity_id = seg.min_entity_id;
     meta.max_entity_id = seg.max_entity_id;
     meta.min_timestamp = seg.min_timestamp;
     meta.max_timestamp = seg.max_timestamp;
+    if (meta.blob_file_number != 0) {
+      blob_refs_to_register.push_back(meta);
+    }
     output_metas.push_back(std::move(meta));
   }
 
@@ -1062,10 +1146,22 @@ Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
     return manifest_status;
   }
 
-  // MANIFEST 已提交，现在才删除被合并掉的物理输入文件。
+  // MANIFEST 已提交（Task 3.6 生命周期）：
+  //   1) 输出 SST 的 blob 引用随 MANIFEST 持久化 → 重建内存引用计数；
+  //   2) 删除输入 SST 与其 1:1 Blob（此时旧 blob 已无引用）；
+  //   3) Blob GC 兜底清理（无引用/孤儿）。
+  for (const auto& meta : blob_refs_to_register) {
+    blob_manager_.RegisterBlobFile(meta.blob_file_number, meta.blob_file_size);
+    blob_manager_.AddReference(meta.blob_file_number, meta.file_number);
+  }
   for (const auto& f : merge_inputs) {
+    if (f.blob_file_number != 0) {
+      blob_manager_.RemoveReference(f.blob_file_number, f.file_number);
+      blob_manager_.RemoveBlobFile(f.blob_file_number);
+    }
     DeleteSstFile(f);
   }
+  TriggerBlobGC().IgnoreError();
 
   if (output_files != nullptr) {
     *output_files = segments.size();
@@ -1170,13 +1266,9 @@ Status SizeTieredCompactionEngine::MergeZones(
     heap.pop();
 
     if (!(has_last_key && IsDominatedBy(item.key, last_key))) {
-      Descriptor value = item.value;
-      // 处理 Blob 引用（当前策略：仅拷贝指针，不重写 Blob）
-      if (value.AsExternalRef().has_value()) {
-        value = HandleBlobReference(value, nullptr, inputs[item.file_index]);
-      }
-
-      const Status s = sink(item.key, value);
+      // Task 3.6：BlobRef 不在归并层改写指针（那会指向不存在的旧 blob）。
+      // 原样交给 sink，由 DoZoneCompaction 从来源文件读取原值并重写到输出 blob。
+      const Status s = sink(item.key, item.value, inputs[item.file_index]);
       if (!s.ok()) {
         return s;
       }
@@ -1215,35 +1307,30 @@ bool SizeTieredCompactionEngine::ShouldDropTombstone(const CedarKey& key, int ou
   if (output_level < config_.tombstone_cleanup_level) {
     return false;
   }
-  
+
   // L3+: 当磁盘使用 > 70% 时，允许清理 Tombstone
   // TODO: 计算实际磁盘使用率
   // if (disk_usage_ratio > config_.tombstone_cleanup_disk_ratio) {
   //   return true;
   // }
-  
+
   // 最底层总是清理 Tombstone
   if (output_level == config_.max_levels - 1) {
     return true;
   }
-  
+
   return false;
 }
 
+// Task 3.6：保留该 API 以兼容旧调用方，但 Blob 重写已移到 DoZoneCompaction 的
+// sink（MergeZones 会把来源 ZoneSstMeta 传给 sink）。这里不再返回"可悬空的指针"。
 Descriptor SizeTieredCompactionEngine::HandleBlobReference(
     const Descriptor& old_desc,
     ZoneColumnarSstBuilder* builder,
     const ZoneSstMeta& source_file) {
-  
-  if (!old_desc.AsExternalRef().has_value()) {
-    return old_desc;
-  }
-  
-  // TODO: 实现 Blob 重写策略
-  // 当前简化处理：仅拷贝指针（延迟拷贝策略）
-  // 引用计数管理由上层调用者处理
-  (void)builder; (void)source_file;
-  
+  (void)builder;
+  (void)source_file;
+  // 直通：真正的 Blob 重写由 DoZoneCompaction 的 add_row 完成（读原值→AddValue）。
   return old_desc;
 }
 
@@ -1256,47 +1343,47 @@ std::vector<ZoneSstMeta> SizeTieredCompactionEngine::GetOverlappingFiles(
     uint64_t min_ts, uint64_t max_ts,
     uint16_t column_id, uint8_t entity_type) const {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
+
   std::vector<ZoneSstMeta> result;
-  
+
   for (const auto& level : levels_) {
     for (const auto& f : level.files) {
       // 列和类型过滤
       if (f.column_id != column_id || f.entity_type != entity_type) {
         continue;
       }
-      
+
       // 范围重叠检查
       bool entity_overlap = !(f.max_entity_id < min_entity || f.min_entity_id > max_entity);
       bool ts_overlap = !(f.max_timestamp < min_ts || f.min_timestamp > max_ts);
-      
+
       if (entity_overlap && ts_overlap) {
         result.push_back(f);
       }
     }
   }
-  
+
   return result;
 }
 
 std::vector<ZoneSstMeta> SizeTieredCompactionEngine::GetFilesForEntity(
     uint64_t entity_id, uint16_t column_id, uint8_t entity_type) const {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
+
   std::vector<ZoneSstMeta> result;
-  
+
   for (const auto& level : levels_) {
     for (const auto& f : level.files) {
       if (f.column_id != column_id || f.entity_type != entity_type) {
         continue;
       }
-      
+
       if (entity_id >= f.min_entity_id && entity_id <= f.max_entity_id) {
         result.push_back(f);
       }
     }
   }
-  
+
   return result;
 }
 
@@ -1305,21 +1392,67 @@ std::vector<ZoneSstMeta> SizeTieredCompactionEngine::GetFilesForEntity(
 // =============================================================================
 
 Status SizeTieredCompactionEngine::TriggerBlobGC() {
-  // 获取需要 GC 的 Blob 文件
-  auto blob_files = blob_manager_.GetBlobFilesForGC(1024 * 1024);  // 1MB 阈值
-  
-  for (uint64_t blob_id : blob_files) {
-    if (blob_manager_.CanDeleteBlob(blob_id)) {
-      std::string blob_path = GetBlobPath(blob_id);
-      std::error_code ec;
-      std::filesystem::remove(blob_path, ec);
-      if (ec) {
-        // 记录错误但继续
+  // 1) 管理器内无引用的 blob（合并后输入 blob 已无 SST 引用）：删磁盘 + 元数据。
+  for (uint64_t blob_id : blob_manager_.TakeUnreferencedBlobs()) {
+    std::error_code ec;
+    std::filesystem::remove(GetBlobPath(blob_id), ec);
+  }
+  // 2) 兜底：扫描磁盘上没有任何 SST 元数据引用的 sst_<n>.blob（崩溃/失败写残留）。
+  CleanupOrphanBlobs();
+  return Status::OK();
+}
+
+// Task 3.6：删除磁盘上无引用的 blob。
+// 安全条件：MANIFEST 是权威；此外只有对应 <n>.frond 不存在时才删除，
+// 避免在 MANIFEST 缺失/尚未迁移的文件上误删数据。
+void SizeTieredCompactionEngine::CleanupOrphanBlobs() {
+  std::unordered_set<uint64_t> referenced;
+  {
+    std::lock_guard<std::mutex> lock(levels_mutex_);
+    for (const auto& level : levels_) {
+      for (const auto& f : level.files) {
+        if (f.blob_file_number != 0) {
+          referenced.insert(f.blob_file_number);
+        }
       }
     }
   }
-  
-  return Status::OK();
+
+  std::error_code ec;
+  if (!std::filesystem::exists(db_path_, ec)) return;
+  for (const auto& entry : std::filesystem::directory_iterator(db_path_, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    const std::string prefix = "sst_";
+    const std::string suffix = ".blob";
+    if (name.size() <= prefix.size() + suffix.size()) continue;
+    if (name.compare(0, prefix.size(), prefix) != 0) continue;
+    if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+      continue;
+    }
+    const std::string digits =
+        name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    if (digits.empty()) continue;
+    uint64_t blob_number = 0;
+    bool valid = true;
+    for (char c : digits) {
+      if (c < '0' || c > '9') {
+        valid = false;
+        break;
+      }
+      blob_number = blob_number * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (!valid) continue;
+    if (referenced.count(blob_number) != 0) continue;
+
+    // 对应 SST 仍存在（可能是尚未登记进 MANIFEST 的旧库文件）→ 不删。
+    const std::string sst_path = GetSstPath(blob_number);
+    if (std::filesystem::exists(sst_path, ec)) continue;
+
+    std::error_code remove_ec;
+    std::filesystem::remove(entry.path(), remove_ec);
+  }
 }
 
 // =============================================================================
@@ -1339,14 +1472,14 @@ void SizeTieredCompactionEngine::RemoveFileMetaFromLevelLocked(uint64_t file_num
   if (level < 0 || level >= config_.max_levels) {
     return;
   }
-  
+
   auto& files = levels_[level].files;
   for (auto it = files.begin(); it != files.end(); ++it) {
     if (it->file_number == file_number) {
       // 移除 Blob 引用
-      if (it->blob_file_number != 0) {
-        blob_manager_.RemoveReference(it->blob_file_number, file_number);
-      }
+      // Task 3.6：Blob 引用不在"元数据移除"阶段删——MANIFEST 提交失败会回滚
+      // levels_，引用必须与提交后的状态一致。引用/物理文件的清理在
+      // DoZoneCompaction 的 MANIFEST 成功之后统一处理。
       files.erase(it);
       break;
     }
@@ -1622,8 +1755,11 @@ Status SizeTieredCompactionEngine::LoadManifest() {
     std::lock_guard<std::mutex> lock(levels_mutex_);
     levels_ = std::move(loaded);
     for (auto& level : levels_) {
-      for (const auto& meta : level.files) {
+      for (auto& meta : level.files) {
         if (meta.blob_file_number != 0) {
+          // Task 3.6：旧 MANIFEST 不持久化 blob_path；重开后按命名规则恢复，
+          // 保证 compaction 删除输入时能删掉它 1:1 的 blob。
+          meta.blob_path = GetBlobPath(meta.blob_file_number);
           blob_manager_.RegisterBlobFile(meta.blob_file_number,
                                          meta.blob_file_size);
           blob_manager_.AddReference(meta.blob_file_number, meta.file_number);
@@ -1717,7 +1853,7 @@ bool SizeTieredCompactionEngine::HasFile(uint64_t file_number) const {
 
 std::optional<ZoneSstMeta> SizeTieredCompactionEngine::FindFile(uint64_t file_number) const {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
+
   for (const auto& level : levels_) {
     for (const auto& f : level.files) {
       if (f.file_number == file_number) {
@@ -1762,27 +1898,27 @@ std::vector<uint64_t> SizeTieredCompactionEngine::GetLevelSizes() const {
 
 std::string SizeTieredCompactionEngine::LevelSummary() const {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
+
   std::ostringstream oss;
   oss << "=== Level Summary ===" << std::endl;
-  
+
   for (int i = 0; i < config_.max_levels; ++i) {
     const auto& level = levels_[i];
     uint64_t size = level.total_size();
     uint64_t threshold = level.capacity_threshold(config_);
     double ratio = static_cast<double>(size) / threshold;
-    
+
     oss << "L" << i << ": ";
     oss << level.file_count() << " files, ";
     oss << size << " bytes / " << threshold << " bytes (";
     oss << std::fixed << std::setprecision(1) << (ratio * 100) << "%)";
-    
+
     if (level.needs_compaction(config_)) {
       oss << " [NEEDS COMPACTION]";
     }
     oss << std::endl;
   }
-  
+
   return oss.str();
 }
 
@@ -1804,21 +1940,21 @@ bool KeyInFileRange(const ZoneSstMeta& file, uint64_t entity_id, uint64_t timest
 int CalculateCompactionPriority(const LevelState& level, const SizeTieredConfig& config) {
   uint64_t size = level.total_size();
   uint64_t threshold = level.capacity_threshold(config);
-  
+
   if (size <= threshold) {
     return 100;  // 不需要合并
   }
-  
+
   double overflow_ratio = static_cast<double>(size) / threshold;
-  
+
   // 优先级 = 层级 * 10 - 溢出比例 * 5（数值越小优先级越高）
   int priority = level.level * 10 - static_cast<int>(overflow_ratio * 5);
-  
+
   // L0 特殊处理：文件数过多时提高优先级
   if (level.level == 0 && level.file_count() > config.l0_max_files) {
     priority -= 20;
   }
-  
+
   return priority;
 }
 

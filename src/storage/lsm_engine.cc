@@ -154,17 +154,17 @@ Status LsmEngine::Open() {
 
   Status s = LoadSstFiles();
   if (!s.ok()) return s;
-  
+
   // DEPRECATED: Old format file cache - now using ZoneColumnar
   // Initialize file cache
   // file_cache_ = std::make_unique<FrondFileCache>(options_.file_cache_size, env_, &options_);
-  
+
   // Initialize SST reader cache
   sst_reader_cache_ = std::make_unique<SstReaderCache>(options_.file_cache_size > 0 ? options_.file_cache_size : 16);
-  
+
   // Build column-based file index for fast query
   BuildColumnFileIndex();
-  
+
   // ========== WAL checkpoint 水位（t10） ==========
   // 必须在 InitWAL 之前读：checkpoint 里的 file_number_floor 决定新段号下限，
   // 水位决定重放跳过哪些段。checkpoint 缺失/损坏时按"水位 0"处理（重放全部，
@@ -209,20 +209,20 @@ Status LsmEngine::Open() {
   // 共用 LsmEngine 持有的这个计数器；压缩输出号自动回写，二者不会再撞号。
   // 必须在 Open() 之前绑定：LoadManifest 会用 MANIFEST 水位推进它（只前进不后退）。
   compaction_engine_->BindFileNumberAllocator(&next_file_number_);
-  
+
   s = compaction_engine_->Open();
   if (!s.ok()) {
     return Status::IOError("LsmEngine", "Failed to open compaction engine: " + s.ToString());
   }
-  
+
   // 如果存在现有的 SST 文件，迁移到新的 Compaction 引擎
   MigrateExistingSstFiles();
 
   // Task 3.4：构建 (entity_type,column) 文件区间索引（之后 O(log F) 选文件）
   RebuildFileIndex();
-  
+
   opened_ = true;
-  
+
   return Status::OK();
 }
 
@@ -408,18 +408,18 @@ std::optional<Descriptor> LsmEngine::Get(const CedarKey& key) {
     auto files = LookupFiles(key.entity_id(),
                              static_cast<uint8_t>(key.entity_type()),
                              key.column_id());
-    
+
     // 按时间从新到旧排序（文件号大的通常更新）
-    std::sort(files.begin(), files.end(), 
+    std::sort(files.begin(), files.end(),
               [](const IndexedFile& a, const IndexedFile& b) {
                 return a.file_number > b.file_number;
               });
-    
+
     // 查询每个文件
     for (const auto& file_meta : files) {
       auto reader = GetCachedReader(file_meta.file_number, file_meta.path);
       if (!reader) continue;
-      
+
       auto result = reader->Get(key);
       if (result.has_value()) {
         // 最新文件里的同 key 版本是墓碑 → 已删除，不得回退到更老的文件
@@ -464,24 +464,24 @@ std::vector<MemTableEntry> LsmEngine::GetAll(uint64_t entity_id,
   // 3. Query SST files via Size-Tiered Compaction Engine
   if (compaction_engine_) {
     auto files = LookupFiles(entity_id, static_cast<uint8_t>(entity_type), column_id);
-    
+
     for (const auto& file_meta : files) {
       auto reader = GetCachedReader(file_meta.file_number, file_meta.path);
       if (!reader) continue;
-      
+
       // 获取该 Entity 的所有版本
       auto range_results = reader->GetRange(entity_id, entity_type, column_id,
                                             Timestamp(0), Timestamp(UINT64_MAX));
-      
+
       for (const auto& [key, descriptor] : range_results) {
-        std::optional<uint64_t> dst_id = (key.target_id() != 0) 
-            ? std::optional<uint64_t>(key.target_id()) 
+        std::optional<uint64_t> dst_id = (key.target_id() != 0)
+            ? std::optional<uint64_t>(key.target_id())
             : std::nullopt;
         results.emplace_back(key.timestamp(), descriptor, dst_id, Timestamp(0));
       }
     }
   }
-  
+
   // Sort by timestamp descending, then by dst_id for stable ordering
   std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
     if (a.timestamp.value() != b.timestamp.value()) {
@@ -493,7 +493,7 @@ std::vector<MemTableEntry> LsmEngine::GetAll(uint64_t entity_id,
     }
     return a.dst_id.has_value() > b.dst_id.has_value();
   });
-  
+
   // 去重（timestamp + dst_id 相同视为同版本）+ 墓碑过滤（审计 3.2）：
   // 同一版本槽位存在墓碑时整槽视为已删除
   return ApplyTombstoneFilter(std::move(results));
@@ -561,26 +561,26 @@ std::optional<Descriptor> LsmEngine::GetAtTimeImpl(
   if (compaction_engine_) {
     // Task 3.4：区间索引 + 统一 reader cache
     auto files = LookupFiles(entity_id, static_cast<uint8_t>(entity_type), column_id);
-    
+
     // 收集所有匹配的条目
     std::vector<std::pair<CedarKey, Descriptor>> all_entries;
-    
+
     for (const auto& file_meta : files) {
       auto reader = GetCachedReader(file_meta.file_number, file_meta.path);
       if (!reader) continue;
-      
+
       // 使用 GetRange 获取该 Entity 的所有版本
       auto range_results = reader->GetRange(entity_id, entity_type, column_id,
                                            Timestamp(0), Timestamp(UINT64_MAX));
       all_entries.insert(all_entries.end(), range_results.begin(), range_results.end());
     }
-    
+
     // 按时间戳降序排序
     std::sort(all_entries.begin(), all_entries.end(),
               [](const auto& a, const auto& b) {
                 return a.first.timestamp().value() > b.first.timestamp().value();
               });
-    
+
     // 找到指定时间的版本（<= timestamp 的最新版本）
     for (const auto& [entry_key, descriptor] : all_entries) {
       if (entry_key.timestamp().value() > timestamp.value()) continue;
@@ -628,20 +628,20 @@ std::vector<MemTableEntry> LsmEngine::GetRange(uint64_t entity_id,
   // 3. Query SST files via Size-Tiered Compaction Engine
   if (compaction_engine_) {
     auto files = LookupFiles(entity_id, static_cast<uint8_t>(entity_type), column_id);
-    
+
     for (const auto& file_meta : files) {
       // 时间范围快速检查
-      if (file_meta.max_timestamp < start.value() || 
+      if (file_meta.max_timestamp < start.value() ||
           file_meta.min_timestamp > end.value()) {
         continue;
       }
-      
+
       auto reader = GetCachedReader(file_meta.file_number, file_meta.path);
       if (!reader) continue;
-      
+
       // 使用 GetRange 获取时间范围内的版本
       auto range_results = reader->GetRange(entity_id, entity_type, column_id, start, end);
-      
+
       for (const auto& [entry_key, descriptor] : range_results) {
         std::optional<uint64_t> dst_id = (entry_key.target_id() != 0)
             ? std::optional<uint64_t>(entry_key.target_id())
@@ -670,7 +670,7 @@ std::vector<MemTableEntry> LsmEngine::GetRangeLimit(uint64_t entity_id,
 
   // OPTIMIZATION: 追踪查询模式（用于识别热数据）
   TrackQueryPattern(entity_id, entity_type, column_id);
-  
+
   // OPTIMIZATION: 尝试从跨查询缓存获取（如果是全范围查询）
   // Task 3.5：缓存存的是完整结果，limit 必须在返回前应用（不能直接返回全量）。
   if (start.value() == 0 && end.value() == UINT64_MAX) {
@@ -681,10 +681,10 @@ std::vector<MemTableEntry> LsmEngine::GetRangeLimit(uint64_t entity_id,
       return hit;
     }
   }
-  
+
   // OPTIMIZATION: 预读取热数据到缓存
   PrefetchHotData(entity_id, entity_type, column_id);
-  
+
   // 读路径持 memtable 强引用（审计 3.5）
   std::shared_ptr<VSLMemTable> mem;
   std::shared_ptr<VSLMemTable> imm;
@@ -809,36 +809,36 @@ void LsmEngine::BatchGetAtTime(std::vector<BatchQueryItem>& items) {
 
 void LsmEngine::BatchGetRange(std::vector<BatchRangeItem>& items) {
   for (auto& item : items) {
-    item.results = GetRangeLimit(item.entity_id, item.entity_type, item.column_id, 
+    item.results = GetRangeLimit(item.entity_id, item.entity_type, item.column_id,
                                   item.start, item.end, item.max_results);
   }
 }
 
 // OPTIMIZATION: 并行 BatchGetRange - 使用线程池加速多 entity 查询
-void LsmEngine::ParallelBatchGetRange(std::vector<BatchRangeItem>& items, 
+void LsmEngine::ParallelBatchGetRange(std::vector<BatchRangeItem>& items,
                                        size_t num_threads) {
   if (items.empty()) return;
-  
+
   // 如果只有少量查询，使用串行版本
   if (items.size() < num_threads * 2) {
     BatchGetRange(items);
     return;
   }
-  
+
   // 限制线程数
   num_threads = std::min(num_threads, items.size());
-  
+
   // 计算每个线程处理的查询数量
   size_t items_per_thread = items.size() / num_threads;
   size_t remainder = items.size() % num_threads;
-  
+
   std::vector<std::thread> threads;
   size_t start_idx = 0;
-  
+
   for (size_t t = 0; t < num_threads; ++t) {
     size_t count = items_per_thread + (t < remainder ? 1 : 0);
     if (count == 0) break;
-    
+
     threads.emplace_back([this, &items, start_idx, count]() {
       for (size_t i = start_idx; i < start_idx + count; ++i) {
         auto& item = items[i];
@@ -846,10 +846,10 @@ void LsmEngine::ParallelBatchGetRange(std::vector<BatchRangeItem>& items,
                                       item.start, item.end, item.max_results);
       }
     });
-    
+
     start_idx += count;
   }
-  
+
   // 等待所有线程完成
   for (auto& t : threads) {
     t.join();
@@ -858,7 +858,7 @@ void LsmEngine::ParallelBatchGetRange(std::vector<BatchRangeItem>& items,
 
 // OPTIMIZATION: P0 - 优化的批量时间范围查询
 // 使用 SST 层的 BatchGetRange 减少文件扫描次数
-std::unordered_map<uint64_t, std::vector<MemTableEntry>> 
+std::unordered_map<uint64_t, std::vector<MemTableEntry>>
 LsmEngine::BatchGetRangeOptimized(const std::vector<uint64_t>& entity_ids,
                                    EntityType entity_type,
                                    uint16_t column_id,
@@ -866,14 +866,14 @@ LsmEngine::BatchGetRangeOptimized(const std::vector<uint64_t>& entity_ids,
                                    Timestamp end,
                                    size_t max_results_per_entity) {
   std::unordered_map<uint64_t, std::vector<MemTableEntry>> results;
-  
+
   if (!opened_ || entity_ids.empty()) return results;
-  
+
   // 预分配结果空间
   for (uint64_t eid : entity_ids) {
     results[eid].reserve(max_results_per_entity);
   }
-  
+
   // 1. 从 MemTable 查询（热数据；Task 1.5：覆盖所有 target）
   for (uint64_t eid : entity_ids) {
     auto mem_results = mem_->GetRangeAllTargets(eid, entity_type, column_id,
@@ -883,12 +883,12 @@ LsmEngine::BatchGetRangeOptimized(const std::vector<uint64_t>& entity_ids,
       results[eid].push_back(entry);
     }
   }
-  
+
   // 2. 从 Immutable MemTable 查询
   if (imm_) {
     for (uint64_t eid : entity_ids) {
       if (results[eid].size() >= max_results_per_entity) continue;
-      
+
       auto imm_results = imm_->GetRangeAllTargets(eid, entity_type, column_id,
                                                   start, end);
       for (const auto& entry : imm_results) {
@@ -897,7 +897,7 @@ LsmEngine::BatchGetRangeOptimized(const std::vector<uint64_t>& entity_ids,
       }
     }
   }
-  
+
   // 3. 从 SST 文件批量查询
   // Task 3.5：文件集合取所有 entity_ids 的并集（不再只用 entity_ids[0]），
   // 且去掉 10 文件的静默截断；文件选择走区间索引。
@@ -915,10 +915,10 @@ LsmEngine::BatchGetRangeOptimized(const std::vector<uint64_t>& entity_ids,
               [](const IndexedFile& a, const IndexedFile& b) {
                 return a.file_number > b.file_number;
               });
-    
+
     // 对每个 SST 文件使用批量查询
     for (const auto& file_meta : relevant_files) {
-      if (file_meta.max_timestamp < start.value() || 
+      if (file_meta.max_timestamp < start.value() ||
           file_meta.min_timestamp > end.value()) {
         continue;  // 时间范围不重叠
       }
@@ -931,29 +931,29 @@ LsmEngine::BatchGetRangeOptimized(const std::vector<uint64_t>& entity_ids,
         }
       }
       if (all_full) break;
-      
+
       auto reader = GetCachedReader(file_meta.file_number, file_meta.path);
       if (!reader) continue;
-      
+
       // 批量查询该文件中的所有 entity
       auto file_results = reader->BatchGetRange(entity_ids, entity_type, column_id, start, end);
-      
+
       // 合并结果
       for (const auto& [eid, entries] : file_results) {
         if (results[eid].size() >= max_results_per_entity) continue;
-        
+
         for (const auto& [key, desc] : entries) {
           if (results[eid].size() >= max_results_per_entity) break;
-          
-          std::optional<uint64_t> dst_id = (key.target_id() != 0) 
-              ? std::optional<uint64_t>(key.target_id()) 
+
+          std::optional<uint64_t> dst_id = (key.target_id() != 0)
+              ? std::optional<uint64_t>(key.target_id())
               : std::nullopt;
           results[eid].emplace_back(key.timestamp(), desc, dst_id, Timestamp(0));
         }
       }
     }
   }
-  
+
   return results;
 }
 
@@ -967,14 +967,14 @@ LsmEngine::ParallelGetRangeFromSST(const std::vector<uint64_t>& entity_ids,
                                      size_t max_results_per_entity,
                                      size_t num_threads) {
   std::unordered_map<uint64_t, std::vector<MemTableEntry>> results;
-  
+
   if (!opened_ || !compaction_engine_ || entity_ids.empty()) return results;
-  
+
   // 预分配结果空间
   for (uint64_t eid : entity_ids) {
     results[eid].reserve(max_results_per_entity);
   }
-  
+
   // Task 3.5：所有 entity_ids 的文件并集（区间索引），无静默截断
   uint64_t min_entity = entity_ids.front();
   uint64_t max_entity = entity_ids.front();
@@ -989,45 +989,45 @@ LsmEngine::ParallelGetRangeFromSST(const std::vector<uint64_t>& entity_ids,
             [](const IndexedFile& a, const IndexedFile& b) {
               return a.file_number > b.file_number;
             });
-  
+
   if (relevant_files.empty()) return results;
-  
+
   // 如果文件数量少，使用串行查询
   if (relevant_files.size() <= 2) {
-    return BatchGetRangeOptimized(entity_ids, entity_type, column_id, 
+    return BatchGetRangeOptimized(entity_ids, entity_type, column_id,
                                    start, end, max_results_per_entity);
   }
-  
+
   // 并行查询多个文件
   num_threads = std::min(num_threads, relevant_files.size());
   size_t files_per_thread = relevant_files.size() / num_threads;
   size_t remainder = relevant_files.size() % num_threads;
-  
+
   // 每个线程的结果
   std::vector<std::unordered_map<uint64_t, std::vector<std::pair<CedarKey, Descriptor>>>>
       thread_results(num_threads);
-  
+
   std::vector<std::thread> threads;
   size_t start_idx = 0;
-  
+
   // 构建 entity_set 用于快速查找
   std::unordered_set<uint64_t> entity_set(entity_ids.begin(), entity_ids.end());
-  
+
   for (size_t t = 0; t < num_threads; ++t) {
     size_t count = files_per_thread + (t < remainder ? 1 : 0);
     if (count == 0) continue;
-    
-    threads.emplace_back([this, &relevant_files, &entity_set, &thread_results, 
+
+    threads.emplace_back([this, &relevant_files, &entity_set, &thread_results,
                           t, start_idx, count, entity_type, column_id, start, end]() {
       for (size_t i = start_idx; i < start_idx + count; ++i) {
         const auto& file_meta = relevant_files[i];
-        
+
         auto reader = GetCachedReader(file_meta.file_number, file_meta.path);
         if (!reader) continue;
-        
+
         // 获取时间范围内的所有数据
         auto positions = reader->GetRange(0, entity_type, column_id, start, end);
-        
+
         // 过滤 entity_ids 中的数据
         for (const auto& [key, desc] : positions) {
           if (entity_set.find(key.entity_id()) != entity_set.end()) {
@@ -1036,31 +1036,31 @@ LsmEngine::ParallelGetRangeFromSST(const std::vector<uint64_t>& entity_ids,
         }
       }
     });
-    
+
     start_idx += count;
   }
-  
+
   // 等待所有线程完成
   for (auto& t : threads) {
     t.join();
   }
-  
+
   // 合并结果
   for (size_t t = 0; t < num_threads; ++t) {
     for (const auto& [eid, entries] : thread_results[t]) {
       if (results[eid].size() >= max_results_per_entity) continue;
-      
+
       for (const auto& [key, desc] : entries) {
         if (results[eid].size() >= max_results_per_entity) break;
-        
-        std::optional<uint64_t> dst_id = (key.target_id() != 0) 
-            ? std::optional<uint64_t>(key.target_id()) 
+
+        std::optional<uint64_t> dst_id = (key.target_id() != 0)
+            ? std::optional<uint64_t>(key.target_id())
             : std::nullopt;
         results[eid].emplace_back(key.timestamp(), desc, dst_id, Timestamp(0));
       }
     }
   }
-  
+
   return results;
 }
 
@@ -1082,12 +1082,12 @@ std::vector<LsmEngine::TemporalVersion> LsmEngine::GetTemporalChain(uint64_t ent
       result.push_back({entry.timestamp, entry.descriptor, -1});
     }
   }
-  
+
   // Sort by timestamp descending
   std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
     return a.timestamp.value() > b.timestamp.value();
   });
-  
+
   return result;
 }
 
@@ -1425,17 +1425,17 @@ void LsmEngine::TrackColumnId(uint64_t entity_id, uint16_t column_id) {
     }
     return;
   }
-  
+
   std::unique_lock<std::shared_mutex> lock(column_map_mutex_);
   entity_column_map_[entity_id].Add(column_id);
 }
 
 void LsmEngine::FlushColumnIdBatch() {
   if (!batch_tracking_enabled_) return;
-  
+
   size_t count = batch_buffer_index_.load();
   if (count == 0) return;
-  
+
   std::unique_lock<std::shared_mutex> lock(column_map_mutex_);
   for (size_t i = 0; i < count && i < kTrackBatchSize; i++) {
     entity_column_map_[batch_buffer_[i].first].Add(batch_buffer_[i].second);
@@ -1446,7 +1446,7 @@ void LsmEngine::FlushColumnIdBatch() {
 Status LsmEngine::InitWAL() {
   // 初始化 TransactionManager
   txn_manager_ = std::make_unique<TransactionManager>();
-  
+
   // 初始化 WAL Writer（如果启用）
   if (options_.enable_wal) {
     std::string wal_path = db_path_ + "/wal";
@@ -1465,7 +1465,7 @@ Status LsmEngine::InitWAL() {
       return s;
     }
   }
-  
+
   return Status::OK();
 }
 
@@ -1493,13 +1493,13 @@ std::unique_ptr<OCCTransaction> LsmEngine::BeginTransaction(const TransactionOpt
       wal_writer_.get(),       // WalWriter
       options                  // TransactionOptions
   );
-  
+
   // 开始事务
   Status s = txn->Begin();
   if (!s.ok()) {
     return nullptr;
   }
-  
+
   return txn;
 }
 
@@ -1744,11 +1744,11 @@ Status LsmEngine::FlushEntityGroup(uint8_t entity_type, uint16_t column_id,
   {
     std::lock_guard<std::shared_mutex> lock(mutex_);
     levels_[0].push_back(meta);
-    
+
     std::unique_lock<std::shared_mutex> index_lock(column_index_mutex_);
     column_file_index_[column_id].push_back(&levels_[0].back());
   }
-  
+
   if (compaction_engine_) {
     ZoneSstMeta zone_meta;
     zone_meta.file_number = file_number;
@@ -1762,8 +1762,14 @@ Status LsmEngine::FlushEntityGroup(uint8_t entity_type, uint16_t column_id,
     zone_meta.column_id = column_id;
     zone_meta.entity_type = entity_type;
     zone_meta.path = filepath;
-    zone_meta.blob_path = db_path_ + "/sst_" + std::to_string(file_number) + ".blob";
-    
+    // Task 3.6：flush 若通过 AddValue 写出 Blob，把 blob 元数据交给压缩引擎
+    //（引用计数/MANIFEST 持久化/GC 依赖它）；没有 Blob 时保持 0/空。
+    zone_meta.blob_file_number = builder.HasBlob() ? file_number : 0;
+    zone_meta.blob_file_size = builder.BlobFileSize();
+    zone_meta.blob_path = zone_meta.blob_file_number != 0
+                              ? db_path_ + "/sst_" + std::to_string(file_number) + ".blob"
+                              : std::string();
+
     Status cs = compaction_engine_->AddSSTFile(zone_meta);
     if (!cs.ok()) {
       // TODO: 添加日志记录
@@ -1783,7 +1789,7 @@ Status LsmEngine::FlushEntityGroup(uint8_t entity_type, uint16_t column_id,
     indexed.level = 0;
     indexed.path = filepath;
     AddFileToIndex(indexed);
-    
+
     compaction_engine_->ScheduleCompaction();
   }
 
@@ -1798,15 +1804,15 @@ Status LsmEngine::DoCompaction(int level, const std::vector<FrondFileMeta>& inpu
   // 提取 entity_type 和 column_id（应该都相同）
   uint8_t entity_type = inputs[0].entity_type;
   uint16_t column_id = inputs[0].column_id;
-  
+
   // 验证所有输入文件类型一致
   for (const auto& input : inputs) {
     if (input.entity_type != entity_type || input.column_id != column_id) {
-      return Status::InvalidArgument("DoCompaction", 
+      return Status::InvalidArgument("DoCompaction",
           "input files have different entity_type or column_id");
     }
   }
-  
+
   // 打开所有输入 SST
   std::vector<std::shared_ptr<ZoneColumnarSstReader>> readers;
   for (const auto& input : inputs) {
@@ -1818,26 +1824,26 @@ Status LsmEngine::DoCompaction(int level, const std::vector<FrondFileMeta>& inpu
     }
     readers.push_back(reader);
   }
-  
+
   // 准备 reader 指针向量
   std::vector<ZoneColumnarSstReader*> reader_ptrs;
   for (auto& r : readers) {
     reader_ptrs.push_back(r.get());
   }
-  
+
   // 创建输出文件
   uint64_t file_number = next_file_number_.fetch_add(1);
   std::string output_path = SstFilePath(file_number);
   int output_level = level + 1;
-  
+
   // 执行归并
   CompactionMerger merger(reader_ptrs, entity_type, column_id);
   auto output_meta = merger.Run(output_path, db_path_);
-  
+
   if (!output_meta) {
     return Status::IOError("DoCompaction", "merger failed");
   }
-  
+
   // 设置文件号
   output_meta->file_number = file_number;
   output_meta->level = output_level;
@@ -1849,14 +1855,14 @@ Status LsmEngine::DoCompaction(int level, const std::vector<FrondFileMeta>& inpu
     output_meta->min_timestamp = std::min(output_meta->min_timestamp, input.min_tx_time);
     output_meta->max_timestamp = std::max(output_meta->max_timestamp, input.max_tx_time);
   }
-  
+
   // 获取文件大小
   uint64_t file_size = 0;
   Status ls = env_->GetFileSize(output_path, &file_size);
   if (!ls.ok()) {
     return Status::IOError("DoCompaction", ls.ToString());
   }
-  
+
   // 创建 FrondFileMeta
   FrondFileMeta new_meta;
   new_meta.file_number = file_number;
@@ -1869,11 +1875,11 @@ Status LsmEngine::DoCompaction(int level, const std::vector<FrondFileMeta>& inpu
   new_meta.level = output_level;
   new_meta.column_id = column_id;
   new_meta.entity_type = entity_type;
-  
+
   // 原子更新 levels_
   {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    
+
     // 从当前层级删除输入文件
     auto& current_level = levels_[level];
     for (const auto& input : inputs) {
@@ -1883,48 +1889,48 @@ Status LsmEngine::DoCompaction(int level, const std::vector<FrondFileMeta>& inpu
                                });
       current_level.erase(it, current_level.end());
     }
-    
+
     // 添加新文件到下一层级
     if (output_level >= static_cast<int>(levels_.size())) {
       levels_.resize(output_level + 1);
     }
     levels_[output_level].push_back(new_meta);
   }
-  
+
   // 删除旧文件
   for (const auto& input : inputs) {
     std::string old_path = SstFilePath(input.file_number);
     env_->RemoveFile(old_path);
   }
-  
+
   // 更新 Compaction Engine
   if (compaction_engine_) {
     compaction_engine_->RemoveSSTFile(output_meta->file_number);
     compaction_engine_->AddSSTFile(*output_meta);
   }
-  
+
   return Status::OK();
 }
 
 std::vector<FrondFileMeta> LsmEngine::SelectCompactionFiles(int level) {
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  
+
   if (level < 0 || level >= static_cast<int>(levels_.size())) {
     return {};
   }
-  
+
   const auto& level_files = levels_[level];
   if (level_files.size() < options_.compaction_config.min_files) {
     return {};
   }
-  
+
   // Simple strategy: select oldest files (smallest file numbers)
   std::vector<FrondFileMeta> candidates = level_files;
   std::sort(candidates.begin(), candidates.end(),
             [](const auto& a, const auto& b) {
               return a.file_number < b.file_number;
             });
-  
+
   // Select up to 4 files for compaction
   size_t num_to_select = std::min(candidates.size(), size_t(4));
   return std::vector<FrondFileMeta>(candidates.begin(), candidates.begin() + num_to_select);
@@ -1932,28 +1938,28 @@ std::vector<FrondFileMeta> LsmEngine::SelectCompactionFiles(int level) {
 
 bool LsmEngine::NeedsCompaction(int level) const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  
+
   if (level < 0 || level >= static_cast<int>(levels_.size())) {
     return false;
   }
-  
+
   const auto& level_files = levels_[level];
-  
+
   // Check file count
   if (level_files.size() >= options_.compaction_config.min_files) {
     return true;
   }
-  
+
   // Check total size
   uint64_t total_size = 0;
   for (const auto& meta : level_files) {
     total_size += meta.file_size;
   }
-  
+
   if (total_size >= options_.compaction_config.min_size) {
     return true;
   }
-  
+
   return false;
 }
 
@@ -1963,43 +1969,43 @@ void LsmEngine::QueryFrondFiles(uint64_t entity_id, EntityType entity_type,
 }
 
 void LsmEngine::GetEntriesFromSst(uint64_t entity_id, EntityType entity_type,
-                                  uint16_t column_id, 
+                                  uint16_t column_id,
                                   std::vector<std::pair<CedarKey, Descriptor>>* results) {
   if (!results || levels_.empty()) {
     return;
   }
-  
+
   // Task 3.4/3.5：区间索引选文件 + reader cache；去掉 50 文件的静默截断。
   auto candidates = LookupFiles(entity_id, static_cast<uint8_t>(entity_type), column_id);
   std::sort(candidates.begin(), candidates.end(),
             [](const IndexedFile& a, const IndexedFile& b) {
               return a.file_number > b.file_number;
             });
-  
+
   // Query candidate files
   for (const auto& meta : candidates) {
     auto reader = GetCachedReader(meta.file_number, meta.path);
     if (!reader) continue;
-    
+
     // Bloom Filter optimization: skip files that definitely don't contain the entity
     if (!reader->MayContainEntity(entity_id)) {
       continue;
     }
-    
+
     // Get all versions for this entity using GetRange
     // Use full time range to get all versions
-    auto versions = reader->GetRange(entity_id, entity_type, column_id, 
-                                     Timestamp(0), 
+    auto versions = reader->GetRange(entity_id, entity_type, column_id,
+                                     Timestamp(0),
                                      Timestamp(UINT64_MAX));
-    
+
     // Add results
     for (auto& [key, desc] : versions) {
       results->emplace_back(key, desc);
     }
   }
-  
+
   // Sort results by timestamp descending (newest first)
-  std::sort(results->begin(), results->end(), 
+  std::sort(results->begin(), results->end(),
             [](const auto& a, const auto& b) {
               return a.first.timestamp().value() > b.first.timestamp().value();
             });
@@ -2083,7 +2089,7 @@ std::vector<FrondFileMeta> LsmEngine::GetFrondFiles(int level) const {
 void LsmEngine::BuildColumnFileIndex() {
   std::unique_lock<std::shared_mutex> lock(column_index_mutex_);
   column_file_index_.clear();
-  
+
   // Iterate through all levels and files
   for (int level = 0; level < static_cast<int>(levels_.size()); ++level) {
     for (auto& meta : levels_[level]) {
@@ -2091,7 +2097,7 @@ void LsmEngine::BuildColumnFileIndex() {
       column_file_index_[meta.column_id].push_back(&meta);
     }
   }
-  
+
   // Sort each column's files by min_entity_id for binary search
   for (auto& [col_id, files] : column_file_index_) {
     std::sort(files.begin(), files.end(), [](FrondFileMeta* a, FrondFileMeta* b) {
@@ -2100,19 +2106,19 @@ void LsmEngine::BuildColumnFileIndex() {
   }
 }
 
-std::vector<FrondFileMeta*> LsmEngine::GetCandidateFiles(uint64_t entity_id, 
-                                                           EntityType entity_type, 
+std::vector<FrondFileMeta*> LsmEngine::GetCandidateFiles(uint64_t entity_id,
+                                                           EntityType entity_type,
                                                            uint16_t column_id) const {
   std::shared_lock<std::shared_mutex> lock(column_index_mutex_);
-  
+
   auto it = column_file_index_.find(column_id);
   if (it == column_file_index_.end()) {
     return {};
   }
-  
+
   const auto& files = it->second;
   std::vector<FrondFileMeta*> candidates;
-  
+
   // Use binary search to find files that might contain entity_id
   // Files are sorted by min_entity_id
   for (FrondFileMeta* meta : files) {
@@ -2126,7 +2132,7 @@ std::vector<FrondFileMeta*> LsmEngine::GetCandidateFiles(uint64_t entity_id,
     // Early termination: if file's min_entity_id > entity_id, no need to check further
     // But we can't break here because files may have overlapping ranges
   }
-  
+
   return candidates;
 }
 
@@ -2309,9 +2315,9 @@ namespace {
 void LsmEngine::MigrateExistingSstFiles() {
   // 将现有的 SST 文件从旧格式迁移到新的 Compaction 引擎
   // 注意：这是一个一次性迁移，在首次启用新引擎时调用
-  
+
   if (!compaction_engine_) return;
-  
+
   for (int level = 0; level < static_cast<int>(levels_.size()); ++level) {
     for (const auto& old_meta : levels_[level]) {
       // 审计 9.3：LoadManifest 已把 MANIFEST 里的高层文件恢复好（同一目录下的
@@ -2333,7 +2339,7 @@ void LsmEngine::MigrateExistingSstFiles() {
       zone_meta.entity_type = old_meta.entity_type;
       zone_meta.path = SstFilePath(old_meta.file_number);
       zone_meta.blob_path = db_path_ + "/sst_" + std::to_string(old_meta.file_number) + ".blob";
-      
+
       // 静默添加，不触发 Compaction
       compaction_engine_->AddSSTFile(zone_meta);
     }
@@ -2344,13 +2350,13 @@ Status LsmEngine::CompactAll() {
   if (!compaction_engine_) {
     return Status::InvalidArgument("LsmEngine", "Compaction engine not initialized");
   }
-  
+
   // 等待所有自动 Compaction 完成
-  
+
   // 执行全量合并
   Status s = compaction_engine_->CompactAll();
-  
-  
+
+
   return s;
 }
 
@@ -2367,13 +2373,13 @@ void LsmEngine::WaitForCompactions() {
 std::optional<std::vector<MemTableEntry>> LsmEngine::GetFromCrossQueryCache(
     uint64_t entity_id, uint16_t column_id) const {
   CacheKey key{entity_id, column_id};
-  
+
   std::shared_lock<std::shared_mutex> lock(cross_query_cache_mutex_);
   auto it = cross_query_cache_.find(key);
   if (it == cross_query_cache_.end()) {
     return std::nullopt;
   }
-  
+
   // 检查是否过期
   auto now = std::chrono::steady_clock::now();
   if (now - it->second.timestamp > kCrossQueryCacheTTL) {
@@ -2402,7 +2408,7 @@ void LsmEngine::AddToCrossQueryCache(uint64_t entity_id, uint16_t column_id,
                                      const std::vector<MemTableEntry>& data) {
   // 清理过期缓存
   CleanupCrossQueryCache();
-  
+
   // 如果缓存已满，不添加
   {
     std::shared_lock<std::shared_mutex> lock(cross_query_cache_mutex_);
@@ -2410,13 +2416,13 @@ void LsmEngine::AddToCrossQueryCache(uint64_t entity_id, uint16_t column_id,
       return;
     }
   }
-  
+
   CacheKey key{entity_id, column_id};
   CacheEntry entry;
   entry.data = data;
   entry.timestamp = std::chrono::steady_clock::now();
   entry.hit_count = 1;
-  
+
   std::unique_lock<std::shared_mutex> lock(cross_query_cache_mutex_);
   cross_query_cache_[key] = std::move(entry);
 }
@@ -2430,7 +2436,7 @@ void LsmEngine::InvalidateCrossQueryCache(uint64_t entity_id, uint16_t column_id
 void LsmEngine::CleanupCrossQueryCache() {
   auto now = std::chrono::steady_clock::now();
   std::unique_lock<std::shared_mutex> lock(cross_query_cache_mutex_);
-  
+
   for (auto it = cross_query_cache_.begin(); it != cross_query_cache_.end();) {
     if (now - it->second.timestamp > kCrossQueryCacheTTL) {
       it = cross_query_cache_.erase(it);
@@ -2444,21 +2450,21 @@ void LsmEngine::CleanupCrossQueryCache() {
 // OPTIMIZATION: 热数据预读取和查询模式追踪
 // =============================================================================
 
-void LsmEngine::TrackQueryPattern(uint64_t entity_id, EntityType entity_type, 
+void LsmEngine::TrackQueryPattern(uint64_t entity_id, EntityType entity_type,
                                    uint16_t column_id) {
   CacheKey key{entity_id, column_id};
-  
+
   std::unique_lock<std::shared_mutex> lock(query_pattern_mutex_);
   auto& pattern = query_patterns_[key];
   pattern.count++;
   pattern.last_query = std::chrono::steady_clock::now();
 }
 
-void LsmEngine::PrefetchHotData(uint64_t entity_id, EntityType entity_type, 
+void LsmEngine::PrefetchHotData(uint64_t entity_id, EntityType entity_type,
                                  uint16_t column_id) {
   // 检查是否是热数据
   CacheKey key{entity_id, column_id};
-  
+
   {
     std::shared_lock<std::shared_mutex> lock(query_pattern_mutex_);
     auto it = query_patterns_.find(key);
@@ -2466,16 +2472,16 @@ void LsmEngine::PrefetchHotData(uint64_t entity_id, EntityType entity_type,
       return;  // 不是热数据，不预读取
     }
   }
-  
+
   // 检查是否已在缓存中
   if (GetFromCrossQueryCache(entity_id, column_id).has_value()) {
     return;  // 已在缓存中
   }
-  
+
   // 预读取数据到缓存（使用全时间范围）
-  auto data = GetRange(entity_id, entity_type, column_id, 
+  auto data = GetRange(entity_id, entity_type, column_id,
                        Timestamp(0), Timestamp(UINT64_MAX));
-  
+
   if (!data.empty()) {
     AddToCrossQueryCache(entity_id, column_id, data);
   }
@@ -2488,13 +2494,13 @@ void LsmEngine::PrefetchHotData(uint64_t entity_id, EntityType entity_type,
 std::optional<std::vector<MemTableEntry>> LsmEngine::GetFromTimeRangeCache(
     uint64_t entity_id, uint16_t column_id, uint64_t start_ts, uint64_t end_ts) const {
   TimeRangeCacheKey key{entity_id, column_id, start_ts, end_ts};
-  
+
   std::shared_lock<std::shared_mutex> lock(time_range_cache_mutex_);
   auto it = time_range_cache_.find(key);
   if (it == time_range_cache_.end()) {
     return std::nullopt;
   }
-  
+
   // 检查是否过期
   auto now = std::chrono::steady_clock::now();
   if (now - it->second.second > kTimeRangeCacheTTL) {
@@ -2503,16 +2509,16 @@ std::optional<std::vector<MemTableEntry>> LsmEngine::GetFromTimeRangeCache(
     time_range_cache_.erase(it);
     return std::nullopt;
   }
-  
+
   return it->second.first;
 }
 
-void LsmEngine::AddToTimeRangeCache(uint64_t entity_id, uint16_t column_id, 
+void LsmEngine::AddToTimeRangeCache(uint64_t entity_id, uint16_t column_id,
                                      uint64_t start_ts, uint64_t end_ts,
                                      const std::vector<MemTableEntry>& data) {
   // 清理过期缓存
   CleanupTimeRangeCache();
-  
+
   // 如果缓存已满，不添加
   {
     std::shared_lock<std::shared_mutex> lock(time_range_cache_mutex_);
@@ -2520,7 +2526,7 @@ void LsmEngine::AddToTimeRangeCache(uint64_t entity_id, uint16_t column_id,
       return;
     }
   }
-  
+
   TimeRangeCacheKey key{entity_id, column_id, start_ts, end_ts};
   std::unique_lock<std::shared_mutex> lock(time_range_cache_mutex_);
   time_range_cache_[key] = {data, std::chrono::steady_clock::now()};
@@ -2529,7 +2535,7 @@ void LsmEngine::AddToTimeRangeCache(uint64_t entity_id, uint16_t column_id,
 void LsmEngine::CleanupTimeRangeCache() {
   auto now = std::chrono::steady_clock::now();
   std::unique_lock<std::shared_mutex> lock(time_range_cache_mutex_);
-  
+
   for (auto it = time_range_cache_.begin(); it != time_range_cache_.end();) {
     if (now - it->second.second > kTimeRangeCacheTTL) {
       it = time_range_cache_.erase(it);
@@ -2545,19 +2551,19 @@ void LsmEngine::CleanupTimeRangeCache() {
 
 void LsmEngine::PreloadHotSSTFiles() {
   if (!sst_reader_cache_ || !compaction_engine_) return;
-  
+
   // 获取最近频繁访问的文件
   auto stats = sst_reader_cache_->GetStats();
   if (stats.hits < 100) return;  // 访问次数不够，不预加载
-  
+
   // 获取热数据文件列表
   auto hot_files = sst_reader_cache_->GetHotFiles();
-  
+
   // 预加载热数据文件（最多预加载 5 个）
   size_t preload_count = 0;
   for (const auto& file_path : hot_files) {
     if (preload_count >= 5) break;
-    
+
     if (sst_reader_cache_->Preload(file_path)) {
       preload_count++;
     }
@@ -2569,29 +2575,29 @@ std::vector<std::string> LsmEngine::GetHotSSTFilesForQuery(
     uint16_t column_id,
     uint8_t entity_type) const {
   std::vector<std::string> hot_files;
-  
+
   if (!compaction_engine_) return hot_files;
-  
+
   // 找出包含最多查询 entity 的文件
   std::unordered_map<std::string, size_t> file_entity_count;
-  
+
   for (uint64_t entity_id : entity_ids) {
     auto files = LookupFiles(entity_id, entity_type, column_id);
     for (const auto& file : files) {
       file_entity_count[file.path]++;
     }
   }
-  
+
   // 按包含 entity 数量排序，返回前 10 个
   std::vector<std::pair<std::string, size_t>> sorted_files(
       file_entity_count.begin(), file_entity_count.end());
   std::sort(sorted_files.begin(), sorted_files.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
-  
+
   for (size_t i = 0; i < std::min(size_t(10), sorted_files.size()); ++i) {
     hot_files.push_back(sorted_files[i].first);
   }
-  
+
   return hot_files;
 }
 

@@ -38,6 +38,7 @@ set(CEDAR_STORAGE_TESTS
     test_edge_target               # 2.4/2.5/8.1/8.2 边 target 贯穿
     test_compaction                # 3.1/9.1/9.2/9.3 压缩列隔离与下层保留
     test_vsl_concurrency           # 1.1/1.9 8 线程 80k 行
+    test_blob                      # 3.6/T11 SST 本地 Blob 端到端
 )
 
 foreach(storage_test ${CEDAR_STORAGE_TESTS})

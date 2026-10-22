@@ -4,6 +4,7 @@
 #include "cedar/fact/meta_codec.h"
 
 #include <limits>
+#include <memory>
 #include <unordered_set>
 
 #include "cedar/core/crc32c.h"
@@ -27,7 +28,18 @@ enum class MetaRecordKind : uint8_t {
   kTransactionOutcome = 6,
   kSequence = 7,
   kVacuumState = 8,
+  // Compact sequence record (meta sequence v2a). A separate kind, not a
+  // kMetaVersion bump: the framing, CRC and meta version stay identical so an
+  // old record and a v2 record can live in the same meta CF.
+  kSequenceV2 = 9,
 };
+
+// v2a sequence payload: payload_version + fact_key_version + txn_id +
+// system_hlc + count, then one 23-byte descriptor per fact. commit_seq is not
+// stored: it is the sequence/<seq> record key.
+constexpr uint8_t kSequenceV2PayloadVersion = 1;
+constexpr size_t kSequenceV2HeaderBytes = 1 + 1 + 8 + 8 + 4;
+constexpr size_t kSequenceV2FactBytes = 4 + 1 + 2 + 8 + 8;
 
 void AppendU16(std::string* out, uint16_t value) {
   out->push_back(static_cast<char>(value >> 8));
@@ -91,6 +103,14 @@ bool ReadU64View(std::string_view input, size_t* offset, uint64_t* value) {
     *value = (*value << 8) | static_cast<uint8_t>(input[*offset + index]);
   }
   *offset += 8;
+  return true;
+}
+
+bool ReadU16View(std::string_view input, size_t* offset, uint16_t* value) {
+  if (input.size() - *offset < 2) return false;
+  *value = (static_cast<uint16_t>(static_cast<uint8_t>(input[*offset])) << 8) |
+           static_cast<uint8_t>(input[*offset + 1]);
+  *offset += 2;
   return true;
 }
 
@@ -159,6 +179,164 @@ StatusOr<std::string> DecodeRecord(MetaRecordKind expected_kind,
   const auto payload = DecodeRecordView(expected_kind, encoded);
   if (!payload.ok()) return payload.status();
   return std::string(payload.ValueOrDie());
+}
+
+// Peeks the record kind so the sequence decoders can dispatch on v1/v2a before
+// the strict per-kind framing check rejects the other kind as a header error.
+StatusOr<uint8_t> PeekRecordKind(std::string_view encoded) {
+  if (encoded.size() < 2) {
+    return Status::Corruption("metadata", "truncated record");
+  }
+  return static_cast<uint8_t>(encoded[1]);
+}
+
+struct SequenceV2Layout {
+  TxnId txn_id;
+  uint64_t system_hlc = 0;
+  uint32_t fact_count = 0;
+  size_t facts_offset = 0;
+};
+
+// Validates the v2 payload header, both version bytes and the exact payload
+// length. Shared by the materializing record decoder and the v2 view decoder.
+StatusOr<SequenceV2Layout> ParseSequenceV2Payload(std::string_view bytes) {
+  if (bytes.size() < kSequenceV2HeaderBytes) {
+    return Status::Corruption("sequence record", "invalid sequence record");
+  }
+  size_t offset = 0;
+  const uint8_t payload_version = static_cast<uint8_t>(bytes[offset++]);
+  const uint8_t fact_key_version = static_cast<uint8_t>(bytes[offset++]);
+  if (payload_version != kSequenceV2PayloadVersion) {
+    return Status::Corruption("sequence record",
+                              "unsupported sequence payload version");
+  }
+  if (fact_key_version != kFactKeyVersion) {
+    return Status::Corruption("sequence record", "unsupported fact key version");
+  }
+  uint64_t txn_id = 0;
+  uint64_t system_hlc = 0;
+  uint32_t fact_count = 0;
+  if (!ReadU64View(bytes, &offset, &txn_id) ||
+      !ReadU64View(bytes, &offset, &system_hlc) ||
+      !ReadU32View(bytes, &offset, &fact_count) || fact_count == 0 ||
+      fact_count > (bytes.size() - offset) / kSequenceV2FactBytes ||
+      bytes.size() - offset !=
+          static_cast<size_t>(fact_count) * kSequenceV2FactBytes) {
+    return Status::Corruption("sequence record", "invalid sequence record");
+  }
+  SequenceV2Layout layout;
+  layout.txn_id = TxnId{txn_id};
+  layout.system_hlc = system_hlc;
+  layout.fact_count = fact_count;
+  layout.facts_offset = offset;
+  return layout;
+}
+
+struct SequenceV2Fact {
+  FactRef ref;
+  ValidTime valid_from;
+};
+
+// Reads one 23-byte fact descriptor: part(4), family(1), property(2), entity(8),
+// ~valid_from(8).
+StatusOr<SequenceV2Fact> ReadSequenceV2Fact(std::string_view bytes,
+                                            size_t* offset) {
+  uint32_t part_id = 0;
+  uint16_t property_id = 0;
+  uint64_t entity_id = 0;
+  uint64_t valid_from_desc = 0;
+  if (!ReadU32View(bytes, offset, &part_id) || *offset >= bytes.size()) {
+    return Status::Corruption("sequence record", "invalid sequence record");
+  }
+  const uint8_t family = static_cast<uint8_t>(bytes[(*offset)++]);
+  if (!ReadU16View(bytes, offset, &property_id) ||
+      !ReadU64View(bytes, offset, &entity_id) ||
+      !ReadU64View(bytes, offset, &valid_from_desc)) {
+    return Status::Corruption("sequence record", "invalid sequence record");
+  }
+  const FactRef ref(PartId{part_id}, static_cast<FactFamily>(family),
+                    PropertyId{property_id}, entity_id);
+  const Status valid = ref.Validate();
+  if (!valid.ok()) {
+    return Status::Corruption("sequence record", valid.ToString());
+  }
+  return SequenceV2Fact{ref, ValidTime{~valid_from_desc}};
+}
+
+// Rebuilds one 32-byte fact key from the descriptor fields. EncodeFactKey is
+// deterministic, so the bytes are identical to the key the v1 writer stored for
+// the same (ref, valid_from, commit_seq).
+StatusOr<std::string> RebuildSequenceV2FactKey(std::string_view bytes,
+                                               size_t* offset,
+                                               CommitSeq commit_seq) {
+  const auto fact = ReadSequenceV2Fact(bytes, offset);
+  if (!fact.ok()) return fact.status();
+  std::string key = EncodeFactKey(fact.ValueOrDie().ref,
+                                  fact.ValueOrDie().valid_from, commit_seq);
+  if (key.empty()) {
+    return Status::Corruption("sequence record", "invalid fact identity");
+  }
+  return key;
+}
+
+StatusOr<SequenceRecord> DecodeSequenceRecordV2(const std::string& encoded,
+                                                CommitSeq commit_seq) {
+  if (commit_seq.value == 0) {
+    return Status::Corruption(
+        "sequence record", "v2 sequence record requires its commit sequence");
+  }
+  const auto payload = DecodeRecord(MetaRecordKind::kSequenceV2, encoded);
+  if (!payload.ok()) return payload.status();
+  const std::string_view bytes = payload.ValueOrDie();
+  const auto layout = ParseSequenceV2Payload(bytes);
+  if (!layout.ok()) return layout.status();
+  const SequenceV2Layout& header = layout.ValueOrDie();
+  std::vector<std::string> keys;
+  keys.reserve(header.fact_count);
+  size_t offset = header.facts_offset;
+  for (uint32_t index = 0; index < header.fact_count; ++index) {
+    auto key = RebuildSequenceV2FactKey(bytes, &offset, commit_seq);
+    if (!key.ok()) return key.status();
+    keys.push_back(key.ConsumeValueOrDie());
+  }
+  SequenceRecord record{commit_seq, header.txn_id, header.system_hlc,
+                        std::move(keys)};
+  // Duplicate detection and the per-key commit_seq agreement check run here.
+  const Status valid = record.Validate();
+  if (!valid.ok()) {
+    return Status::Corruption("sequence record", valid.ToString());
+  }
+  return record;
+}
+
+StatusOr<SequenceRecordView> DecodeSequenceRecordViewV2(
+    std::string_view encoded, CommitSeq commit_seq) {
+  if (commit_seq.value == 0) {
+    return Status::Corruption(
+        "sequence record", "v2 sequence record requires its commit sequence");
+  }
+  const auto payload = DecodeRecordView(MetaRecordKind::kSequenceV2, encoded);
+  if (!payload.ok()) return payload.status();
+  const std::string_view bytes = payload.ValueOrDie();
+  const auto layout = ParseSequenceV2Payload(bytes);
+  if (!layout.ok()) return layout.status();
+  const SequenceV2Layout& header = layout.ValueOrDie();
+  auto owned = std::make_shared<std::string>();
+  owned->reserve(static_cast<size_t>(header.fact_count) * kEncodedFactKeyBytes);
+  size_t offset = header.facts_offset;
+  for (uint32_t index = 0; index < header.fact_count; ++index) {
+    auto key = RebuildSequenceV2FactKey(bytes, &offset, commit_seq);
+    if (!key.ok()) return key.status();
+    owned->append(key.ValueOrDie());
+  }
+  SequenceRecordView view;
+  view.commit_seq = commit_seq;
+  view.txn_id = header.txn_id;
+  view.system_hlc = header.system_hlc;
+  view.fact_count = header.fact_count;
+  view.identities = std::string_view(*owned);
+  view.owned_identities = std::move(owned);
+  return view;
 }
 
 }  // namespace
@@ -490,7 +668,46 @@ StatusOr<std::string> EncodeSequenceRecord(const SequenceRecord& record) {
   return EncodeRecord(MetaRecordKind::kSequence, payload);
 }
 
+StatusOr<std::string> EncodeSequenceRecordV2(const SequenceRecord& record) {
+  const Status valid = record.Validate();
+  if (!valid.ok()) return valid;
+  std::string payload;
+  payload.reserve(kSequenceV2HeaderBytes +
+                  record.fact_keys.size() * kSequenceV2FactBytes);
+  payload.push_back(static_cast<char>(kSequenceV2PayloadVersion));
+  payload.push_back(static_cast<char>(kFactKeyVersion));
+  AppendU64(&payload, record.txn_id.value);
+  AppendU64(&payload, record.system_hlc);
+  AppendU32(&payload, static_cast<uint32_t>(record.fact_keys.size()));
+  for (const std::string& key : record.fact_keys) {
+    const auto decoded = DecodeFactKey(key);
+    if (!decoded.ok()) return decoded.status();
+    const DecodedFactKey& fact = decoded.ValueOrDie();
+    // The descriptor has room only for the fields the v1 key encodes, so the
+    // rebuilt key is byte-identical. Refuse anything the encoder would not
+    // reproduce instead of silently losing key bits.
+    if (EncodeFactKey(fact.ref, fact.valid_from, record.commit_seq) != key) {
+      return Status::InvalidArgument(
+          "sequence record", "fact key is not representable in meta sequence v2");
+    }
+    AppendU32(&payload, fact.ref.part_id().value);
+    payload.push_back(static_cast<char>(fact.ref.family()));
+    AppendU16(&payload, fact.ref.property_id().value);
+    AppendU64(&payload, fact.ref.entity_id());
+    AppendU64(&payload, ~fact.valid_from.value);
+  }
+  return EncodeRecord(MetaRecordKind::kSequenceV2, payload);
+}
+
 StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded) {
+  const auto kind = PeekRecordKind(encoded);
+  if (!kind.ok()) return kind.status();
+  if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    // The v2 payload intentionally omits commit_seq (it is the record key).
+    // Guessing it would rebuild wrong 32-byte keys, so reject explicitly.
+    return Status::Corruption(
+        "sequence record", "v2 sequence record requires its commit sequence");
+  }
   const auto payload = DecodeRecord(MetaRecordKind::kSequence, encoded);
   if (!payload.ok()) return payload.status();
   const std::string& bytes = payload.ValueOrDie();
@@ -516,6 +733,18 @@ StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded) {
   const Status valid = record.Validate();
   if (!valid.ok()) return Status::Corruption("sequence record", valid.ToString());
   return record;
+}
+
+StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded,
+                                              CommitSeq commit_seq) {
+  const auto kind = PeekRecordKind(encoded);
+  if (!kind.ok()) return kind.status();
+  if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    return DecodeSequenceRecordV2(encoded, commit_seq);
+  }
+  // v1 records carry commit_seq in the payload; decoding stays identical so the
+  // caller's existing key/value agreement check is unchanged.
+  return DecodeSequenceRecord(encoded);
 }
 
 Status SequenceRecordView::Validate() const {
@@ -548,6 +777,14 @@ Status SequenceRecordView::Validate() const {
 
 StatusOr<SequenceRecordView> DecodeSequenceRecordView(
     std::string_view encoded) {
+  const auto kind = PeekRecordKind(encoded);
+  if (!kind.ok()) return kind.status();
+  if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    // A v2 view cannot borrow packed keys: the payload stores descriptors and
+    // rebuilding them needs the commit_seq from the record key.
+    return Status::Corruption(
+        "sequence record", "v2 sequence record requires its commit sequence");
+  }
   const auto payload = DecodeRecordView(MetaRecordKind::kSequence, encoded);
   if (!payload.ok()) return payload.status();
   const std::string_view bytes = payload.ValueOrDie();
@@ -573,6 +810,18 @@ StatusOr<SequenceRecordView> DecodeSequenceRecordView(
   view.identities = bytes.substr(offset, static_cast<size_t>(count) *
                                              kEncodedFactKeyBytes);
   return view;
+}
+
+StatusOr<SequenceRecordView> DecodeSequenceRecordView(
+    std::string_view encoded, CommitSeq commit_seq) {
+  const auto kind = PeekRecordKind(encoded);
+  if (!kind.ok()) return kind.status();
+  if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    return DecodeSequenceRecordViewV2(encoded, commit_seq);
+  }
+  // v1 stays the zero-copy view decoder; the sequence key is unused because the
+  // v1 payload carries commit_seq itself.
+  return DecodeSequenceRecordView(encoded);
 }
 
 StatusOr<std::string> EncodeVacuumState(const VacuumState& state) {

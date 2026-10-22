@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "storage/facts/fact_store.h"
+#include "cedar/core/crc32c.h"
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
 
@@ -1365,6 +1366,311 @@ TEST_F(FactStoreMetadataTest, ScanFamilyReadsFlushedFactsAfterCleanReopen) {
   ASSERT_EQ(identities.size(), 1U);
   ASSERT_TRUE(identities.front().edge_identity.has_value());
   EXPECT_EQ(*identities.front().edge_identity, identity);
+}
+
+// ---------------------------------------------------------------------------
+// Meta sequence record v2a (kSequenceV2)
+// ---------------------------------------------------------------------------
+// A v2 record replaces the packed 32-byte fact keys with 23-byte descriptors:
+// 6-byte meta header, payload_version(1), fact_key_version(1), txn_id(8),
+// system_hlc(8), count(4), then N x [part(4), family(1), property(2), entity(8),
+// ~valid_from(8)]. commit_seq is not in the payload; it is the sequence/<seq>
+// record key. Offsets below name the bytes a corruption test mutates.
+constexpr size_t kSequenceV2PayloadVersionOffset = 6;
+constexpr size_t kSequenceV2FactKeyVersionOffset = 7;
+constexpr size_t kSequenceV2CountOffset = 24;
+constexpr size_t kSequenceV2FirstFactOffset = 28;
+constexpr size_t kSequenceV2FirstFactFamilyOffset =
+    kSequenceV2FirstFactOffset + 4;
+
+// Recomputes the trailing CRC32C so a test can mutate a record and have the
+// targeted corruption (kind, version, count, descriptor) reach the decoder
+// instead of failing the checksum first.
+void RewriteMetaChecksum(std::string* encoded) {
+  ASSERT_GE(encoded->size(), 10U);
+  const uint32_t checksum =
+      crc32c::Value(encoded->data(), encoded->size() - 4);
+  size_t offset = encoded->size() - 4;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    (*encoded)[offset++] = static_cast<char>(checksum >> shift);
+  }
+}
+
+void SetMetaRecordKind(std::string* encoded, uint8_t kind) {
+  ASSERT_GE(encoded->size(), 2U);
+  (*encoded)[1] = static_cast<char>(kind);
+  RewriteMetaChecksum(encoded);
+}
+
+// Mixed vertex/edge, state/property references and per-fact valid times so the
+// part/family/property/entity/~valid_from descriptor fields all differ.
+FactRef SequenceV2FixtureRef(uint64_t index) {
+  const PartId part{static_cast<uint32_t>(index % 5)};
+  const uint64_t entity = index + 1;
+  const PropertyId property{static_cast<uint16_t>(1 + index % 7)};
+  switch (index % 4) {
+    case 0:
+      return EntityFact::Vertex(VertexRef{part, VertexId{entity}}).ref();
+    case 1:
+      return PropertyFact::Vertex(VertexRef{part, VertexId{entity}}, property)
+          .ref();
+    case 2:
+      return EntityFact::Edge(EdgeRef{part, EdgeId{entity}}).ref();
+    default:
+      return PropertyFact::Edge(EdgeRef{part, EdgeId{entity}}, property).ref();
+  }
+}
+
+SequenceRecord SequenceV2FixtureRecord(uint64_t fact_count,
+                                       CommitSeq commit_seq = CommitSeq{7}) {
+  SequenceRecord record{commit_seq, TxnId{9}, 123, {}};
+  record.fact_keys.reserve(static_cast<size_t>(fact_count));
+  for (uint64_t index = 0; index < fact_count; ++index) {
+    record.fact_keys.push_back(EncodeFactKey(
+        SequenceV2FixtureRef(index), ValidTime{100 + index}, commit_seq));
+  }
+  return record;
+}
+
+TEST(FactStoreMetaCodecSequenceV2Test,
+     RoundTripsV2RecordsAndRebuildsByteIdenticalFactKeys) {
+  for (uint64_t fact_count : {1U, 18U, 182U}) {
+    SCOPED_TRACE(::testing::Message() << "fact_count=" << fact_count);
+    const SequenceRecord record = SequenceV2FixtureRecord(fact_count);
+    ASSERT_TRUE(record.Validate().ok()) << record.Validate().ToString();
+    const auto v1 = EncodeSequenceRecord(record);
+    ASSERT_TRUE(v1.ok()) << v1.status().ToString();
+    const auto v2 = EncodeSequenceRecordV2(record);
+    ASSERT_TRUE(v2.ok()) << v2.status().ToString();
+
+    const auto decoded =
+        DecodeSequenceRecord(v2.ValueOrDie(), record.commit_seq);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(decoded.ValueOrDie(), record);
+    ASSERT_EQ(decoded.ValueOrDie().fact_keys.size(), fact_count);
+    for (uint64_t index = 0; index < fact_count; ++index) {
+      const std::string& rebuilt = decoded.ValueOrDie().fact_keys[index];
+      EXPECT_EQ(rebuilt.size(), kEncodedFactKeyBytes);
+      // Full 32-byte identity: the rebuilt key must equal the v1 key for the
+      // same (ref, valid_from, commit_seq), not merely decode to it.
+      EXPECT_EQ(rebuilt, record.fact_keys[index]);
+      const auto decoded_key = DecodeFactKey(rebuilt);
+      ASSERT_TRUE(decoded_key.ok()) << decoded_key.status().ToString();
+      EXPECT_EQ(decoded_key.ValueOrDie().commit_seq, record.commit_seq);
+      EXPECT_EQ(EncodeFactKey(decoded_key.ValueOrDie().ref,
+                              decoded_key.ValueOrDie().valid_from,
+                              record.commit_seq),
+                rebuilt);
+    }
+
+    // The v1 writer's records still decode unchanged.
+    const auto decoded_v1 = DecodeSequenceRecord(v1.ValueOrDie());
+    ASSERT_TRUE(decoded_v1.ok()) << decoded_v1.status().ToString();
+    EXPECT_EQ(decoded_v1.ValueOrDie(), record);
+  }
+}
+
+TEST(FactStoreMetaCodecSequenceV2Test,
+     DecodesBothRecordKindsAndRejectsCorruptV2Records) {
+  const SequenceRecord record = SequenceV2FixtureRecord(3);
+  const auto v1 = EncodeSequenceRecord(record);
+  const auto v2 = EncodeSequenceRecordV2(record);
+  ASSERT_TRUE(v1.ok()) << v1.status().ToString();
+  ASSERT_TRUE(v2.ok()) << v2.status().ToString();
+  const std::string v1_bytes = v1.ValueOrDie();
+  const std::string v2_bytes = v2.ValueOrDie();
+
+  // Both kinds decode through the key-aware entry point; v1 keeps its
+  // single-argument decoder.
+  EXPECT_TRUE(DecodeSequenceRecord(v1_bytes, record.commit_seq).ok());
+  EXPECT_TRUE(DecodeSequenceRecord(v1_bytes).ok());
+  const auto decoded_v2 =
+      DecodeSequenceRecord(v2_bytes, record.commit_seq);
+  ASSERT_TRUE(decoded_v2.ok()) << decoded_v2.status().ToString();
+  EXPECT_EQ(decoded_v2.ValueOrDie(), record);
+
+  // A v2 record does not carry commit_seq: the sequence key must be supplied.
+  // The key-less decoders reject with an actionable corruption instead of
+  // guessing and silently rebuilding wrong fact keys.
+  const auto keyless = DecodeSequenceRecord(v2_bytes);
+  ASSERT_TRUE(keyless.status().IsCorruption()) << keyless.status().ToString();
+  EXPECT_NE(keyless.status().ToString().find("commit sequence"),
+            std::string::npos)
+      << keyless.status().ToString();
+  EXPECT_TRUE(DecodeSequenceRecordView(v2_bytes).status().IsCorruption());
+  EXPECT_TRUE(
+      DecodeSequenceRecordView(v2_bytes, CommitSeq{0}).status().IsCorruption());
+
+  // The materializing view rebuilds the packed identities a v1 view would have
+  // borrowed, and still validates (duplicate/commit checks included).
+  const auto view = DecodeSequenceRecordView(v2_bytes, record.commit_seq);
+  ASSERT_TRUE(view.ok()) << view.status().ToString();
+  EXPECT_EQ(view.ValueOrDie().commit_seq, record.commit_seq);
+  EXPECT_EQ(view.ValueOrDie().txn_id, record.txn_id);
+  EXPECT_EQ(view.ValueOrDie().system_hlc, record.system_hlc);
+  EXPECT_EQ(view.ValueOrDie().fact_count, 3U);
+  std::string expected_identities;
+  for (const std::string& key : record.fact_keys) expected_identities += key;
+  EXPECT_EQ(std::string(view.ValueOrDie().identities), expected_identities);
+  EXPECT_TRUE(view.ValueOrDie().Validate().ok());
+  // v2 materializes the rebuilt keys; v1 stays zero-copy.
+  EXPECT_NE(view.ValueOrDie().owned_identities, nullptr);
+  const auto v1_view = DecodeSequenceRecordView(v1_bytes);
+  ASSERT_TRUE(v1_view.ok()) << v1_view.status().ToString();
+  EXPECT_EQ(v1_view.ValueOrDie().owned_identities, nullptr);
+  EXPECT_EQ(std::string(v1_view.ValueOrDie().identities), expected_identities);
+  EXPECT_TRUE(v1_view.ValueOrDie().Validate().ok());
+
+  // CRC mismatch.
+  std::string bad_crc = v2_bytes;
+  bad_crc.back() = static_cast<char>(bad_crc.back() ^ 0x01);
+  EXPECT_TRUE(
+      DecodeSequenceRecord(bad_crc, record.commit_seq).status().IsCorruption());
+
+  // Truncated framing.
+  EXPECT_TRUE(DecodeSequenceRecord(v2_bytes.substr(0, v2_bytes.size() - 2),
+                                   record.commit_seq)
+                  .status()
+                  .IsCorruption());
+
+  // Unknown record kind (checksum recomputed so the kind, not the CRC, rejects).
+  std::string unknown_kind = v2_bytes;
+  SetMetaRecordKind(&unknown_kind, 42);
+  EXPECT_TRUE(DecodeSequenceRecord(unknown_kind, record.commit_seq)
+                  .status()
+                  .IsCorruption());
+
+  // A v2 payload re-tagged as a v1 sequence record must not be silently decoded
+  // as a v1 record; the framing checks catch the mismatch.
+  std::string retagged_v1 = v2_bytes;
+  SetMetaRecordKind(&retagged_v1, 7);
+  EXPECT_TRUE(DecodeSequenceRecord(retagged_v1).status().IsCorruption());
+
+  // Unsupported payload version.
+  std::string bad_payload_version = v2_bytes;
+  bad_payload_version[kSequenceV2PayloadVersionOffset] = 2;
+  RewriteMetaChecksum(&bad_payload_version);
+  EXPECT_TRUE(DecodeSequenceRecord(bad_payload_version, record.commit_seq)
+                  .status()
+                  .IsCorruption());
+
+  // Unsupported fact-key version.
+  std::string bad_fact_key_version = v2_bytes;
+  bad_fact_key_version[kSequenceV2FactKeyVersionOffset] =
+      static_cast<char>(kFactKeyVersion + 1);
+  RewriteMetaChecksum(&bad_fact_key_version);
+  const auto bad_version =
+      DecodeSequenceRecord(bad_fact_key_version, record.commit_seq);
+  ASSERT_TRUE(bad_version.status().IsCorruption())
+      << bad_version.status().ToString();
+  EXPECT_NE(bad_version.status().ToString().find("fact key version"),
+            std::string::npos)
+      << bad_version.status().ToString();
+
+  // Count disagrees with the payload length.
+  std::string bad_count = v2_bytes;
+  bad_count[kSequenceV2CountOffset] =
+      static_cast<char>(bad_count[kSequenceV2CountOffset] + 1);
+  RewriteMetaChecksum(&bad_count);
+  EXPECT_TRUE(
+      DecodeSequenceRecord(bad_count, record.commit_seq).status().IsCorruption());
+
+  // A per-fact descriptor with an invalid fact reference.
+  std::string bad_family = v2_bytes;
+  bad_family[kSequenceV2FirstFactFamilyOffset] = 0;
+  RewriteMetaChecksum(&bad_family);
+  EXPECT_TRUE(DecodeSequenceRecord(bad_family, record.commit_seq)
+                  .status()
+                  .IsCorruption());
+}
+
+TEST(FactStoreMetaCodecSequenceV2Test, V2RecordDropsNineBytesPerFact) {
+  size_t delta_for_one = 0;
+  size_t delta_for_many = 0;
+  for (uint64_t fact_count : {1U, 182U}) {
+    SCOPED_TRACE(::testing::Message() << "fact_count=" << fact_count);
+    const SequenceRecord record = SequenceV2FixtureRecord(fact_count);
+    const auto v1 = EncodeSequenceRecord(record);
+    const auto v2 = EncodeSequenceRecordV2(record);
+    ASSERT_TRUE(v1.ok()) << v1.status().ToString();
+    ASSERT_TRUE(v2.ok()) << v2.status().ToString();
+    const size_t v1_bytes = v1.ValueOrDie().size();
+    const size_t v2_bytes = v2.ValueOrDie().size();
+    ASSERT_GT(v1_bytes, v2_bytes);
+    const size_t delta = v1_bytes - v2_bytes;
+    // Same 10-byte framing. The v1 payload is 28 + 32*N; the v2 payload is
+    // 22 + 23*N. v2 drops v1's 8-byte commit_seq and adds two 1-byte version
+    // fields (a fixed -6 bytes per record), then saves 9 bytes per fact.
+    EXPECT_EQ(delta, 6U + 9U * static_cast<size_t>(fact_count));
+    if (fact_count == 1) {
+      delta_for_one = delta;
+    } else {
+      delta_for_many = delta;
+    }
+  }
+  // The per-fact slope is exactly 9 bytes: (32 - 23).
+  EXPECT_EQ(delta_for_many - delta_for_one, 9U * (182U - 1U));
+}
+
+// Mixed v1/v2 database: one sequence record stays v1 and one is rewritten as
+// v2a in the raw meta CF. Reopen validation (default policy), ReadSequence and
+// ReadSequenceRange must read both kinds.
+TEST_F(FactStoreMetadataTest, ReopenAndReadSequenceAcceptMixedV1AndV2Records) {
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+  ASSERT_TRUE(store_->Close().ok());
+
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{2});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  SequenceRecord expected;
+  std::string encoded_v2;
+  {
+    RawFactDatabase raw;
+    ASSERT_TRUE(OpenRawFactDatabase(path_, &raw));
+    std::string encoded_v1;
+    const rocksdb::Status got = raw.database->Get(
+        rocksdb::ReadOptions(), raw.handles[2], sequence_key.ValueOrDie(),
+        &encoded_v1);
+    ASSERT_TRUE(got.ok()) << got.ToString();
+    const auto decoded = DecodeSequenceRecord(encoded_v1);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    expected = decoded.ValueOrDie();
+    // Reopen validation does not cross-check system_hlc, so a sentinel here
+    // distinguishes "the reopened store read the v2 record" from "it re-read a
+    // stale v1 record" (which would decode to the same fact keys).
+    expected.system_hlc = 424242;
+    const auto v2 = EncodeSequenceRecordV2(expected);
+    ASSERT_TRUE(v2.ok()) << v2.status().ToString();
+    encoded_v2 = v2.ValueOrDie();
+    ASSERT_TRUE(raw.database
+                    ->Put(rocksdb::WriteOptions(), raw.handles[2],
+                          sequence_key.ValueOrDie(), encoded_v2)
+                    .ok());
+    std::string stored;
+    const rocksdb::Status stored_status = raw.database->Get(
+        rocksdb::ReadOptions(), raw.handles[2], sequence_key.ValueOrDie(),
+        &stored);
+    ASSERT_TRUE(stored_status.ok()) << stored_status.ToString();
+    EXPECT_EQ(stored, encoded_v2);
+  }
+
+  // Default reopen policy validates both kinds and succeeds.
+  store_ = std::make_unique<FactStore>(FactStoreOptions{path_});
+  ASSERT_TRUE(store_->Open().ok());
+
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto read_v2 = store_->ReadSequence(snapshot.ValueOrDie(), CommitSeq{2});
+  ASSERT_TRUE(read_v2.ok()) << read_v2.status().ToString();
+  EXPECT_EQ(read_v2.ValueOrDie(), expected);
+  const auto read_v1 = store_->ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
+  ASSERT_TRUE(read_v1.ok()) << read_v1.status().ToString();
+
+  const auto range =
+      store_->ReadSequenceRange(snapshot.ValueOrDie(), CommitSeq{1}, CommitSeq{2});
+  ASSERT_TRUE(range.ok()) << range.status().ToString();
+  ASSERT_EQ(range.ValueOrDie().size(), 2U);
+  EXPECT_EQ(range.ValueOrDie()[1], expected);
 }
 
 }  // namespace

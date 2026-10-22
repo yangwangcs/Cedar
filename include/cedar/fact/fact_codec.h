@@ -15,6 +15,10 @@ namespace cedar {
 
 inline constexpr size_t kEncodedFactKeyBytes = 32;
 inline constexpr size_t kMaxFactValuePayloadBytes = 16U * 1024U * 1024U;
+// Format version of the 32-byte fact key (the first byte of every key). The
+// compact meta sequence record v2a stores this byte so a reader can reject a key
+// layout it cannot rebuild.
+inline constexpr uint8_t kFactKeyVersion = 2;
 
 struct DecodedFactKey {
   FactRef ref;

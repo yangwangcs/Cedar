@@ -11,7 +11,6 @@
 namespace cedar {
 namespace {
 
-constexpr uint8_t kFactKeyVersion = 2;
 constexpr uint8_t kFactValueVersion = 1;
 constexpr uint8_t kNoValueKind = 0;
 constexpr uint8_t kEdgeIdentityValueKind = 9;

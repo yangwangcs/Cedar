@@ -5,6 +5,7 @@
 #define CEDAR_FACT_META_CODEC_H_
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,16 +47,21 @@ struct SequenceRecord {
   bool operator==(const SequenceRecord&) const = default;
 };
 
-// Zero-copy view of one committed sequence record. `identities` borrows the
-// caller's encoded record bytes; each entry is kEncodedFactKeyBytes long and
-// the view is valid only while those bytes stay alive. Validation and reopen
-// scanning use this to avoid materializing one std::string per fact key.
+// Zero-copy view of one committed sequence record. For v1 records (`kSequence`)
+// `identities` borrows the caller's encoded record bytes; each entry is
+// kEncodedFactKeyBytes long and the view is valid only while those bytes stay
+// alive. v2 records (`kSequenceV2`) store a 23-byte descriptor per fact instead
+// of the packed key, so the key-aware view decoder rebuilds the keys once into
+// `owned_identities` and `identities` points into that shared buffer; the view
+// keeps the buffer alive through copies and moves.
 struct SequenceRecordView {
   CommitSeq commit_seq;
   TxnId txn_id;
   uint64_t system_hlc = 0;
   uint32_t fact_count = 0;
   std::string_view identities;
+  // Non-null only for v2 records (whose identities are rebuilt, not borrowed).
+  std::shared_ptr<const std::string> owned_identities;
 
   Status Validate() const;
 };
@@ -109,12 +115,39 @@ StatusOr<std::string> EncodeTransactionOutcome(
 StatusOr<TransactionOutcomeRecord> DecodeTransactionOutcome(
     const std::string& encoded);
 StatusOr<std::string> EncodeSequenceRecord(const SequenceRecord& record);
+// Compact v2a sequence record (`kSequenceV2`). The payload is
+//   payload_version(1) + fact_key_version(1) + txn_id(8) + system_hlc(8) +
+//   count(4) + N x [part(4) + family(1) + property(2) + entity(8) +
+//   ~valid_from(8)]   // 23 bytes per fact, big-endian
+// commit_seq is not in the payload: it is the sequence/<seq> record key, and the
+// reader rebuilds the 32-byte fact keys from it with EncodeFactKey. The v1
+// writer keeps writing `kSequence`; this encoder exists for the opt-in writer
+// and the migration tool.
+StatusOr<std::string> EncodeSequenceRecordV2(const SequenceRecord& record);
+// Decodes a v1 `kSequence` record. Returns Corruption for a v2 `kSequenceV2`
+// record: the v2 payload does not carry commit_seq, so that decoder cannot
+// rebuild the fact keys without the record key. Use the key-aware overload.
 StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded);
+// Decodes either record kind. v1 records carry commit_seq themselves (the
+// argument is unused); v2 records rebuild every fact key with the supplied
+// commit_seq, so callers must pass the sequence number the record was stored
+// under (`sequence/<seq>`). A zero commit_seq for a v2 record is rejected with
+// Corruption.
+StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded,
+                                              CommitSeq commit_seq);
 // Decodes only the record framing and the packed identity region; fact-key and
 // duplicate checks are Validate()'s job so callers that only need txn_id/count
-// do not pay for them twice.
+// do not pay for them twice. This overload is v1-only (zero-copy) and returns
+// Corruption for a v2 record for the same reason as DecodeSequenceRecord.
 StatusOr<SequenceRecordView> DecodeSequenceRecordView(
     std::string_view encoded);
+// Dual-kind view decoder. For a v1 record this is the same zero-copy decode as
+// the overload above; for a v2 record it rebuilds the fact keys into
+// `owned_identities` (23 bytes per fact in the payload) and points `identities`
+// at that buffer. `commit_seq` is required for v2 records exactly like the key-
+// aware DecodeSequenceRecord overload.
+StatusOr<SequenceRecordView> DecodeSequenceRecordView(
+    std::string_view encoded, CommitSeq commit_seq);
 StatusOr<std::string> EncodeVacuumState(const VacuumState& state);
 StatusOr<VacuumState> DecodeVacuumState(const std::string& encoded);
 

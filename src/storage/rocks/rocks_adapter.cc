@@ -82,6 +82,18 @@ void AssignSequenceMetaKey(uint64_t commit_seq, std::string* out) {
   }
 }
 
+// Parses the commit sequence out of a canonical `sequence/<seq>` key. Compact
+// v2a sequence records do not embed commit_seq (it is the record key), so a
+// reader that decoded one needs the number the iterator key already holds.
+uint64_t ParseSequenceMetaKey(rocksdb::Slice key) {
+  uint64_t commit_seq = 0;
+  for (size_t index = kSequenceMetaPrefixBytes; index < kSequenceMetaKeyBytes;
+       ++index) {
+    commit_seq = (commit_seq << 8) | static_cast<uint8_t>(key[index]);
+  }
+  return commit_seq;
+}
+
 uint64_t TransactionIdLeaseSize(const FactStoreOptions& options) {
   return options.transaction_id_lease_size_for_testing == 0
              ? kDefaultIdLeaseSize
@@ -2006,7 +2018,13 @@ Status LoadTransactionAllocatorState(FactStoreImpl* store,
   for (iterator->Seek(kSequenceMetaPrefix);
        iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix);
        iterator->Next()) {
-    const auto sequence = DecodeSequenceRecord(iterator->value().ToString());
+    if (iterator->key().size() != kSequenceMetaKeyBytes) {
+      return Status::Corruption("fact store",
+                                "invalid durable sequence record key");
+    }
+    const auto sequence = DecodeSequenceRecord(
+        iterator->value().ToString(),
+        CommitSeq{ParseSequenceMetaKey(iterator->key())});
     if (!sequence.ok()) return sequence.status();
     highest = std::max(highest, sequence.ValueOrDie().txn_id.value);
   }
@@ -2213,8 +2231,9 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
       // when it returned NotFound.
       return Status::Corruption("fact store", "missing durable sequence record");
     }
-    const auto sequence = DecodeSequenceRecordView(std::string_view(
-        iterator->value().data(), iterator->value().size()));
+    const auto sequence = DecodeSequenceRecordView(
+        std::string_view(iterator->value().data(), iterator->value().size()),
+        CommitSeq{expected});
     if (!sequence.ok()) return sequence.status();
     // deep restores the pre-F9 coverage (every fact at or above the retention
     // boundary); it must not re-check facts Vacuum has legitimately removed.
@@ -3891,7 +3910,7 @@ StatusOr<SequenceRecord> FactStore::ReadSequence(
   const rocksdb::Status got = store->db->Get(options, store->meta_cf,
                                               key.ValueOrDie(), &encoded);
   if (!got.ok()) return FromRocksDb(got, "read scan sequence");
-  auto record = DecodeSequenceRecord(encoded);
+  auto record = DecodeSequenceRecord(encoded, commit_seq);
   if (!record.ok()) return record.status();
   if (record.ValueOrDie().commit_seq != commit_seq) {
     return Status::Corruption("scan sequence", "commit sequence disagrees with key");
@@ -3932,7 +3951,8 @@ StatusOr<std::vector<SequenceRecord>> FactStore::ReadSequenceRange(
     if (iterator->key().ToString() != expected_key.ValueOrDie()) {
       return Status::Corruption("scan sequence range", "sequence key disagrees with requested range");
     }
-    const auto decoded = DecodeSequenceRecord(iterator->value().ToString());
+    const auto decoded =
+        DecodeSequenceRecord(iterator->value().ToString(), expected);
     if (!decoded.ok()) {
       return decoded.status();
     }
@@ -4601,7 +4621,8 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
     if (!got_sequence.ok()) {
       return Status::Corruption("commit", "outcome is missing sequence record");
     }
-    const auto sequence = DecodeSequenceRecord(encoded_sequence);
+    const auto sequence = DecodeSequenceRecord(
+        encoded_sequence, outcome.ValueOrDie().commit_seq);
     if (!sequence.ok()) return sequence.status();
     if (sequence.ValueOrDie().txn_id != batch.txn_id ||
         sequence.ValueOrDie().system_hlc != batch.system_hlc ||
@@ -5844,7 +5865,8 @@ StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(
   if (!got_sequence.ok()) {
     return Status::Corruption("transaction", "outcome is missing sequence record");
   }
-  const auto sequence = DecodeSequenceRecord(encoded_sequence);
+  const auto sequence = DecodeSequenceRecord(
+      encoded_sequence, outcome.ValueOrDie().commit_seq);
   if (!sequence.ok()) return sequence.status();
   if (sequence.ValueOrDie().txn_id != txn_id ||
       sequence.ValueOrDie().commit_seq != outcome.ValueOrDie().commit_seq) {

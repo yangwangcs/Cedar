@@ -55,7 +55,7 @@ std::pair<uint64_t, size_t> VarintCodec::Decode(const char* buf, size_t max_len)
   uint64_t result = 0;
   size_t shift = 0;
   size_t pos = 0;
-  
+
   while (pos < max_len && pos < 10) {
     uint8_t byte = static_cast<uint8_t>(buf[pos]);
     result |= static_cast<uint64_t>(byte & 0x7F) << shift;
@@ -97,15 +97,15 @@ std::string EntityIdZoneEncoder::Encode(const std::vector<uint64_t>& ids) {
 
 std::string EntityIdZoneEncoder::Encode(const std::vector<uint64_t>& ids, ZoneMap* zone_map) {
   if (ids.empty()) return "";
-  
+
   std::string result;
   result.reserve(ids.size() * 8);  // 预分配
-  
+
   uint64_t prev = ids[0];
   uint32_t run = 1;
-  
+
   zone_map->Update(prev);
-  
+
   for (size_t i = 1; i < ids.size(); ++i) {
     zone_map->Update(ids[i]);
     if (ids[i] == prev) {
@@ -118,219 +118,209 @@ std::string EntityIdZoneEncoder::Encode(const std::vector<uint64_t>& ids, ZoneMa
       run = 1;
     }
   }
-  
+
   // 处理尾部
   result.append(reinterpret_cast<char*>(&prev), 8);
   VarintCodec::Encode(run, result);
-  
+
   return result;
 }
 
-// EntityIdZoneEncoder::Decoder 实现
-EntityIdZoneEncoder::Decoder::Decoder(const std::string& data) : data_(data) {
-  // 计算总条目数
-  size_t pos = 0;
-  while (pos < data_.size()) {
-    if (pos + 8 > data_.size()) break;
-    pos += 8;  // skip value
-    auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
-    if (bytes == 0) break;
-    total_count_ += run;
-    pos += bytes;
-  }
+// EntityIdZoneEncoder::Decoder 实现（Task 3.2：行对齐块表 + 顺序游标 + 零拷贝）
+EntityIdZoneEncoder::Decoder::Decoder(Slice data) : data_(data) {}
+
+void EntityIdZoneEncoder::Decoder::EnsureIndex() const {
+  std::call_once(index_once_, [this]() {
+    // 一次线性扫描：统计总行数，并为每个 8192 行块记录可从其解码的 (byte_offset, row_idx)。
+    // 关键：块表按“行”对齐而不是 run 边界（审计 2.9：长 run 跨块时不能漏索引）。
+    index_.blocks.clear();
+    size_t pos = 0;
+    size_t idx = 0;
+    size_t next_block = 0;
+    while (pos + 8 <= data_.size()) {
+      const size_t run_start_pos = pos;
+      uint64_t value;
+      memcpy(&value, data_.data() + pos, 8);
+      pos += 8;
+      auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
+      if (bytes == 0 || run == 0) break;
+      pos += bytes;
+
+      while (idx + run > next_block) {
+        // 该块的第一行落在本 run 内：从本 run 起点解码即可到达。
+        if (index_.blocks.empty() || index_.blocks.back().row_idx != idx) {
+          index_.blocks.push_back({run_start_pos, idx});
+        }
+        next_block += kBlockRows;
+      }
+      idx += run;
+    }
+    index_.total_count = idx;
+  });
 }
 
-void EntityIdZoneEncoder::Decoder::BuildRestartPoints() const {
-  if (!restart_points_.empty()) return;
-  
-  size_t pos = 0;
-  size_t idx = 0;
-  
-  while (pos < data_.size()) {
-    if (idx % kRestartInterval == 0) {
-      restart_points_.push_back({pos, idx});
-    }
-    
-    if (pos + 8 > data_.size()) break;
-    uint64_t value;
-    memcpy(&value, data_.data() + pos, 8);
-    pos += 8;
-    
-    auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
-    if (bytes == 0) break;
-    pos += bytes;
-    idx += run;
-  }
+const std::vector<EntityIdZoneEncoder::Decoder::BlockEntry>&
+EntityIdZoneEncoder::Decoder::blocks() const {
+  EnsureIndex();
+  return index_.blocks;
+}
+
+size_t EntityIdZoneEncoder::Decoder::Count() const {
+  EnsureIndex();
+  return index_.total_count;
 }
 
 uint64_t EntityIdZoneEncoder::Decoder::Get(size_t idx) const {
-  BuildRestartPoints();
-  
-  // 找到最近的重启点
-  size_t restart_idx = idx / kRestartInterval;
-  if (restart_idx >= restart_points_.size()) {
-    restart_idx = restart_points_.size() - 1;
+  EnsureIndex();
+  if (idx >= index_.total_count || index_.blocks.empty()) return 0;
+
+  // 二分找到最后一个 row_idx <= idx 的块
+  size_t lo = 0, hi = index_.blocks.size();
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (index_.blocks[mid].row_idx <= idx) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
   }
-  
-  size_t pos = restart_points_[restart_idx].first;
-  size_t current_idx = restart_points_[restart_idx].second;
-  
-  // 从重启点开始扫描
-  while (pos < data_.size()) {
-    if (pos + 8 > data_.size()) return 0;
+  if (lo == 0) return 0;
+  size_t pos = index_.blocks[lo - 1].byte_offset;
+  size_t current_idx = index_.blocks[lo - 1].row_idx;
+
+  while (pos + 8 <= data_.size()) {
     uint64_t value;
     memcpy(&value, data_.data() + pos, 8);
     pos += 8;
-    
     auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
     if (bytes == 0) return 0;
     pos += bytes;
-    
-    if (idx < current_idx + run) {
-      return value;
-    }
+    if (idx < current_idx + run) return value;
     current_idx += run;
   }
-  
   return 0;
+}
+
+bool EntityIdZoneEncoder::Decoder::Cursor::Seek(size_t target_idx, uint64_t* value) {
+  valid_ = false;
+  run_remaining_ = 0;
+  if (decoder_ == nullptr) return false;
+  decoder_->EnsureIndex();
+  if (target_idx >= decoder_->index_.total_count ||
+      decoder_->index_.blocks.empty()) {
+    return false;
+  }
+  size_t lo = 0, hi = decoder_->index_.blocks.size();
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (decoder_->index_.blocks[mid].row_idx <= target_idx) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo == 0) return false;
+  pos_ = decoder_->index_.blocks[lo - 1].byte_offset;
+  idx_ = decoder_->index_.blocks[lo - 1].row_idx;
+  const Slice& data = decoder_->data_;
+  while (pos_ + 8 <= data.size()) {
+    uint64_t v;
+    memcpy(&v, data.data() + pos_, 8);
+    pos_ += 8;
+    auto [run, bytes] = VarintCodec::Decode(data.data() + pos_, data.size() - pos_);
+    if (bytes == 0 || run == 0) return false;
+    pos_ += bytes;
+    if (target_idx < idx_ + run) {
+      run_remaining_ = idx_ + run - target_idx;
+      idx_ = target_idx;
+      value_ = v;
+      valid_ = true;
+      if (value != nullptr) *value = value_;
+      return true;
+    }
+    idx_ += run;
+  }
+  return false;
+}
+
+bool EntityIdZoneEncoder::Decoder::Cursor::Advance(size_t target_idx, uint64_t* value) {
+  if (!valid_ || target_idx < idx_) return Seek(target_idx, value);
+  if (decoder_ == nullptr) return false;
+  const Slice& data = decoder_->data_;
+  while (idx_ < target_idx) {
+    if (run_remaining_ > 1) {
+      --run_remaining_;
+      ++idx_;
+      continue;
+    }
+    // 当前 run 结束，解码下一个 run
+    if (pos_ + 8 > data.size()) {
+      valid_ = false;
+      return false;
+    }
+    memcpy(&value_, data.data() + pos_, 8);
+    pos_ += 8;
+    auto [run, bytes] = VarintCodec::Decode(data.data() + pos_, data.size() - pos_);
+    if (bytes == 0 || run == 0) {
+      valid_ = false;
+      return false;
+    }
+    pos_ += bytes;
+    run_remaining_ = run;
+    ++idx_;
+  }
+  if (value != nullptr) *value = value_;
+  return true;
 }
 
 void EntityIdZoneEncoder::Decoder::GetRange(
     size_t start_idx, size_t count, std::vector<uint64_t>* out) const {
   out->reserve(out->size() + count);
-  
-  for (size_t i = 0; i < count; ++i) {
-    out->push_back(Get(start_idx + i));
+  Cursor cursor(this);
+  uint64_t value = 0;
+  if (!cursor.Seek(start_idx, &value)) return;
+  out->push_back(value);
+  for (size_t i = 1; i < count; ++i) {
+    if (!cursor.Advance(start_idx + i, &value)) break;
+    out->push_back(value);
   }
 }
 
-// OPTIMIZATION: 查询结果缓存实现
-void EntityIdZoneEncoder::Decoder::AddToCache(
-    uint64_t entity_id, const std::vector<size_t>& positions) const {
-  if (position_cache_.size() >= kCacheSize) {
-    position_cache_.erase(position_cache_.begin());  // LRU: 移除最旧的
-  }
-  position_cache_.push_back({entity_id, positions});
-}
-
-const std::vector<size_t>* EntityIdZoneEncoder::Decoder::GetFromCache(uint64_t entity_id) const {
-  for (const auto& [id, positions] : position_cache_) {
-    if (id == entity_id) {
-      return &positions;
-    }
-  }
-  return nullptr;
-}
-
-// OPTIMIZATION: 使用 Bitmap 快速检查 entity 是否存在
 bool EntityIdZoneEncoder::Decoder::MayContainEntity(uint64_t entity_id) const {
-  // 如果索引已构建，使用索引
-  if (index_built_) {
-    return entity_index_.find(entity_id) != entity_index_.end();
-  }
-  
-  // 否则线性扫描（只检查是否存在，不记录所有位置）
+  EnsureIndex();
   size_t pos = 0;
-  while (pos < data_.size()) {
-    if (pos + 8 > data_.size()) break;
+  while (pos + 8 <= data_.size()) {
     uint64_t value;
     memcpy(&value, data_.data() + pos, 8);
     pos += 8;
-    
     auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
     if (bytes == 0) break;
     pos += bytes;
-    
-    if (value == entity_id) {
-      return true;
-    }
+    if (value == entity_id) return true;
+    (void)run;
   }
   return false;
 }
 
-// OPTIMIZATION: 构建 Entity 倒排索引（延迟构建，第一次查询时触发）
-void EntityIdZoneEncoder::Decoder::BuildEntityIndex() const {
-  if (index_built_) return;
-  
-  entity_index_.reserve(total_count_ / 16);  // 估算唯一 entity 数量
-  
-  size_t pos = 0;
-  size_t idx = 0;
-  
-  while (pos < data_.size()) {
-    if (pos + 8 > data_.size()) break;
-    uint64_t value;
-    memcpy(&value, data_.data() + pos, 8);
-    pos += 8;
-    
-    auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
-    if (bytes == 0) break;
-    pos += bytes;
-    
-    auto& positions = entity_index_[value];
-    for (uint32_t i = 0; i < run; ++i) {
-      positions.push_back(idx + i);
-    }
-    idx += run;
-  }
-  
-  index_built_ = true;
-}
-
-std::vector<size_t> EntityIdZoneEncoder::Decoder::FindEntityPositions(uint64_t entity_id) const {
-  // OPTIMIZATION 1: 检查缓存
-  if (auto* cached = GetFromCache(entity_id)) {
-    cache_hits_++;
-    return *cached;
-  }
-  cache_misses_++;
-  
-  // OPTIMIZATION 2: 如果查询次数较多，构建倒排索引
-  // 策略：当缓存未命中次数超过阈值且索引未构建时，构建索引
-  if (!index_built_ && cache_misses_ > 100) {
-    BuildEntityIndex();
-  }
-  
-  // 如果索引已构建，使用索引查询
-  if (index_built_) {
-    auto it = entity_index_.find(entity_id);
-    if (it != entity_index_.end()) {
-      AddToCache(entity_id, it->second);
-      return it->second;
-    }
-    return {};
-  }
-  
-  // 回退到线性扫描（原始实现）
+std::vector<size_t> EntityIdZoneEncoder::Decoder::FindEntityPositions(
+    uint64_t entity_id) const {
+  // 无持久化索引时的回退：一次线性扫描 entity zone（结果完整，不会漏行）。
   std::vector<size_t> positions;
-  positions.reserve(32);  // 预分配合理大小
-  
+  EnsureIndex();
   size_t pos = 0;
   size_t idx = 0;
-  
-  while (pos < data_.size()) {
-    if (pos + 8 > data_.size()) break;
+  while (pos + 8 <= data_.size()) {
     uint64_t value;
     memcpy(&value, data_.data() + pos, 8);
     pos += 8;
-    
     auto [run, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
     if (bytes == 0) break;
     pos += bytes;
-    
     if (value == entity_id) {
-      for (uint32_t i = 0; i < run; ++i) {
-        positions.push_back(idx + i);
-      }
+      for (size_t i = 0; i < run; ++i) positions.push_back(idx + i);
     }
     idx += run;
   }
-  
-  // 添加到缓存
-  if (!positions.empty()) {
-    AddToCache(entity_id, positions);
-  }
-  
   return positions;
 }
 
@@ -343,27 +333,27 @@ std::string TimestampZoneEncoder::Encode(const std::vector<uint64_t>& timestamps
   return Encode(timestamps, &dummy);
 }
 
-std::string TimestampZoneEncoder::Encode(const std::vector<uint64_t>& timestamps, 
+std::string TimestampZoneEncoder::Encode(const std::vector<uint64_t>& timestamps,
                                          ZoneMap* zone_map) {
   if (timestamps.empty()) return "";
-  
+
   std::string result;
   result.reserve(timestamps.size() * 4);
-  
+
   // 存储第一个时间戳
   uint64_t first_ts = timestamps[0];
   result.append(reinterpret_cast<char*>(&first_ts), 8);
-  
+
   zone_map->Update(first_ts);
-  
+
   if (timestamps.size() == 1) {
     return result;
   }
-  
+
   // 计算第一个 delta
   int64_t prev_delta = static_cast<int64_t>(timestamps[0]) - static_cast<int64_t>(timestamps[1]);
   VarintCodec::EncodeSigned(prev_delta, result);
-  
+
   // Delta-of-Delta 编码剩余值 (i 从 2 到 timestamps.size()-1，共 timestamps.size()-2 个)
   for (size_t i = 2; i < timestamps.size(); ++i) {
     zone_map->Update(timestamps[i]);
@@ -372,117 +362,129 @@ std::string TimestampZoneEncoder::Encode(const std::vector<uint64_t>& timestamps
     VarintCodec::EncodeSigned(dod, result);
     prev_delta = delta;
   }
-  
+
   // 修复：确保写入正确数量的 DoD 值
   // 对于 n 个时间戳，应该写入：1 个 first_ts + 1 个 delta + (n-2) 个 dod = n 个值
-  
+
   return result;
 }
 
-// TimestampZoneEncoder::Decoder 实现
-TimestampZoneEncoder::Decoder::Decoder(const std::string& data) : data_(data) {
+// TimestampZoneEncoder::Decoder 实现（Task 3.1/3.2：零拷贝 + one-time 解码）
+TimestampZoneEncoder::Decoder::Decoder(Slice data) : data_(data) {
   if (data_.size() < 8) return;
-  
+
   memcpy(&first_ts_, data_.data(), 8);
-  min_ts_ = max_ts_ = first_ts_;
   total_count_ = 1;
-  
+
   if (data_.size() > 8) {
     auto [delta, bytes] = VarintCodec::DecodeSigned(data_.data() + 8, data_.size() - 8);
     if (bytes > 0) {
       first_delta_ = delta;
-      
-      // 计算总条目数：1 (first) + 1 (second via delta) + DoD count
-      total_count_ = 2;  // 第一个和第二个时间戳
+      // 只扫描 varint 计算行数，不分配 O(n) cache（RSS：Open 不触碰整条 zone）
+      total_count_ = 2;
       size_t pos = 8 + bytes;
       while (pos < data_.size()) {
-        auto [dod, bytes_read] = VarintCodec::DecodeSigned(data_.data() + pos, data_.size() - pos);
+        auto [dod, bytes_read] =
+            VarintCodec::DecodeSigned(data_.data() + pos, data_.size() - pos);
         if (bytes_read == 0) break;
         pos += bytes_read;
-        total_count_++;  // 剩余的通过 DoD 解码
-      }
-      
-      // 计算 min/max timestamp
-      decoded_cache_.reserve(total_count_);
-      decoded_cache_.push_back(first_ts_);
-      
-      if (total_count_ > 1) {
-        uint64_t prev_ts = first_ts_ - static_cast<uint64_t>(first_delta_);
-        decoded_cache_.push_back(prev_ts);
-        min_ts_ = std::min(min_ts_, prev_ts);
-        max_ts_ = std::max(max_ts_, prev_ts);
-        
-        int64_t prev_delta = first_delta_;
-        pos = 8 + bytes;
-        
-        // 修复：处理所有剩余的 DoD 值（total_count_ - 2 个）
-        for (size_t i = 2; i < total_count_; ++i) {
-          if (pos >= data_.size()) break;
-          auto [dod, bytes_read] = VarintCodec::DecodeSigned(data_.data() + pos, data_.size() - pos);
-          if (bytes_read == 0) break;
-          pos += bytes_read;
-          
-          int64_t delta = prev_delta + dod;
-          uint64_t ts = prev_ts - static_cast<uint64_t>(delta);
-          decoded_cache_.push_back(ts);
-          min_ts_ = std::min(min_ts_, ts);
-          max_ts_ = std::max(max_ts_, ts);
-          
-          prev_delta = delta;
-          prev_ts = ts;
-        }
+        total_count_++;
       }
     }
   }
-  decoded_up_to_ = total_count_;
-  decompressed_ = true;
 }
 
-void TimestampZoneEncoder::Decoder::BuildRestartPoints() const {
-  // 时间戳解码器预解压所有数据，不需要重启点
+void TimestampZoneEncoder::Decoder::EnsureDecoded() const {
+  std::call_once(decode_once_, [this]() {
+    decoded_cache_.clear();
+    if (total_count_ == 0 || data_.size() < 8) return;
+    decoded_cache_.reserve(total_count_);
+
+    // 审计 10.1：n==1 时也必须把首时间戳放进 cache。
+    decoded_cache_.push_back(first_ts_);
+    min_ts_ = max_ts_ = first_ts_;
+
+    if (total_count_ > 1) {
+      uint64_t prev_ts = first_ts_ - static_cast<uint64_t>(first_delta_);
+      decoded_cache_.push_back(prev_ts);
+      min_ts_ = std::min(min_ts_, prev_ts);
+      max_ts_ = std::max(max_ts_, prev_ts);
+
+      int64_t prev_delta = first_delta_;
+      size_t pos = 8;
+      {
+        auto [delta, bytes] =
+            VarintCodec::DecodeSigned(data_.data() + 8, data_.size() - 8);
+        (void)delta;
+        if (bytes == 0) return;
+        pos = 8 + bytes;
+      }
+
+      for (size_t i = 2; i < total_count_; ++i) {
+        if (pos >= data_.size()) break;
+        auto [dod, bytes_read] =
+            VarintCodec::DecodeSigned(data_.data() + pos, data_.size() - pos);
+        if (bytes_read == 0) break;
+        pos += bytes_read;
+
+        const int64_t delta = prev_delta + dod;
+        const uint64_t ts = prev_ts - static_cast<uint64_t>(delta);
+        decoded_cache_.push_back(ts);
+        min_ts_ = std::min(min_ts_, ts);
+        max_ts_ = std::max(max_ts_, ts);
+        prev_delta = delta;
+        prev_ts = ts;
+      }
+    }
+  });
 }
 
 uint64_t TimestampZoneEncoder::Decoder::Get(size_t idx) const {
+  EnsureDecoded();
   if (idx >= decoded_cache_.size()) return 0;
   return decoded_cache_[idx];
 }
 
 void TimestampZoneEncoder::Decoder::GetRange(
     size_t start_idx, size_t count, std::vector<uint64_t>* out) const {
+  EnsureDecoded();
   for (size_t i = 0; i < count && (start_idx + i) < decoded_cache_.size(); ++i) {
     out->push_back(decoded_cache_[start_idx + i]);
   }
 }
 
-// OPTIMIZATION: 构建升序索引以支持二分查找
-void TimestampZoneEncoder::Decoder::BuildSortedIndex() const {
-  if (index_built_) return;
-  
-  // 创建升序索引（原始数据是降序的）
-  sorted_index_.resize(decoded_cache_.size());
-  for (size_t i = 0; i < decoded_cache_.size(); ++i) {
-    sorted_index_[i] = i;
-  }
-  
-  // 按时间戳升序排序索引
-  std::sort(sorted_index_.begin(), sorted_index_.end(),
-            [this](size_t a, size_t b) {
-              return decoded_cache_[a] < decoded_cache_[b];
-            });
-  
-  index_built_ = true;
+uint64_t TimestampZoneEncoder::Decoder::MinTimestamp() const {
+  EnsureDecoded();
+  return min_ts_;
 }
 
-// OPTIMIZATION: 二分查找 LowerBound（升序排列）
-// 返回第一个大于等于 target_ts 的索引
+uint64_t TimestampZoneEncoder::Decoder::MaxTimestamp() const {
+  EnsureDecoded();
+  return max_ts_;
+}
+
+// 构建升序索引（one-time；时间戳在文件内并非全局有序，无法用块表二分）
+void TimestampZoneEncoder::Decoder::BuildSortedIndex() const {
+  std::call_once(sorted_once_, [this]() {
+    EnsureDecoded();
+    sorted_index_.resize(decoded_cache_.size());
+    for (size_t i = 0; i < decoded_cache_.size(); ++i) {
+      sorted_index_[i] = i;
+    }
+    std::sort(sorted_index_.begin(), sorted_index_.end(),
+              [this](size_t a, size_t b) {
+                return decoded_cache_[a] < decoded_cache_[b];
+              });
+  });
+}
+
 size_t TimestampZoneEncoder::Decoder::LowerBound(uint64_t target_ts) const {
-  if (!index_built_) BuildSortedIndex();
+  EnsureDecoded();
+  BuildSortedIndex();
   if (sorted_index_.empty()) return 0;
-  
-  // 在升序索引上进行二分查找
+
   size_t left = 0;
   size_t right = sorted_index_.size();
-  
   while (left < right) {
     size_t mid = left + (right - left) / 2;
     if (decoded_cache_[sorted_index_[mid]] < target_ts) {
@@ -491,20 +493,16 @@ size_t TimestampZoneEncoder::Decoder::LowerBound(uint64_t target_ts) const {
       right = mid;
     }
   }
-  
   return left;
 }
 
-// OPTIMIZATION: 二分查找 UpperBound（升序排列）
-// 返回第一个大于 target_ts 的索引
 size_t TimestampZoneEncoder::Decoder::UpperBound(uint64_t target_ts) const {
-  if (!index_built_) BuildSortedIndex();
+  EnsureDecoded();
+  BuildSortedIndex();
   if (sorted_index_.empty()) return 0;
-  
-  // 在升序索引上进行二分查找
+
   size_t left = 0;
   size_t right = sorted_index_.size();
-  
   while (left < right) {
     size_t mid = left + (right - left) / 2;
     if (decoded_cache_[sorted_index_[mid]] <= target_ts) {
@@ -513,30 +511,24 @@ size_t TimestampZoneEncoder::Decoder::UpperBound(uint64_t target_ts) const {
       right = mid;
     }
   }
-  
   return left;
 }
 
-// OPTIMIZATION: 使用二分查找优化 FindTimeRange
 std::vector<size_t> TimestampZoneEncoder::Decoder::FindTimeRange(
     uint64_t start_ts, uint64_t end_ts) const {
+  EnsureDecoded();
   std::vector<size_t> positions;
-  
   if (decoded_cache_.empty()) return positions;
-  
-  // 使用二分查找快速定位范围
-  size_t lb = LowerBound(start_ts);  // 第一个 >= start_ts
-  size_t ub = UpperBound(end_ts);     // 第一个 > end_ts
-  
-  // 收集范围内的索引
+  if (start_ts > end_ts) return positions;  // 审计 10.7：避免无符号下溢
+
+  const size_t lb = LowerBound(start_ts);
+  const size_t ub = UpperBound(end_ts);
+
   positions.reserve(ub - lb);
   for (size_t i = lb; i < ub && i < sorted_index_.size(); ++i) {
     positions.push_back(sorted_index_[i]);
   }
-  
-  // 按原始顺序排序（降序）以保持一致性
   std::sort(positions.begin(), positions.end(), std::greater<size_t>());
-  
   return positions;
 }
 
@@ -554,11 +546,11 @@ std::string TargetIdZoneEncoder::Encode(const std::vector<uint64_t>& target_ids,
                                         const std::vector<uint64_t>& entity_ids,
                                         ZoneMap* zone_map) {
   if (target_ids.empty()) return "";
-  
+
   // 决定编码策略
   size_t same_as_entity = 0;
   size_t small_delta = 0;
-  
+
   for (size_t i = 0; i < target_ids.size() && i < entity_ids.size(); ++i) {
     if (target_ids[i] == entity_ids[i]) {
       same_as_entity++;
@@ -569,17 +561,17 @@ std::string TargetIdZoneEncoder::Encode(const std::vector<uint64_t>& target_ids,
     }
     zone_map->Update(target_ids[i]);
   }
-  
+
   // 如果大部分与 Entity ID 相同，使用特殊的短编码
   if (same_as_entity > target_ids.size() * 0.8) {
     // 使用位图标记哪些位置不同
     std::string result;
     result.push_back(static_cast<char>(EncodingType::kDelta));
-    
+
     size_t bitmap_size = (target_ids.size() + 7) / 8;
     std::vector<uint8_t> bitmap(bitmap_size, 0);
     std::string deltas;
-    
+
     for (size_t i = 0; i < target_ids.size() && i < entity_ids.size(); ++i) {
       if (target_ids[i] != entity_ids[i]) {
         bitmap[i / 8] |= (1 << (i % 8));
@@ -587,33 +579,108 @@ std::string TargetIdZoneEncoder::Encode(const std::vector<uint64_t>& target_ids,
         VarintCodec::EncodeSigned(delta, deltas);
       }
     }
-    
+
     // 写入位图和 deltas
     result.append(reinterpret_cast<char*>(bitmap.data()), bitmap.size());
     result.append(deltas);
     return result;
   }
-  
+
   // 默认使用原始编码
   std::string result;
   result.push_back(static_cast<char>(EncodingType::kRaw));
-  
+
   // 使用简单 varint 编码
   for (size_t i = 0; i < target_ids.size(); ++i) {
     VarintCodec::Encode(target_ids[i], result);
   }
-  
+
   return result;
 }
 
+std::string TargetIdZoneEncoder::EncodeFileLevel(
+    const std::vector<uint64_t>& target_ids, ZoneMap* zone_map) {
+  if (target_ids.empty()) return "";
+
+  std::string result;
+  result.reserve(target_ids.size() * 2 + 1);
+  // 整文件只写一个编码类型前缀（旧格式是每 block 一个）。
+  result.push_back(static_cast<char>(EncodingType::kRaw));
+  for (uint64_t target_id : target_ids) {
+    if (zone_map != nullptr) {
+      zone_map->Update(target_id);
+    }
+    VarintCodec::Encode(target_id, result);
+  }
+  return result;
+}
+
+std::vector<uint64_t> TargetIdZoneEncoder::DecodeStream(
+    const char* data, size_t size, EncodingType type, size_t count,
+    const std::vector<uint64_t>& entity_ids, size_t* bytes_consumed) {
+  std::vector<uint64_t> out;
+  out.reserve(count);
+
+  auto finish = [&](size_t consumed) {
+    if (bytes_consumed != nullptr) *bytes_consumed = consumed;
+    out.resize(count, 0);  // 数据不足/损坏时缺省为 0，保持行数对齐
+    return out;
+  };
+
+  if (data == nullptr || size == 0) return finish(0);
+
+  // 布局：[encoding_type:1B][payload]
+  size_t pos = 1;
+  if (type == EncodingType::kRaw) {
+    while (out.size() < count && pos < size) {
+      auto [value, bytes] = VarintCodec::Decode(data + pos, size - pos);
+      if (bytes == 0) break;
+      pos += bytes;
+      out.push_back(value);
+    }
+    return finish(pos);
+  }
+
+  if (type == EncodingType::kDelta) {
+    const size_t bitmap_size = (count + 7) / 8;
+    if (pos + bitmap_size > size) return finish(pos);
+    const size_t bitmap_pos = pos;
+    size_t delta_pos = pos + bitmap_size;
+    for (size_t i = 0; i < count; ++i) {
+      const uint64_t entity = i < entity_ids.size() ? entity_ids[i] : 0;
+      const bool differs =
+          (static_cast<uint8_t>(data[bitmap_pos + i / 8]) & (1u << (i % 8))) != 0;
+      if (!differs) {
+        out.push_back(entity);
+        continue;
+      }
+      if (delta_pos >= size) {
+        out.push_back(0);
+        continue;
+      }
+      auto [delta, bytes] = VarintCodec::DecodeSigned(data + delta_pos, size - delta_pos);
+      if (bytes == 0) {
+        out.push_back(0);
+        continue;
+      }
+      delta_pos += bytes;
+      out.push_back(static_cast<uint64_t>(static_cast<int64_t>(entity) + delta));
+    }
+    return finish(delta_pos);
+  }
+
+  // kRle 等未实现的编码：按 0 填充（写端从不产生，兼容性保守处理）
+  return finish(size);
+}
+
 // TargetIdZoneEncoder::Decoder 实现
-TargetIdZoneEncoder::Decoder::Decoder(const std::string& data, EncodingType type) 
+TargetIdZoneEncoder::Decoder::Decoder(Slice data, EncodingType type)
     : data_(data), type_(type) {
   if (data_.empty()) return;
-  
+
   // 跳过编码类型字节
   size_t pos = 1;
-  
+
   if (type_ == EncodingType::kRaw) {
     while (pos < data_.size()) {
       auto [value, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
@@ -717,35 +784,35 @@ KeyMetadataZoneEncoder::EncodedResult KeyMetadataZoneEncoder::EncodeWithResult(
     const std::vector<MetadataEntry>& entries) {
   EncodedResult result;
   result.count = entries.size();
-  
+
   // 分离 sequences 和 flags
   std::vector<uint16_t> sequences;
   std::vector<uint8_t> flags;
   sequences.reserve(entries.size());
   flags.reserve(entries.size());
-  
+
   for (const auto& e : entries) {
     sequences.push_back(e.sequence);
     flags.push_back(e.flags);
   }
-  
+
   result.sequence_rle = EncodeSequenceRLE(sequences);
   result.flags_bitmap = EncodeFlagsBitmap(flags);
-  
+
   return result;
 }
 
 std::string KeyMetadataZoneEncoder::EncodeSequenceRLE(const std::vector<uint16_t>& sequences) {
   std::string result;
-  
+
   if (sequences.empty()) return result;
-  
+
   uint16_t prev = sequences[0];
   uint32_t run = 1;
-  
+
   // 写入第一个值
   VarintCodec::Encode(prev, result);
-  
+
   for (size_t i = 1; i < sequences.size(); ++i) {
     if (sequences[i] == prev) {
       run++;
@@ -760,37 +827,37 @@ std::string KeyMetadataZoneEncoder::EncodeSequenceRLE(const std::vector<uint16_t
   }
   // 写入最后的 run length
   VarintCodec::Encode(run, result);
-  
+
   return result;
 }
 
 std::string KeyMetadataZoneEncoder::EncodeFlagsBitmap(const std::vector<uint8_t>& flags) {
   size_t bitmap_size = (flags.size() + 7) / 8;
   std::string result(bitmap_size, 0);
-  
+
   for (size_t i = 0; i < flags.size(); ++i) {
     if (flags[i] & key_flags::kTombstone) {
       result[i / 8] |= (1 << (i % 8));
     }
   }
-  
+
   return result;
 }
 
 std::vector<uint16_t> KeyMetadataZoneEncoder::DecodeSequenceRLE(
-    const std::string& data, uint32_t count) {
+    Slice data, uint32_t count) {
   std::vector<uint16_t> result;
   result.reserve(count);
-  
+
   size_t pos = 0;
   bool first = true;
   uint16_t current_value = 0;
-  
+
   while (pos < data.size() && result.size() < count) {
     auto [value, bytes] = VarintCodec::Decode(data.data() + pos, data.size() - pos);
     if (bytes == 0) break;
     pos += bytes;
-    
+
     if (first) {
       current_value = static_cast<uint16_t>(value);
       first = false;
@@ -803,15 +870,15 @@ std::vector<uint16_t> KeyMetadataZoneEncoder::DecodeSequenceRLE(
       first = true;  // 下一个值是新的 sequence
     }
   }
-  
+
   return result;
 }
 
 std::vector<uint8_t> KeyMetadataZoneEncoder::DecodeFlagsBitmap(
-    const std::string& data, uint32_t count) {
+    Slice data, uint32_t count) {
   std::vector<uint8_t> result;
   result.reserve(count);
-  
+
   for (uint32_t i = 0; i < count; ++i) {
     uint8_t flags = 0;
     if (i / 8 < data.size()) {
@@ -821,33 +888,31 @@ std::vector<uint8_t> KeyMetadataZoneEncoder::DecodeFlagsBitmap(
     }
     result.push_back(flags);
   }
-  
+
   return result;
 }
 
-// KeyMetadataZoneEncoder::Decoder 实现
+// KeyMetadataZoneEncoder::Decoder 实现（Task 3.1：Slice 零拷贝视图）
 KeyMetadataZoneEncoder::Decoder::Decoder(
-    const std::string& sequence_rle, 
-    const std::string& flags_bitmap, 
+    Slice sequence_rle,
+    Slice flags_bitmap,
     uint32_t count)
     : sequence_rle_(sequence_rle), flags_bitmap_(flags_bitmap), count_(count) {
 }
 
 void KeyMetadataZoneEncoder::Decoder::EnsureDecoded() const {
-  if (decoded_) return;
-  
-  auto sequences = DecodeSequenceRLE(sequence_rle_, count_);
-  auto flags = DecodeFlagsBitmap(flags_bitmap_, count_);
-  
-  decoded_cache_.reserve(count_);
-  for (size_t i = 0; i < count_; ++i) {
-    MetadataEntry entry;
-    if (i < sequences.size()) entry.sequence = sequences[i];
-    if (i < flags.size()) entry.flags = flags[i];
-    decoded_cache_.push_back(entry);
-  }
-  
-  decoded_ = true;
+  std::call_once(decode_once_, [this]() {
+    auto sequences = DecodeSequenceRLE(sequence_rle_, count_);
+    auto flags = DecodeFlagsBitmap(flags_bitmap_, count_);
+
+    decoded_cache_.reserve(count_);
+    for (size_t i = 0; i < count_; ++i) {
+      MetadataEntry entry;
+      if (i < sequences.size()) entry.sequence = sequences[i];
+      if (i < flags.size()) entry.flags = flags[i];
+      decoded_cache_.push_back(entry);
+    }
+  });
 }
 
 KeyMetadataZoneEncoder::MetadataEntry KeyMetadataZoneEncoder::Decoder::Get(size_t idx) const {
@@ -868,7 +933,7 @@ void KeyMetadataZoneEncoder::Decoder::GetRange(
 
 bool KeyMetadataZoneEncoder::Decoder::IsTombstone(size_t idx) const {
   if (idx / 8 >= flags_bitmap_.size()) return false;
-  return (flags_bitmap_[idx / 8] & (1 << (idx % 8))) != 0;
+  return (static_cast<uint8_t>(flags_bitmap_[idx / 8]) & (1 << (idx % 8))) != 0;
 }
 
 uint16_t KeyMetadataZoneEncoder::Decoder::GetSequence(size_t idx) const {
@@ -914,22 +979,22 @@ std::string ValueZoneEncoder::Encode(const std::vector<Descriptor>& values, Zone
 ValueZoneEncoder::EncodedResult ValueZoneEncoder::EncodeWithType(
     const std::vector<Descriptor>& values) {
   EncodedResult result;
-  
+
   if (values.empty()) {
     result.type = EncodingType::kRaw;
     return result;
   }
-  
+
   // 统计唯一值
   std::unordered_map<uint64_t, size_t> value_to_idx;
   for (const auto& v : values) {
     value_to_idx[v.AsRaw()] = 0;
   }
-  
+
   // 如果唯一值数量少，使用字典编码
   if (value_to_idx.size() <= kDictionaryThreshold) {
     result.type = EncodingType::kDictionary;
-    
+
     // 构建字典
     std::vector<uint64_t> unique_values;
     for (const auto& [val, _] : value_to_idx) {
@@ -937,20 +1002,20 @@ ValueZoneEncoder::EncodedResult ValueZoneEncoder::EncodeWithType(
       value_to_idx[val] = idx;
       unique_values.push_back(val);
     }
-    
+
     // 编码字典
     for (uint64_t val : unique_values) {
       char buf[8];
       memcpy(buf, &val, 8);
       result.dictionary.emplace_back(buf, 8);
     }
-    
+
     // 编码索引
     size_t bits_per_idx = 1;
     while ((1ULL << bits_per_idx) < unique_values.size()) {
       bits_per_idx++;
     }
-    
+
     if (bits_per_idx <= 8) {
       // 使用 1 字节索引
       for (const auto& v : values) {
@@ -969,22 +1034,22 @@ ValueZoneEncoder::EncodedResult ValueZoneEncoder::EncodeWithType(
         VarintCodec::Encode(value_to_idx[v.AsRaw()], result.data);
       }
     }
-    
+
     return result;
   }
-  
+
   // 否则使用原始编码（实际应该用 LZ4/Zstd）
   result.type = EncodingType::kRaw;
   for (const auto& v : values) {
     uint64_t raw = v.AsRaw();
     result.data.append(reinterpret_cast<char*>(&raw), 8);
   }
-  
+
   return result;
 }
 
-// ValueZoneEncoder::Decoder 实现
-ValueZoneEncoder::Decoder::Decoder(const std::string& data, 
+// ValueZoneEncoder::Decoder 实现（Task 3.1/3.2：Slice + kRaw 直接索引）
+ValueZoneEncoder::Decoder::Decoder(Slice data,
                                    EncodingType type,
                                    const std::vector<std::string>& dictionary)
     : data_(data), type_(type), dictionary_(dictionary) {
@@ -996,7 +1061,6 @@ ValueZoneEncoder::Decoder::Decoder(const std::string& data,
     } else if (dictionary_.size() <= 65536) {
       total_count_ = data_.size() / 2;  // 2 bytes per index
     } else {
-      // varint 编码，需要扫描
       size_t pos = 0;
       while (pos < data_.size()) {
         auto [idx, bytes] = VarintCodec::Decode(data_.data() + pos, data_.size() - pos);
@@ -1009,42 +1073,44 @@ ValueZoneEncoder::Decoder::Decoder(const std::string& data,
 }
 
 void ValueZoneEncoder::Decoder::EnsureDecompressed() const {
-  if (decompressed_) return;
-  
-  if (type_ == EncodingType::kRaw) {
-    for (size_t i = 0; i < data_.size(); i += 8) {
-      if (i + 8 > data_.size()) break;
-      uint64_t raw;
-      memcpy(&raw, data_.data() + i, 8);
-      decompressed_cache_.emplace_back(Descriptor(raw));
+  std::call_once(decode_once_, [this]() {
+    if (type_ == EncodingType::kRaw) {
+      // 写端固定 kRaw：直接按 idx*8 索引，Get 不再走缓存（RSS：不复制整列）
+      return;
     }
-  } else if (type_ == EncodingType::kDictionary) {
-    if (dictionary_.size() <= 256) {
-      for (size_t i = 0; i < data_.size(); ++i) {
-        uint8_t idx = static_cast<uint8_t>(data_[i]);
-        if (idx < dictionary_.size()) {
-          uint64_t raw;
-          memcpy(&raw, dictionary_[idx].data(), 8);
-          decompressed_cache_.emplace_back(Descriptor(raw));
+    if (type_ == EncodingType::kDictionary) {
+      if (dictionary_.size() <= 256) {
+        for (size_t i = 0; i < data_.size(); ++i) {
+          uint8_t idx = static_cast<uint8_t>(data_[i]);
+          if (idx < dictionary_.size()) {
+            uint64_t raw;
+            memcpy(&raw, dictionary_[idx].data(), 8);
+            decompressed_cache_.emplace_back(Descriptor(raw));
+          }
         }
-      }
-    } else if (dictionary_.size() <= 65536) {
-      for (size_t i = 0; i + 1 < data_.size(); i += 2) {
-        uint16_t idx = static_cast<uint8_t>(data_[i]) | 
-                      (static_cast<uint8_t>(data_[i+1]) << 8);
-        if (idx < dictionary_.size()) {
-          uint64_t raw;
-          memcpy(&raw, dictionary_[idx].data(), 8);
-          decompressed_cache_.emplace_back(Descriptor(raw));
+      } else if (dictionary_.size() <= 65536) {
+        for (size_t i = 0; i + 1 < data_.size(); i += 2) {
+          uint16_t idx = static_cast<uint8_t>(data_[i]) |
+                        (static_cast<uint8_t>(data_[i + 1]) << 8);
+          if (idx < dictionary_.size()) {
+            uint64_t raw;
+            memcpy(&raw, dictionary_[idx].data(), 8);
+            decompressed_cache_.emplace_back(Descriptor(raw));
+          }
         }
       }
     }
-  }
-  
-  decompressed_ = true;
+  });
 }
 
 Descriptor ValueZoneEncoder::Decoder::Get(size_t idx) const {
+  if (type_ == EncodingType::kRaw) {
+    // 零拷贝直索引：8B/行
+    if ((idx + 1) * 8 > data_.size()) return Descriptor();
+    uint64_t raw;
+    memcpy(&raw, data_.data() + idx * 8, 8);
+    return Descriptor(raw);
+  }
   EnsureDecompressed();
   if (idx < decompressed_cache_.size()) {
     return decompressed_cache_[idx];
@@ -1054,9 +1120,8 @@ Descriptor ValueZoneEncoder::Decoder::Get(size_t idx) const {
 
 void ValueZoneEncoder::Decoder::GetRange(
     size_t start_idx, size_t count, std::vector<Descriptor>* out) const {
-  EnsureDecompressed();
-  for (size_t i = 0; i < count && (start_idx + i) < decompressed_cache_.size(); ++i) {
-    out->push_back(decompressed_cache_[start_idx + i]);
+  for (size_t i = 0; i < count; ++i) {
+    out->push_back(Get(start_idx + i));
   }
 }
 
@@ -1083,28 +1148,28 @@ void ZoneColumnarBuilder::Add(const CedarKey& key, const Descriptor& value) {
 
 std::vector<ZoneData> ZoneColumnarBuilder::Finish() {
   std::vector<ZoneData> zones;
-  
+
   if (entity_ids_.empty()) {
     return zones;
   }
-  
+
   // Zone 0: Entity IDs
   ZoneMap entity_map;
   std::string entity_data = EntityIdZoneEncoder::Encode(entity_ids_, &entity_map);
   zones.push_back(ZoneData(ZoneType::kEntityIds, std::move(entity_data), entity_map));
-  
+
   // Zone 1: Timestamps
   ZoneMap ts_map;
   std::string ts_data = TimestampZoneEncoder::Encode(timestamps_, &ts_map);
   ZoneData ts_zone(ZoneType::kTimestamps, std::move(ts_data), ts_map);
   ts_zone.raw_timestamps = timestamps_;  // 保存原始时间戳用于统一编码
   zones.push_back(std::move(ts_zone));
-  
+
   // Zone 2: Target IDs
   ZoneMap target_map;
   std::string target_data = TargetIdZoneEncoder::Encode(target_ids_, entity_ids_, &target_map);
   zones.push_back(ZoneData(ZoneType::kTargetIds, std::move(target_data), target_map));
-  
+
   // Zone 3: Key Metadata (Sequence + Flags)
   ZoneMap metadata_map;
   std::vector<KeyMetadataZoneEncoder::MetadataEntry> metadata_entries;
@@ -1118,11 +1183,11 @@ std::vector<ZoneData> ZoneColumnarBuilder::Finish() {
   metadata_zone.sequence_rle = std::move(metadata_result.sequence_rle);
   metadata_zone.flags_bitmap = std::move(metadata_result.flags_bitmap);
   zones.push_back(std::move(metadata_zone));
-  
+
   // Zone 4: Values
   ZoneMap value_map;
   auto value_result = ValueZoneEncoder::EncodeWithType(values_);
-  
+
   // FIX: Dictionary encoding not properly supported in current format
   // Re-encode as kRaw if dictionary encoding was selected
   if (value_result.type == ValueZoneEncoder::EncodingType::kDictionary) {
@@ -1134,11 +1199,11 @@ std::vector<ZoneData> ZoneColumnarBuilder::Finish() {
     }
     value_result.dictionary.clear();
   }
-  
+
   ZoneData value_zone(ZoneType::kValues, std::move(value_result.data), value_map);
   value_zone.encoding.value_encoding = value_result.type;
   zones.push_back(std::move(value_zone));
-  
+
   return zones;
 }
 
@@ -1163,7 +1228,7 @@ void ZoneColumnarBuilder::Reserve(size_t count) {
 CedarKey ZoneColumnarBuilder::ReconstructKey(
     size_t idx, uint16_t column_id, uint8_t entity_type) const {
   if (idx >= entity_ids_.size()) return CedarKey();
-  
+
   return CedarKey(
       entity_ids_[idx],
       static_cast<EntityType>(entity_type),
@@ -1203,7 +1268,7 @@ void ZoneColumnarReader::Init(const std::vector<ZoneData>& zones) {
   for (const auto& zone : zones) {
     if (zone.type == ZoneType::kKeyMetadata) {
       // Key Metadata Zone 特殊处理
-      metadata_decoder_.emplace(zone.sequence_rle, zone.flags_bitmap, 
+      metadata_decoder_.emplace(zone.sequence_rle, zone.flags_bitmap,
                                 zone.zone_map.count);
     } else {
       InitZone(zone.type, zone.encoded_data);
@@ -1213,22 +1278,22 @@ void ZoneColumnarReader::Init(const std::vector<ZoneData>& zones) {
 
 bool ZoneColumnarReader::Get(size_t idx, CedarKey* key, Descriptor* value) const {
   if (idx >= count_) return false;
-  
+
   if (!entity_decoder_ || !timestamp_decoder_ || !value_decoder_) {
     return false;
   }
-  
+
   uint64_t entity_id = entity_decoder_->Get(idx);
   uint64_t ts = timestamp_decoder_->Get(idx);
-  
+
   // 获取 metadata
   uint16_t seq = metadata_decoder_ ? metadata_decoder_->GetSequence(idx) : 0;
   uint8_t flags = metadata_decoder_ ? metadata_decoder_->GetFlags(idx) : 0;
-  
+
   // 构建 CedarKey（默认作为 Vertex，实际应从 SST Header 获取类型）
   *key = CedarKey(entity_id, EntityType::Vertex, 0, Timestamp(ts), seq, 0, flags);
   *value = value_decoder_->Get(idx);
-  
+
   return true;
 }
 
@@ -1268,29 +1333,29 @@ void ZoneColumnarReader::ScanWithLateMaterialization(
       matching_indices.push_back(i);
     }
   }
-  
+
   // Phase 2: 只读取匹配的 Values（延迟物化）
   for (size_t idx : matching_indices) {
     CedarKey key;
     Descriptor value = value_decoder_->Get(idx);
-    
+
     uint64_t entity_id = entity_decoder_->Get(idx);
     uint64_t ts = timestamp_decoder_->Get(idx);
     uint64_t target_id = target_decoder_ ? target_decoder_->Get(idx, {}) : 0;
-    
+
     key = CedarKey(entity_id, EntityType::Vertex, 0, Timestamp(ts), 0, target_id);
     callback(idx, key, value);
   }
 }
 
 bool ZoneColumnarReader::ZoneMapCheck(uint64_t entity_id) const {
-  return entity_id >= entity_zone_map_.min_value && 
+  return entity_id >= entity_zone_map_.min_value &&
          entity_id <= entity_zone_map_.max_value;
 }
 
 bool ZoneColumnarReader::ZoneMapCheck(uint64_t start_ts, uint64_t end_ts) const {
   // 检查时间范围是否与 SST 时间范围有交集
-  return !(end_ts < timestamp_zone_map_.min_value || 
+  return !(end_ts < timestamp_zone_map_.min_value ||
            start_ts > timestamp_zone_map_.max_value);
 }
 
@@ -1300,7 +1365,7 @@ void ZoneColumnarReader::ValidateConsistency() {
   size_t ts_count = timestamp_decoder_ ? timestamp_decoder_->Count() : 0;
   size_t target_count = target_decoder_ ? target_decoder_->Count() : 0;
   size_t value_count = value_decoder_ ? value_decoder_->Count() : 0;
-  
+
   if (entity_count != ts_count || entity_count != target_count || entity_count != value_count) {
     // 不一致，使用最小的
     count_ = std::min({entity_count, ts_count, target_count, value_count});
@@ -1311,13 +1376,13 @@ void ZoneColumnarReader::ValidateConsistency() {
 CedarKey ZoneColumnarReader::ReconstructKey(
     size_t idx, uint16_t column_id, uint8_t entity_type) const {
   if (idx >= count_) return CedarKey();
-  
+
   uint64_t entity_id = entity_decoder_ ? entity_decoder_->Get(idx) : 0;
   uint64_t ts = timestamp_decoder_ ? timestamp_decoder_->Get(idx) : 0;
   uint64_t target_id = target_decoder_ ? target_decoder_->Get(idx, {}) : 0;
   uint16_t seq = metadata_decoder_ ? metadata_decoder_->GetSequence(idx) : 0;
   uint8_t flags = metadata_decoder_ ? metadata_decoder_->GetFlags(idx) : 0;
-  
+
   return CedarKey(
       entity_id,
       static_cast<EntityType>(entity_type),
@@ -1346,7 +1411,7 @@ size_t ZoneColumnarReader::CountTombstones() const {
 }
 
 // ZoneData 辅助方法
-ZoneData ZoneData::MakeKeyMetadata(const std::string& seq_rle, 
+ZoneData ZoneData::MakeKeyMetadata(const std::string& seq_rle,
                                     const std::string& flags_bm,
                                     uint32_t count) {
   ZoneData zone;

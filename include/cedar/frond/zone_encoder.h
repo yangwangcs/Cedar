@@ -26,11 +26,13 @@
 #define FERN_ZONE_ENCODER_H_
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <optional>
 
+#include "cedar/core/slice.h"
 #include "cedar/types/cedar_key.h"
 #include "cedar/types/descriptor.h"
 
@@ -103,51 +105,75 @@ class EntityIdZoneEncoder {
   // 带统计信息的编码
   static std::string Encode(const std::vector<uint64_t>& ids, ZoneMap* zone_map);
   
-  // 解码器
+  // 解码器（Task 3.1/3.2）
+  // - 零拷贝：只持有 Slice 视图，不复制 zone。
+  // - 块表：构造时不扫描；首次使用时一次性建立每 kBlockRows 行一个
+  //   (byte_offset, row_idx) 块表（一次线性扫描），之后 Get(idx) 从最近块
+  //   解码不超过 kBlockRows 行。块表按“行”对齐（不是 run 边界），修掉审计 2.9。
+  // - 线程安全：索引用 std::once_flag 构建；构建完成后只读，可被并发查询共享。
   class Decoder {
    public:
-    explicit Decoder(const std::string& data);
-    
+    explicit Decoder(Slice data);
+
     // 获取指定索引的 Entity ID
     uint64_t Get(size_t idx) const;
-    
+
     // 批量获取
     void GetRange(size_t start_idx, size_t count, std::vector<uint64_t>* out) const;
-    
-    // 二分查找指定 Entity ID 的所有位置
-    // 返回: 该 Entity ID 出现的所有索引（已解压后的逻辑索引）
+
+    // 顺序访问游标（迭代器使用；每个游标独立状态，O(1)/行）
+    class Cursor {
+     public:
+      explicit Cursor(const Decoder* decoder) : decoder_(decoder) {}
+      // 定位到 target_idx 并返回其 entity_id
+      bool Seek(size_t target_idx, uint64_t* value);
+      // 从当前位置前进到 target_idx（target_idx >= 当前行）并返回其值
+      bool Advance(size_t target_idx, uint64_t* value);
+      size_t index() const { return idx_; }
+      bool valid() const { return valid_; }
+
+     private:
+      const Decoder* decoder_;
+      size_t pos_ = 0;
+      size_t idx_ = 0;
+      uint64_t value_ = 0;
+      size_t run_remaining_ = 0;  // 当前 run 内从 idx_ 起剩余行数（含 idx_）
+      bool valid_ = false;
+    };
+
+    // 二分查找指定 Entity ID 的所有位置（按行号升序）
     std::vector<size_t> FindEntityPositions(uint64_t entity_id) const;
-    
-    // OPTIMIZATION: 使用 Bitmap 索引快速检查 entity 是否存在
-    // 返回: true = 可能存在, false = 肯定不存在
+
+    // true = 可能存在（无 Bloom 时的保守判断）, false = 肯定不存在
     bool MayContainEntity(uint64_t entity_id) const;
-    
-    // 获取总条目数
-    size_t Count() const { return total_count_; }
-    
+
+    // 获取总条目数（会触发一次块表构建）
+    size_t Count() const;
+
+    // 块表（Task 3.2）；Get/Find 内部使用，测试/诊断可读。
+    struct BlockEntry {
+      size_t byte_offset;
+      size_t row_idx;
+    };
+    const std::vector<BlockEntry>& blocks() const;
+
+    bool valid() const { return !data_.empty(); }
+
    private:
-    const std::string& data_;
-    mutable std::vector<std::pair<uint64_t, size_t>> restart_points_;  // 重启点
-    size_t total_count_ = 0;
-    
-    // OPTIMIZATION: Entity ID -> Positions 的倒排索引（延迟构建）
-    mutable std::unordered_map<uint64_t, std::vector<size_t>> entity_index_;
-    mutable bool index_built_ = false;
-    
-    // OPTIMIZATION: 查询结果缓存（最近查询的 entity positions）
-    static constexpr size_t kCacheSize = 64;
-    mutable std::vector<std::pair<uint64_t, std::vector<size_t>>> position_cache_;
-    mutable size_t cache_hits_ = 0;
-    mutable size_t cache_misses_ = 0;
-    
-    void BuildRestartPoints() const;
-    void BuildEntityIndex() const;  // 构建倒排索引
-    void AddToCache(uint64_t entity_id, const std::vector<size_t>& positions) const;
-    const std::vector<size_t>* GetFromCache(uint64_t entity_id) const;
+    struct Index {
+      std::vector<BlockEntry> blocks;
+      size_t total_count = 0;
+    };
+    void EnsureIndex() const;
+
+    Slice data_;
+    mutable std::once_flag index_once_;
+    mutable Index index_;
   };
   
  private:
-  static constexpr size_t kRestartInterval = 8192;  // 每 8192 行一个重启点
+  static constexpr size_t kRestartInterval = 8192;  // 每 8192 行一个块
+  static constexpr size_t kBlockRows = 8192;
 };
 
 // =============================================================================
@@ -163,10 +189,13 @@ class TimestampZoneEncoder {
   // 带统计信息的编码
   static std::string Encode(const std::vector<uint64_t>& timestamps, ZoneMap* zone_map);
   
-  // 解码器
+  // 解码器（Task 3.1/3.2）
+  // - 零拷贝：只持有 Slice 视图。
+  // - 懒解码：构造只扫描 varint 计算行数（不分配 O(n) cache）；首次 Get/
+  //   FindTimeRange 时 one-time 解码全部时间戳并构建升序索引（线程安全）。
   class Decoder {
    public:
-    explicit Decoder(const std::string& data);
+    explicit Decoder(Slice data);
     
     // 获取指定索引的时间戳
     uint64_t Get(size_t idx) const;
@@ -174,47 +203,39 @@ class TimestampZoneEncoder {
     // 批量获取
     void GetRange(size_t start_idx, size_t count, std::vector<uint64_t>* out) const;
     
-    // 查找时间戳范围内的所有索引
-    // 返回: [start_idx, end_idx) 范围内的所有索引
+    // 查找时间戳范围内的所有索引（按行号降序）
     std::vector<size_t> FindTimeRange(uint64_t start_ts, uint64_t end_ts) const;
     
-    // OPTIMIZATION: 使用二分查找快速定位时间戳范围
-    // 返回: 大于等于 target_ts 的最小索引（降序排列）
+    // 升序索引上的二分（返回下标，不是行号）
     size_t LowerBound(uint64_t target_ts) const;
-    // 返回: 小于等于 target_ts 的最大索引（降序排列）
     size_t UpperBound(uint64_t target_ts) const;
     
-    // 获取总条目数
+    // 获取总条目数（构造时扫描得到，无需解码）
     size_t Count() const { return total_count_; }
     
-    // 获取最小/最大时间戳
-    uint64_t MinTimestamp() const { return min_ts_; }
-    uint64_t MaxTimestamp() const { return max_ts_; }
+    // 获取最小/最大时间戳（触发一次解码）
+    uint64_t MinTimestamp() const;
+    uint64_t MaxTimestamp() const;
     
    private:
-    const std::string& data_;
-    mutable std::vector<std::pair<uint64_t, size_t>> restart_points_;
+    void EnsureDecoded() const;
+    void BuildSortedIndex() const;
+
+    Slice data_;
     size_t total_count_ = 0;
     uint64_t first_ts_ = 0;
     int64_t first_delta_ = 0;
-    uint64_t min_ts_ = UINT64_MAX;
-    uint64_t max_ts_ = 0;
-    mutable bool decompressed_ = false;
-    
-    void BuildRestartPoints() const;
-    void DecodeUpTo(size_t idx) const;
+    mutable std::once_flag decode_once_;
+    mutable std::once_flag sorted_once_;
     mutable std::vector<uint64_t> decoded_cache_;
-    mutable size_t decoded_up_to_ = 0;
-    
-    // OPTIMIZATION: 构建索引以支持二分查找
-    // 由于 decoded_cache_ 是降序的，我们需要一个升序索引来支持二分查找
-    mutable std::vector<size_t> sorted_index_;  // 升序排列的索引
-    mutable bool index_built_ = false;
-    void BuildSortedIndex() const;
+    mutable uint64_t min_ts_ = UINT64_MAX;
+    mutable uint64_t max_ts_ = 0;
+    mutable std::vector<size_t> sorted_index_;  // 升序排列的行号
   };
   
  private:
   static constexpr size_t kRestartInterval = 4096;  // 每 4096 行一个重启点
+  static constexpr size_t kBlockRows = 8192;        // 块表粒度（审计 3.2）
 };
 
 // =============================================================================
@@ -240,11 +261,29 @@ class TargetIdZoneEncoder {
     kDelta = 1,    // Delta 编码 (相对于 Entity ID)
     kRle = 2,      // RLE 编码
   };
+
+  // 文件级一次编码（Task 1.4，审计 2.1）：
+  //   [encoding_type:1B][varint target_id ...]
+  // 整文件只有一个 encoding_type 前缀，不再按 block 各写一个 tag。
+  // 固定 kRaw：文件级 kDelta 需要与 entity zone 对齐的额外信息，写端不选择；
+  // 读端的旧格式 fallback 仍能解出旧文件里的 kDelta 块。
+  static std::string EncodeFileLevel(const std::vector<uint64_t>& target_ids,
+                                     ZoneMap* zone_map);
+
+  // 解码一段 target zone 流：[encoding_type:1B][payload]。
+  //   kRaw   → count 个 varint
+  //   kDelta → bitmap(ceil(count/8)B) + 按位图顺序的 zigzag delta（entity_ids 与行对齐）
+  // 返回 count 个 target_id（数据不足处补 0）。bytes_consumed 返回实际消耗的
+  // 字节数（旧格式按 block 切片解码时需要推进游标）。
+  static std::vector<uint64_t> DecodeStream(const char* data, size_t size,
+                                            EncodingType type, size_t count,
+                                            const std::vector<uint64_t>& entity_ids,
+                                            size_t* bytes_consumed = nullptr);
   
   // 解码器
   class Decoder {
    public:
-    Decoder(const std::string& data, EncodingType type);
+    Decoder(Slice data, EncodingType type);
     
     // 获取指定索引的 Target ID
     uint64_t Get(size_t idx, const std::vector<uint64_t>& entity_ids) const;
@@ -258,7 +297,7 @@ class TargetIdZoneEncoder {
     size_t Count() const { return total_count_; }
     
    private:
-    const std::string& data_;
+    Slice data_;
     EncodingType type_;
     size_t total_count_ = 0;
   };
@@ -303,7 +342,7 @@ class KeyMetadataZoneEncoder {
   // 解码器
   class Decoder {
    public:
-    Decoder(const std::string& sequence_rle, const std::string& flags_bitmap, uint32_t count);
+    Decoder(Slice sequence_rle, Slice flags_bitmap, uint32_t count);
     
     // 获取指定索引的元数据
     MetadataEntry Get(size_t idx) const;
@@ -327,13 +366,13 @@ class KeyMetadataZoneEncoder {
     uint32_t CountTombstones() const;
     
    private:
-    std::string sequence_rle_;
-    std::string flags_bitmap_;
+    Slice sequence_rle_;
+    Slice flags_bitmap_;
     uint32_t count_ = 0;
     
-    // 解压后的缓存
+    // 解压后的缓存（one-time，线程安全）
+    mutable std::once_flag decode_once_;
     mutable std::vector<MetadataEntry> decoded_cache_;
-    mutable bool decoded_ = false;
     
     void EnsureDecoded() const;
   };
@@ -346,10 +385,10 @@ class KeyMetadataZoneEncoder {
   static std::string EncodeFlagsBitmap(const std::vector<uint8_t>& flags);
   
   // RLE 解码
-  static std::vector<uint16_t> DecodeSequenceRLE(const std::string& data, uint32_t count);
+  static std::vector<uint16_t> DecodeSequenceRLE(Slice data, uint32_t count);
   
   // Bitmap 解码
-  static std::vector<uint8_t> DecodeFlagsBitmap(const std::string& data, uint32_t count);
+  static std::vector<uint8_t> DecodeFlagsBitmap(Slice data, uint32_t count);
 };
 
 // =============================================================================
@@ -388,7 +427,7 @@ class ValueZoneEncoder {
   // 解码器
   class Decoder {
    public:
-    Decoder(const std::string& data, EncodingType type,
+    Decoder(Slice data, EncodingType type,
             const std::vector<std::string>& dictionary = {});
     
     // 获取指定索引的 Value
@@ -405,14 +444,14 @@ class ValueZoneEncoder {
     size_t Count() const { return total_count_; }
     
    private:
-    const std::string& data_;
+    Slice data_;
     EncodingType type_;
     std::vector<std::string> dictionary_;
     size_t total_count_ = 0;
     
-    // 解压后的缓存（延迟解压）
+    // 字典编码的解压缓存（one-time）；kRaw 直接按 idx*8 索引，不再全量缓存。
+    mutable std::once_flag decode_once_;
     mutable std::vector<Descriptor> decompressed_cache_;
-    mutable bool decompressed_ = false;
     
     void EnsureDecompressed() const;
   };

@@ -77,6 +77,11 @@ struct SizeTieredConfig {
   // 后台线程
   int compaction_threads = 2;                    // 合并线程数
   bool enable_background_compaction = true;      // 是否启用后台合并
+
+  // 调度（Task 4.3）：有界 pending + 失败指数退避
+  size_t max_pending_tasks = 8;                  // pending_tasks_ 上限
+  uint64_t failure_backoff_base_ms = 50;         // 首次失败退避
+  uint64_t failure_backoff_max_ms = 5000;        // 退避上限
 };
 
 // =============================================================================
@@ -158,6 +163,71 @@ struct LevelState {
   std::vector<ZoneSstMeta> FindOverlapping(
       uint64_t min_entity, uint64_t max_entity,
       uint64_t min_ts, uint64_t max_ts) const;
+
+  // 找出与给定 Key 范围重叠、且属于同一 (entity_type, column_id) 的文件。
+  // 审计 9.1：一个压缩任务只能合并同组文件（输出文件头只有一组列/类型），
+  // 因此下层重叠文件的选取必须同时按列/类型过滤。
+  std::vector<ZoneSstMeta> FindOverlapping(
+      uint64_t min_entity, uint64_t max_entity,
+      uint64_t min_ts, uint64_t max_ts,
+      uint16_t column_id, uint8_t entity_type) const;
+};
+
+// =============================================================================
+// 多路归并结果（输出文件元数据）
+// =============================================================================
+// 一次归并（可能切成多个输出分段）的整体统计；分段自己的统计由调用方维护。
+struct MergeZoneResult {
+  uint64_t num_rows = 0;
+  uint64_t min_entity_id = UINT64_MAX;
+  uint64_t max_entity_id = 0;
+  uint64_t min_timestamp = UINT64_MAX;
+  uint64_t max_timestamp = 0;
+};
+
+// 归并输出汇：每写一行调用一次；返回非 OK 立即中止归并（调用方清理输出）。
+// Task 4.1：MergeZones 改为 K 路堆，逐行 push 给 sink；Task 4.2 的分段输出
+// 由 DoZoneCompaction 的 sink 负责切文件。
+using MergeRowSink = std::function<Status(const CedarKey&, const Descriptor&)>;
+
+// =============================================================================
+// 单一文件号分配器（Task 1.7 / 审计 9.2 / 设计 D2）
+// =============================================================================
+// 全库只有一个计数器（LsmEngine::next_file_number_）：flush 直接用它取号，
+// 压缩引擎通过 BindFileNumberAllocator 绑定同一个原子计数器，所以任何写文件
+// 路径都不会再拿到重复文件号。取号水位（Peek）写入 MANIFEST，重开时只前进
+// 不后退。未绑定外部计数器时使用自有计数器（独立使用/测试场景）。
+class FileNumberAllocator {
+ public:
+  explicit FileNumberAllocator(uint64_t next_file_number = 1)
+      : owned_(next_file_number) {}
+
+  // 共享外部计数器（LsmEngine 持有的那个）。指针生命周期由调用方保证；
+  // 传 nullptr 恢复为内部计数器。
+  void Bind(std::atomic<uint64_t>* counter) { counter_ = counter; }
+  bool bound() const { return counter_ != nullptr; }
+
+  // 唯一取号点（并发唯一）。
+  uint64_t Allocate() {
+    return counter_->fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // 下一个将分配的值（MANIFEST 持久化的水位）。
+  uint64_t Peek() const { return counter_->load(std::memory_order_relaxed); }
+
+  // 从磁盘状态恢复水位：只前进不后退（CAS 循环，可与并发取号交错）。
+  void EnsureAtLeast(uint64_t next_file_number) {
+    uint64_t current = counter_->load(std::memory_order_relaxed);
+    while (current < next_file_number &&
+           !counter_->compare_exchange_weak(current, next_file_number,
+                                            std::memory_order_relaxed,
+                                            std::memory_order_relaxed)) {
+    }
+  }
+
+ private:
+  mutable std::atomic<uint64_t> owned_;
+  std::atomic<uint64_t>* counter_ = &owned_;
 };
 
 // =============================================================================
@@ -251,7 +321,8 @@ struct CompactionStats {
   std::atomic<int> active_compactions{0};
   std::atomic<uint64_t> pending_compaction_bytes{0};
   
-  void RecordCompaction(const CompactionTask& task, uint64_t duration_ms);
+  void RecordCompaction(const CompactionTask& task, uint64_t duration_ms,
+                        uint64_t output_files = 1);
   std::string Report() const;
 };
 
@@ -360,8 +431,37 @@ class SizeTieredCompactionEngine {
   friend class ThreadPoolCompactionExecutor;
   friend class ParallelCompactionEngine;
   
-  // 获取下一个文件编号
-  uint64_t NewFileNumber() { return next_file_number_.fetch_add(1); }
+  // 获取下一个文件编号（唯一取号点）
+  uint64_t NewFileNumber() { return file_number_allocator_.Allocate(); }
+
+  // ============= 文件号分配（Task 1.7 / 审计 9.2） =============
+  //
+  // 共享 LsmEngine 持有的唯一分配器：绑定后 flush 与 compaction 从同一处取号，
+  // 压缩输出号自动回写到 LsmEngine 的计数器。必须在 Open() 之前调用
+  //（LoadManifest 会用 MANIFEST 水位推进分配器）。
+  void BindFileNumberAllocator(std::atomic<uint64_t>* counter) {
+    file_number_allocator_.Bind(counter);
+  }
+
+  // 下一个将分配的文件号（MANIFEST 持久化的水位）。
+  uint64_t PeekNextFileNumber() const { return file_number_allocator_.Peek(); }
+
+  // 该文件号是否已登记在任意层级（重开迁移去重，审计 9.3）。
+  bool HasFile(uint64_t file_number) const;
+
+  // ============= 调度诊断（Task 4.3，只增 API） =============
+  //
+  // 单一调度器：PickNextCompaction 返回任务时按文件集原子登记 reserved_files_，
+  // ExecuteCompaction 结束/失败/Close 时释放；同一文件不会被两个任务同时持有。
+  size_t PendingTaskCount() const;
+  std::vector<CompactionTask> PendingTasksSnapshot() const;
+  size_t ReservedFileCount() const;
+
+  // 连续失败次数 / 剩余退避时间（微秒，0 表示可以立即调度）。
+  uint32_t ConsecutiveCompactionFailures() const;
+  uint64_t BackoffRemainingMicros() const;
+  // 运维/测试钩子：清空退避（下一次 ScheduleCompaction 立即生效）。
+  void ResetCompactionBackoff();
 
  private:
   // ============= 内部方法 =============
@@ -369,12 +469,25 @@ class SizeTieredCompactionEngine {
   // 后台合并线程
   void BackgroundCompactionThread();
   
-  // 执行具体的 Zone-Columnar 合并
-  Status DoZoneCompaction(const CompactionTask& task);
+  // 执行具体的 Zone-Columnar 合并（Task 4.2：输出按 l0_file_size 切成多段）
+  // output_files 非空时回填本次实际写出的 SST 文件数（统计用）。
+  Status DoZoneCompaction(const CompactionTask& task,
+                          uint64_t* output_files = nullptr);
   
-  // 多路归并（核心算法）
+  // 多路堆归并（核心算法，Task 4.1）
+  //
+  // inputs 必须同属 (entity_type, column_id)；调用方传入 inputs ∪ overlaps
+  //（审计 3.1：重叠文件的数据必须参与合并，不能直接删除）。
+  // 采用 std::priority_queue（O(log K)/行）而不是逐行扫描 K 个游标（O(K)/行）。
+  // 同 key 取舍规则（代码内固定，见 MergeHeapGreater）：
+  //   1) 同 user key 且同 timestamp：只保留 sequence 更大的版本；
+  //   2) 完整 key 完全相同：只保留输入文件号更大的那份；
+  // 输出行按 CedarKey::Compare 递增（每个 (user key, ts) 只留一行，顺序与唯一
+  // 化后的 key 序一致）。
+  // 逐行交给 sink 写盘；整体真实行数/范围回填到 result。
   Status MergeZones(const std::vector<ZoneSstMeta>& inputs,
-                    ZoneColumnarSstBuilder* output);
+                    const MergeRowSink& sink,
+                    MergeZoneResult* result);
   
   // 处理 Tombstone 清理
   bool ShouldDropTombstone(const CedarKey& key, int output_level);
@@ -387,12 +500,24 @@ class SizeTieredCompactionEngine {
   // 原子操作：添加文件到某层
   void AddFileToLevel(const ZoneSstMeta& meta, int level);
   
-  // 原子操作：从某层移除文件
-  void RemoveFileFromLevel(uint64_t file_number, int level);
-  
   // 持久化层级状态（MANIFEST）
   Status SaveManifest();
+  // 调用方已持有 levels_mutex_（压缩提交: 先写 MANIFEST 再删输入文件）
+  Status SaveManifestLocked();
   Status LoadManifest();
+  // fsync 目录项：rename 之后调用，让 MANIFEST 的替换在掉电后也可见
+  //（复用 PosixWritableFile 对 "MANIFEST*" 文件 Sync 时顺带 fsync 目录的行为）
+  Status SyncParentDirectory();
+
+  // Task 4.3：失败指数退避（失败不紧循环）
+  void RecordCompactionFailure();
+  void RecordCompactionSuccess();
+
+  // 只从层级元数据里移除（不删物理文件）；物理删除见 DeleteSstFile。
+  // 调用方必须持有 levels_mutex_。
+  void RemoveFileMetaFromLevelLocked(uint64_t file_number, int level);
+  // 删除物理 SST/Blob 文件（必须在 MANIFEST 提交之后调用）
+  void DeleteSstFile(const ZoneSstMeta& meta);
   
   // 查找文件
   std::optional<ZoneSstMeta> FindFile(uint64_t file_number) const;
@@ -415,25 +540,31 @@ class SizeTieredCompactionEngine {
   // Blob 引用管理
   BlobReferenceManager blob_manager_;
   
-  // 文件编号生成器
-  std::atomic<uint64_t> next_file_number_{1};
+  // 文件号分配器（默认自有计数器）。BindFileNumberAllocator 后它与
+  // LsmEngine::next_file_number_ 共享同一个原子计数器（单一分配器，审计 9.2）。
+  FileNumberAllocator file_number_allocator_;
   
   // 后台线程控制
   std::atomic<bool> shutdown_{false};
   std::atomic<bool> opened_{false};
   std::vector<std::thread> compaction_threads_;
   
-  // 任务队列
-  std::mutex queue_mutex_;
+  // 任务队列（mutable：pending 数量/快照是 const 诊断接口）
+  mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::queue<CompactionTask> pending_tasks_;
   
   // 统计
   mutable CompactionStats stats_;
   
-  // 当前正在合并的文件（防止并发合并同一文件）
+  // 当前被任务保留的文件（reserved_files_，防止并发合并同一文件）。
+  // PickNextCompaction 返回任务时登记，ExecuteCompaction 结束/失败释放。
   mutable std::mutex compacting_mutex_;
   std::unordered_set<uint64_t> compacting_files_;
+
+  // 调度退避（Task 4.3）：连续失败次数与下次允许调度的时刻（Env::NowMicros）
+  std::atomic<uint32_t> consecutive_failures_{0};
+  std::atomic<uint64_t> backoff_until_us_{0};
 };
 
 // =============================================================================

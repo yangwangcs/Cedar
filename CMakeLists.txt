@@ -42,6 +42,7 @@ set(CEDAR_CORE_SOURCES
 # Storage sources
 set(CEDAR_STORAGE_SOURCES
     src/storage/lsm_engine.cc
+    src/storage/wal_replay.cc
     src/storage/sst_reader_cache.cc
     src/storage/block_cache.cc
     src/storage/compaction_merger.cc
@@ -170,6 +171,12 @@ add_custom_target(generate_proto ALL
 option(BUILD_EXAMPLES "Build example programs" OFF)
 if(BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+# Optional: Build benchmarks if enabled
+option(BUILD_BENCHMARKS "Build benchmark programs" OFF)
+if(BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 # Optional: Build tests if enabled

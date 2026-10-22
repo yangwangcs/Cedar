@@ -1,55 +1,98 @@
 // Copyright (c) 2025 The Cedar Authors. All rights reserved.
-// SST Reader Cache implementation
+// SST Reader Cache implementation (Task 3.4)
 
 #include "cedar/storage/sst_reader_cache.h"
 
+#include <algorithm>
+
 namespace cedar {
 
-std::shared_ptr<ZoneColumnarSstReader> SstReaderCache::Get(const std::string& file_path) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  
-  auto it = cache_map_.find(file_path);
-  if (it != cache_map_.end()) {
-    // 缓存命中 - 移动到 LRU 列表前面
-    lru_list_.erase(it->second.first);
-    lru_list_.push_front(file_path);
-    it->second.first = lru_list_.begin();
-    it->second.second->ref_count++;
-    stats_.hits++;
-    return it->second.second->reader;
+bool SstReaderCache::ParseFileNumber(const std::string& file_path, uint64_t* number) {
+  if (number == nullptr) return false;
+  const size_t slash = file_path.find_last_of('/');
+  const std::string base =
+      slash == std::string::npos ? file_path : file_path.substr(slash + 1);
+  const size_t dot = base.find('.');
+  const std::string digits = base.substr(0, dot);
+  if (digits.empty()) return false;
+  uint64_t value = 0;
+  for (char c : digits) {
+    if (c < '0' || c > '9') return false;
+    value = value * 10 + static_cast<uint64_t>(c - '0');
   }
-  
-  // 缓存未命中 - 创建新的 Reader
-  stats_.misses++;
-  
+  *number = value;
+  return true;
+}
+
+std::shared_ptr<ZoneColumnarSstReader> SstReaderCache::Get(
+    uint64_t file_number, const std::string& file_path) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = cache_map_.find(file_number);
+    if (it != cache_map_.end()) {
+      lru_list_.erase(it->second.first);
+      lru_list_.push_front(file_number);
+      it->second.first = lru_list_.begin();
+      it->second.second->hit_count++;
+      it->second.second->last_access = std::chrono::steady_clock::now();
+      stats_.hits++;
+      return it->second.second->reader;
+    }
+    stats_.misses++;
+  }
+
+  // 在锁外打开文件（Open 可能做 mmap/fstat；不阻塞其它 reader 命中）
   auto reader = std::make_shared<ZoneColumnarSstReader>(file_path);
   Status s = reader->Open();
   if (!s.ok()) {
     return nullptr;
   }
-  
-  // 如果需要，淘汰旧项
-  while (cache_map_.size() >= capacity_) {
-    EvictLRU();
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 双重检查：并发 miss 时另一线程可能已插入
+    auto it = cache_map_.find(file_number);
+    if (it != cache_map_.end()) {
+      return it->second.second->reader;
+    }
+
+    // 不忙等：条目总是可从 map 淘汰（reader 由 shared_ptr 保活）。
+    // 仅当超过硬上限（异常情况）时不再插入，避免无界增长。
+    if (cache_map_.size() >= max_overflow_) {
+      return reader;
+    }
+    while (cache_map_.size() >= capacity_ && !cache_map_.empty()) {
+      if (!EvictLRU()) break;  // 防御：理论上不会发生
+    }
+
+    lru_list_.push_front(file_number);
+    auto cached = std::make_shared<CachedSstReader>(file_number, file_path, reader);
+    cache_map_[file_number] = {lru_list_.begin(), cached};
   }
-  
-  // 添加到缓存
-  lru_list_.push_front(file_path);
-  auto cached = std::make_shared<CachedSstReader>(file_path, reader);
-  cached->ref_count = 1;
-  cache_map_[file_path] = {lru_list_.begin(), cached};
-  
+  return reader;
+}
+
+std::shared_ptr<ZoneColumnarSstReader> SstReaderCache::Get(const std::string& file_path) {
+  uint64_t file_number = 0;
+  if (ParseFileNumber(file_path, &file_number)) {
+    return Get(file_number, file_path);
+  }
+  auto reader = std::make_shared<ZoneColumnarSstReader>(file_path);
+  if (!reader->Open().ok()) return nullptr;
   return reader;
 }
 
 void SstReaderCache::Release(const std::string& file_path) {
+  uint64_t file_number = 0;
+  if (ParseFileNumber(file_path, &file_number)) Release(file_number);
+}
+
+void SstReaderCache::Release(uint64_t file_number) {
+  // reader 由 shared_ptr 保活；这里只更新最近访问时间（保留 API 兼容）。
   std::lock_guard<std::mutex> lock(mutex_);
-  
-  auto it = cache_map_.find(file_path);
+  auto it = cache_map_.find(file_number);
   if (it != cache_map_.end()) {
-    if (it->second.second->ref_count > 0) {
-      it->second.second->ref_count--;
-    }
+    it->second.second->last_access = std::chrono::steady_clock::now();
   }
 }
 
@@ -63,124 +106,85 @@ void SstReaderCache::SetCapacity(size_t capacity) {
   std::lock_guard<std::mutex> lock(mutex_);
   capacity_ = capacity;
   while (cache_map_.size() > capacity_) {
-    EvictLRU();
+    if (!EvictLRU()) break;
   }
 }
 
-void SstReaderCache::EvictLRU() {
-  if (lru_list_.empty()) return;
-  
-  // 从 LRU 列表尾部淘汰（最久未使用）
-  const std::string& evict_path = lru_list_.back();
-  auto it = cache_map_.find(evict_path);
-  
-  if (it != cache_map_.end()) {
-    // 只有引用计数为 0 时才真正淘汰
-    if (it->second.second->ref_count == 0) {
-      cache_map_.erase(it);
-      lru_list_.pop_back();
-      stats_.evictions++;
-    } else {
-      // 如果引用计数不为 0，移到前面，稍后淘汰
-      lru_list_.pop_back();
-      lru_list_.push_front(evict_path);
-      it->second.first = lru_list_.begin();
-    }
-  }
+bool SstReaderCache::EvictLRU() {
+  if (lru_list_.empty() || cache_map_.empty()) return false;
+  const uint64_t victim = lru_list_.back();
+  lru_list_.pop_back();
+  auto it = cache_map_.find(victim);
+  if (it == cache_map_.end()) return true;  // 列表与 map 暂不一致：已移除，继续
+  cache_map_.erase(it);
+  stats_.evictions++;
+  return true;
 }
 
-// OPTIMIZATION: P1 - 标记热数据文件
 void SstReaderCache::MarkAsHot(const std::string& file_path) {
+  uint64_t file_number = 0;
+  if (!ParseFileNumber(file_path, &file_number)) return;
   std::lock_guard<std::mutex> lock(mutex_);
-  
-  auto it = cache_map_.find(file_path);
+  auto it = cache_map_.find(file_number);
   if (it != cache_map_.end()) {
     it->second.second->is_hot = true;
   }
 }
 
-// OPTIMIZATION: P1 - 预加载指定文件
 bool SstReaderCache::Preload(const std::string& file_path) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  
-  // 检查是否已缓存
-  auto it = cache_map_.find(file_path);
-  if (it != cache_map_.end()) {
-    it->second.second->hit_count++;
-    it->second.second->last_access = std::chrono::steady_clock::now();
-    return true;  // 已在缓存中
+  auto reader = Get(file_path);
+  if (!reader) return false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.preloads++;
   }
-  
-  // 创建新的 Reader
-  auto reader = std::make_shared<ZoneColumnarSstReader>(file_path);
-  Status s = reader->Open();
-  if (!s.ok()) {
-    return false;
-  }
-  
-  // 如果需要，淘汰旧项
-  while (cache_map_.size() >= capacity_) {
-    EvictLRU();
-  }
-  
-  // 添加到缓存并标记为预加载
-  lru_list_.push_front(file_path);
-  auto cached = std::make_shared<CachedSstReader>(file_path, reader);
-  cached->data_preloaded = true;
-  cache_map_[file_path] = {lru_list_.begin(), cached};
-  
-  stats_.preloads++;
   return true;
 }
 
-// OPTIMIZATION: P1 - 批量预加载多个文件
 void SstReaderCache::PreloadFiles(const std::vector<std::string>& file_paths) {
   for (const auto& path : file_paths) {
     Preload(path);
   }
 }
 
-// OPTIMIZATION: P1 - 获取热数据文件列表
 std::vector<std::string> SstReaderCache::GetHotFiles() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  
   std::vector<std::string> hot_files;
-  for (const auto& [path, cached] : cache_map_) {
+  for (const auto& [number, cached] : cache_map_) {
     if (cached.second->is_hot) {
-      hot_files.push_back(path);
+      hot_files.push_back(cached.second->file_path);
     }
   }
   return hot_files;
 }
 
-// OPTIMIZATION: P1 - 清理冷数据
 size_t SstReaderCache::EvictColdData(std::chrono::seconds idle_threshold) {
   std::lock_guard<std::mutex> lock(mutex_);
-  
   auto now = std::chrono::steady_clock::now();
   size_t evicted = 0;
-  
-  auto it = lru_list_.begin();
-  while (it != lru_list_.end() && cache_map_.size() > capacity_ / 2) {
-    auto map_it = cache_map_.find(*it);
-    if (map_it != cache_map_.end()) {
-      auto& cached = map_it->second.second;
-      // 只清理非热数据且长时间未访问的文件
-      if (!cached->is_hot && cached->ref_count == 0) {
-        auto idle_time = std::chrono::duration_cast<std::chrono::seconds>(
-            now - cached->last_access);
-        if (idle_time > idle_threshold) {
-          it = lru_list_.erase(it);
-          cache_map_.erase(map_it);
-          stats_.evictions++;
-          evicted++;
-          continue;
-        }
+
+  for (auto it = lru_list_.begin(); it != lru_list_.end() &&
+                                     cache_map_.size() > capacity_ / 2;) {
+    const uint64_t number = *it;
+    auto map_it = cache_map_.find(number);
+    if (map_it == cache_map_.end()) {
+      it = lru_list_.erase(it);
+      continue;
+    }
+    auto& cached = map_it->second.second;
+    if (!cached->is_hot) {
+      auto idle_time = std::chrono::duration_cast<std::chrono::seconds>(
+          now - cached->last_access);
+      if (idle_time > idle_threshold) {
+        it = lru_list_.erase(it);
+        cache_map_.erase(map_it);
+        stats_.evictions++;
+        evicted++;
+        continue;
       }
     }
     ++it;
   }
-  
   return evicted;
 }
 

@@ -249,11 +249,13 @@ std::optional<Descriptor> CedarGraphStorage::GetEdge(uint64_t src_id,
     return std::nullopt;
   }
   
-  // 构建出边 Key 查询
+  // 构建出边 Key 查询（Task 1.5 / 审计 8.2）
   CedarKey edge_key = CedarKey::EdgeOut(src_id, dst_id, edge_type, timestamp);
   
-  // 通过 LsmEngine 查询
-  return rep_->engine->GetAtTime(src_id, EntityType::EdgeOut, edge_type, timestamp);
+  // 通过 LsmEngine 按完整 user key（含 dst）查询；旧实现丢掉了 dst，
+  // 同 src/type 不同 dst 的边会互相串读。
+  return rep_->engine->GetAtTime(src_id, EntityType::EdgeOut, edge_type,
+                                 edge_key.target_id(), timestamp);
 }
 
 std::vector<std::tuple<uint64_t, Timestamp, Descriptor>> CedarGraphStorage::ScanEdges(
@@ -272,10 +274,11 @@ std::vector<std::tuple<uint64_t, Timestamp, Descriptor>> CedarGraphStorage::Scan
       src_id, EntityType::EdgeOut, edge_type, start_time, end_time, SIZE_MAX);
   
   // 转换为 (dst_id, timestamp, descriptor) 格式
+  // Task 1.5（审计 2.5/8.2）：GetRangeLimit 依赖 SST 侧的完整 key 重建，
+  // entry.dst_id 现在是真实 dst；旧实现用 src_id 占位。
   for (const auto& entry : entries) {
-    // Note: 目前返回的 entry 不包含 dst_id，需要进一步优化
-    // 暂时返回 src_id 作为占位
-    results.emplace_back(src_id, entry.timestamp, entry.descriptor);
+    const uint64_t dst_id = entry.dst_id.value_or(0);
+    results.emplace_back(dst_id, entry.timestamp, entry.descriptor);
   }
   
   return results;
@@ -685,21 +688,20 @@ std::optional<Descriptor> CedarGraphStorage::GetStaticEdge(uint64_t src_id,
   // 我们需要查询相同的 key
   CedarKey key = CedarKey::EdgeOut(src_id, dst_id, edge_type, Timestamp::Static());
   
-  // 使用底层引擎直接查询
-  // 由于 LsmEngine 没有直接根据 key 查询的接口，我们使用 GetAtTime
-  // 并验证返回结果的 dst_id 匹配
-  auto result = rep_->engine->GetAtTime(src_id, EntityType::EdgeOut, edge_type, Timestamp::Static());
+  // 使用底层引擎直接查询（Task 1.5：带上 dst，避免读到别的边）
+  auto result = rep_->engine->GetAtTime(src_id, EntityType::EdgeOut, edge_type,
+                                        key.target_id(), Timestamp::Static());
   
   if (result.has_value() && result->GetColumnId() == property_id) {
     return result;
   }
   
-  // 如果上面的方法没有找到，尝试扫描所有版本
-  // 获取所有 EdgeOut 记录，过滤匹配 dst_id 和 property_id 的
+  // 如果上面的方法没有找到，尝试扫描该 dst 的所有版本
   auto all_entries = rep_->engine->GetAll(src_id, EntityType::EdgeOut, edge_type);
   
   for (const auto& entry : all_entries) {
-    // 检查时间戳是否为 Static (静态属性标记)
+    // 检查时间戳是否为 Static (静态属性标记)，且 dst/property 匹配
+    if (entry.dst_id.value_or(0) != dst_id) continue;
     if (entry.timestamp.value() == Timestamp::Static().value() &&
         entry.descriptor.GetColumnId() == property_id) {
       return entry.descriptor;
@@ -738,7 +740,18 @@ std::optional<Descriptor> CedarGraphStorage::GetDynamicEdge(uint64_t src_id,
     return std::nullopt;
   }
   
-  return rep_->engine->GetAtTime(src_id, EntityType::EdgeOut, property_id, timestamp);
+  // Task 1.5（审计 8.2）：key 的 column 是 edge_type，dst 在 target_id 里；
+  // 旧实现把 property_id 当成 column 传入，且没有 dst，参数完全错位。
+  auto result = rep_->engine->GetAtTime(src_id, EntityType::EdgeOut, edge_type,
+                                        dst_id, timestamp);
+  if (!result.has_value()) {
+    return std::nullopt;
+  }
+  // descriptor 的 column_id 记录的是具体属性（PutDynamicEdge 写入）
+  if (result->GetColumnId() != property_id) {
+    return std::nullopt;
+  }
+  return result;
 }
 
 std::vector<std::pair<Timestamp, Descriptor>> CedarGraphStorage::ScanDynamicEdge(
@@ -754,11 +767,14 @@ std::vector<std::pair<Timestamp, Descriptor>> CedarGraphStorage::ScanDynamicEdge
     return results;
   }
   
-  // Note: 当前实现会返回该 src_id 下所有边的数据，需要进一步过滤 dst_id
+  // Task 1.5（审计 8.2）：key 的 column 是 edge_type（property 在 descriptor 里），
+  // 旧实现用 property_id 当 column 且不按 dst 过滤，参数错位。
   auto entries = rep_->engine->GetRangeLimit(
-      src_id, EntityType::EdgeOut, property_id, start_time, end_time, SIZE_MAX);
+      src_id, EntityType::EdgeOut, edge_type, start_time, end_time, SIZE_MAX);
   
   for (const auto& entry : entries) {
+    if (entry.dst_id.value_or(0) != dst_id) continue;
+    if (entry.descriptor.GetColumnId() != property_id) continue;
     results.emplace_back(entry.timestamp, entry.descriptor);
   }
   

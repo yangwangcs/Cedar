@@ -18,9 +18,30 @@
 
 #include "cedar/storage/cedar_memtable.h"
 #include "cedar/storage/lsm_engine.h"
+#include "cedar/storage/wal_replay.h"
 #include "cedar/transaction/batch_api.h"
 
 namespace cedar {
+
+namespace {
+
+// 事务读取版本链：优先通过 LsmEngine 取当前 memtable 的强引用（审计 3.5），
+// 避免解引用 Begin 时捕获、可能已被 flush 换掉的裸 memtable 指针。
+std::vector<MemTableEntry> ReadVersionChain(VSLMemTable* memtable,
+                                           LsmEngine* lsm_engine,
+                                           uint64_t entity_id,
+                                           EntityType entity_type,
+                                           uint16_t column_id) {
+  if (lsm_engine != nullptr) {
+    return lsm_engine->GetVersionChain(entity_id, entity_type, column_id);
+  }
+  if (memtable != nullptr) {
+    return memtable->GetVersionChain(entity_id, entity_type, column_id);
+  }
+  return {};
+}
+
+}  // namespace
 
 // ========== TransactionManager ==========
 
@@ -166,18 +187,12 @@ Status OCCTransaction::Commit() {
   }
   
   state_.store(TransactionState::kCommitting);
-  
-  // 写入 MemTable
-  Status write_status = WriteToMemTable();
-  if (!write_status.ok()) {
-    state_.store(TransactionState::kAborted);
-    txn_manager_->UnregisterActiveTransaction(txn_id_);
-    txn_manager_->mutable_stats().txn_aborted.fetch_add(1, std::memory_order_relaxed);
-    return write_status;
-  }
-  
-  // 写入 WAL
-  if (wal_writer_) {
+
+  // ========== WAL-first（Task 1.2 / 审计 3.3） ==========
+  // 顺序：写集 + 提交围栏落到同一条 WAL record → 成功后才写 memtable。
+  // WAL 失败时 memtable 未写入，调用方看到错误且数据不可见；
+  // WAL 成功但 memtable 写失败时，重放会在下次 Open 补齐（已提交语义）。
+  if (wal_writer_ || lsm_engine_) {
     Status wal_status = WriteToWAL();
     if (!wal_status.ok()) {
       state_.store(TransactionState::kAborted);
@@ -186,7 +201,16 @@ Status OCCTransaction::Commit() {
       return wal_status;
     }
   }
-  
+
+  // 写入 MemTable（与 WAL 使用同一个 CedarKey）
+  Status write_status = WriteToMemTable();
+  if (!write_status.ok()) {
+    state_.store(TransactionState::kAborted);
+    txn_manager_->UnregisterActiveTransaction(txn_id_);
+    txn_manager_->mutable_stats().txn_aborted.fetch_add(1, std::memory_order_relaxed);
+    return write_status;
+  }
+
   // 标记提交完成
   state_.store(TransactionState::kCommitted);
   txn_manager_->UnregisterActiveTransaction(txn_id_);
@@ -210,10 +234,11 @@ Status OCCTransaction::Abort() {
   txn_manager_->UnregisterActiveTransaction(txn_id_);
   txn_manager_->mutable_stats().txn_aborted.fetch_add(1, std::memory_order_relaxed);
   
-  // 写入 WAL 中止记录 (用于恢复)
-  if (wal_writer_) {
-    wal_writer_->WriteAbort(txn_id_, commit_timestamp_);
-  }
+  // 不写 WAL 中止记录（Task 1.2 语义变化，审计 3.3）：
+  // 1. 本设计里"未提交事务的写集根本不进 WAL"，重放只认带提交围栏的 record，
+  //    因此中止记录对恢复没有作用；
+  // 2. WalWriter::WriteInternal 不带锁，绕过 LsmEngine::WriteWALBatch 的串行化
+  //    会在并发 Commit 时破坏 WAL 记录边界。
   
   Cleanup();
   return Status::OK();
@@ -249,9 +274,10 @@ Status OCCTransaction::Get(uint64_t entity_id,
     }
   }
   
-  // 2. 从 MemTable 读取
-  auto chain_opt = memtable_->GetVersionChain(entity_id, entity_type, column_id);
-  
+  // 2. 从 MemTable 读取（经 LsmEngine 持引用，避免裸指针悬空）
+  auto chain_opt =
+      ReadVersionChain(memtable_, lsm_engine_, entity_id, entity_type, column_id);
+
   // 3. 根据隔离级别和事务版本号选择版本
   // 快照隔离: 读取 read_timestamp_ (事务版本号) 之前的最新版本
   // 修复: 使用 txn_version 而非业务时间戳进行 MVCC 版本比较
@@ -326,8 +352,9 @@ Status OCCTransaction::GetAllColumns(uint64_t entity_id,
       continue;
     }
     
-    // 2. 从 MemTable 读取
-    auto chain_opt = memtable_->GetVersionChain(entity_id, entity_type, col_id);
+    // 2. 从 MemTable 读取（经 LsmEngine 持引用，避免裸指针悬空）
+    auto chain_opt =
+        ReadVersionChain(memtable_, lsm_engine_, entity_id, entity_type, col_id);
     if (!chain_opt.empty()) {
       for (const auto& entry : chain_opt) {
         // 修复: 使用 txn_version 而非业务时间戳进行 MVCC 版本比较
@@ -376,7 +403,13 @@ Status OCCTransaction::Put(uint64_t entity_id,
   
   CedarKey temp_key = MakeKey(entity_id, entity_type, column_id, ts, target_id);
   write_set_.push_back({entity_id, entity_type, column_id, descriptor, temp_key, ts, txn_version, target_id});
-  
+
+  // WAL 与 memtable 必须使用同一个 CedarKey（审计 8.1）：这里把 temp_key 同步
+  // 放进 WAL 批次，Commit 时整批（含提交围栏）一次落盘（Task 1.2）。
+  if (wal_writer_ || lsm_engine_) {
+    wal_batch_.Put(temp_key, descriptor, txn_version);
+  }
+
   return Status::OK();
 }
 
@@ -397,13 +430,18 @@ Status OCCTransaction::PutBatch(const std::vector<WriteSetEntry>& entries) {
   
   for (const auto& entry : entries) {
     // 检查是否已在写集中
+    // Task 1.6 / 审计 8.1：去重键必须包含 target_id（边的 dst），否则同
+    // src/type/column、不同 dst 的多条边会被当成同一条互相覆盖，批量写入后
+    // 只剩最后一条。
     bool updated = false;
     for (auto& existing : write_set_) {
       if (existing.entity_id == entry.entity_id &&
           existing.entity_type == entry.entity_type &&
-          existing.column_id == entry.column_id) {
+          existing.column_id == entry.column_id &&
+          existing.key.target_id() == entry.key.target_id()) {
         existing.descriptor = entry.descriptor;
         existing.key = entry.key;
+        existing.target_id = entry.target_id;
         updated = true;
         break;
       }
@@ -434,8 +472,9 @@ Status OCCTransaction::GetVersionHistory(uint64_t entity_id,
   std::lock_guard<std::mutex> lock(mutex_);
   history->clear();
   
-  // 从 MemTable 读取完整历史
-  auto chain_opt = memtable_->GetVersionChain(entity_id, entity_type, column_id);
+  // 从 MemTable 读取完整历史（经 LsmEngine 持引用，避免裸指针悬空）
+  auto chain_opt =
+      ReadVersionChain(memtable_, lsm_engine_, entity_id, entity_type, column_id);
   
   for (const auto& entry : chain_opt) {
     // 只包含在读取时间戳之前的版本
@@ -489,10 +528,10 @@ Status OCCTransaction::Validate() {
   // 验证写集 (写写冲突检测) - 通常较小，使用串行验证
   for (const auto& write_entry : write_set_) {
     // 检查是否有其他事务在当前事务开始后修改了相同键
-    auto chain_opt = memtable_->GetVersionChain(
-        write_entry.entity_id, 
-        write_entry.entity_type, 
-        write_entry.column_id);
+    auto chain_opt = ReadVersionChain(memtable_, lsm_engine_,
+                                      write_entry.entity_id,
+                                      write_entry.entity_type,
+                                      write_entry.column_id);
     
     if (!chain_opt.empty()) {
       // 获取最新版本
@@ -565,9 +604,9 @@ bool OCCTransaction::ValidateReadEntry(const ReadSetEntry& entry) {
     return true;
   }
   
-  // 获取当前最新版本
-  auto chain_opt = memtable_->GetVersionChain(
-      entry.entity_id, entry.entity_type, entry.column_id);
+  // 获取当前最新版本（经 LsmEngine 持引用，避免裸指针悬空）
+  auto chain_opt = ReadVersionChain(memtable_, lsm_engine_, entry.entity_id,
+                                    entry.entity_type, entry.column_id);
   
   if (chain_opt.empty()) {
     // 记录被删除，但如果读时存在则冲突
@@ -595,23 +634,21 @@ bool OCCTransaction::ValidateReadEntry(const ReadSetEntry& entry) {
 }
 
 Status OCCTransaction::WriteToMemTable() {
-  if (!memtable_) {
+  if (!memtable_ && !lsm_engine_) {
     return Status::InvalidArgument("OCCTransaction", "memtable is null");
   }
-  
+
   for (const auto& entry : write_set_) {
-    // 修复 2: 直接使用写入集中存储的业务时间戳
-    // user_timestamp 在 Put() 阶段已经确定是业务时间戳（系统时间或用户指定）
-    // 不再回退到 commit_timestamp_（事务版本号）
-    Timestamp ts = entry.user_timestamp;
-    
-    // 构建键 - 使用业务时间戳和 target_id
-    CedarKey key = MakeKey(entry.entity_id, entry.entity_type, 
-                          entry.column_id, ts, entry.target_id);
-    
-    // 写入 MemTable - 同时传递事务版本号用于 MVCC
-    // 注意：这里需要支持传递 txn_version 给 MemTable
-    Status s = memtable_->Put(key, entry.descriptor, entry.txn_version);
+    // 修复（Task 1.2 / 审计 8.1）：直接复用写集里已经算好的 CedarKey，
+    // 保证 WAL 与 memtable 的 key 字节完全一致，且 target_id 不丢失。
+    Status s;
+    if (lsm_engine_ != nullptr) {
+      // 经 LsmEngine 写入：内部持 memtable 强引用 + 共享锁，并发 flush 换表时
+      // 既不丢写也不会写到已销毁的表（审计 3.5）
+      s = lsm_engine_->PutPinned(entry.key, entry.descriptor, entry.txn_version);
+    } else {
+      s = memtable_->Put(entry.key, entry.descriptor, entry.txn_version);
+    }
     if (!s.ok()) {
       return s;
     }
@@ -620,11 +657,25 @@ Status OCCTransaction::WriteToMemTable() {
 }
 
 Status OCCTransaction::WriteToWAL() {
-  if (!wal_writer_ || wal_batch_.empty()) {
+  if (wal_batch_.empty()) {
     return Status::OK();
   }
-  
-  return wal_writer_->WriteBatch(wal_batch_);
+  if (!wal_writer_ && !lsm_engine_) {
+    return Status::OK();
+  }
+
+  // 写集 + 提交围栏放在同一条 WAL record 中（Task 1.2）：
+  // 整条 record 由 CRC 保护，重放时"有围栏 = 已提交"，未提交事务不会落表。
+  WalBatch commit_batch = wal_batch_;
+  WalReplay::AppendCommitFence(&commit_batch, txn_id_, commit_timestamp_);
+
+  if (lsm_engine_ != nullptr) {
+    // 统一入口：组提交 + sync，返回 OK 即代表已持久化（Task 1.2 / t9）
+    return lsm_engine_->WriteWALBatch(commit_batch);
+  }
+
+  // WalWriter::WriteBatch 在批次 sync 完成后才返回，无需再 Sync（t9）
+  return wal_writer_->WriteBatch(commit_batch);
 }
 
 void OCCTransaction::Cleanup() {

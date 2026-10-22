@@ -41,7 +41,7 @@ void BloomFilter::Init(const char* data, size_t size) {
 }
 
 void BloomFilter::Add(const char* key, size_t len) {
-  if (data_.empty()) return;
+  if (view_data_ != nullptr || data_.empty()) return;
   
   uint32_t h = Hash(key, len, 0xbc9f1d34);
   const uint32_t delta = (h >> 17) | (h << 15);  // 旋转
@@ -59,14 +59,16 @@ void BloomFilter::Add(uint64_t key) {
 }
 
 bool BloomFilter::MayContain(const char* key, size_t len) const {
-  if (data_.empty()) return true;  // 无 filter，假设存在
+  const char* bits = data();
+  const size_t bytes = size();
+  if (bits == nullptr || bytes == 0) return true;  // 无 filter，假设存在
   
   uint32_t h = Hash(key, len, 0xbc9f1d34);
   const uint32_t delta = (h >> 17) | (h << 15);
   
   for (size_t i = 0; i < hash_funcs_; ++i) {
-    const uint32_t bitpos = h % (data_.size() * 8);
-    if ((data_[bitpos / 8] & (1 << (bitpos % 8))) == 0) {
+    const uint32_t bitpos = h % (bytes * 8);
+    if ((bits[bitpos / 8] & (1 << (bitpos % 8))) == 0) {
       return false;  // 肯定不存在
     }
     h += delta;
@@ -85,8 +87,8 @@ std::vector<char> BloomFilter::Finish() {
 }
 
 void BloomFilter::EncodeTo(std::string* buf) const {
-  if (buf && !data_.empty()) {
-    buf->append(data_.data(), data_.size());
+  if (buf && size() > 0) {
+    buf->append(data(), size());
   }
 }
 
@@ -109,8 +111,22 @@ bool BloomFilter::DecodeFrom(const Slice* slice, size_t num_keys_hint) {
   return DecodeFrom(slice->data(), slice->size(), num_keys_hint);
 }
 
+bool BloomFilter::DecodeView(const char* data, size_t size, size_t num_keys_hint) {
+  if (data == nullptr || size == 0) return false;
+  data_.clear();
+  view_data_ = data;
+  view_size_ = size;
+  initialized_ = true;
+  num_keys_ = num_keys_hint;
+  // 与写入端一致：bits_per_key=10 时 hash 函数数量 = 10*0.69 = 6。
+  hash_funcs_ = 6;
+  return true;
+}
+
 void BloomFilter::Clear() {
   data_.clear();
+  view_data_ = nullptr;
+  view_size_ = 0;
   hash_funcs_ = 0;
   num_keys_ = 0;
   initialized_ = false;

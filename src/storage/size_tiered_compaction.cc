@@ -15,11 +15,17 @@
 #include "cedar/storage/size_tiered_compaction.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
+#include <utility>
 
 #include "cedar/core/crc32c.h"
 
@@ -55,6 +61,28 @@ std::vector<ZoneSstMeta> LevelState::FindOverlapping(
     // 检查 Timestamp 范围重叠
     bool ts_overlap = !(f.max_timestamp < min_ts || f.min_timestamp > max_ts);
     
+    if (entity_overlap && ts_overlap) {
+      result.push_back(f);
+    }
+  }
+  return result;
+}
+
+// 审计 9.1：压缩任务只能合并同一 (entity_type, column_id) 的文件，
+// 因此下层重叠文件的选取也必须按列/类型过滤。
+std::vector<ZoneSstMeta> LevelState::FindOverlapping(
+    uint64_t min_entity, uint64_t max_entity,
+    uint64_t min_ts, uint64_t max_ts,
+    uint16_t column_id, uint8_t entity_type) const {
+  std::vector<ZoneSstMeta> result;
+  for (const auto& f : files) {
+    if (f.column_id != column_id || f.entity_type != entity_type) {
+      continue;
+    }
+    const bool entity_overlap = !(f.max_entity_id < min_entity ||
+                                  f.min_entity_id > max_entity);
+    const bool ts_overlap = !(f.max_timestamp < min_ts ||
+                              f.min_timestamp > max_ts);
     if (entity_overlap && ts_overlap) {
       result.push_back(f);
     }
@@ -222,10 +250,12 @@ void BlobReferenceManager::CleanupReferences(const std::unordered_set<uint64_t>&
 // CompactionStats 实现
 // =============================================================================
 
-void CompactionStats::RecordCompaction(const CompactionTask& task, uint64_t duration_ms) {
+void CompactionStats::RecordCompaction(const CompactionTask& task,
+                                      uint64_t duration_ms,
+                                      uint64_t output_files) {
   total_compactions.fetch_add(1);
   total_input_files.fetch_add(task.input_files.size() + task.overlapping_files.size());
-  total_output_files.fetch_add(1);  // 预估
+  total_output_files.fetch_add(output_files);
   total_duration_ms.fetch_add(duration_ms);
   
   if (task.input_level < 7) {
@@ -329,7 +359,18 @@ Status SizeTieredCompactionEngine::Close() {
     }
   }
   compaction_threads_.clear();
-  
+
+  // 丢弃未执行任务留下的文件保留与待执行任务（单一调度器：Close 后不再运行）
+  {
+    std::lock_guard<std::mutex> lock(compacting_mutex_);
+    compacting_files_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    std::queue<CompactionTask> empty;
+    pending_tasks_.swap(empty);
+  }
+
   // 保存 MANIFEST
   Status s = SaveManifest();
   
@@ -342,6 +383,7 @@ Status SizeTieredCompactionEngine::Close() {
 // =============================================================================
 
 Status SizeTieredCompactionEngine::AddSSTFile(const ZoneSstMeta& meta) {
+  bool needs_scheduling = false;
   {
     std::lock_guard<std::mutex> lock(levels_mutex_);
     
@@ -358,23 +400,23 @@ Status SizeTieredCompactionEngine::AddSSTFile(const ZoneSstMeta& meta) {
     
     levels_[meta.level].files.push_back(meta);
     
-    // 更新文件编号计数器
-    if (meta.file_number >= next_file_number_.load()) {
-      next_file_number_.store(meta.file_number + 1);
-    }
+    // 更新文件号水位（只前进不后退）；绑定 LsmEngine 的分配器后同样生效
+    file_number_allocator_.EnsureAtLeast(meta.file_number + 1);
     
     // 注册 Blob 引用
     if (meta.blob_file_number != 0) {
       blob_manager_.RegisterBlobFile(meta.blob_file_number, meta.blob_file_size);
       blob_manager_.AddReference(meta.blob_file_number, meta.file_number);
     }
+
+    // 检查是否需要立即触发合并（同一把锁内读取，避免与压缩/刷新并发读写 levels_）
+    needs_scheduling = meta.level == 0 && config_.enable_background_compaction &&
+                       levels_[0].needs_compaction(config_);
   }
-  
-  // 检查是否需要立即触发合并
-  if (meta.level == 0 && config_.enable_background_compaction) {
-    if (levels_[0].needs_compaction(config_)) {
-      ScheduleCompaction();
-    }
+
+  // 在锁外调度：ScheduleCompaction 会拿 queue_mutex_ 再取 levels_mutex_
+  if (needs_scheduling) {
+    ScheduleCompaction();
   }
   
   return Status::OK();
@@ -450,84 +492,148 @@ bool SizeTieredCompactionEngine::NeedsCompaction() const {
   return false;
 }
 
+namespace {
+
+// Size-Tiered 的 tier：按文件大小每翻一倍分一档（类似 LSM 的 size-tier）。
+// Task 4.2：任务选择按 tier 进行，而不是"整层复制后按大小截断"。
+uint64_t TierForFileSize(uint64_t file_size) {
+  if (file_size == 0) {
+    return 0;
+  }
+  uint64_t tier = 0;
+  while (file_size > 1) {
+    file_size >>= 1;
+    ++tier;
+  }
+  return tier;
+}
+
+}  // namespace
+
 std::optional<CompactionTask> SizeTieredCompactionEngine::PickNextCompaction() {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
+
   // 优先级：L0 > L1 > L2 > ... （从下往上）
   for (int level = 0; level < config_.max_levels - 1; ++level) {
     if (!levels_[level].needs_compaction(config_)) {
       continue;
     }
-    
-    // 检查是否有文件正在被合并
-    bool files_available = true;
-    for (const auto& f : levels_[level].files) {
-      std::lock_guard<std::mutex> compact_lock(compacting_mutex_);
-      if (compacting_files_.count(f.file_number) > 0) {
-        files_available = false;
-        break;
+
+    // 审计 9.1：按 (entity_type, column_id) 分组。输出 SST 的 header 只保存
+    // 一组列/类型，把不同组的文件混进同一个任务会改写/隐藏其它列的数据。
+    // 分组只保存指针，不在 Pick 路径上复制整层元数据。
+    std::map<std::pair<uint8_t, uint16_t>, std::vector<const ZoneSstMeta*>> groups;
+    for (const auto& meta : levels_[level].files) {
+      groups[{meta.entity_type, meta.column_id}].push_back(&meta);
+    }
+
+    for (auto& [group_key, group_files] : groups) {
+      const uint8_t entity_type = group_key.first;
+      const uint16_t column_id = group_key.second;
+
+      // Task 4.2：按文件大小分 tier。选最小的、至少 2 个文件的 tier（相似大小
+      // 一起合并，写放大最低）；每个 tier 只有 1 个文件时退化为选最小文件
+      //（层容量溢出时必须把文件往下搬）。
+      std::map<uint64_t, std::vector<const ZoneSstMeta*>> tiers;
+      for (const ZoneSstMeta* f : group_files) {
+        tiers[TierForFileSize(f->file_size)].push_back(f);
       }
-    }
-    
-    if (!files_available) {
-      continue;
-    }
-    
-    CompactionTask task;
-    task.input_level = level;
-    task.output_level = level + 1;
-    task.input_files = levels_[level].files;
-    
-    // 限制合并宽度
-    if (task.input_files.size() > config_.max_merge_width) {
-      // 按文件大小排序，优先合并小文件
-      std::sort(task.input_files.begin(), task.input_files.end(),
-                [](const ZoneSstMeta& a, const ZoneSstMeta& b) {
-                  return a.file_size < b.file_size;
+      std::vector<const ZoneSstMeta*> selected;
+      for (auto& [tier, files] : tiers) {  // tier 升序：优先合并小文件
+        if (files.size() >= 2) {
+          selected = files;
+          break;
+        }
+      }
+      if (selected.empty()) {
+        selected = tiers.begin()->second;  // 单文件 tier：取最小的那个
+      }
+
+      // 同 tier 内按文件号升序（确定性），并按 max_merge_width 限制宽度
+      std::sort(selected.begin(), selected.end(),
+                [](const ZoneSstMeta* a, const ZoneSstMeta* b) {
+                  return a->file_number < b->file_number;
                 });
-      task.input_files.resize(config_.max_merge_width);
+      if (selected.size() > config_.max_merge_width) {
+        selected.resize(config_.max_merge_width);
+      }
+
+      CompactionTask task;
+      task.input_level = level;
+      task.output_level = level + 1;
+      task.input_files.reserve(selected.size());
+      uint64_t min_entity = UINT64_MAX, max_entity = 0;
+      uint64_t min_ts = UINT64_MAX, max_ts = 0;
+      for (const ZoneSstMeta* f : selected) {
+        task.input_files.push_back(*f);
+        min_entity = std::min(min_entity, f->min_entity_id);
+        max_entity = std::max(max_entity, f->max_entity_id);
+        min_ts = std::min(min_ts, f->min_timestamp);
+        max_ts = std::max(max_ts, f->max_timestamp);
+      }
+
+      // 下层重叠文件：同列/同类型 + 范围重叠（审计 9.1）。
+      // 它们的数据必须参与合并（审计 3.1），任务里一并带上。
+      if (level + 1 < config_.max_levels) {
+        task.overlapping_files = levels_[level + 1].FindOverlapping(
+            min_entity, max_entity, min_ts, max_ts, column_id, entity_type);
+      }
+
+      // 原子登记保留（reserved_files_）：同一文件集不会被并发重复选中。
+      // 输入或重叠文件已被其它任务保留时跳过本组，继续尝试下一组。
+      {
+        std::lock_guard<std::mutex> compact_lock(compacting_mutex_);
+        bool busy = false;
+        for (const auto& f : task.input_files) {
+          if (compacting_files_.count(f.file_number) > 0) {
+            busy = true;
+            break;
+          }
+        }
+        if (!busy) {
+          for (const auto& f : task.overlapping_files) {
+            if (compacting_files_.count(f.file_number) > 0) {
+              busy = true;
+              break;
+            }
+          }
+        }
+        if (busy) {
+          continue;
+        }
+        for (const auto& f : task.input_files) {
+          compacting_files_.insert(f.file_number);
+        }
+        for (const auto& f : task.overlapping_files) {
+          compacting_files_.insert(f.file_number);
+        }
+      }
+
+      // 预估输出大小（含重叠文件；假设压缩率 0.7）。
+      // 注：priority 仍按层溢出比例计算，供并行引擎/外部调度排序使用。
+      task.estimated_output_size = 0;
+      for (const auto& f : task.input_files) {
+        task.estimated_output_size += f.file_size;
+      }
+      for (const auto& f : task.overlapping_files) {
+        task.estimated_output_size += f.file_size;
+      }
+      task.estimated_output_size =
+          static_cast<uint64_t>(task.estimated_output_size * 0.7);
+
+      task.priority = CalculateCompactionPriority(levels_[level], config_);
+      return task;
     }
-    
-    // 计算输入范围
-    uint64_t min_entity = UINT64_MAX, max_entity = 0;
-    uint64_t min_ts = UINT64_MAX, max_ts = 0;
-    for (const auto& f : task.input_files) {
-      min_entity = std::min(min_entity, f.min_entity_id);
-      max_entity = std::max(max_entity, f.max_entity_id);
-      min_ts = std::min(min_ts, f.min_timestamp);
-      max_ts = std::max(max_ts, f.max_timestamp);
-    }
-    
-    // 查找下层重叠文件
-    if (level + 1 < config_.max_levels) {
-      task.overlapping_files = levels_[level + 1].FindOverlapping(
-          min_entity, max_entity, min_ts, max_ts);
-    }
-    
-    // 计算预估输出大小
-    task.estimated_output_size = 0;
-    for (const auto& f : task.input_files) {
-      task.estimated_output_size += f.file_size;
-    }
-    for (const auto& f : task.overlapping_files) {
-      task.estimated_output_size += f.file_size;
-    }
-    // 假设压缩率 0.7
-    task.estimated_output_size = static_cast<uint64_t>(task.estimated_output_size * 0.7);
-    
-    // 计算优先级
-    task.priority = CalculateCompactionPriority(levels_[level], config_);
-    
-    return task;
   }
-  
+
   return std::nullopt;
 }
 
 Status SizeTieredCompactionEngine::ExecuteCompaction(const CompactionTask& task) {
   auto start_time = std::chrono::steady_clock::now();
-  
-  // 标记文件正在合并
+
+  // 保留（reserved_files_）：PickNextCompaction 返回任务时已登记；这里再做一次
+  // 幂等登记，允许直接调用 ExecuteCompaction（测试/并行引擎）。
   {
     std::lock_guard<std::mutex> lock(compacting_mutex_);
     for (const auto& f : task.input_files) {
@@ -537,11 +643,12 @@ Status SizeTieredCompactionEngine::ExecuteCompaction(const CompactionTask& task)
       compacting_files_.insert(f.file_number);
     }
   }
-  
-  // 执行合并
-  Status s = DoZoneCompaction(task);
-  
-  // 解除标记
+
+  // 执行合并（Task 4.2：一次任务可能写出多个分段）
+  uint64_t output_files = 0;
+  Status s = DoZoneCompaction(task, &output_files);
+
+  // 解除保留：成功或失败都必须释放，否则该文件集永久不可再被选中
   {
     std::lock_guard<std::mutex> lock(compacting_mutex_);
     for (const auto& f : task.input_files) {
@@ -551,324 +658,555 @@ Status SizeTieredCompactionEngine::ExecuteCompaction(const CompactionTask& task)
       compacting_files_.erase(f.file_number);
     }
   }
-  
+
   auto end_time = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-  
+
   if (s.ok()) {
-    stats_.RecordCompaction(task, static_cast<uint64_t>(duration));
+    stats_.RecordCompaction(task, static_cast<uint64_t>(duration), output_files);
+    RecordCompactionSuccess();
+  } else {
+    // Task 4.3：失败指数退避，调度器不会紧循环重试同一失败
+    RecordCompactionFailure();
   }
-  
+
   return s;
 }
 
 void SizeTieredCompactionEngine::ScheduleCompaction() {
+  // 只有 engine 后台 worker 是调度器（Task 4.3：删除 LsmEngine 里的第二个
+  // 直接执行线程）。没有消费者时不能入队：
+  //   - 任务会永久留在 pending_tasks_，WaitForCompactions 会一直等下去；
+  //   - PickNextCompaction 已原子 reserved_files_ 登记，该组文件会永久不可选。
+  if (!config_.enable_background_compaction) {
+    return;
+  }
+
+  // 失败指数退避：连续失败期间不调度（失败不紧循环）
+  if (env_->NowMicros() <
+      backoff_until_us_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(queue_mutex_);
-  
+
+  // pending 有界：队列满时跳过本次调度，worker 完成当前任务后会再次调度
+  if (pending_tasks_.size() >= config_.max_pending_tasks) {
+    return;
+  }
+
+  // PickNextCompaction 按文件集原子保留（reserved_files_）：同一文件绝不会
+  // 出现在两个 pending/执行中的任务里（任务去重）。
   auto task = PickNextCompaction();
   if (task.has_value()) {
-    pending_tasks_.push(task.value());
+    pending_tasks_.push(std::move(*task));
     queue_cv_.notify_one();
   }
 }
 
 void SizeTieredCompactionEngine::WaitForCompactions() {
+  // 以"实际启动的后台线程"为准：enable_background_compaction=true 但
+  // compaction_threads=0 时没有消费者，调用线程必须自己排空队列（否则死等）。
+  const bool has_worker = !compaction_threads_.empty();
   while (true) {
+    CompactionTask task;
+    bool has_task = false;
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
-      if (pending_tasks_.empty() && stats_.active_compactions.load() == 0) {
+      if (!has_worker && !pending_tasks_.empty()) {
+        // 没有后台线程时在调用线程把队列排空，避免永久等待
+        task = pending_tasks_.front();
+        pending_tasks_.pop();
+        has_task = true;
+      } else if (pending_tasks_.empty() &&
+                 stats_.active_compactions.load() == 0) {
         break;
       }
     }
+
+    if (has_task) {
+      ExecuteCompaction(task).IgnoreError();
+      continue;
+    }
+
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
 
 Status SizeTieredCompactionEngine::CompactAll() {
-  // 逐层强制合并
-  for (int level = 0; level < config_.max_levels - 1; ++level) {
-    while (true) {
-      auto task = PickNextCompaction();
-      if (!task.has_value() || task->input_level != level) {
-        break;
-      }
-      
-      Status s = ExecuteCompaction(task.value());
-      if (!s.ok()) {
-        return s;
-      }
+  // 反复执行所有需要合并的层级任务，直到没有任务为止。
+  // 注意：PickNextCompaction 返回的任务已原子登记 reserved_files_，因此任何
+  // 被选中的任务都必须执行（不能丢弃，否则该组文件会永久处于保留状态）。
+  // 文件每次都会上升一层，层级有上限，循环必然终止。
+  while (true) {
+    auto task = PickNextCompaction();
+    if (!task.has_value()) {
+      break;
+    }
+
+    Status s = ExecuteCompaction(*task);
+    if (!s.ok()) {
+      return s;
     }
   }
   return Status::OK();
 }
 
 // =============================================================================
-// 后台线程
+// 后台线程（唯一的调度执行器）
 // =============================================================================
 
 void SizeTieredCompactionEngine::BackgroundCompactionThread() {
   while (!shutdown_.load()) {
     std::unique_lock<std::mutex> lock(queue_mutex_);
-    
+
     queue_cv_.wait(lock, [this] {
       return shutdown_.load() || !pending_tasks_.empty();
     });
-    
+
     if (shutdown_.load()) {
       break;
     }
-    
+
     if (pending_tasks_.empty()) {
       continue;
     }
-    
+
     CompactionTask task = pending_tasks_.front();
     pending_tasks_.pop();
-    
+
     lock.unlock();
-    
+
     stats_.active_compactions.fetch_add(1);
     stats_.pending_compaction_bytes.fetch_add(task.estimated_output_size);
-    
+
     Status s = ExecuteCompaction(task);
-    
+
     stats_.active_compactions.fetch_sub(1);
     stats_.pending_compaction_bytes.fetch_sub(task.estimated_output_size);
-    
+
     if (!s.ok()) {
-      // 记录错误，继续处理其他任务
-      // TODO: 添加错误日志
+      // Task 4.3：失败后按指数退避等待，避免紧循环重试同一个失败
+      const uint64_t remaining = BackoffRemainingMicros();
+      if (remaining > 0 && !shutdown_.load()) {
+        std::unique_lock<std::mutex> backoff_lock(queue_mutex_);
+        queue_cv_.wait_for(backoff_lock, std::chrono::microseconds(remaining),
+                           [this] { return shutdown_.load(); });
+      }
     }
-    
-    // 继续调度可能的新任务
+
+    // 继续调度可能的新任务（若仍在退避窗口内，ScheduleCompaction 会直接返回）
     ScheduleCompaction();
   }
 }
 
+// =============================================================================
+// 压缩输出分段（Task 4.2：按 l0_file_size 切分输出）
+// =============================================================================
+namespace {
 
+// 一个输出 SST 分段：归并过程中按目标大小轮转，每段一个文件号、一份真实统计。
+struct OutputSegment {
+  uint64_t file_number = 0;
+  std::string path;
+  std::string blob_path;
+  std::unique_ptr<WritableFile> file;
+  std::unique_ptr<ZoneColumnarSstBuilder> builder;
+  uint64_t rows = 0;
+  uint64_t file_size = 0;
+  uint64_t min_entity_id = UINT64_MAX;
+  uint64_t max_entity_id = 0;
+  uint64_t min_timestamp = UINT64_MAX;
+  uint64_t max_timestamp = 0;
+  bool finished = false;
+
+  // 失败清理：放弃 builder 并关闭句柄（物理文件由调用方删除）。
+  void Abandon() {
+    if (!finished && builder) {
+      builder->Abandon();
+    }
+    builder.reset();
+    file.reset();
+  }
+};
+
+}  // namespace
 
 // =============================================================================
 // Zone-Columnar 合并实现（核心算法）
 // =============================================================================
 
-Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task) {
-  // 生成输出文件编号
-  uint64_t output_file_number = NewFileNumber();
-  std::string output_path = GetSstPath(output_file_number);
-  std::string output_blob_path = GetBlobPath(output_file_number);
-  
-  // 创建 WritableFile
-  WritableFile* writable_file_raw;
-  Status s = env_->NewWritableFile(output_path, &writable_file_raw);
-  if (!s.ok()) {
-    return s;
+Status SizeTieredCompactionEngine::DoZoneCompaction(const CompactionTask& task,
+                                                    uint64_t* output_files) {
+  if (output_files != nullptr) {
+    *output_files = 0;
   }
-  std::unique_ptr<WritableFile> writable_file(writable_file_raw);
-  if (!s.ok()) {
-    return s;
+  if (task.input_files.empty()) {
+    return Status::InvalidArgument("SizeTieredCompactionEngine",
+                                   "compaction task has no input files");
   }
-  
-  // 创建临时 CedarOptions
+  if (task.input_level < 0 || task.input_level >= config_.max_levels ||
+      task.output_level < 0 || task.output_level >= config_.max_levels ||
+      task.input_level == task.output_level) {
+    return Status::InvalidArgument("SizeTieredCompactionEngine",
+                                   "compaction task has invalid levels");
+  }
+
+  const uint8_t entity_type = task.input_files[0].entity_type;
+  const uint16_t column_id = task.input_files[0].column_id;
+
+  // 审计 9.1：一个任务（inputs ∪ overlaps）必须同属一个 (entity_type, column_id)。
+  // 输出 SST 的 header 只保存一组列/类型，混组会改写/隐藏其它列的数据。
+  for (const auto& f : task.input_files) {
+    if (f.entity_type != entity_type || f.column_id != column_id) {
+      return Status::InvalidArgument(
+          "SizeTieredCompactionEngine",
+          "input files have different entity_type or column_id");
+    }
+  }
+  for (const auto& f : task.overlapping_files) {
+    if (f.entity_type != entity_type || f.column_id != column_id) {
+      return Status::InvalidArgument(
+          "SizeTieredCompactionEngine",
+          "overlapping files have different entity_type or column_id");
+    }
+  }
+
+  // 审计 3.1：合并输入 = inputs ∪ overlaps。重叠文件的数据必须写进输出，
+  // 旧实现只合并 inputs 却把 overlaps 直接删除（下层数据丢失）。
+  std::vector<ZoneSstMeta> merge_inputs = task.input_files;
+  merge_inputs.insert(merge_inputs.end(), task.overlapping_files.begin(),
+                      task.overlapping_files.end());
+
+  // Task 4.2：按 l0_file_size 切分输出。builder 的 FileSize() 在 Finish 前始终
+  // 为 0（Zone 数据在 Finish 统一落盘），因此用"输入平均编码字节/行"估算目标
+  // 行数，并在每段结束后用该段真实 file_size/rows 重新校准。
+  const uint64_t target_file_size = config_.l0_file_size;
+  uint64_t input_rows = 0;
+  uint64_t input_bytes = 0;
+  for (const auto& f : merge_inputs) {
+    input_rows += f.num_entries;
+    input_bytes += f.file_size;
+  }
+  double avg_row_bytes =
+      input_rows > 0 ? static_cast<double>(input_bytes) / input_rows : 24.0;
+  if (avg_row_bytes <= 0.0) {
+    avg_row_bytes = 24.0;
+  }
+  uint64_t target_rows =
+      target_file_size > 0
+          ? std::max<uint64_t>(1, static_cast<uint64_t>(target_file_size / avg_row_bytes))
+          : 0;
+
   CedarOptions options;
   options.env = env_;
-  options.column_id = 0;  // 默认列，后续从输入文件推断
-  if (!task.input_files.empty()) {
-    options.column_id = task.input_files[0].column_id;
-  }
-  
-  // 创建输出 Builder
-  ZoneColumnarSstBuilder builder(options, writable_file.get(), options.column_id, db_path_);
-  builder.SetLevel(task.output_level);
-  builder.SetFileNumber(output_file_number);
-  
-  // 执行多路归并
-  s = MergeZones(task.input_files, &builder);
-  if (!s.ok()) {
-    builder.Abandon();
-    return s;
-  }
-  
-  // 完成构建
-  s = builder.Finish();
-  if (!s.ok()) {
-    return s;
-  }
-  
-  // 获取文件大小
-  uint64_t file_size = builder.FileSize();
-  uint64_t num_entries = builder.NumEntries();
-  
-  // 构建输出元数据
-  ZoneSstMeta output_meta;
-  output_meta.file_number = output_file_number;
-  output_meta.level = task.output_level;
-  output_meta.file_size = file_size;
-  output_meta.num_entries = num_entries;
-  output_meta.path = output_path;
-  output_meta.blob_path = output_blob_path;
-  
-  // 从输入文件推断范围（实际应该从 builder 获取）
-  if (!task.input_files.empty()) {
-    output_meta.column_id = task.input_files[0].column_id;
-    output_meta.entity_type = task.input_files[0].entity_type;
-    
-    // 计算合并后的范围
-    uint64_t min_entity = UINT64_MAX, max_entity = 0;
-    uint64_t min_ts = UINT64_MAX, max_ts = 0;
-    for (const auto& f : task.input_files) {
-      min_entity = std::min(min_entity, f.min_entity_id);
-      max_entity = std::max(max_entity, f.max_entity_id);
-      min_ts = std::min(min_ts, f.min_timestamp);
-      max_ts = std::max(max_ts, f.max_timestamp);
-    }
-    for (const auto& f : task.overlapping_files) {
-      min_entity = std::min(min_entity, f.min_entity_id);
-      max_entity = std::max(max_entity, f.max_entity_id);
-      min_ts = std::min(min_ts, f.min_timestamp);
-      max_ts = std::max(max_ts, f.max_timestamp);
-    }
-    output_meta.min_entity_id = min_entity;
-    output_meta.max_entity_id = max_entity;
-    output_meta.min_timestamp = min_ts;
-    output_meta.max_timestamp = max_ts;
-  }
-  
-  // 添加到新层级
-  {
-    std::lock_guard<std::mutex> lock(levels_mutex_);
-    levels_[task.output_level].files.push_back(output_meta);
-  }
-  
-  // 从旧层级移除输入文件
-  for (const auto& f : task.input_files) {
-    RemoveFileFromLevel(f.file_number, task.input_level);
-  }
-  
-  // 从下层移除重叠文件
-  for (const auto& f : task.overlapping_files) {
-    RemoveFileFromLevel(f.file_number, task.output_level);
-  }
-  
-  // 保存 MANIFEST
-  s = SaveManifest();
-  
-  return s;
-}
+  options.column_id = column_id;
 
-// 归并迭代器辅助结构
-struct MergeIteratorItem {
-  std::unique_ptr<ZoneColumnarSstReader> reader;
-  std::unique_ptr<ZoneColumnarIterator> iterator;
-  CedarKey current_key;
-  Descriptor current_value;
-  size_t file_index;
-  
-  bool valid = false;
-  
-  void Next() {
-    if (iterator && iterator->Valid()) {
-      iterator->Next();
-      UpdateCurrent();
+  std::vector<OutputSegment> segments;
+  auto remove_segments = [&]() {
+    for (auto& seg : segments) {
+      seg.Abandon();
+      if (!seg.path.empty()) {
+        env_->RemoveFile(seg.path);
+      }
+      if (!seg.blob_path.empty()) {
+        env_->RemoveFile(seg.blob_path);
+      }
     }
-  }
-  
-  void UpdateCurrent() {
-    if (iterator && iterator->Valid()) {
-      current_key = iterator->Key();
-      current_value = iterator->Value();
-      valid = true;
-    } else {
-      valid = false;
-    }
-  }
-};
+    segments.clear();
+  };
 
-Status SizeTieredCompactionEngine::MergeZones(
-    const std::vector<ZoneSstMeta>& inputs,
-    ZoneColumnarSstBuilder* output) {
-  
-  // 打开所有输入文件
-  std::vector<std::unique_ptr<MergeIteratorItem>> items;
-  
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    auto item = std::make_unique<MergeIteratorItem>();
-    item->file_index = i;
-    
-    item->reader = std::make_unique<ZoneColumnarSstReader>(inputs[i].path);
-    Status s = item->reader->Open();
+  auto start_segment = [&]() -> Status {
+    OutputSegment seg;
+    seg.file_number = NewFileNumber();
+    seg.path = GetSstPath(seg.file_number);
+    seg.blob_path = GetBlobPath(seg.file_number);
+
+    WritableFile* raw = nullptr;
+    Status s = env_->NewWritableFile(seg.path, &raw);
     if (!s.ok()) {
       return s;
     }
-    
-    item->iterator = std::make_unique<ZoneColumnarIterator>(item->reader.get());
-    item->iterator->SeekToFirst();
-    item->UpdateCurrent();
-    
-    if (item->valid) {
-      items.push_back(std::move(item));
+    seg.file.reset(raw);
+    seg.builder = std::make_unique<ZoneColumnarSstBuilder>(options, raw, column_id,
+                                                           db_path_);
+    seg.builder->SetLevel(task.output_level);
+    seg.builder->SetFileNumber(seg.file_number);
+    segments.push_back(std::move(seg));
+    return Status::OK();
+  };
+
+  // 结束当前段：builder.Finish() 内含 Sync（压缩输出是 MANIFEST 提交后唯一
+  // 副本、且输入随后被删除，必须 fsync 后才能提交元数据），再关闭句柄并统计。
+  auto finish_segment = [&]() -> Status {
+    if (segments.empty() || segments.back().finished) {
+      return Status::OK();
     }
-  }
-  
-  // 批量写入缓冲区
-  const size_t kBatchSize = 65536;
-  std::vector<CedarKey> key_buffer;
-  std::vector<Descriptor> value_buffer;
-  key_buffer.reserve(kBatchSize);
-  value_buffer.reserve(kBatchSize);
-  
-  // 归并循环
-  while (!items.empty()) {
-    // 找到最小的 Key
-    size_t min_idx = 0;
-    for (size_t i = 1; i < items.size(); ++i) {
-      if (items[i]->current_key < items[min_idx]->current_key) {
-        min_idx = i;
+    OutputSegment& seg = segments.back();
+    Status s = seg.builder->Finish();
+    seg.finished = true;
+    if (s.ok()) {
+      s = seg.file->Close();
+    }
+    seg.builder.reset();
+    seg.file.reset();
+    if (!s.ok()) {
+      return s;
+    }
+    s = env_->GetFileSize(seg.path, &seg.file_size);
+    if (!s.ok()) {
+      return s;
+    }
+    // 用真实编码结果校准下一段的目标行数（每段 ≤ 目标 + 一次 block 刷写）
+    if (seg.rows > 0 && target_file_size > 0) {
+      avg_row_bytes = static_cast<double>(seg.file_size) / static_cast<double>(seg.rows);
+      if (avg_row_bytes > 0.0) {
+        target_rows = std::max<uint64_t>(
+            1, static_cast<uint64_t>(target_file_size / avg_row_bytes));
       }
     }
-    
-    auto& min_item = items[min_idx];
-    CedarKey key = min_item->current_key;
-    Descriptor value = min_item->current_value;
-    
-    // 处理相同 Key 的去重（保留最新版本）
-    // 注：CedarKey 包含 timestamp 和 sequence，相同逻辑 Key 会有不同 timestamp
-    // 这里我们假设输入已经按 timestamp 降序排列，所以遇到相同 Key 跳过即可
-    
-    // 处理 Tombstone（在较低层级可以清理）
-    // TODO: 传递 output level 给 ShouldDropTombstone
-    
-    // 处理 Blob 引用
-    if (value.AsExternalRef().has_value()) {
-      value = HandleBlobReference(value, output, inputs[min_item->file_index]);
-    }
-    
-    // 添加到缓冲区
-    key_buffer.push_back(key);
-    value_buffer.push_back(value);
-    
-    // 批量写入
-    if (key_buffer.size() >= kBatchSize) {
-      for (size_t i = 0; i < key_buffer.size(); ++i) {
-        output->Add(key_buffer[i], value_buffer[i]);
+    return Status::OK();
+  };
+
+  // 归并 sink：把每一行写进当前分段；达到目标行数就先切段再写新行。
+  auto add_row = [&](const CedarKey& key, const Descriptor& value) -> Status {
+    if (segments.empty()) {
+      Status s = start_segment();
+      if (!s.ok()) {
+        return s;
       }
-      key_buffer.clear();
-      value_buffer.clear();
     }
-    
-    // 移动到下一个
-    min_item->Next();
-    if (!min_item->valid) {
-      items.erase(items.begin() + min_idx);
+    if (target_rows > 0 && segments.back().rows >= target_rows) {
+      Status s = finish_segment();
+      if (!s.ok()) {
+        return s;
+      }
+      s = start_segment();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+
+    OutputSegment& seg = segments.back();
+    seg.builder->Add(key, value);
+    ++seg.rows;
+    seg.min_entity_id = std::min(seg.min_entity_id, key.entity_id());
+    seg.max_entity_id = std::max(seg.max_entity_id, key.entity_id());
+    const uint64_t ts = key.timestamp().value();
+    seg.min_timestamp = std::min(seg.min_timestamp, ts);
+    seg.max_timestamp = std::max(seg.max_timestamp, ts);
+    return Status::OK();
+  };
+
+  // 多路堆归并 inputs ∪ overlaps（Task 4.1），逐行写分段输出
+  MergeZoneResult merge_result;
+  Status s = MergeZones(merge_inputs, add_row, &merge_result);
+  if (!s.ok()) {
+    remove_segments();
+    return s;
+  }
+  s = finish_segment();
+  if (!s.ok()) {
+    remove_segments();
+    return s;
+  }
+
+  // 输出元数据：列/类型来自任务分组，行数/范围来自每段真实写出内容
+  std::vector<ZoneSstMeta> output_metas;
+  output_metas.reserve(segments.size());
+  for (const auto& seg : segments) {
+    ZoneSstMeta meta;
+    meta.file_number = seg.file_number;
+    meta.level = task.output_level;
+    meta.file_size = seg.file_size;
+    meta.num_entries = seg.rows;
+    meta.path = seg.path;
+    meta.blob_path = seg.blob_path;
+    meta.column_id = column_id;
+    meta.entity_type = entity_type;
+    meta.min_entity_id = seg.min_entity_id;
+    meta.max_entity_id = seg.max_entity_id;
+    meta.min_timestamp = seg.min_timestamp;
+    meta.max_timestamp = seg.max_timestamp;
+    output_metas.push_back(std::move(meta));
+  }
+
+  // 提交顺序（审计 3.1 / Task 4.4）：一次 MANIFEST 写覆盖所有分段，成功之后
+  // 才删除输入的物理文件。失败则回滚内存状态并清理全部分段输出。
+  Status manifest_status = Status::OK();
+  {
+    std::lock_guard<std::mutex> lock(levels_mutex_);
+
+    const LevelState saved_input_level = levels_[task.input_level];
+    const LevelState saved_output_level = levels_[task.output_level];
+
+    for (const auto& f : task.input_files) {
+      RemoveFileMetaFromLevelLocked(f.file_number, task.input_level);
+    }
+    for (const auto& f : task.overlapping_files) {
+      RemoveFileMetaFromLevelLocked(f.file_number, task.output_level);
+    }
+    for (auto& meta : output_metas) {
+      levels_[task.output_level].files.push_back(std::move(meta));
+    }
+
+    manifest_status = SaveManifestLocked();
+    if (!manifest_status.ok()) {
+      levels_[task.input_level] = saved_input_level;
+      levels_[task.output_level] = saved_output_level;
     }
   }
-  
-  // 刷盘剩余数据
-  if (!key_buffer.empty()) {
-    for (size_t i = 0; i < key_buffer.size(); ++i) {
-      output->Add(key_buffer[i], value_buffer[i]);
+
+  if (!manifest_status.ok()) {
+    remove_segments();
+    return manifest_status;
+  }
+
+  // MANIFEST 已提交，现在才删除被合并掉的物理输入文件。
+  for (const auto& f : merge_inputs) {
+    DeleteSstFile(f);
+  }
+
+  if (output_files != nullptr) {
+    *output_files = segments.size();
+  }
+  return Status::OK();
+}
+
+// =============================================================================
+// K 路堆归并（Task 4.1：O(N×K) → O(N log K)）
+// =============================================================================
+
+namespace {
+
+// 归并堆项：每个输入文件在堆里最多有一个"当前行"。
+struct MergeHeapItem {
+  CedarKey key;
+  Descriptor value;
+  uint32_t file_index = 0;   // inputs 下标（取 file_number / Blob 归属）
+  uint64_t file_number = 0;  // 输入文件号（完整同 key 时用它取舍）
+};
+
+// 小顶堆比较器（std::priority_queue 是最大堆：返回 true 表示 a 优先级更低）。
+// 取舍规则（Task 4.1，代码即规范）：
+//   主序：CedarKey::Compare（entity → type → column → target → ts 降序 → seq → flags）；
+//   同 user key 且同 timestamp：sequence 更大的先出（只保留 sequence 大的版本）；
+//   完整 key 完全相同：输入文件号更大的先出（保留更新的文件）。
+// 这是严格弱序：组间按 Compare，组内按 (seq, flags) 反序，完全相同再按文件号反序。
+struct MergeHeapGreater {
+  bool operator()(const MergeHeapItem& a, const MergeHeapItem& b) const {
+    const int c = a.key.Compare(b.key);
+    if (c != 0) {
+      if (a.key.SameUserKey(b.key) && a.key.timestamp() == b.key.timestamp()) {
+        // Compare 在 sequence 上递增；反转 → 大 sequence 先出
+        return c < 0;
+      }
+      return c > 0;
+    }
+    return a.file_number < b.file_number;
+  }
+};
+
+// next 是否已被 last 覆盖（被丢弃）：
+//   - 完整相同：保留文件号更大的（堆序已把大的排在前）；
+//   - 同 user key + 同 timestamp：只保留 sequence 更大的（堆序已把大的排在前）。
+bool IsDominatedBy(const CedarKey& next, const CedarKey& last) {
+  if (next.Compare(last) == 0) {
+    return true;
+  }
+  return next.SameUserKey(last) && next.timestamp() == last.timestamp();
+}
+
+}  // namespace
+
+Status SizeTieredCompactionEngine::MergeZones(
+    const std::vector<ZoneSstMeta>& inputs,
+    const MergeRowSink& sink,
+    MergeZoneResult* result) {
+  if (result != nullptr) {
+    *result = MergeZoneResult();
+  }
+
+  // 打开所有输入文件（= inputs ∪ overlaps，由 DoZoneCompaction 组装）
+  std::vector<std::unique_ptr<ZoneColumnarSstReader>> readers;
+  std::vector<std::unique_ptr<ZoneColumnarIterator>> iterators;
+  readers.reserve(inputs.size());
+  iterators.reserve(inputs.size());
+
+  // 堆底层容器预分配 K 个元素（priority_queue 本身没有 reserve）
+  std::vector<MergeHeapItem> heap_storage;
+  heap_storage.reserve(inputs.size());
+  std::priority_queue<MergeHeapItem, std::vector<MergeHeapItem>, MergeHeapGreater>
+      heap(MergeHeapGreater(), std::move(heap_storage));
+
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    auto reader = std::make_unique<ZoneColumnarSstReader>(inputs[i].path);
+    const Status s = reader->Open();
+    if (!s.ok()) {
+      // 打开失败不得静默跳过：那会把"读不到"变成"数据被合并掉"
+      return Status::IOError("SizeTieredCompactionEngine",
+                             "cannot open compaction input " + inputs[i].path +
+                                 ": " + s.ToString());
+    }
+    auto iterator = std::make_unique<ZoneColumnarIterator>(reader.get());
+    iterator->SeekToFirst();
+    if (iterator->Valid()) {
+      MergeHeapItem item;
+      item.key = iterator->Key();
+      item.value = iterator->Value();
+      item.file_index = static_cast<uint32_t>(i);
+      item.file_number = inputs[i].file_number;
+      heap.push(item);
+    }
+    readers.push_back(std::move(reader));
+    iterators.push_back(std::move(iterator));
+  }
+
+  // 归并循环：每行 O(log K)
+  bool has_last_key = false;
+  CedarKey last_key;
+  while (!heap.empty()) {
+    const MergeHeapItem item = heap.top();
+    heap.pop();
+
+    if (!(has_last_key && IsDominatedBy(item.key, last_key))) {
+      Descriptor value = item.value;
+      // 处理 Blob 引用（当前策略：仅拷贝指针，不重写 Blob）
+      if (value.AsExternalRef().has_value()) {
+        value = HandleBlobReference(value, nullptr, inputs[item.file_index]);
+      }
+
+      const Status s = sink(item.key, value);
+      if (!s.ok()) {
+        return s;
+      }
+
+      if (result != nullptr) {
+        const uint64_t ts = item.key.timestamp().value();
+        ++result->num_rows;
+        result->min_entity_id = std::min(result->min_entity_id, item.key.entity_id());
+        result->max_entity_id = std::max(result->max_entity_id, item.key.entity_id());
+        result->min_timestamp = std::min(result->min_timestamp, ts);
+        result->max_timestamp = std::max(result->max_timestamp, ts);
+      }
+
+      last_key = item.key;
+      has_last_key = true;
+    }
+
+    // 同一路前进一行
+    auto& iterator = iterators[item.file_index];
+    iterator->Next();
+    if (iterator->Valid()) {
+      MergeHeapItem next;
+      next.key = iterator->Key();
+      next.value = iterator->Value();
+      next.file_index = item.file_index;
+      next.file_number = item.file_number;
+      heap.push(next);
     }
   }
-  
+
   return Status::OK();
 }
 
@@ -995,7 +1333,9 @@ void SizeTieredCompactionEngine::AddFileToLevel(const ZoneSstMeta& meta, int lev
   }
 }
 
-void SizeTieredCompactionEngine::RemoveFileFromLevel(uint64_t file_number, int level) {
+// 只移除元数据（调用方持有 levels_mutex_，且必须在 MANIFEST 提交前调用）。
+void SizeTieredCompactionEngine::RemoveFileMetaFromLevelLocked(uint64_t file_number,
+                                                               int level) {
   if (level < 0 || level >= config_.max_levels) {
     return;
   }
@@ -1007,138 +1347,372 @@ void SizeTieredCompactionEngine::RemoveFileFromLevel(uint64_t file_number, int l
       if (it->blob_file_number != 0) {
         blob_manager_.RemoveReference(it->blob_file_number, file_number);
       }
-      
-      // 删除物理文件
-      std::error_code ec;
-      std::filesystem::remove(it->path, ec);
-      
       files.erase(it);
       break;
     }
   }
 }
 
-Status SizeTieredCompactionEngine::SaveManifest() {
-  std::string manifest_path = GetManifestPath();
-  std::string tmp_path = manifest_path + ".tmp";
-  
-  std::ofstream file(tmp_path, std::ios::binary);
-  if (!file) {
-    return Status::IOError("SizeTieredCompactionEngine", "Cannot open manifest for writing");
+// 删除物理文件：只在 MANIFEST 提交成功之后调用（审计 3.1 的提交顺序）。
+void SizeTieredCompactionEngine::DeleteSstFile(const ZoneSstMeta& meta) {
+  if (!meta.path.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(meta.path, ec);
   }
-  
+  if (!meta.blob_path.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(meta.blob_path, ec);
+  }
+}
+
+Status SizeTieredCompactionEngine::SaveManifest() {
   std::lock_guard<std::mutex> lock(levels_mutex_);
-  
-  // 写入下一个文件编号
-  uint64_t next_file = next_file_number_.load();
-  file.write(reinterpret_cast<const char*>(&next_file), sizeof(next_file));
-  
+  return SaveManifestLocked();
+}
+
+// 调用方已持有 levels_mutex_。
+// 持久化内容：文件号水位 + 每层文件元数据（磁盘格式与旧版逐字节相同）。
+// 写入顺序：tmp 文件 → fsync（MANIFEST 前缀会顺带 fsync 目录）→ 原子 rename，
+// 因此 SaveManifestLocked 返回 OK 时元数据已经提交，之后才能删除输入 SST。
+Status SizeTieredCompactionEngine::SaveManifestLocked() {
+  std::string manifest_path = GetManifestPath();
+  // tmp 文件名故意不以 MANIFEST 开头：PosixWritableFile 只对 MANIFEST* 文件
+  // 在 Sync() 时 fsync 目录。tmp 的目录项由 rename 之后的 SyncParentDirectory
+  // 统一 fsync 一次（否则每提交会付两次目录 fsync，本机 ~4-8ms/次）。
+  std::string tmp_path = db_path_ + "/zc-manifest.tmp";
+
+  std::string buf;
+  auto append = [&buf](const void* data, size_t size) {
+    buf.append(static_cast<const char*>(data), size);
+  };
+
+  // 写入下一个文件编号（绑定 LsmEngine 后即它的共享计数器水位）
+  uint64_t next_file = file_number_allocator_.Peek();
+  append(&next_file, sizeof(next_file));
+
   // 写入层级数量
   int32_t num_levels = static_cast<int32_t>(levels_.size());
-  file.write(reinterpret_cast<const char*>(&num_levels), sizeof(num_levels));
-  
+  append(&num_levels, sizeof(num_levels));
+
   // 写入每个层级的文件
   for (const auto& level : levels_) {
     int32_t file_count = static_cast<int32_t>(level.files.size());
-    file.write(reinterpret_cast<const char*>(&file_count), sizeof(file_count));
-    
+    append(&file_count, sizeof(file_count));
+
     for (const auto& f : level.files) {
-      file.write(reinterpret_cast<const char*>(&f.file_number), sizeof(f.file_number));
-      file.write(reinterpret_cast<const char*>(&f.file_size), sizeof(f.file_size));
-      file.write(reinterpret_cast<const char*>(&f.num_entries), sizeof(f.num_entries));
-      file.write(reinterpret_cast<const char*>(&f.level), sizeof(f.level));
-      file.write(reinterpret_cast<const char*>(&f.min_entity_id), sizeof(f.min_entity_id));
-      file.write(reinterpret_cast<const char*>(&f.max_entity_id), sizeof(f.max_entity_id));
-      file.write(reinterpret_cast<const char*>(&f.min_timestamp), sizeof(f.min_timestamp));
-      file.write(reinterpret_cast<const char*>(&f.max_timestamp), sizeof(f.max_timestamp));
-      file.write(reinterpret_cast<const char*>(&f.column_id), sizeof(f.column_id));
-      file.write(reinterpret_cast<const char*>(&f.entity_type), sizeof(f.entity_type));
-      file.write(reinterpret_cast<const char*>(&f.blob_file_number), sizeof(f.blob_file_number));
-      file.write(reinterpret_cast<const char*>(&f.blob_file_size), sizeof(f.blob_file_size));
-      
+      append(&f.file_number, sizeof(f.file_number));
+      append(&f.file_size, sizeof(f.file_size));
+      append(&f.num_entries, sizeof(f.num_entries));
+      append(&f.level, sizeof(f.level));
+      append(&f.min_entity_id, sizeof(f.min_entity_id));
+      append(&f.max_entity_id, sizeof(f.max_entity_id));
+      append(&f.min_timestamp, sizeof(f.min_timestamp));
+      append(&f.max_timestamp, sizeof(f.max_timestamp));
+      append(&f.column_id, sizeof(f.column_id));
+      append(&f.entity_type, sizeof(f.entity_type));
+      append(&f.blob_file_number, sizeof(f.blob_file_number));
+      append(&f.blob_file_size, sizeof(f.blob_file_size));
+
       // 写入路径
       uint32_t path_len = static_cast<uint32_t>(f.path.size());
-      file.write(reinterpret_cast<const char*>(&path_len), sizeof(path_len));
-      file.write(f.path.data(), path_len);
+      append(&path_len, sizeof(path_len));
+      append(f.path.data(), path_len);
     }
   }
-  
-  file.close();
-  
-  // 原子重命名
-  std::error_code ec;
-  std::filesystem::rename(tmp_path, manifest_path, ec);
-  if (ec) {
-    return Status::IOError("SizeTieredCompactionEngine", "Failed to rename manifest");
+
+  WritableFile* file_raw = nullptr;
+  Status s = env_->NewWritableFile(tmp_path, &file_raw);
+  if (!s.ok()) {
+    return Status::IOError("SizeTieredCompactionEngine",
+                           "Cannot open manifest for writing: " + s.ToString());
   }
-  
+  std::unique_ptr<WritableFile> file(file_raw);
+
+  s = file->Append(Slice(buf));
+  if (s.ok()) {
+    s = file->Sync();
+  }
+  const Status close_status = file->Close();
+  file.reset();
+
+  if (!s.ok() || !close_status.ok()) {
+    env_->RemoveFile(tmp_path);
+    return s.ok() ? close_status : s;
+  }
+
+  // 原子重命名：rename 返回后 MANIFEST 内容即已生效
+  s = env_->RenameFile(tmp_path, manifest_path);
+  if (!s.ok()) {
+    env_->RemoveFile(tmp_path);
+    return Status::IOError("SizeTieredCompactionEngine",
+                           "Failed to rename manifest: " + s.ToString());
+  }
+
+  // Task 4.4：rename 之后再 fsync 一次目录项（best-effort：rename 已生效，
+  // 这里失败只影响掉电后的目录持久性，不让上层回滚已提交的元数据）。
+  SyncParentDirectory().IgnoreError();
+
   return Status::OK();
 }
 
+// MANIFEST-zc 加载校验上限（Task 4.4：长度/层级/路径上限，损坏文件不越界）
+namespace {
+
+constexpr uint32_t kMaxManifestPathLength = 4096;
+constexpr int32_t kMaxManifestFilesPerLevel = 1 << 20;
+
+// 带边界检查的顺序读取器（解析失败返回 false，绝不越界读）。
+class ManifestReader {
+ public:
+  explicit ManifestReader(std::string data) : data_(std::move(data)) {}
+
+  bool ReadU8(uint8_t* v) { return Read(v, sizeof(*v)); }
+  bool ReadU16(uint16_t* v) { return Read(v, sizeof(*v)); }
+  bool ReadU32(uint32_t* v) { return Read(v, sizeof(*v)); }
+  bool ReadI32(int32_t* v) { return Read(v, sizeof(*v)); }
+  bool ReadU64(uint64_t* v) { return Read(v, sizeof(*v)); }
+  bool ReadDouble(double* v) { return Read(v, sizeof(*v)); }
+
+  bool ReadBytes(std::string* out, size_t n) {
+    if (n > remaining()) {
+      return false;
+    }
+    out->assign(data_.data() + pos_, n);
+    pos_ += n;
+    return true;
+  }
+
+  bool Read(void* out, size_t n) {
+    if (n > remaining()) {
+      return false;
+    }
+    std::memcpy(out, data_.data() + pos_, n);
+    pos_ += n;
+    return true;
+  }
+
+  size_t remaining() const { return data_.size() - pos_; }
+
+ private:
+  std::string data_;
+  size_t pos_ = 0;
+};
+
+}  // namespace
+
+Status SizeTieredCompactionEngine::SyncParentDirectory() {
+  // Task 4.4：rename 之后 fsync 目录项。Env 没有暴露"fsync 目录"的 API，而
+  // PosixWritableFile::Sync() 在 macOS 上用 F_FULLFSYNC（会把目录里所有脏
+  // 元数据重刷，实测 ~5ms/次）；这里直接用标准 POSIX open(dir)+fsync(fd)，
+  // 语义就是需求里的 fsync(dir)，代价 ~0.1ms。
+  const std::string dir = db_path_;
+#if defined(__APPLE__) || defined(__linux__)
+  const int fd = ::open(dir.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return Status::IOError("SizeTieredCompactionEngine",
+                           "cannot open directory: " + dir);
+  }
+  const int rc = ::fsync(fd);
+  const int saved_errno = errno;
+  ::close(fd);
+  if (rc != 0) {
+    return Status::IOError("SizeTieredCompactionEngine",
+                           "fsync directory failed (errno " +
+                               std::to_string(saved_errno) + "): " + dir);
+  }
+  return Status::OK();
+#else
+  (void)dir;
+  return Status::OK();
+#endif
+}
+
 Status SizeTieredCompactionEngine::LoadManifest() {
-  std::string manifest_path = GetManifestPath();
-  
+  const std::string manifest_path = GetManifestPath();
+
   if (!std::filesystem::exists(manifest_path)) {
     return Status::NotFound("SizeTieredCompactionEngine", "Manifest not found");
   }
-  
-  std::ifstream file(manifest_path, std::ios::binary);
-  if (!file) {
-    return Status::IOError("SizeTieredCompactionEngine", "Cannot open manifest");
+
+  // 整文件读入 + 带边界校验解析：截断/损坏的 MANIFEST 返回 Corruption，
+  // 半截字段不会进入层级状态（Task 4.4）。残留的 MANIFEST-zc.tmp 一律忽略。
+  std::string data;
+  {
+    std::ifstream file(manifest_path, std::ios::binary | std::ios::ate);
+    if (!file) {
+      return Status::IOError("SizeTieredCompactionEngine", "Cannot open manifest");
+    }
+    const std::streamoff size = file.tellg();
+    const std::streamoff min_size =
+        static_cast<std::streamoff>(sizeof(uint64_t) + sizeof(int32_t));
+    if (size < min_size) {
+      return Status::Corruption("SizeTieredCompactionEngine",
+                                "manifest too small");
+    }
+    data.resize(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!file.read(data.data(), size)) {
+      return Status::Corruption("SizeTieredCompactionEngine",
+                                "manifest read failed");
+    }
   }
-  
-  // 读取下一个文件编号
-  uint64_t next_file;
-  file.read(reinterpret_cast<char*>(&next_file), sizeof(next_file));
-  next_file_number_.store(next_file);
-  
-  // 读取层级数量
-  int32_t num_levels;
-  file.read(reinterpret_cast<char*>(&num_levels), sizeof(num_levels));
-  
-  levels_.clear();
-  levels_.resize(num_levels);
-  
-  // 读取每个层级的文件
+
+  ManifestReader reader(std::move(data));
+
+  // 文件号水位（只前进不后退）
+  uint64_t next_file = 0;
+  int32_t num_levels = 0;
+  if (!reader.ReadU64(&next_file) || !reader.ReadI32(&num_levels)) {
+    return Status::Corruption("SizeTieredCompactionEngine",
+                              "truncated manifest header");
+  }
+  if (num_levels < 1 || num_levels > config_.max_levels) {
+    return Status::Corruption("SizeTieredCompactionEngine",
+                              "manifest level count out of range: " +
+                                  std::to_string(num_levels));
+  }
+
+  std::vector<LevelState> loaded(static_cast<size_t>(config_.max_levels));
+  for (int level = 0; level < config_.max_levels; ++level) {
+    loaded[level].level = level;
+  }
+
   for (int level = 0; level < num_levels; ++level) {
-    levels_[level].level = level;
-    
-    int32_t file_count;
-    file.read(reinterpret_cast<char*>(&file_count), sizeof(file_count));
-    
-    for (int i = 0; i < file_count; ++i) {
+    int32_t file_count = 0;
+    if (!reader.ReadI32(&file_count) || file_count < 0 ||
+        file_count > kMaxManifestFilesPerLevel) {
+      return Status::Corruption("SizeTieredCompactionEngine",
+                                "invalid file count in manifest");
+    }
+
+    for (int32_t i = 0; i < file_count; ++i) {
       ZoneSstMeta meta;
-      
-      file.read(reinterpret_cast<char*>(&meta.file_number), sizeof(meta.file_number));
-      file.read(reinterpret_cast<char*>(&meta.file_size), sizeof(meta.file_size));
-      file.read(reinterpret_cast<char*>(&meta.num_entries), sizeof(meta.num_entries));
-      file.read(reinterpret_cast<char*>(&meta.level), sizeof(meta.level));
-      file.read(reinterpret_cast<char*>(&meta.min_entity_id), sizeof(meta.min_entity_id));
-      file.read(reinterpret_cast<char*>(&meta.max_entity_id), sizeof(meta.max_entity_id));
-      file.read(reinterpret_cast<char*>(&meta.min_timestamp), sizeof(meta.min_timestamp));
-      file.read(reinterpret_cast<char*>(&meta.max_timestamp), sizeof(meta.max_timestamp));
-      file.read(reinterpret_cast<char*>(&meta.column_id), sizeof(meta.column_id));
-      file.read(reinterpret_cast<char*>(&meta.entity_type), sizeof(meta.entity_type));
-      file.read(reinterpret_cast<char*>(&meta.blob_file_number), sizeof(meta.blob_file_number));
-      file.read(reinterpret_cast<char*>(&meta.blob_file_size), sizeof(meta.blob_file_size));
-      
-      // 读取路径
-      uint32_t path_len;
-      file.read(reinterpret_cast<char*>(&path_len), sizeof(path_len));
-      meta.path.resize(path_len);
-      file.read(meta.path.data(), path_len);
-      
-      levels_[level].files.push_back(meta);
-      
-      // 注册 Blob 引用
-      if (meta.blob_file_number != 0) {
-        blob_manager_.RegisterBlobFile(meta.blob_file_number, meta.blob_file_size);
-        blob_manager_.AddReference(meta.blob_file_number, meta.file_number);
+      uint32_t path_len = 0;
+      const bool ok =
+          reader.ReadU64(&meta.file_number) &&
+          reader.ReadU64(&meta.file_size) &&
+          reader.ReadU64(&meta.num_entries) &&
+          reader.ReadI32(&meta.level) &&
+          reader.ReadU64(&meta.min_entity_id) &&
+          reader.ReadU64(&meta.max_entity_id) &&
+          reader.ReadU64(&meta.min_timestamp) &&
+          reader.ReadU64(&meta.max_timestamp) &&
+          reader.ReadU16(&meta.column_id) &&
+          reader.ReadU8(&meta.entity_type) &&
+          reader.ReadU64(&meta.blob_file_number) &&
+          reader.ReadU64(&meta.blob_file_size) &&
+          reader.ReadU32(&path_len);
+      if (!ok) {
+        return Status::Corruption("SizeTieredCompactionEngine",
+                                  "truncated file entry in manifest");
+      }
+      if (path_len == 0 || path_len > kMaxManifestPathLength ||
+          !reader.ReadBytes(&meta.path, path_len)) {
+        return Status::Corruption("SizeTieredCompactionEngine",
+                                  "invalid file path in manifest");
+      }
+      // 层级以 MANIFEST 的分层结构为准（不信任记录里的 level 字段）
+      meta.level = level;
+      loaded[level].files.push_back(std::move(meta));
+    }
+  }
+
+  // 全部校验通过后才替换内存状态，并恢复文件号水位 / Blob 引用
+  {
+    std::lock_guard<std::mutex> lock(levels_mutex_);
+    levels_ = std::move(loaded);
+    for (auto& level : levels_) {
+      for (const auto& meta : level.files) {
+        if (meta.blob_file_number != 0) {
+          blob_manager_.RegisterBlobFile(meta.blob_file_number,
+                                         meta.blob_file_size);
+          blob_manager_.AddReference(meta.blob_file_number, meta.file_number);
+        }
       }
     }
   }
-  
-  return file.good() ? Status::OK() : Status::IOError("SizeTieredCompactionEngine", "Manifest read failed");
+  file_number_allocator_.EnsureAtLeast(next_file);
+
+  return Status::OK();
+}
+
+size_t SizeTieredCompactionEngine::PendingTaskCount() const {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  return pending_tasks_.size();
+}
+
+std::vector<CompactionTask> SizeTieredCompactionEngine::PendingTasksSnapshot() const {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  std::vector<CompactionTask> out;
+  out.reserve(pending_tasks_.size());
+  std::queue<CompactionTask> copy = pending_tasks_;
+  while (!copy.empty()) {
+    out.push_back(std::move(copy.front()));
+    copy.pop();
+  }
+  return out;
+}
+
+size_t SizeTieredCompactionEngine::ReservedFileCount() const {
+  std::lock_guard<std::mutex> lock(compacting_mutex_);
+  return compacting_files_.size();
+}
+
+uint32_t SizeTieredCompactionEngine::ConsecutiveCompactionFailures() const {
+  return consecutive_failures_.load(std::memory_order_relaxed);
+}
+
+uint64_t SizeTieredCompactionEngine::BackoffRemainingMicros() const {
+  const uint64_t until = backoff_until_us_.load(std::memory_order_relaxed);
+  const uint64_t now = env_->NowMicros();
+  return until > now ? until - now : 0;
+}
+
+void SizeTieredCompactionEngine::ResetCompactionBackoff() {
+  consecutive_failures_.store(0, std::memory_order_relaxed);
+  backoff_until_us_.store(0, std::memory_order_relaxed);
+}
+
+void SizeTieredCompactionEngine::RecordCompactionFailure() {
+  const uint32_t failures =
+      consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint64_t base = config_.failure_backoff_base_ms;
+  uint64_t max_delay = config_.failure_backoff_max_ms;
+  if (base == 0) {
+    base = 1;
+  }
+  if (max_delay < base) {
+    max_delay = base;
+  }
+  // base * 2^(failures-1)，封顶 max_delay（指数退避）
+  uint64_t delay_ms = base;
+  const uint32_t shift = std::min<uint32_t>(failures - 1, 20);
+  for (uint32_t i = 0; i < shift && delay_ms < max_delay; ++i) {
+    delay_ms *= 2;
+  }
+  if (delay_ms > max_delay) {
+    delay_ms = max_delay;
+  }
+  backoff_until_us_.store(env_->NowMicros() + delay_ms * 1000,
+                          std::memory_order_relaxed);
+}
+
+void SizeTieredCompactionEngine::RecordCompactionSuccess() {
+  consecutive_failures_.store(0, std::memory_order_relaxed);
+  backoff_until_us_.store(0, std::memory_order_relaxed);
+}
+
+bool SizeTieredCompactionEngine::HasFile(uint64_t file_number) const {
+  std::lock_guard<std::mutex> lock(levels_mutex_);
+
+  for (const auto& level : levels_) {
+    for (const auto& f : level.files) {
+      if (f.file_number == file_number) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 std::optional<ZoneSstMeta> SizeTieredCompactionEngine::FindFile(uint64_t file_number) const {

@@ -1,14 +1,22 @@
 // Copyright (c) 2025 The Cedar Authors. All rights reserved.
 // SST Reader Cache - LRU cache for opened SST file handles
+//
+// Task 3.4：缓存 key 改为 file_number（file_number 是 SST 的稳定身份，路径可迁移）；
+// 修复"容量满且所有 reader 都被 pin 住"时的忙等：Get 返回 shared_ptr，淘汰 map
+// 条目不会影响仍在使用的 reader，因此 EvictLRU 总是能真正淘汰，不存在死循环。
+// 允许短时间内超过容量（有上限），不做忙等。
 
 #ifndef FERN_STORAGE_SST_READER_CACHE_H_
 #define FERN_STORAGE_SST_READER_CACHE_H_
 
+#include <chrono>
+#include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <list>
+#include <vector>
 
 #include "cedar/frond/zone_columnar_format.h"
 
@@ -16,99 +24,89 @@ namespace cedar {
 
 // SST Reader 缓存项
 struct CachedSstReader {
+  uint64_t file_number = 0;
   std::string file_path;
   std::shared_ptr<ZoneColumnarSstReader> reader;
-  size_t ref_count = 0;
-  
-  // OPTIMIZATION: P1 - 热数据标记
-  bool is_hot = false;           // 是否是热数据文件
-  uint64_t hit_count = 0;        // 命中次数
+
+  bool is_hot = false;
+  uint64_t hit_count = 0;
   std::chrono::steady_clock::time_point last_access;
-  
-  // OPTIMIZATION: P1 - 预加载标记
-  bool data_preloaded = false;   // 是否已预加载数据
-  
-  CachedSstReader(const std::string& path, std::shared_ptr<ZoneColumnarSstReader> r)
-      : file_path(path), reader(std::move(r)), last_access(std::chrono::steady_clock::now()) {}
+
+  CachedSstReader(uint64_t number, const std::string& path,
+                  std::shared_ptr<ZoneColumnarSstReader> r)
+      : file_number(number),
+        file_path(path),
+        reader(std::move(r)),
+        last_access(std::chrono::steady_clock::now()) {}
 };
 
-// LRU SST Reader 缓存
+// LRU SST Reader 缓存（按 file_number 索引）
 class SstReaderCache {
  public:
   explicit SstReaderCache(size_t capacity = 16) : capacity_(capacity) {}
-  
-  ~SstReaderCache() {
-    Clear();
-  }
-  
-  // 获取或创建 Reader
+
+  ~SstReaderCache() { Clear(); }
+
+  // Task 3.4：主入口——按 file_number + path 获取（缓存未命中时打开并缓存）。
+  std::shared_ptr<ZoneColumnarSstReader> Get(uint64_t file_number,
+                                             const std::string& file_path);
+
+  // 兼容旧 API：从路径解析 file_number 后走上面的入口；解析失败时直接打开
+  // （不缓存），保证旧调用方功能不变。
   std::shared_ptr<ZoneColumnarSstReader> Get(const std::string& file_path);
-  
-  // 释放 Reader（减少引用计数）
+
+  // 兼容旧 API：现在 reader 由 shared_ptr 保活，Release 只更新统计。
   void Release(const std::string& file_path);
-  
-  // 清除所有缓存
+  void Release(uint64_t file_number);
+
   void Clear();
-  
-  // 获取当前缓存大小
+
   size_t Size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return cache_map_.size();
   }
-  
-  // 获取缓存容量
+
   size_t Capacity() const { return capacity_; }
-  
-  // 设置缓存容量
   void SetCapacity(size_t capacity);
-  
-  // 获取统计信息
+
   struct Stats {
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t evictions = 0;
-    uint64_t preloads = 0;  // 预加载次数
+    uint64_t preloads = 0;
   };
-  
+
   Stats GetStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return stats_;
   }
-  
+
   void ResetStats() {
     std::lock_guard<std::mutex> lock(mutex_);
     stats_ = Stats{};
   }
-  
-  // OPTIMIZATION: P1 - 标记热数据文件
+
   void MarkAsHot(const std::string& file_path);
-  
-  // OPTIMIZATION: P1 - 预加载指定文件
   bool Preload(const std::string& file_path);
-  
-  // OPTIMIZATION: P1 - 批量预加载多个文件
   void PreloadFiles(const std::vector<std::string>& file_paths);
-  
-  // OPTIMIZATION: P1 - 获取热数据文件列表
   std::vector<std::string> GetHotFiles() const;
-  
-  // OPTIMIZATION: P1 - 清理冷数据（长时间未访问的非热数据）
   size_t EvictColdData(std::chrono::seconds idle_threshold);
 
+  // 从 "123.frond" 解析文件号；失败返回 false。
+  static bool ParseFileNumber(const std::string& file_path, uint64_t* number);
+
  private:
-  void EvictLRU();
-  
+  // 只做真正的淘汰：条目总是可从 map 移除（reader 由 shared_ptr 保活），返回是否淘汰。
+  bool EvictLRU();
+
   mutable std::mutex mutex_;
   size_t capacity_;
-  
-  // LRU 列表 - 最近使用的在前面
-  std::list<std::string> lru_list_;
-  
-  // 缓存映射
-  std::unordered_map<std::string, std::pair<
-      std::list<std::string>::iterator, 
-      std::shared_ptr<CachedSstReader>>> cache_map_;
-  
+  size_t max_overflow_ = 1024;  // 打开失败的并发场景下允许的临时超容量上限
+
+  std::list<uint64_t> lru_list_;  // 最近使用在前
+  std::unordered_map<uint64_t, std::pair<std::list<uint64_t>::iterator,
+                                         std::shared_ptr<CachedSstReader>>>
+      cache_map_;
   Stats stats_;
 };
 

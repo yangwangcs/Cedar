@@ -40,15 +40,18 @@
 #ifndef FERN_ZONE_COLUMNAR_FORMAT_H_
 #define FERN_ZONE_COLUMNAR_FORMAT_H_
 
+#include <array>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <array>
 
 #include "cedar/core/slice.h"
 #include "cedar/core/status.h"
 #include "cedar/frond/bloom_filter.h"
 #include "cedar/frond/zone_encoder.h"
+#include "cedar/frond/zone_reader_view.h"
 #include "cedar/storage/block_cache.h"
 #include "cedar/storage/cedar_options.h"
 // WritableFile is in env.h which is included by cedar_options.h
@@ -61,6 +64,15 @@ class SimpleSSTBlobManager;
 // Zone-Columnar 文件魔数
 static constexpr uint32_t kZoneColumnarMagic = 0x5A434F4C;  // "ZCOL"
 static constexpr uint32_t kZoneColumnarVersion = 1;  // 版本 1
+
+// =============================================================================
+// Header flags 保留位（Task 1.4，格式兼容用；不改变 v1 布局）
+// =============================================================================
+// 旧写端：target zone 按 block 编码（每块 1B encoding_type tag 首尾拼接），
+//         header.flags == 0。
+// 新写端：target zone 整文件一次编码（只有一个 1B tag），置位该标志；读端据此
+//         选择文件级解码，未置位时按旧的逐块格式解码（旧文件仍可读）。
+static constexpr uint32_t kFlagTargetZoneFileLevel = 1u << 0;
 
 // =============================================================================
 // Zone-Columnar Header (256 bytes)
@@ -329,7 +341,6 @@ class ZoneColumnarSstBuilder {
   // 缓存所有 block 的 zone 数据（确保相同 zone 的数据连续）
   std::vector<std::string> zone0_chunks_;
   std::vector<std::string> zone1_chunks_;
-  std::vector<std::string> zone2_chunks_;
   std::vector<std::string> zone3_seq_rle_chunks_;
   std::vector<std::string> zone3_flags_chunks_;
   std::vector<std::string> zone4_chunks_;
@@ -337,6 +348,11 @@ class ZoneColumnarSstBuilder {
   
   // 缓存原始 timestamps（用于统一编码）
   std::vector<uint64_t> all_timestamps_;
+
+  // 缓存原始 target_ids（Task 1.4：target zone 整文件一次编码）。
+  // 文件级编码固定 kRaw，不需要 entity_ids（旧格式的 per-block delta 只出现在
+  // 读端兼容路径，写端不再产生）。
+  std::vector<uint64_t> all_target_ids_;
   
   // Blob 文件管理器（大值外部存储）
   std::unique_ptr<SimpleSSTBlobManager> blob_manager_;
@@ -371,9 +387,19 @@ class ZoneColumnarSstBuilder {
   CedarKey first_key_;
   CedarKey last_key_;
   
-  // OPTIMIZATION: 构建 Entity Index 的临时数据结构
-  // 格式: entity_id -> [positions...]
-  std::unordered_map<uint64_t, std::vector<uint32_t>> entity_index_builder_;
+  // Task 3.2/3.3：Bloom 的 entity 集合。行按 entity 升序写入，只在 entity
+  // 变化时追加，内存 ≈ 唯一 entity 数 × 8B（不再为每行维护倒排 map）。
+  std::vector<uint64_t> bloom_entity_ids_;
+
+  // Task 3.3：持久化紧凑 Entity Index：(entity_id, first_row) 每 entity 一条，
+  // 文件内 entity 连续，因此 [first_row, next_first_row) 即该 entity 的行区间。
+  std::vector<std::pair<uint64_t, uint32_t>> entity_runs_;
+
+  // 输入必须按 entity 升序（flush/compaction 保证）；若检测到乱序，则放弃写
+  // 持久索引，读端回退到 entity zone 线性扫描（绝不返回错误空区间）。
+  bool entity_runs_sorted_ = true;
+  bool has_last_index_entity_ = false;
+  uint64_t last_index_entity_ = 0;
 };
 
 // =============================================================================
@@ -408,11 +434,19 @@ class ZoneColumnarSstReader {
   // 点查：获取指定 Key 的 Value
   std::optional<Descriptor> Get(const CedarKey& key) const;
   
-  // 获取指定时间的最新版本
+  // 获取指定时间的最新版本（旧签名：Vertex 语义，不区分 target）
   std::optional<Descriptor> GetAtTime(uint64_t entity_id, 
                                        EntityType entity_type,
                                        uint16_t column_id,
                                        Timestamp timestamp) const;
+
+  // 获取指定时间的最新版本（Task 1.5：按完整 user key 定位，边查询必须用它，
+  // 否则同 (entity,type,column) 不同 target 的边会互相串读 —— 审计 2.4）
+  std::optional<Descriptor> GetAtTime(uint64_t entity_id,
+                                      EntityType entity_type,
+                                      uint16_t column_id,
+                                      uint64_t target_id,
+                                      Timestamp timestamp) const;
   
   // 获取时间范围
   std::vector<std::pair<CedarKey, Descriptor>> GetRange(
@@ -471,6 +505,33 @@ class ZoneColumnarSstReader {
   // 设置 SST 所在目录（用于定位 Blob 文件）
   void SetDbPath(const std::string& db_path) { db_path_ = db_path; }
 
+  // ==================== 完整 Key 重建 / Target 解码（Task 1.4/1.5） ====================
+
+  // 重建第 row_idx 行的完整 32B CedarKey：
+  // entity_id + header.entity_type + header.column_id + target + ts + seq + flags。
+  // 旧实现（GetRange/BatchGetRange）用 CedarKey::Vertex 重建，丢掉 target/entity_type。
+  // 两参重载允许用外部 header（如迁移/校验工具）重建，不读本 reader 的 header_。
+  CedarKey ReconstructKey(size_t row_idx) const;
+  CedarKey ReconstructKey(size_t row_idx, const ZoneColumnarHeader& header) const;
+
+  // 第 row_idx 行的 target_id（Edge 的 dst/src 或 Vertex 的 extension）。
+  // 懒解码（one-time）：新格式文件级一次线性展开，旧格式按 restart point 分块解码。
+  uint64_t TargetAt(size_t row_idx) const;
+
+  // ==================== Task 3.2/3.3：随机访问与 entity 区间 ====================
+
+  // 按行号随机访问（完整 key + value）；越界返回 false。
+  bool GetRow(size_t row_idx, CedarKey* key, Descriptor* value) const;
+
+  // entity 在本文件中的行区间 [first, last+1)；不存在返回 {0, 0}。
+  // 有持久化 Entity Index 时 O(log n)，否则回退到 entity zone 线性扫描（结果一致）。
+  std::pair<size_t, size_t> FindEntityRowRange(uint64_t entity_id) const;
+
+  // 元数据开关（测试/诊断）
+  bool HasEntityIndex() const { return has_entity_index_; }
+  bool HasBloomFilter() const { return bloom_filter_.NumKeys() > 0; }
+  bool IsMmapBacked() const { return view_.mapped(); }
+
   // ==================== 元数据访问 ====================
   
   const ZoneColumnarHeader& Header() const { return header_; }
@@ -494,16 +555,33 @@ class ZoneColumnarSstReader {
   // 解压 Zone 数据
   Status DecompressZone(ZoneType type, std::string* out);
   
+  // Task 1.4/1.5 + 3.2：把 target zone 展开成行对齐的 vector（懒加载，one-time）。
+  //   新格式（flags & kFlagTargetZoneFileLevel）：文件级单条流；
+  //   旧格式：按 restart point 切块，每块一个 1B encoding_type tag（兼容旧文件）。
+  void EnsureTargetValues() const;
+  void DecodeTargetZone() const;
+
+  // 用已知的 entity_id 与行内其它 zone 拼完整 key（GetRange/Iterator 快路径，
+  // 不再逐行解码 entity zone）。
+  CedarKey MakeKeyForRow(size_t row_idx, uint64_t entity_id) const;
+
+  // GetAtTime 的公共实现；target 为空表示旧签名（Vertex 语义，不区分 target）。
+  std::optional<Descriptor> GetAtTimeImpl(uint64_t entity_id,
+                                          EntityType entity_type,
+                                          uint16_t column_id,
+                                          const std::optional<uint64_t>& target_id,
+                                          Timestamp timestamp) const;
+
   // 使用重启点二分查找
   size_t BinarySearchRestartPoint(uint64_t entity_id) const;
   
   // 验证文件
   Status ValidateFile();
   
-  // OPTIMIZATION: 加载持久化的 Entity Index
+  // Task 3.3：加载持久化的紧凑 Entity Index（零拷贝视图）
   Status LoadEntityIndex();
-  
-  // OPTIMIZATION: 使用持久化索引快速查找 entity positions
+
+  // Task 3.3：使用持久化索引快速查找 entity positions；无索引返回空。
   std::vector<size_t> FindEntityPositionsFromIndex(uint64_t entity_id) const;
 
   std::string file_path_;
@@ -513,6 +591,9 @@ class ZoneColumnarSstReader {
   
   bool owns_buffer_ = false;
   bool opened_ = false;
+
+  // Task 3.1：文件只读视图（mmap；回退 pread 到堆）
+  ZoneReaderView view_;
   
   ZoneColumnarHeader header_;
   ZoneColumnarFooter footer_;
@@ -522,22 +603,26 @@ class ZoneColumnarSstReader {
   // Zone 解码器
   std::optional<EntityIdZoneEncoder::Decoder> entity_decoder_;
   std::optional<TimestampZoneEncoder::Decoder> timestamp_decoder_;
-  std::optional<TargetIdZoneEncoder::Decoder> target_decoder_;
   std::optional<KeyMetadataZoneEncoder::Decoder> metadata_decoder_;
   std::optional<ValueZoneEncoder::Decoder> value_decoder_;
   
-  // Zone 原始数据（可能需要解压）
-  std::array<std::string, 5> zone_data_;
+  // Zone 原始数据：mmap 视图上的 Slice（Task 3.1，零拷贝；不再复制整份 zone）
+  std::array<Slice, 5> zone_data_;
+
+  // 行对齐的 target_id（懒解码，Task 1.4/3.2；one-time，O(n) 内存换掉逐行 O(n) 扫描）
+  mutable std::once_flag target_once_;
+  mutable std::vector<uint64_t> target_values_;
   
-  // Bloom Filter（用于快速排除不存在的 key）
+  // Bloom Filter（用于快速排除不存在的 key；Task 3.3 写入真实 bitmap，读端零拷贝视图）
   mutable BloomFilter bloom_filter_;
   
   // Blob 文件管理器（懒加载）
   mutable std::unique_ptr<SimpleSSTBlobManager> blob_manager_;
   
-  // OPTIMIZATION: 持久化 Entity Index (entity_id -> [positions])
-  // 格式: [num_entries:4B] [entity_id:8B] [num_positions:4B] [pos:4B...]...
-  std::unordered_map<uint64_t, std::vector<uint32_t>> entity_index_;
+  // Task 3.3：持久化紧凑 Entity Index 的零拷贝视图：
+  //   [magic:4B="EIDX"][count:4B][entity_id:8B][first_row:4B] * count
+  Slice entity_index_slice_;
+  uint32_t entity_index_count_ = 0;
   bool has_entity_index_ = false;
 };
 
@@ -574,6 +659,11 @@ class ZoneColumnarIterator {
   size_t current_idx_ = 0;
   size_t total_count_ = 0;
   bool valid_ = false;
+
+  // Task 3.2：顺序访问 entity zone 的独立游标（每行 O(1)，不修改 reader 共享状态）。
+  // Key() 是 const：游标为 mutable（迭代器本身不是线程共享对象）。
+  mutable std::unique_ptr<EntityIdZoneEncoder::Decoder::Cursor> entity_cursor_;
+  mutable uint64_t entity_value_ = 0;
 };
 
 }  // namespace cedar

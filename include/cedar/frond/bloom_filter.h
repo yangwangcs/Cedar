@@ -49,13 +49,16 @@ class BloomFilter {
   // 编码到 Slice（用于写入）
   void EncodeTo(std::string* buf) const;
   
-  // 从 Slice 解码（用于读取）
+  // 从 Slice 解码（用于读取；复制一份 bitmap）
   bool DecodeFrom(const char* data, size_t size, size_t num_keys_hint = 0);
   bool DecodeFrom(const Slice* slice, size_t num_keys_hint = 0);
+
+  // 零拷贝视图解码（Task 3.1/3.3）：bitmap 直接指向 mmap 区域，不复制。
+  bool DecodeView(const char* data, size_t size, size_t num_keys_hint = 0);
   
   // 获取原始数据（读取模式）
-  const char* data() const { return data_.data(); }
-  size_t size() const { return data_.size(); }
+  const char* data() const { return view_data_ != nullptr ? view_data_ : data_.data(); }
+  size_t size() const { return view_data_ != nullptr ? view_size_ : data_.size(); }
   
   // 获取预估的 key 数量
   size_t NumKeys() const { return num_keys_; }
@@ -64,12 +67,14 @@ class BloomFilter {
   void Clear();
   
   // 是否为空
-  bool empty() const { return data_.empty() && hash_funcs_ == 0; }
+  bool empty() const { return size() == 0 && hash_funcs_ == 0; }
 
  private:
   static uint32_t Hash(const char* data, size_t len, uint32_t seed);
   
-  std::vector<char> data_;
+  std::vector<char> data_;        // 构建模式：拥有 bitmap
+  const char* view_data_ = nullptr;  // 读取模式：零拷贝视图（mmap）
+  size_t view_size_ = 0;
   size_t bits_per_key_ = 10;
   size_t hash_funcs_ = 0;
   size_t num_keys_ = 0;

@@ -322,9 +322,12 @@ std::vector<WriteSetEntry> WriteBatch::ToWriteSet(Timestamp business_ts,
     CedarKey key(entry.entity_id, entry.entity_type, entry.column_id,
                 business_ts, static_cast<uint16_t>(txn_id), dst_id.value_or(0));
     
-    // 修复: 正确传递 business_ts 和 txn_version 给 WriteSetEntry
+    // 修复: 正确传递 business_ts 和 txn_version 给 WriteSetEntry；
+    // Task 1.6（审计 8.1）：target_id（边的 dst）也必须进写集，
+    // 否则 WAL/冲突检测/后续重建 key 时 dst 丢失。
     write_set.emplace_back(entry.entity_id, entry.entity_type, entry.column_id,
-                           entry.descriptor, key, business_ts, txn_version);
+                           entry.descriptor, key, business_ts, txn_version,
+                           dst_id.value_or(0));
   }
   
   return write_set;

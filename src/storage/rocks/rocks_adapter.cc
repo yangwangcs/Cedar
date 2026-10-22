@@ -3555,74 +3555,17 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
   options.snapshot = snapshot.epoch_->lease->get();
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->facts_cf));
-  const auto read_part = [](const rocksdb::Slice& key) {
-    return (static_cast<uint32_t>(static_cast<uint8_t>(key[1])) << 24) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(key[2])) << 16) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(key[3])) << 8) |
-           static_cast<uint32_t>(static_cast<uint8_t>(key[4]));
-  };
-  const auto append_part = [](std::string* prefix, uint32_t part) {
-    prefix->push_back(static_cast<char>(part >> 24));
-    prefix->push_back(static_cast<char>(part >> 16));
-    prefix->push_back(static_cast<char>(part >> 8));
-    prefix->push_back(static_cast<char>(part));
-  };
-  // Family/partition-bounded scan. Fact keys are ordered by
-  // version|part|family|..., so the whole family can be read with one prefix
-  // seek per (version, part) instead of decoding every fact key in the CF.
-  // Successive partitions are reached by seeking to part+1; the family filter
-  // then only has to run on the rows that actually belong to `family`.
-  std::string family_prefix;
-  family_prefix.reserve(6);
-  // A corrupt key in an unrelated family/partition is skipped rather than
-  // decoded: ScanFamily only guarantees decoding of the selected family.
-  iterator->SeekToFirst();
-  while (iterator->Valid()) {
-    if (iterator->key().size() < kEncodedFactKeyBytes) {
-      return Status::Corruption("fact scan", "invalid fact key");
-    }
-    const uint8_t key_version =
-        static_cast<uint8_t>(iterator->key().data()[0]);
-    const uint32_t part = read_part(iterator->key());
-    family_prefix.clear();
-    family_prefix.push_back(static_cast<char>(key_version));
-    append_part(&family_prefix, part);
-    family_prefix.push_back(static_cast<char>(family));
-    iterator->Seek(rocksdb::Slice(family_prefix));
-    while (iterator->Valid() &&
-           iterator->key().starts_with(rocksdb::Slice(family_prefix))) {
-      auto decoded_key = DecodeFactKey(std::string_view(
-          iterator->key().data(), iterator->key().size()));
-      if (!decoded_key.ok()) return decoded_key.status();
-      if (decoded_key.ValueOrDie().commit_seq.value <=
-          snapshot.commit_seq().value) {
-        auto decoded_value = DecodeFactValue(
-            decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
-            decoded_key.ValueOrDie().commit_seq,
-            std::string_view(iterator->value().data(),
-                             iterator->value().size()));
-        if (!decoded_value.ok()) return decoded_value.status();
-        if (Status status = visitor(decoded_value.ValueOrDie());
-            !status.ok()) {
-          return status;
-        }
-      }
-      iterator->Next();
-    }
-    // Skip the rest of this (version, part) and move to the next partition.
-    std::string next_prefix;
-    next_prefix.reserve(5);
-    next_prefix.push_back(static_cast<char>(key_version));
-    if (part != std::numeric_limits<uint32_t>::max()) {
-      append_part(&next_prefix, part + 1);
-      iterator->Seek(rocksdb::Slice(next_prefix));
-      if (iterator->Valid()) continue;
-    }
-    // Last partition of this key version: try the next version.
-    std::string next_version;
-    next_version.push_back(static_cast<char>(key_version + 1));
-    iterator->Seek(rocksdb::Slice(next_version));
-    if (!iterator->Valid()) break;
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    auto decoded_key = DecodeFactKey(iterator->key().ToString());
+    if (!decoded_key.ok()) return decoded_key.status();
+    if (decoded_key.ValueOrDie().ref.family() != family ||
+        decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value)
+      continue;
+    auto decoded_value = DecodeFactValue(
+        decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
+        decoded_key.ValueOrDie().commit_seq, iterator->value().ToString());
+    if (!decoded_value.ok()) return decoded_value.status();
+    if (Status status = visitor(decoded_value.ValueOrDie()); !status.ok()) return status;
   }
   return iterator->status().ok() ? Status::OK()
                                  : FromRocksDb(iterator->status(), "iterate family scan");

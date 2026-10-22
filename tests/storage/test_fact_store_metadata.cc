@@ -1316,5 +1316,56 @@ TEST_F(FactStoreMetadataTest, ReopenValidationCountersResetBetweenOpens) {
   }
 }
 
+// Regression (a3ecf3b): ScanFamily replaced its full canonical scan with
+// synthetic (version, part) prefix seeks. Once a clean close has flushed the
+// facts CF into Cedar Parquet SSTs, the last-partition "next version" probe
+// (a one-byte 0x03 key) cannot be decoded by the parquet comparator, so the
+// scan latched Corruption after visiting the first fact. Database::Open then
+// silently skipped its adjacency rebuild. ScanFamily must read committed facts
+// of both requested families across flushed SSTs.
+TEST_F(FactStoreMetadataTest, ScanFamilyReadsFlushedFactsAfterCleanReopen) {
+  const EdgeIdentity identity{EdgeId{17}, VertexId{7}, VertexId{11}, 3};
+  const StoreCommitBatch batch{
+      TxnId{1},
+      10,
+      {{EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref(),
+        ValidTime{10}, FactOperation::kPut, 0, std::nullopt},
+       {EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{17}}).ref(), ValidTime{10},
+        FactOperation::kPut, 0, std::nullopt}},
+      {identity}};
+  const auto committed = store_->Commit(batch);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+
+  // Close flushes the facts memtable into Cedar Parquet SSTs; only the reopened
+  // store exercises the table comparator on the scan seeks.
+  Reopen();
+
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  std::vector<FactEvent> vertices;
+  const Status vertex_scan = store_->ScanFamily(
+      snapshot.ValueOrDie(), FactFamily::kVertexState,
+      [&vertices](const FactEvent& event) {
+        vertices.push_back(event);
+        return Status::OK();
+      });
+  ASSERT_TRUE(vertex_scan.ok()) << vertex_scan.ToString();
+  ASSERT_EQ(vertices.size(), 1U);
+  EXPECT_EQ(vertices.front().ref,
+            EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref());
+
+  std::vector<FactEvent> identities;
+  const Status identity_scan = store_->ScanFamily(
+      snapshot.ValueOrDie(), FactFamily::kEdgeIdentity,
+      [&identities](const FactEvent& event) {
+        identities.push_back(event);
+        return Status::OK();
+      });
+  ASSERT_TRUE(identity_scan.ok()) << identity_scan.ToString();
+  ASSERT_EQ(identities.size(), 1U);
+  ASSERT_TRUE(identities.front().edge_identity.has_value());
+  EXPECT_EQ(*identities.front().edge_identity, identity);
+}
+
 }  // namespace
 }  // namespace cedar

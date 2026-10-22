@@ -563,6 +563,7 @@ target_link_libraries(test_temporal_neighborhood
 gtest_discover_tests(test_temporal_neighborhood)
 
 add_executable(test_kernel_lifecycle kernel/test_kernel_lifecycle.cc)
+target_include_directories(test_kernel_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_kernel_lifecycle
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_lifecycle)

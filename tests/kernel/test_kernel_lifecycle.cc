@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "cedar/database.h"
+#include "query/runtime/graph_frontier.h"
 
 namespace cedar {
 namespace {
@@ -397,6 +398,66 @@ TEST_F(KernelLifecycleTest, CloseRacingQueryStatisticsDoesNotReadReleasedCatalog
   EXPECT_TRUE(close_status.ok()) << close_status.ToString();
   EXPECT_TRUE(refresh.ok() || refresh.status().IsShutdownInProgress())
       << refresh.status().ToString();
+}
+
+// Regression (a3ecf3b): Database::Open rebuilds the adjacency cache from
+// FactStore::ScanFamily(kEdgeIdentity). The bounded prefix-seek scan failed
+// once a clean close had flushed the facts CF into Cedar Parquet SSTs, so the
+// rebuild was silently skipped and every adjacency posting was missing. A
+// reopened kernel must scan both families successfully and publish the
+// reopened edge identity into a seekable adjacency index.
+TEST_F(KernelLifecycleTest, ReopenScansFlushedFactsAndRebuildsAdjacency) {
+  const EdgeIdentity identity{EdgeId{17}, VertexId{7}, VertexId{11}, 3};
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  auto seeded = Begin();
+  ASSERT_TRUE(seeded);
+  ASSERT_TRUE(seeded
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}),
+                           ValidTime{10})
+                  .ok());
+  ASSERT_TRUE(seeded->Assert(identity, ValidTime{10}).ok());
+  const auto committed = seeded->Commit();
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+  database_ = Open();  // Rebuilds the adjacency index from flushed facts.
+  ASSERT_TRUE(database_);
+
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  const auto index = snapshot.ValueOrDie().adjacency_index();
+  ASSERT_NE(index, nullptr)
+      << "Database::Open silently skipped the adjacency rebuild";
+  const auto postings = index->Seek(
+      {VertexRef{PartId{0}, VertexId{7}}}, ExpandDirection::kOut, std::nullopt,
+      snapshot.ValueOrDie().commit_seq());
+  ASSERT_TRUE(postings.ok()) << postings.status().ToString();
+  ASSERT_EQ(postings.ValueOrDie().size(), 1U);
+  EXPECT_EQ(postings.ValueOrDie().front(), identity);
+
+  std::vector<FactEvent> vertices;
+  const Status vertex_scan = snapshot.ValueOrDie().ScanFamily(
+      FactFamily::kVertexState, [&vertices](const FactEvent& event) {
+        vertices.push_back(event);
+        return Status::OK();
+      });
+  ASSERT_TRUE(vertex_scan.ok()) << vertex_scan.ToString();
+  ASSERT_EQ(vertices.size(), 1U);
+
+  std::vector<FactEvent> identities;
+  const Status identity_scan = snapshot.ValueOrDie().ScanFamily(
+      FactFamily::kEdgeIdentity, [&identities](const FactEvent& event) {
+        identities.push_back(event);
+        return Status::OK();
+      });
+  ASSERT_TRUE(identity_scan.ok()) << identity_scan.ToString();
+  ASSERT_EQ(identities.size(), 1U);
+  ASSERT_TRUE(identities.front().edge_identity.has_value());
+  EXPECT_EQ(*identities.front().edge_identity, identity);
 }
 
 }  // namespace

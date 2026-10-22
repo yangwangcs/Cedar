@@ -192,6 +192,24 @@ struct FactStoreOptions {
   // can exist at that point because no commit has been accepted.
   std::function<Status()>
       meta_sequence_format_marker_write_fault_injector_for_testing;
+  // Opt-in sequence-record retention (F14). Default false: Vacuum keeps every
+  // `sequence/*` record and the reopen contract (contiguous [1..visible]) is
+  // unchanged. When true, Vacuum advances the durable
+  // `watermark/sequence-retention` boundary to its target and then deletes the
+  // records below it in bounded (<=1024-key) batches. An open with the option
+  // enabled also finishes a prune a crash interrupted. Pruning never removes a
+  // record at or above the published oldest-readable boundary, never deletes
+  // anything before the watermark write is durable, and is idempotent.
+  bool prune_sequence_records_on_vacuum = false;
+  // Sync flag for each sequence-prune delete batch. The watermark write itself
+  // is always Sync=true; delete batches may be buffered because losing one in a
+  // crash only leaves records below the durable watermark that the next prune
+  // removes (reopen already tolerates them).
+  bool sequence_prune_sync = true;
+  // Test-only override of the maximum number of keys deleted per sequence-prune
+  // write batch (0 keeps the production bound of 1024). Values above the bound
+  // are clamped to it, so production always satisfies the <=1024 contract.
+  size_t sequence_prune_batch_size_for_testing = 0;
 };
 
 struct SnapshotWriteDependency {

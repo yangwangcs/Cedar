@@ -347,6 +347,16 @@ struct DatabaseOptions {
   // Tests use it to park an as_of open between its retention-boundary read and
   // its epoch registration while Vacuum advances the boundary.
   std::function<void()> snapshot_boundary_loaded_observer_for_testing;
+  // Opt-in sequence-record retention (F14). Default false keeps every durable
+  // `sequence/*` record and the historical reopen contract unchanged. When
+  // true, Database::Vacuum (and a later open) advances the durable
+  // `watermark/sequence-retention` boundary to the Vacuum target and deletes
+  // the older committed sequence records in bounded, idempotent batches.
+  // Pruning below the oldest-readable boundary makes the missing sequence
+  // history explicit: reads at or below it report SnapshotExpired instead of
+  // silently shortening a range. See docs/README.md ("Sequence-record
+  // retention") for the compatibility and crash-safety contract.
+  bool prune_sequence_records_on_vacuum = false;
 };
 
 struct CommitPipelineMetrics {

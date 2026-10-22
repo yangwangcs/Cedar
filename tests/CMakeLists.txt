@@ -602,6 +602,12 @@ target_link_libraries(test_vacuum
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_vacuum)
 
+add_executable(test_sequence_retention storage/test_sequence_retention.cc)
+target_include_directories(test_sequence_retention PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_sequence_retention
+    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_sequence_retention)
+
 add_executable(test_recovery_crash_matrix recovery/test_crash_matrix.cc)
 target_include_directories(test_recovery_crash_matrix PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_recovery_crash_matrix

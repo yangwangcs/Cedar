@@ -120,29 +120,53 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
 - Databases that never opt in remain fully readable by old binaries; the
   default writer format is unchanged.
 
-### Sequence-record retention below the Vacuum watermark — deferred
+### Sequence-record retention below the Vacuum watermark — opt-in
 
-Decision record (F10 Task 13, audit #11 follow-up): **deferred**, not
-implemented in this milestone.
+Implemented in F14 as an **opt-in** reclamation step; the default is unchanged,
+which keeps every `sequence/*` record and the historical contiguous
+`[1..visible]` reopen contract.
 
-- No code prunes `sequence/*` records at or below the Vacuum watermark.
-  Reclamation only rewrites v1 records to v2 in place; it never deletes a
-  sequence record, and `Vacuum` continues to remove only obsolete fact
-  versions.
-- Why deferred: correct pruning needs (a) a crash matrix covering pruning
-  against visible/oldest-readable watermark publication and Vacuum resume,
-  (b) an explicit old-binary/interop and downgrade story, and (c) retention
-  policy semantics (minimum retained history, `as_of` reads, and
-  `ReadSequenceRange` behavior below the boundary). The v2 space saving is
-  available without changing any retention contract.
-- What a future implementation must guarantee: never prune above the
-  published `oldest_readable` boundary or any pinned reader's sequence; keep
-  pruning and the durable watermark update atomic/crash-safe so reopen sees
-  either the pre-prune or the post-prune consistent state; bound and resume
-  deletion work in batches; make read/repair paths report an explicit error at
-  or below the retained boundary instead of silently shortening a range; and
-  document the minimum-retention, old-binary, and reclaim-interaction
-  behavior with tests.
+- **Enable:** `DatabaseOptions::prune_sequence_records_on_vacuum = true`
+  (`FactStoreOptions::prune_sequence_records_on_vacuum` at the storage layer).
+  Default `false`. `Database::Vacuum` then advances the newest durable boundary
+  and removes older committed sequence records; an open with the option enabled
+  also finishes a prune a crash interrupted.
+- **What is deleted:** only records with `commit_seq < oldest_readable`, the
+  durable Vacuum boundary. One baseline per valid-time chain and every fact at
+  or above the boundary stay. The reclamation tool's v1→v2 rewrite is
+  independent and never deletes sequence records.
+- **Durable watermark:** the boundary is persisted as
+  `watermark/sequence-retention` (the same watermark record encoding) with
+  `Sync=true` *before* the first delete. Reopen validation starts at that
+  watermark: missing records below it are expected, while any gap at or above
+  it (and any record above the visible watermark) still fails the open with
+  `Corruption`. A watermark above the oldest-readable boundary is rejected as
+  corruption.
+- **Crash safety:** a crash before the watermark write leaves the old
+  contiguous history; a crash after it (including inside a delete batch) leaves
+  a watermark that exactly excuses the records that may be missing, and the
+  surviving records at or above it are untouched. Deletes run in idempotent
+  batches of at most 1024 keys; the next `Vacuum` or opted-in open resumes the
+  remaining work. There is no separate prune cursor to corrupt.
+- **Read/repair semantics:** `ReadSequence` and `ReadSequenceRange` report
+  `SnapshotExpired` for history below the durable boundary instead of silently
+  shortening the range; a missing record at or above it is `Corruption`. The
+  transaction-ID allocator cold path starts its rebuild at the watermark.
+  `BeginSnapshot`/`GetPointAtAt` already reject `as_of` below
+  `oldest_readable`.
+- **Compatibility:** the extra meta key is invisible to binaries that predate
+  it, and a database that never opts in is byte-compatible and fully readable
+  by them. Once pruning removes sequence history, however, an old binary's
+  strict `[1..visible]` reopen (or a new binary opened without ever reading the
+  watermark) would report missing durable sequence records. Treat enabling
+  retention as a one-way operational choice for the retention policy, just like
+  the v2 writer gate; keep a backup if old binaries must still open the
+  database.
+- **Tests:** `tests/storage/test_sequence_retention.cc` covers the default
+  no-op, bounded/idempotent pruning, exact deleted-byte accounting, retained
+  `ReadSequenceRange` semantics, gaps at/above the watermark, actual process
+  crashes before the watermark and inside the first delete batch, a crash
+  after fact-cleanup resumes both phases, and kernel option plumbing.
 
 ## Evidence Interpretation
 

@@ -467,6 +467,10 @@ std::string EncodeOldestReadableWatermarkKey() {
   return "watermark/oldest_readable";
 }
 
+std::string EncodeSequenceRetentionWatermarkKey() {
+  return "watermark/sequence-retention";
+}
+
 std::string EncodeVacuumStateKey() { return "vacuum/state"; }
 
 std::string EncodeSequenceFormatKey() {

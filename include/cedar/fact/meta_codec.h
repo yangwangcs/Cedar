@@ -105,6 +105,16 @@ StatusOr<std::string> EncodeTransactionMetaKey(TxnId txn_id);
 StatusOr<std::string> EncodeSequenceMetaKey(CommitSeq commit_seq);
 std::string EncodeVisibleWatermarkKey();
 std::string EncodeOldestReadableWatermarkKey();
+// Durable sequence-retention boundary ("watermark/sequence-retention"). Value 0
+// (or an absent record) means no `sequence/*` record has ever been pruned, so
+// history from sequence 1 must still be contiguous. A value W >= 1 means
+// records below W may be absent (they were pruned after Vacuum advanced the
+// oldest-readable boundary to at least W); every record from W through the
+// visible watermark must still exist. The record is written with Sync=true
+// before the first pruning delete, which is what makes a mid-prune crash safe:
+// reopen either sees the old contiguous history or a watermark that excuses the
+// missing prefix.
+std::string EncodeSequenceRetentionWatermarkKey();
 std::string EncodeVacuumStateKey();
 // Durable meta sequence-format marker key ("format/sequence-record-format").
 // The marker is an ordinary framed meta record whose 4-byte big-endian payload

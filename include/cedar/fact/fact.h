@@ -76,6 +76,26 @@ enum class VacuumFaultPoint : uint8_t {
   kAfterBoundaryWrite = 2,
   kAfterCleanupBatch = 3,
   kBeforeCompletion = 4,
+  // Sequence-record retention (F14). The three windows pin the crash-safety
+  // ordering: the durable sequence-retention watermark is written (Sync=true)
+  // before the first pruning delete, so a crash in any window below leaves
+  // reopen with either the old contiguous history or a watermark that excuses
+  // exactly the records that may be missing.
+  //
+  // kBeforeSequencePruneWatermark: the Vacuum boundary and the fact cleanup are
+  // durable, but the retention watermark has not been advanced and no sequence
+  // record has been deleted.
+  kBeforeSequencePruneWatermark = 5,
+  // kAfterSequencePruneWatermark: the retention watermark is durable; sequence
+  // deletes may not have started.
+  kAfterSequencePruneWatermark = 6,
+  // kAfterSequencePruneBatch: one bounded (<=1024-key) delete batch is durable;
+  // more batches may remain.
+  kAfterSequencePruneBatch = 7,
+  // kBeforeSequencePruneCompletion: every record below the watermark has been
+  // deleted; the prune recorded no completion marker, so a failure here is
+  // observationally identical to a crash after the last batch.
+  kBeforeSequencePruneCompletion = 8,
 };
 
 enum class FactFamily : uint8_t {

@@ -271,6 +271,8 @@ class Database::Impl {
           // FactStore validates it again and the durable marker stays
           // authoritative on reopen.
           store_options.meta_sequence_format = options.meta_sequence_format;
+          store_options.prune_sequence_records_on_vacuum =
+              options.prune_sequence_records_on_vacuum;
           return store_options;
         }()),
         async_executor(ResolveAsyncExecutorOptions(options)),

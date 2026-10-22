@@ -452,6 +452,13 @@ class FactStoreImpl {
   uint64_t pressure_last_compact_bytes = 0;
   CommitSeq visible_seq;
   CommitSeq oldest_readable_seq;
+  // Durable boundary below which committed `sequence/*` records may be absent
+  // (F14). 0 means no retention prune has ever been published, so reopen
+  // validation requires every record from 1 through visible_seq. A value W >= 1
+  // requires records [W..visible_seq] to be contiguous and tolerates a missing
+  // prefix below W. Only the opt-in Vacuum prune advances it (after a durable,
+  // Sync=true write), and it never exceeds the oldest-readable boundary.
+  std::atomic<uint64_t> sequence_retention_watermark{0};
   std::atomic<uint64_t> published_visible_seq{0};
   std::atomic<uint64_t> published_oldest_readable_seq{0};
   std::atomic<uint64_t> point_read_operations{0};
@@ -1577,6 +1584,89 @@ Status ResumeVacuum(FactStoreImpl* store, const FactStoreOptions& options,
   }
 }
 
+// Deletes committed `sequence/<seq>` records below `boundary` after making the
+// durable retention watermark cover them (F14). Crash-safety order:
+//   1. persist watermark/sequence-retention = boundary with Sync=true;
+//   2. only then delete, in bounded WriteBatches.
+// A crash between (1) and (2) (or during the deletes) therefore reopens onto a
+// watermark that excuses exactly the records that may be missing. Reopen
+// validation starts at the watermark; it never sees a gap it cannot explain.
+//
+// Idempotent and resumable: every call re-scans from the sequence prefix and
+// deletes whatever is still below the boundary, so a crash-interrupted prune is
+// finished by the next Vacuum or by an open with the option enabled. `boundary`
+// is the Vacuum target (= the durable oldest-readable boundary), so this never
+// deletes a record a live snapshot can read: a snapshot below the boundary is
+// already rejected by BeginSnapshot.
+// Never invoked unless FactStoreOptions::prune_sequence_records_on_vacuum is
+// set, so the default meta layout and reopen contract are unchanged.
+Status PruneSequenceRecords(FactStoreImpl* store,
+                            const FactStoreOptions& options,
+                            CommitSeq boundary) {
+  if (boundary.value <= 1) return Status::OK();
+  const uint64_t durable = store->sequence_retention_watermark.load(
+      std::memory_order_acquire);
+  if (durable < boundary.value) {
+    const Status before = RunVacuumFaultInjector(
+        options, VacuumFaultPoint::kBeforeSequencePruneWatermark);
+    if (!before.ok()) return before;
+    const auto watermark = EncodeWatermark(boundary);
+    if (!watermark.ok()) return watermark.status();
+    rocksdb::WriteBatch batch;
+    batch.Put(store->meta_cf, EncodeSequenceRetentionWatermarkKey(),
+              watermark.ValueOrDie());
+    rocksdb::WriteOptions write_options;
+    write_options.sync = true;
+    const rocksdb::Status written = store->db->Write(write_options, &batch);
+    if (!written.ok()) return FromMetadataWriteFailure(written);
+    store->sequence_retention_watermark.store(boundary.value,
+                                              std::memory_order_release);
+    const Status after = RunVacuumFaultInjector(
+        options, VacuumFaultPoint::kAfterSequencePruneWatermark);
+    if (!after.ok()) return after;
+  }
+  constexpr size_t kMaxKeysPerBatch = 1024;
+  const size_t keys_per_batch =
+      options.sequence_prune_batch_size_for_testing == 0
+          ? kMaxKeysPerBatch
+          : std::min(kMaxKeysPerBatch,
+                     options.sequence_prune_batch_size_for_testing);
+  while (true) {
+    std::unique_ptr<rocksdb::Iterator> iterator(
+        store->db->NewIterator(rocksdb::ReadOptions(), store->meta_cf));
+    iterator->Seek(kSequenceMetaPrefix);
+    rocksdb::WriteBatch deletes;
+    size_t batch_keys = 0;
+    for (; iterator->Valid() &&
+           StartsWith(iterator->key(), kSequenceMetaPrefix);
+         iterator->Next()) {
+      if (batch_keys == keys_per_batch) break;
+      if (iterator->key().size() != kSequenceMetaKeyBytes) {
+        return Status::Corruption(
+            "sequence retention", "invalid durable sequence record key");
+      }
+      const uint64_t sequence = ParseSequenceMetaKey(iterator->key());
+      if (sequence >= boundary.value) break;
+      deletes.Delete(store->meta_cf, iterator->key());
+      ++batch_keys;
+    }
+    if (!iterator->status().ok()) {
+      return FromRocksDb(iterator->status(),
+                         "iterate sequence records for retention pruning");
+    }
+    if (batch_keys == 0) break;
+    rocksdb::WriteOptions write_options;
+    write_options.sync = options.sequence_prune_sync;
+    const rocksdb::Status written = store->db->Write(write_options, &deletes);
+    if (!written.ok()) return FromMetadataWriteFailure(written);
+    const Status after_batch = RunVacuumFaultInjector(
+        options, VacuumFaultPoint::kAfterSequencePruneBatch);
+    if (!after_batch.ok()) return after_batch;
+  }
+  return RunVacuumFaultInjector(
+      options, VacuumFaultPoint::kBeforeSequencePruneCompletion);
+}
+
 std::optional<std::vector<CurrentFactInterval>> CachedFactIntervals(
     FactStoreImpl* store, const FactRef& ref) {
   if (store->version_validation_cache == nullptr) return std::nullopt;
@@ -2017,9 +2107,19 @@ Status LoadTransactionAllocatorState(FactStoreImpl* store,
   if (!got.IsNotFound()) return FromRocksDb(got, "read transaction ID allocator");
 
   uint64_t highest = 0;
+  // A pruned database no longer has the full history; the committed
+  // transaction IDs still live in the surviving records, so the cold-path
+  // rebuild starts at the durable sequence-retention watermark instead of
+  // sequence 1. IDs allocated to transactions that never committed are not in
+  // either scan (that was already true before pruning).
+  const uint64_t first_sequence =
+      std::max<uint64_t>(1, store->sequence_retention_watermark.load(
+                                std::memory_order_acquire));
+  std::string first_key;
+  AssignSequenceMetaKey(first_sequence, &first_key);
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(rocksdb::ReadOptions(), store->meta_cf));
-  for (iterator->Seek(kSequenceMetaPrefix);
+  for (iterator->Seek(first_key);
        iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix);
        iterator->Next()) {
     if (iterator->key().size() != kSequenceMetaKeyBytes) {
@@ -2233,7 +2333,8 @@ void ReportReopenValidationPhase(
 }
 
 Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
-                                  CommitSeq oldest_readable_seq) {
+                                  CommitSeq oldest_readable_seq,
+                                  CommitSeq sequence_retention_watermark) {
   const auto phase_started = std::chrono::steady_clock::now();
   const auto report_phase = [&](uint64_t records, uint64_t fact_gets,
                                 uint64_t meta_gets) {
@@ -2244,6 +2345,12 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     report_phase(0, 0, 0);
     return Status::OK();
   }
+  // Records below the durable sequence-retention watermark were pruned by an
+  // opted-in Vacuum and are allowed to be absent. Everything from the watermark
+  // through the visible sequence must still be contiguous; that is the whole
+  // point of persisting the boundary before the first delete.
+  const uint64_t first_expected =
+      std::max<uint64_t>(1, sequence_retention_watermark.value);
   rocksdb::ReadOptions options;
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->meta_cf));
@@ -2273,8 +2380,9 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   outcome_commit_seqs.reserve(kOutcomeBatch);
   uint64_t fact_gets = 0;
   uint64_t meta_gets = 0;
-  uint64_t expected = 1;
-  for (iterator->Seek(kSequenceMetaPrefix);
+  uint64_t expected = first_expected;
+  AssignSequenceMetaKey(expected, &expected_key);
+  for (iterator->Seek(expected_key);
        iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix) &&
        expected <= visible_seq.value;
        iterator->Next(), ++expected) {
@@ -2286,7 +2394,9 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     if (iterator->key().compare(rocksdb::Slice(expected_key)) != 0) {
       // The canonical record for this sequence is missing (or the iterated key
       // is not canonical), exactly what the previous per-sequence Get reported
-      // when it returned NotFound.
+      // when it returned NotFound. Because the scan starts at the durable
+      // sequence-retention watermark, reaching this from a pruned database means
+      // a gap at or above the watermark, which is still corruption.
       return Status::Corruption("fact store", "missing durable sequence record");
     }
     const auto sequence = DecodeSequenceRecordView(
@@ -2330,7 +2440,7 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   if (iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix)) {
     return Status::Corruption("fact store", "sequence exceeds visible watermark");
   }
-  report_phase(expected - 1, fact_gets, meta_gets);
+  report_phase(expected - first_expected, fact_gets, meta_gets);
   return Status::OK();
 }
 
@@ -2710,6 +2820,7 @@ Status FactStore::Open() {
     if (!initialized.ok()) return FromRocksDb(initialized, "initialize fact store");
     store->visible_seq = CommitSeq{};
     store->oldest_readable_seq = CommitSeq{};
+    store->sequence_retention_watermark.store(0, std::memory_order_relaxed);
   } else {
     if (!got_format.ok()) return FromRocksDb(got_format, "read fact store format");
     const auto identity = DecodeSystemIdentity(encoded_format);
@@ -2735,6 +2846,30 @@ Status FactStore::Open() {
     }
     store->visible_seq = visible.ValueOrDie();
     store->oldest_readable_seq = oldest.ValueOrDie();
+    // Optional durable sequence-retention boundary. Databases that never pruned
+    // sequence history do not have the record at all; 0 keeps the historical
+    // contract that every record from 1 through the visible watermark exists.
+    std::string encoded_sequence_retention;
+    const rocksdb::Status got_sequence_retention = store->db->Get(
+        rocksdb::ReadOptions(), store->meta_cf,
+        EncodeSequenceRetentionWatermarkKey(), &encoded_sequence_retention);
+    CommitSeq sequence_retention{};
+    if (!got_sequence_retention.IsNotFound()) {
+      if (!got_sequence_retention.ok()) {
+        return FromRocksDb(got_sequence_retention,
+                           "read sequence retention watermark");
+      }
+      const auto decoded_retention = DecodeWatermark(encoded_sequence_retention);
+      if (!decoded_retention.ok()) return decoded_retention.status();
+      sequence_retention = decoded_retention.ValueOrDie();
+    }
+    if (sequence_retention.value > store->oldest_readable_seq.value) {
+      return Status::Corruption(
+          "fact store",
+          "sequence retention watermark exceeds the retention boundary");
+    }
+    store->sequence_retention_watermark.store(sequence_retention.value,
+                                              std::memory_order_relaxed);
   }
   // Resolve the effective meta sequence writer format before reopen validation
   // and before the store can accept any commit. The durable marker is
@@ -2751,10 +2886,13 @@ Status FactStore::Open() {
       marker_is_v2 ? kMetaSequenceFormatV2 : options_.meta_sequence_format;
   if (!is_new_database) {
     // Marker loaded, then validation: the sequence scanner is dual-read, but the
-    // open contract is that the durable format is known first.
-    const Status sequences_valid =
-        ValidateCommittedSequences(store.get(), store->visible_seq,
-                                   store->oldest_readable_seq);
+    // open contract is that the durable format is known first. Validation starts
+    // at the durable sequence-retention watermark, so pruned history below it is
+    // accepted while any gap at or above it still fails the open.
+    const Status sequences_valid = ValidateCommittedSequences(
+        store.get(), store->visible_seq, store->oldest_readable_seq,
+        CommitSeq{store->sequence_retention_watermark.load(
+            std::memory_order_relaxed)});
     if (!sequences_valid.ok()) return sequences_valid;
   }
   if (store->meta_sequence_format == kMetaSequenceFormatV2 && !marker_is_v2) {
@@ -2801,6 +2939,15 @@ Status FactStore::Open() {
     const Status resumed =
         ResumeVacuum(store.get(), options_, vacuum_state.ValueOrDie());
     if (!resumed.ok()) return resumed;
+  }
+  // Opt-in retention resume: a crash after the durable watermark write (but
+  // before/inside the bounded deletes) leaves records below the watermark that
+  // this open removes. The operation is idempotent, so a clean database pays one
+  // bounded seek and no writes.
+  if (options_.prune_sequence_records_on_vacuum) {
+    const Status pruned = PruneSequenceRecords(
+        store.get(), options_, store->oldest_readable_seq);
+    if (!pruned.ok()) return pruned;
   }
   // Split the fixed validation budget: recent-write Bloom windows, the
   // ever-written identity Bloom, and the version validation cache.
@@ -3991,6 +4138,13 @@ StatusOr<SequenceRecord> FactStore::ReadSequence(
   if (commit_seq.value == 0 || commit_seq.value > snapshot.commit_seq().value) {
     return Status::InvalidArgument("scan sequence", "outside snapshot range");
   }
+  const uint64_t sequence_retention =
+      store->sequence_retention_watermark.load(std::memory_order_acquire);
+  if (commit_seq.value < sequence_retention) {
+    return Status::SnapshotExpired(
+        "scan sequence",
+        "sequence record was pruned below the sequence retention watermark");
+  }
   const auto key = EncodeSequenceMetaKey(commit_seq);
   if (!key.ok()) return key.status();
   std::string encoded;
@@ -3998,6 +4152,14 @@ StatusOr<SequenceRecord> FactStore::ReadSequence(
   options.snapshot = snapshot.epoch_->lease->get();
   const rocksdb::Status got = store->db->Get(options, store->meta_cf,
                                               key.ValueOrDie(), &encoded);
+  if (got.IsNotFound()) {
+    // Below the watermark a NotFound is the documented pruned-history outcome
+    // and is handled above; at or above it a missing record is corruption.
+    return Status::Corruption(
+        "scan sequence",
+        "missing durable sequence record at or above the sequence retention "
+        "watermark");
+  }
   if (!got.ok()) return FromRocksDb(got, "read scan sequence");
   auto record = DecodeSequenceRecord(encoded, commit_seq);
   if (!record.ok()) return record.status();
@@ -4022,6 +4184,15 @@ StatusOr<std::vector<SequenceRecord>> FactStore::ReadSequenceRange(
   if (first.value == 0 || last.value < first.value ||
       last.value > snapshot.commit_seq().value) {
     return Status::InvalidArgument("scan sequence range", "invalid snapshot range");
+  }
+  // A pruned range must fail loudly instead of silently returning the surviving
+  // suffix: the caller asked for history that the retention policy removed.
+  const uint64_t sequence_retention =
+      store->sequence_retention_watermark.load(std::memory_order_acquire);
+  if (first.value < sequence_retention) {
+    return Status::SnapshotExpired(
+        "scan sequence range",
+        "sequence record range starts below the sequence retention watermark");
   }
   const auto first_key = EncodeSequenceMetaKey(first);
   if (!first_key.ok()) return first_key.status();
@@ -5834,7 +6005,19 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
       oldest_readable.value > store->visible_seq.value) {
     return Status::InvalidArgument("vacuum", "target is outside readable range");
   }
-  if (oldest_readable == store->oldest_readable_seq) return Status::OK();
+  // Opt-in retention (F14): every successful Vacuum finishes any sequence prune
+  // up to its target, including the no-op Vacuums that repeat the current
+  // boundary after a crash interrupted the deletes. The helper is a no-op when
+  // the option is off, so the default durable layout and behavior are unchanged.
+  const auto run_sequence_prune = [&](CommitSeq boundary) {
+    if (!options_.prune_sequence_records_on_vacuum) return Status::OK();
+    const Status pruned = PruneSequenceRecords(store.get(), options_, boundary);
+    if (pruned.IsIndeterminate()) store->recovery_required = true;
+    return pruned;
+  };
+  if (oldest_readable == store->oldest_readable_seq) {
+    return run_sequence_prune(store->oldest_readable_seq);
+  }
   // Cached historical epochs hold references that would otherwise pin the
   // retention boundary forever. Evict them first; readers still inside a cached
   // as_of read keep their own reference and are visible to the scan below.
@@ -5911,7 +6094,7 @@ Status FactStore::Vacuum(CommitSeq oldest_readable) {
     if (cleaned.IsIndeterminate()) store->recovery_required = true;
     return cleaned;
   }
-  return Status::OK();
+  return run_sequence_prune(oldest_readable);
 }
 
 CommitSeq FactStore::visible_seq() const {
@@ -5949,6 +6132,15 @@ StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(
     if (outcome.ValueOrDie().commit_seq.value > store->visible_seq.value) {
       return std::optional<StoreCommitResult>{};
     }
+  }
+  // A committed transaction whose sequence history was pruned is below the
+  // durable retention boundary. Report the retention outcome explicitly instead
+  // of the generic "outcome is missing sequence record" corruption below.
+  if (outcome.ValueOrDie().commit_seq.value <
+      store->sequence_retention_watermark.load(std::memory_order_acquire)) {
+    return Status::SnapshotExpired(
+        "transaction",
+        "sequence record was pruned below the sequence retention watermark");
   }
   const auto sequence_key = EncodeSequenceMetaKey(outcome.ValueOrDie().commit_seq);
   if (!sequence_key.ok()) return sequence_key.status();

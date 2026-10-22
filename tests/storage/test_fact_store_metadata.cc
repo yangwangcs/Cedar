@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "storage/facts/fact_store.h"
@@ -1380,6 +1382,79 @@ TEST_F(FactStoreMetadataTest, ScanFamilyReadsFlushedFactsAfterCleanReopen) {
   ASSERT_EQ(identities.size(), 1U);
   ASSERT_TRUE(identities.front().edge_identity.has_value());
   EXPECT_EQ(*identities.front().edge_identity, identity);
+}
+
+// The bounded ScanFamily must read every partition of the requested family:
+// partitions are discovered with (version, part+1) prefix seeks, empty
+// partitions are skipped, part 0 is a real partition, and part 0xffffffff ends
+// the version. The same walk must be correct while facts still live in the WAL
+// memtable (crash recovery, adjacency rebuild) and after a clean close flushed
+// them into Cedar Parquet SSTs.
+TEST_F(FactStoreMetadataTest,
+       ScanFamilyReadsEveryPartitionInMemtableAndFlushedSst) {
+  using ScannedFact =
+      std::tuple<uint32_t, uint8_t, uint16_t, uint64_t, uint64_t, uint64_t,
+                 uint8_t>;
+  const auto collect = [this](FactFamily family) {
+    std::vector<ScannedFact> facts;
+    const auto snapshot = store_->BeginSnapshot();
+    EXPECT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    if (!snapshot.ok()) return facts;
+    const Status status = store_->ScanFamily(
+        snapshot.ValueOrDie(), family, [&facts](const FactEvent& event) {
+          facts.emplace_back(event.ref.part_id().value,
+                             static_cast<uint8_t>(event.ref.family()),
+                             event.ref.property_id().value,
+                             event.ref.entity_id(), event.valid_from.value,
+                             event.commit_seq.value,
+                             static_cast<uint8_t>(event.operation));
+          return Status::OK();
+        });
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    return facts;
+  };
+
+  constexpr uint64_t kValidFrom = 10;
+  constexpr uint32_t kMaxPart = std::numeric_limits<uint32_t>::max();
+  const EdgeIdentity identity{EdgeId{17}, VertexId{7}, VertexId{11}, 3};
+  StoreCommitBatch batch{TxnId{1}, kValidFrom, {}, {identity}, {}, {}, false};
+  const std::array<std::pair<uint32_t, uint64_t>, 5> vertices = {
+      {{0, 1}, {0, 2}, {2, 3}, {5, 4}, {kMaxPart, 5}}};
+  for (const auto& [part, entity] : vertices) {
+    batch.mutations.push_back(PendingFactMutation{
+        EntityFact::Vertex(VertexRef{PartId{part}, VertexId{entity}}).ref(),
+        ValidTime{kValidFrom}, FactOperation::kPut, 0, std::nullopt});
+  }
+  // The identity needs its edge-state assertion; it belongs to other families
+  // and must not leak into the vertex-state scan.
+  batch.mutations.push_back(PendingFactMutation{
+      EntityFact::Edge(EdgeRef{PartId{0}, EdgeId{17}}).ref(),
+      ValidTime{kValidFrom}, FactOperation::kPut, 0, std::nullopt});
+  const auto committed = store_->Commit(batch);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+  const uint64_t commit_seq = committed.ValueOrDie().commit_seq.value;
+
+  std::vector<ScannedFact> expected_vertices;
+  expected_vertices.reserve(vertices.size());
+  for (const auto& [part, entity] : vertices) {
+    expected_vertices.emplace_back(part, 1, 0, entity, kValidFrom, commit_seq,
+                                   1);
+  }
+  const std::vector<ScannedFact> expected_identities = {
+      {0, 3, 0, 17, 0, commit_seq, 1}};
+
+  // Memtable/WAL path: the bounded seeks must be understood by the facts
+  // memtable index, not only by the Cedar Parquet tables.
+  EXPECT_EQ(collect(FactFamily::kVertexState), expected_vertices);
+  EXPECT_EQ(collect(FactFamily::kEdgeIdentity), expected_identities);
+  EXPECT_TRUE(collect(FactFamily::kVertexProperty).empty());
+
+  // Clean close flushes the facts CF into Cedar Parquet SSTs; the identical
+  // partition walk must return the same rows through the table comparator.
+  Reopen();
+  EXPECT_EQ(collect(FactFamily::kVertexState), expected_vertices);
+  EXPECT_EQ(collect(FactFamily::kEdgeIdentity), expected_identities);
+  EXPECT_TRUE(collect(FactFamily::kVertexProperty).empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -3814,20 +3814,93 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
   options.snapshot = snapshot.epoch_->lease->get();
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->facts_cf));
-  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
-    auto decoded_key = DecodeFactKey(iterator->key().ToString());
-    if (!decoded_key.ok()) return decoded_key.status();
-    if (decoded_key.ValueOrDie().ref.family() != family ||
-        decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value)
-      continue;
-    auto decoded_value = DecodeFactValue(
-        decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
-        decoded_key.ValueOrDie().commit_seq, iterator->value().ToString());
-    if (!decoded_value.ok()) return decoded_value.status();
-    if (Status status = visitor(decoded_value.ValueOrDie()); !status.ok()) return status;
+  // Fact keys are ordered by version|part|family|..., so one prefix seek per
+  // (version, part) reads only the requested family instead of decoding every
+  // fact in the CF. The prefixes go through the transient 0x04 seek encoding:
+  // a synthetic short user key would be mistaken for a canonical fact key by
+  // the Cedar Parquet comparator as soon as the facts CF holds flushed SSTs.
+  const auto seek_prefix = [&iterator](std::string_view prefix) -> Status {
+    const std::string encoded =
+        rocksdb::cedar_parquet::EncodeCedarParquetPrefixSeekKey(prefix);
+    if (encoded.empty()) {
+      return Status::Corruption("fact scan", "invalid family scan prefix");
+    }
+    iterator->Seek(rocksdb::Slice(encoded));
+    return iterator->status().ok()
+               ? Status::OK()
+               : FromRocksDb(iterator->status(), "seek family scan");
+  };
+  const auto read_part = [](const rocksdb::Slice& key) {
+    return (static_cast<uint32_t>(static_cast<uint8_t>(key[1])) << 24) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(key[2])) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(key[3])) << 8) |
+           static_cast<uint32_t>(static_cast<uint8_t>(key[4]));
+  };
+  const auto append_part = [](std::string* prefix, uint32_t part) {
+    prefix->push_back(static_cast<char>(part >> 24));
+    prefix->push_back(static_cast<char>(part >> 16));
+    prefix->push_back(static_cast<char>(part >> 8));
+    prefix->push_back(static_cast<char>(part));
+  };
+
+  iterator->SeekToFirst();
+  while (iterator->Valid()) {
+    if (iterator->key().size() < kEncodedFactKeyBytes) {
+      return Status::Corruption("fact scan", "invalid fact key");
+    }
+    const uint8_t key_version =
+        static_cast<uint8_t>(iterator->key().data()[0]);
+    const uint32_t part = read_part(iterator->key());
+
+    // Only decode rows of the requested family. A corrupt key in an unrelated
+    // family or partition is skipped by the range seeks below: ScanFamily only
+    // guarantees decoding of the selected family.
+    std::string family_prefix;
+    family_prefix.reserve(6);
+    family_prefix.push_back(static_cast<char>(key_version));
+    append_part(&family_prefix, part);
+    family_prefix.push_back(static_cast<char>(family));
+    Status status = seek_prefix(family_prefix);
+    if (!status.ok()) return status;
+    while (iterator->Valid() &&
+           iterator->key().starts_with(rocksdb::Slice(family_prefix))) {
+      const auto decoded_key = DecodeFactKey(iterator->key().ToStringView());
+      if (!decoded_key.ok()) return decoded_key.status();
+      if (decoded_key.ValueOrDie().commit_seq.value <=
+          snapshot.commit_seq().value) {
+        auto decoded_value = DecodeFactValue(
+            decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
+            decoded_key.ValueOrDie().commit_seq,
+            iterator->value().ToStringView());
+        if (!decoded_value.ok()) return decoded_value.status();
+        if (Status visited = visitor(decoded_value.ValueOrDie());
+            !visited.ok()) {
+          return visited;
+        }
+      }
+      iterator->Next();
+    }
+    if (!iterator->status().ok()) {
+      return FromRocksDb(iterator->status(), "iterate family scan");
+    }
+
+    // Skip the rest of this (version, part) and move to the next partition;
+    // when this was the last partition, advance to the next key version.
+    std::string next_prefix;
+    if (part != std::numeric_limits<uint32_t>::max()) {
+      next_prefix.push_back(static_cast<char>(key_version));
+      append_part(&next_prefix, part + 1);
+    } else if (key_version != std::numeric_limits<uint8_t>::max()) {
+      next_prefix.push_back(static_cast<char>(key_version + 1));
+    } else {
+      break;
+    }
+    status = seek_prefix(next_prefix);
+    if (!status.ok()) return status;
   }
-  return iterator->status().ok() ? Status::OK()
-                                 : FromRocksDb(iterator->status(), "iterate family scan");
+  return iterator->status().ok()
+             ? Status::OK()
+             : FromRocksDb(iterator->status(), "iterate family scan");
 }
 
 Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,

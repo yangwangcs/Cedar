@@ -7,11 +7,13 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <string_view>
 
 #include "db/dbformat.h"
 #include "db/memtable.h"
 #include "memtable/cedar_pure_radix_index.h"
 #include "memory/allocator.h"
+#include "table/cedar_parquet/cedar_parquet_format.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -28,6 +30,22 @@ void StoreBigEndian64(char* destination, uint64_t value) {
 
 CedarPureRadixIndex::Key NormalizeInternalKey(const Slice& internal_key) {
   CedarPureRadixIndex::Key result{};
+  // A Cedar Parquet prefix-seek key is [0x04][length][prefix][zero padding],
+  // optionally followed by the 8-byte internal-key trailer DBIter appends.
+  // Normalize it to the smallest key in the prefix range (prefix bytes, zero
+  // suffix, zero inverted trailer). Treating the marker as an opaque 0x04 user
+  // key would sort the seek after every 0x02 fact key and skip the memtable
+  // facts a bounded family scan has to return. Check the marker before decoding
+  // because the point-read path is allocation-free: a NotFound Status would
+  // allocate on every ordinary seek.
+  if (cedar_parquet::IsCedarParquetPrefixSeekKey(internal_key)) {
+    std::string_view prefix;
+    if (cedar_parquet::DecodeCedarParquetPrefixSeekKey(internal_key, &prefix)
+            .ok()) {
+      std::memcpy(result.data(), prefix.data(), prefix.size());
+      return result;
+    }
+  }
   const bool is_short_v2_seek =
       internal_key.size() > 8 && internal_key.size() < kV2UserKeyBytes &&
       static_cast<unsigned char>(internal_key[0]) == 2;

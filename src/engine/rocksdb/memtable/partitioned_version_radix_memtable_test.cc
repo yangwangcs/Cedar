@@ -15,6 +15,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "memory/concurrent_arena.h"
 #include "memtable/cedar_pure_radix_index.h"
 #include "rocksdb/memtablerep.h"
+#include "table/cedar_parquet/cedar_parquet_format.h"
 #include "util/coding.h"
 
 namespace {
@@ -187,6 +189,40 @@ std::string InternalKeyFor(uint64_t entity_id, SequenceNumber sequence,
   std::string internal_key;
   AppendInternalKey(&internal_key,
                     ParsedInternalKey(V2UserKey(entity_id), sequence, type));
+  return internal_key;
+}
+
+void PutBigEndian32(std::string* destination, size_t offset, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    (*destination)[offset++] = static_cast<char>(value >> shift);
+  }
+}
+
+std::string PartFactKeyFor(uint32_t part, uint8_t family, uint64_t entity,
+                           SequenceNumber sequence) {
+  std::string user_key(32, '\0');
+  user_key[0] = 2;
+  PutBigEndian32(&user_key, 1, part);
+  user_key[5] = static_cast<char>(family);
+  StoreBigEndian64(&user_key, 8, entity);
+  StoreBigEndian64(&user_key, 16, ~uint64_t{0});
+  StoreBigEndian64(&user_key, 24, ~uint64_t{1});
+  std::string internal_key;
+  AppendInternalKey(&internal_key,
+                    ParsedInternalKey(user_key, sequence, kTypeValue));
+  return internal_key;
+}
+
+// The database layer hands the memtable a user-key seek target after DBIter
+// appends the usual 8-byte internal-key trailer.
+std::string PrefixSeekInternalKey(std::string_view prefix) {
+  const std::string encoded =
+      cedar_parquet::EncodeCedarParquetPrefixSeekKey(prefix);
+  EXPECT_FALSE(encoded.empty());
+  std::string internal_key;
+  AppendInternalKey(&internal_key,
+                    ParsedInternalKey(Slice(encoded), kMaxSequenceNumber,
+                                      kValueTypeForSeek));
   return internal_key;
 }
 
@@ -790,6 +826,51 @@ TEST(PartitionedVersionRadixMemTableTest,
   iterator->Seek(prefix_seek, nullptr);
   ASSERT_TRUE(iterator->Valid());
   EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()), Slice(first));
+}
+
+// Bounded family scans seek with the transient 0x04 prefix encoding. The
+// normalized index must place such a seek at the start of the prefix range,
+// not after every 0x02 fact key, otherwise WAL/memtable-resident facts are
+// skipped when a scan starts before them.
+TEST(PartitionedVersionRadixMemTableTest, SeeksFromEncodedPrefixSeekKey) {
+  TestKeyComparator comparator;
+  Arena arena;
+  PartitionedVersionRadixFactory factory;
+  std::unique_ptr<MemTableRep> table(
+      factory.CreateMemTableRep(comparator, &arena, nullptr, nullptr));
+  const std::string first = PartFactKeyFor(0, 1, 3, 1);
+  const std::string same_family_later = PartFactKeyFor(0, 1, 7, 2);
+  const std::string other_family = PartFactKeyFor(0, 4, 2, 3);
+  const std::string next_part = PartFactKeyFor(2, 1, 1, 4);
+  for (const std::string& key :
+       {first, same_family_later, other_family, next_part}) {
+    ASSERT_TRUE(Insert(table.get(), key, "value"));
+  }
+  std::unique_ptr<MemTableRep::Iterator> iterator(table->GetIterator());
+
+  // [version][part][family] starts at the first fact of that family.
+  std::string family_prefix(6, '\0');
+  family_prefix[0] = 2;
+  PutBigEndian32(&family_prefix, 1, 0);
+  family_prefix[5] = 1;
+  iterator->Seek(PrefixSeekInternalKey(family_prefix), nullptr);
+  ASSERT_TRUE(iterator->Valid());
+  EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()).ToString(), first);
+
+  // Partition 1 holds no rows, so [version][part+1] lands at partition 2.
+  std::string next_prefix(5, '\0');
+  next_prefix[0] = 2;
+  PutBigEndian32(&next_prefix, 1, 1);
+  iterator->Seek(PrefixSeekInternalKey(next_prefix), nullptr);
+  ASSERT_TRUE(iterator->Valid());
+  EXPECT_EQ(GetLengthPrefixedSlice(iterator->key()).ToString(), next_part);
+
+  // A prefix past the last partition leaves a healthy invalid iterator.
+  std::string beyond(5, '\0');
+  beyond[0] = 2;
+  PutBigEndian32(&beyond, 1, 9);
+  iterator->Seek(PrefixSeekInternalKey(beyond), nullptr);
+  EXPECT_FALSE(iterator->Valid());
 }
 
 TEST(PartitionedVersionRadixMemTableTest,

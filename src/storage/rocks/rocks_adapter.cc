@@ -2216,8 +2216,12 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
     const auto sequence = DecodeSequenceRecordView(std::string_view(
         iterator->value().data(), iterator->value().size()));
     if (!sequence.ok()) return sequence.status();
-    const bool require_facts = store->deep_recovery_validation ||
-                               expected >= fact_validation_floor;
+    // deep restores the pre-F9 coverage (every fact at or above the retention
+    // boundary); it must not re-check facts Vacuum has legitimately removed.
+    const bool require_facts =
+        expected >= (store->deep_recovery_validation
+                         ? oldest_readable_seq.value
+                         : fact_validation_floor);
     const Status valid = ValidateSequenceRecordContent(
         store, CommitSeq{expected}, sequence.ValueOrDie(), require_facts,
         &fact_gets);

@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -971,6 +972,72 @@ TEST(FactStoreSnapshotSchemaLookupTest, RejectsSnapshotFromAnotherStore) {
   EXPECT_TRUE(second.Close().ok());
   std::filesystem::remove_all(first_path);
   std::filesystem::remove_all(second_path);
+}
+
+TEST(FactStoreMetaCodecSequenceViewTest,
+     DecodesPackedSequenceWithoutOwningFactKeys) {
+  const FactRef first(PartId{1}, FactFamily::kVertexProperty, PropertyId{2}, 42);
+  const FactRef second(PartId{1}, FactFamily::kVertexProperty, PropertyId{3}, 43);
+  const std::string key1 =
+      EncodeFactKey(first, ValidTime{10}, CommitSeq{7});
+  const std::string key2 =
+      EncodeFactKey(second, ValidTime{10}, CommitSeq{7});
+  ASSERT_EQ(key1.size(), kEncodedFactKeyBytes);
+  const SequenceRecord record{CommitSeq{7}, TxnId{9}, 123, {key1, key2}};
+  const auto encoded = EncodeSequenceRecord(record);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+  const auto view = DecodeSequenceRecordView(encoded.ValueOrDie());
+  ASSERT_TRUE(view.ok()) << view.status().ToString();
+  EXPECT_EQ(view.ValueOrDie().commit_seq, CommitSeq{7});
+  EXPECT_EQ(view.ValueOrDie().txn_id, TxnId{9});
+  EXPECT_EQ(view.ValueOrDie().system_hlc, 123U);
+  EXPECT_EQ(view.ValueOrDie().fact_count, 2U);
+  ASSERT_EQ(view.ValueOrDie().identities.size(), 2 * kEncodedFactKeyBytes);
+  EXPECT_TRUE(view.ValueOrDie().Validate().ok());
+
+  const auto owning = DecodeSequenceRecord(encoded.ValueOrDie());
+  ASSERT_TRUE(owning.ok()) << owning.status().ToString();
+  EXPECT_EQ(owning.ValueOrDie().fact_keys.size(), 2U);
+  EXPECT_EQ(owning.ValueOrDie().commit_seq, CommitSeq{7});
+}
+
+TEST(FactStoreMetaCodecSequenceViewTest,
+     RejectsCorruptOrInconsistentSequenceRecords) {
+  const FactRef first(PartId{1}, FactFamily::kVertexProperty, PropertyId{2}, 42);
+  const FactRef other(PartId{1}, FactFamily::kVertexProperty, PropertyId{3}, 43);
+  const std::string key1 =
+      EncodeFactKey(first, ValidTime{10}, CommitSeq{7});
+  const std::string stale_key =
+      EncodeFactKey(other, ValidTime{10}, CommitSeq{6});
+  const SequenceRecord record{CommitSeq{7}, TxnId{9}, 0, {key1}};
+  const auto encoded = EncodeSequenceRecord(record);
+  ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+  const std::string bytes = encoded.ValueOrDie();
+
+  EXPECT_FALSE(
+      DecodeSequenceRecordView(std::string_view(bytes).substr(
+          0, bytes.size() - 2))
+          .ok());
+  std::string bad_crc = bytes;
+  bad_crc.back() = static_cast<char>(bad_crc.back() ^ 0x1);
+  EXPECT_FALSE(DecodeSequenceRecordView(bad_crc).ok());
+
+  const auto good_view = DecodeSequenceRecordView(bytes);
+  ASSERT_TRUE(good_view.ok()) << good_view.status().ToString();
+  SequenceRecordView stale_view = good_view.ValueOrDie();
+  stale_view.identities = std::string_view(stale_key);
+  EXPECT_FALSE(stale_view.Validate().ok());
+
+  const std::string duplicated = key1 + key1;
+  SequenceRecordView duplicate_view = good_view.ValueOrDie();
+  duplicate_view.fact_count = 2;
+  duplicate_view.identities = std::string_view(duplicated);
+  EXPECT_FALSE(duplicate_view.Validate().ok());
+
+  SequenceRecordView length_view = good_view.ValueOrDie();
+  length_view.fact_count = 2;
+  EXPECT_FALSE(length_view.Validate().ok());
 }
 
 }  // namespace

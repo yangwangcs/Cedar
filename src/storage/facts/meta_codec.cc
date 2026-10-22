@@ -74,6 +74,26 @@ bool ReadU64(const std::string& input, size_t* offset, uint64_t* value) {
   return true;
 }
 
+bool ReadU32View(std::string_view input, size_t* offset, uint32_t* value) {
+  if (input.size() - *offset < 4) return false;
+  *value = 0;
+  for (int index = 0; index < 4; ++index) {
+    *value = (*value << 8) | static_cast<uint8_t>(input[*offset + index]);
+  }
+  *offset += 4;
+  return true;
+}
+
+bool ReadU64View(std::string_view input, size_t* offset, uint64_t* value) {
+  if (input.size() - *offset < 8) return false;
+  *value = 0;
+  for (int index = 0; index < 8; ++index) {
+    *value = (*value << 8) | static_cast<uint8_t>(input[*offset + index]);
+  }
+  *offset += 8;
+  return true;
+}
+
 bool IsPhysicalType(uint8_t value) {
   return value >= static_cast<uint8_t>(PhysicalType::kBool) &&
          value <= static_cast<uint8_t>(PhysicalType::kBinary);
@@ -109,8 +129,8 @@ StatusOr<std::string> EncodeRecord(MetaRecordKind kind,
   return encoded;
 }
 
-StatusOr<std::string> DecodeRecord(MetaRecordKind expected_kind,
-                                   const std::string& encoded) {
+StatusOr<std::string_view> DecodeRecordView(MetaRecordKind expected_kind,
+                                            std::string_view encoded) {
   if (encoded.size() < kMetaHeaderBytes + kMetaChecksumBytes) {
     return Status::Corruption("metadata", "truncated record");
   }
@@ -119,7 +139,7 @@ StatusOr<std::string> DecodeRecord(MetaRecordKind expected_kind,
   const uint8_t kind = static_cast<uint8_t>(encoded[offset++]);
   uint32_t payload_length = 0;
   if (version != kMetaVersion || kind != static_cast<uint8_t>(expected_kind) ||
-      !ReadU32(encoded, &offset, &payload_length) ||
+      !ReadU32View(encoded, &offset, &payload_length) ||
       payload_length > kMaxMetaPayloadBytes ||
       encoded.size() - offset != payload_length + kMetaChecksumBytes) {
     return Status::Corruption("metadata", "invalid record header");
@@ -127,11 +147,18 @@ StatusOr<std::string> DecodeRecord(MetaRecordKind expected_kind,
   const size_t checksum_offset = encoded.size() - kMetaChecksumBytes;
   size_t checksum_cursor = checksum_offset;
   uint32_t stored_checksum = 0;
-  if (!ReadU32(encoded, &checksum_cursor, &stored_checksum) ||
+  if (!ReadU32View(encoded, &checksum_cursor, &stored_checksum) ||
       stored_checksum != crc32c::Value(encoded.data(), checksum_offset)) {
     return Status::Corruption("metadata", "CRC32C mismatch");
   }
   return encoded.substr(offset, payload_length);
+}
+
+StatusOr<std::string> DecodeRecord(MetaRecordKind expected_kind,
+                                   const std::string& encoded) {
+  const auto payload = DecodeRecordView(expected_kind, encoded);
+  if (!payload.ok()) return payload.status();
+  return std::string(payload.ValueOrDie());
 }
 
 }  // namespace
@@ -489,6 +516,63 @@ StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded) {
   const Status valid = record.Validate();
   if (!valid.ok()) return Status::Corruption("sequence record", valid.ToString());
   return record;
+}
+
+Status SequenceRecordView::Validate() const {
+  if (commit_seq.value == 0 || !txn_id.valid() || fact_count == 0 ||
+      identities.size() !=
+          static_cast<size_t>(fact_count) * kEncodedFactKeyBytes) {
+    return Status::InvalidArgument("sequence record",
+                                   "invalid sequence metadata");
+  }
+  std::unordered_set<std::string_view> unique_keys;
+  unique_keys.reserve(fact_count);
+  for (uint32_t index = 0; index < fact_count; ++index) {
+    const std::string_view key = identities.substr(
+        static_cast<size_t>(index) * kEncodedFactKeyBytes,
+        kEncodedFactKeyBytes);
+    const auto decoded = DecodeFactKey(key);
+    if (!decoded.ok()) {
+      return Status::InvalidArgument("sequence record", "invalid fact key");
+    }
+    if (decoded.ValueOrDie().commit_seq != commit_seq) {
+      return Status::InvalidArgument("sequence record",
+                                     "fact key commit sequence disagrees");
+    }
+    if (!unique_keys.insert(key).second) {
+      return Status::InvalidArgument("sequence record", "duplicate fact key");
+    }
+  }
+  return Status::OK();
+}
+
+StatusOr<SequenceRecordView> DecodeSequenceRecordView(
+    std::string_view encoded) {
+  const auto payload = DecodeRecordView(MetaRecordKind::kSequence, encoded);
+  if (!payload.ok()) return payload.status();
+  const std::string_view bytes = payload.ValueOrDie();
+  size_t offset = 0;
+  uint64_t commit_seq = 0;
+  uint64_t txn_id = 0;
+  uint64_t system_hlc = 0;
+  uint32_t count = 0;
+  if (!ReadU64View(bytes, &offset, &commit_seq) ||
+      !ReadU64View(bytes, &offset, &txn_id) ||
+      !ReadU64View(bytes, &offset, &system_hlc) ||
+      !ReadU32View(bytes, &offset, &count) ||
+      count > (bytes.size() - offset) / kEncodedFactKeyBytes ||
+      bytes.size() - offset !=
+          static_cast<size_t>(count) * kEncodedFactKeyBytes) {
+    return Status::Corruption("sequence record", "invalid sequence record");
+  }
+  SequenceRecordView view;
+  view.commit_seq = CommitSeq{commit_seq};
+  view.txn_id = TxnId{txn_id};
+  view.system_hlc = system_hlc;
+  view.fact_count = count;
+  view.identities = bytes.substr(offset, static_cast<size_t>(count) *
+                                             kEncodedFactKeyBytes);
+  return view;
 }
 
 StatusOr<std::string> EncodeVacuumState(const VacuumState& state) {

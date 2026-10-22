@@ -2053,14 +2053,20 @@ Status LoadPropertySchemas(FactStoreImpl* store) {
 // under a different key, and its *existence* is what this check pins, which the
 // sequence record cannot prove.
 Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq,
-                                 const std::string& encoded_sequence,
+                                 std::string_view encoded_sequence,
                                  bool require_facts) {
-  const auto sequence = DecodeSequenceRecord(encoded_sequence);
-  if (!sequence.ok()) return sequence.status();
-  if (sequence.ValueOrDie().commit_seq != commit_seq) {
-    return Status::Corruption("fact store", "sequence record has wrong commit sequence");
+  const auto sequence_view = DecodeSequenceRecordView(encoded_sequence);
+  if (!sequence_view.ok()) return sequence_view.status();
+  const SequenceRecordView& sequence = sequence_view.ValueOrDie();
+  if (sequence.commit_seq != commit_seq) {
+    return Status::Corruption("fact store",
+                              "sequence record has wrong commit sequence");
   }
-  const auto transaction_key = EncodeTransactionMetaKey(sequence.ValueOrDie().txn_id);
+  const Status structure = sequence.Validate();
+  if (!structure.ok()) {
+    return Status::Corruption("sequence record", structure.ToString());
+  }
+  const auto transaction_key = EncodeTransactionMetaKey(sequence.txn_id);
   if (!transaction_key.ok()) return transaction_key.status();
   std::string encoded_outcome;
   const rocksdb::Status got_outcome = store->db->Get(
@@ -2071,21 +2077,27 @@ Status ValidateCommittedSequence(FactStoreImpl* store, CommitSeq commit_seq,
   }
   const auto outcome = DecodeTransactionOutcome(encoded_outcome);
   if (!outcome.ok()) return outcome.status();
-  if (outcome.ValueOrDie().txn_id != sequence.ValueOrDie().txn_id ||
+  if (outcome.ValueOrDie().txn_id != sequence.txn_id ||
       outcome.ValueOrDie().commit_seq != commit_seq) {
     return Status::Corruption("fact store", "outcome and sequence disagree");
   }
-  for (const std::string& fact_key : sequence.ValueOrDie().fact_keys) {
+  for (uint32_t index = 0; index < sequence.fact_count; ++index) {
+    const std::string_view fact_key = sequence.identities.substr(
+        static_cast<size_t>(index) * kEncodedFactKeyBytes,
+        kEncodedFactKeyBytes);
     const auto decoded_key = DecodeFactKey(fact_key);
     if (!decoded_key.ok() || decoded_key.ValueOrDie().commit_seq != commit_seq) {
-      return Status::Corruption("fact store", "sequence contains invalid fact key");
+      return Status::Corruption("fact store",
+                                "sequence contains invalid fact key");
     }
     if (!require_facts) continue;
     std::string encoded_fact;
     const rocksdb::Status got_fact = store->db->Get(
-        rocksdb::ReadOptions(), store->facts_cf, fact_key, &encoded_fact);
+        rocksdb::ReadOptions(), store->facts_cf,
+        rocksdb::Slice(fact_key.data(), fact_key.size()), &encoded_fact);
     if (!got_fact.ok()) {
-      return Status::Corruption("fact store", "sequence record is missing fact");
+      return Status::Corruption("fact store",
+                                "sequence record is missing fact");
     }
     const auto fact = DecodeFactValue(decoded_key.ValueOrDie().ref,
                                       decoded_key.ValueOrDie().valid_from,
@@ -2107,9 +2119,6 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   // Get the old loop issued per sequence.
   std::string expected_key;
   expected_key.reserve(kSequenceMetaKeyBytes);
-  // Reused value buffer: the iterator owns the record bytes, so copy them once
-  // into a stable string instead of allocating one string per sequence.
-  std::string encoded_sequence;
   uint64_t expected = 1;
   for (iterator->Seek(kSequenceMetaPrefix);
        iterator->Valid() && StartsWith(iterator->key(), kSequenceMetaPrefix) &&
@@ -2126,10 +2135,10 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
       // when it returned NotFound.
       return Status::Corruption("fact store", "missing durable sequence record");
     }
-    encoded_sequence.assign(iterator->value().data(),
-                            iterator->value().size());
     const Status valid = ValidateCommittedSequence(
-        store, CommitSeq{expected}, encoded_sequence,
+        store, CommitSeq{expected},
+        std::string_view(iterator->value().data(),
+                         iterator->value().size()),
         expected >= oldest_readable_seq.value);
     if (!valid.ok()) return valid;
   }

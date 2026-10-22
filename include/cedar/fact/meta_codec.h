@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cedar/core/status.h"
@@ -43,6 +44,20 @@ struct SequenceRecord {
 
   Status Validate() const;
   bool operator==(const SequenceRecord&) const = default;
+};
+
+// Zero-copy view of one committed sequence record. `identities` borrows the
+// caller's encoded record bytes; each entry is kEncodedFactKeyBytes long and
+// the view is valid only while those bytes stay alive. Validation and reopen
+// scanning use this to avoid materializing one std::string per fact key.
+struct SequenceRecordView {
+  CommitSeq commit_seq;
+  TxnId txn_id;
+  uint64_t system_hlc = 0;
+  uint32_t fact_count = 0;
+  std::string_view identities;
+
+  Status Validate() const;
 };
 
 enum class VacuumPhase : uint8_t { kPrepared = 1, kRunning = 2 };
@@ -95,6 +110,11 @@ StatusOr<TransactionOutcomeRecord> DecodeTransactionOutcome(
     const std::string& encoded);
 StatusOr<std::string> EncodeSequenceRecord(const SequenceRecord& record);
 StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded);
+// Decodes only the record framing and the packed identity region; fact-key and
+// duplicate checks are Validate()'s job so callers that only need txn_id/count
+// do not pay for them twice.
+StatusOr<SequenceRecordView> DecodeSequenceRecordView(
+    std::string_view encoded);
 StatusOr<std::string> EncodeVacuumState(const VacuumState& state);
 StatusOr<VacuumState> DecodeVacuumState(const std::string& encoded);
 

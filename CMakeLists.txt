@@ -112,6 +112,7 @@ add_library(cedar_core STATIC
     src/storage/rocks/rocksdb_config.cc
     src/storage/rocks/storage_file_inspection.cc
     src/storage/facts/vacuum.cc
+    src/storage/rocks/meta_v2_reclaim.cc
     src/storage/rocks/rocks_adapter.cc
     src/runtime/pressure_controller.cc
     src/kernel/adaptive_epoch_controller.cc
@@ -143,6 +144,10 @@ add_executable(cedar-server tools/cedar_server_main.cc)
 target_link_libraries(cedar-server PRIVATE cedar_core)
 add_executable(cedar-admin tools/cedar_admin_main.cc)
 target_link_libraries(cedar-admin PRIVATE cedar_core)
+
+# Offline maintenance tool; independent of the test/benchmark build options.
+add_executable(cedar-meta-v2-reclaim tools/cedar-meta-v2-reclaim.cc)
+target_link_libraries(cedar-meta-v2-reclaim PRIVATE cedar_core)
 
 add_library(cedar_kernel_bench_options STATIC
     benchmarks/cedar_kernel_bench_options.cc)
@@ -206,7 +211,8 @@ install(TARGETS cedar_core EXPORT CedarTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS cedar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(TARGETS cedar-server cedar-admin RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS cedar-server cedar-admin cedar-meta-v2-reclaim
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES "${CEDAR_ROCKSDB_LIBRARY}"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal"
     RENAME "libcedar_engine.a")

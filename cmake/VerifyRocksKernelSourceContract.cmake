@@ -36,6 +36,7 @@ endforeach()
 set(expected_rocksdb_include_sources
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/commit_publisher.cc"
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/decided_epoch.cc"
+    "${CEDAR_SOURCE_DIR}/src/storage/rocks/meta_v2_reclaim.cc"
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocks_adapter.cc"
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/rocksdb_config.cc"
     "${CEDAR_SOURCE_DIR}/src/storage/rocks/storage_file_inspection.cc")

@@ -366,6 +366,12 @@ target_link_libraries(test_fact_store_metadata
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_fact_store_metadata)
 
+add_executable(test_meta_v2_reclaim storage/test_meta_v2_reclaim.cc)
+target_include_directories(test_meta_v2_reclaim PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_meta_v2_reclaim
+    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_meta_v2_reclaim)
+
 add_executable(test_kernel_interface public/test_kernel_interface.cc)
 target_link_libraries(test_kernel_interface
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})

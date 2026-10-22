@@ -519,6 +519,105 @@ TEST_F(KernelLifecycleTest, ReopenScansFlushedFactsAndRebuildsAdjacency) {
   EXPECT_EQ(*identities.front().edge_identity, identity);
 }
 
+// F12: the P3 adjacency rebuild is observable instead of silent. A healthy open
+// reports the scanned identity records and elapsed time, and strict mode does
+// not change a successful open.
+TEST_F(KernelLifecycleTest, AdjacencyRebuildObserverReportsHealthyOpen) {
+  const EdgeIdentity identity{EdgeId{17}, VertexId{7}, VertexId{11}, 3};
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  auto seeded = Begin();
+  ASSERT_TRUE(seeded);
+  ASSERT_TRUE(seeded
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}),
+                           ValidTime{10})
+                  .ok());
+  ASSERT_TRUE(seeded->Assert(identity, ValidTime{10}).ok());
+  ASSERT_TRUE(seeded->Commit().ok());
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  std::vector<AdjacencyRebuildObservation> observations;
+  DatabaseOptions options;
+  options.strict_adjacency_rebuild = true;
+  options.adjacency_rebuild_observer_for_testing =
+      [&observations](const AdjacencyRebuildObservation& observation) {
+        observations.push_back(observation);
+      };
+  database_ = Open(options);
+  ASSERT_TRUE(database_);
+  ASSERT_EQ(observations.size(), 1U);
+  EXPECT_STREQ(observations.front().phase, "adjacency_rebuild");
+  EXPECT_EQ(observations.front().records, 1U);
+  EXPECT_FALSE(observations.front().failed);
+
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  ASSERT_NE(snapshot.ValueOrDie().adjacency_index(), nullptr);
+  const auto postings = snapshot.ValueOrDie().adjacency_index()->Seek(
+      {VertexRef{PartId{0}, VertexId{7}}}, ExpandDirection::kOut, std::nullopt,
+      snapshot.ValueOrDie().commit_seq());
+  ASSERT_TRUE(postings.ok()) << postings.status().ToString();
+  ASSERT_EQ(postings.ValueOrDie().size(), 1U);
+  EXPECT_EQ(postings.ValueOrDie().front(), identity);
+}
+
+// F12: a tolerated rebuild failure is reported (records/failed) and leaves the
+// default open successful with an empty adjacency index, preserving the
+// historical non-strict behavior while removing the silence.
+TEST_F(KernelLifecycleTest, AdjacencyRebuildFailureIsObservedNotFatalByDefault) {
+  std::vector<AdjacencyRebuildObservation> observations;
+  DatabaseOptions options;
+  options.adjacency_rebuild_fault_injector_for_testing = [] {
+    return Status::Corruption("adjacency rebuild",
+                              "injected edge-identity scan failure");
+  };
+  options.adjacency_rebuild_observer_for_testing =
+      [&observations](const AdjacencyRebuildObservation& observation) {
+        observations.push_back(observation);
+      };
+  database_ = Open(options);
+  ASSERT_TRUE(database_);
+  ASSERT_EQ(observations.size(), 1U);
+  EXPECT_STREQ(observations.front().phase, "adjacency_rebuild");
+  EXPECT_TRUE(observations.front().failed);
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  EXPECT_EQ(snapshot.ValueOrDie().adjacency_index(), nullptr);
+}
+
+// F12: strict_adjacency_rebuild propagates the ScanFamily/build failure to
+// Database::Open and closes the store so the path can be opened again.
+TEST_F(KernelLifecycleTest, StrictAdjacencyRebuildFailsOpenAndCleansUp) {
+  std::vector<AdjacencyRebuildObservation> observations;
+  DatabaseOptions failing;
+  failing.path = path_;
+  failing.strict_adjacency_rebuild = true;
+  failing.adjacency_rebuild_fault_injector_for_testing = [] {
+    return Status::Corruption("adjacency rebuild",
+                              "injected edge-identity scan failure");
+  };
+  failing.adjacency_rebuild_observer_for_testing =
+      [&observations](const AdjacencyRebuildObservation& observation) {
+        observations.push_back(observation);
+      };
+  const auto opened = Database::Open(std::move(failing));
+  ASSERT_FALSE(opened.ok());
+  EXPECT_TRUE(opened.status().IsCorruption()) << opened.status().ToString();
+  EXPECT_NE(opened.status().ToString().find("injected edge-identity scan failure"),
+            std::string::npos);
+  ASSERT_EQ(observations.size(), 1U);
+  EXPECT_TRUE(observations.front().failed);
+
+  // The failed open released the RocksDB lock; a healthy open works again.
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  EXPECT_NE(snapshot.ValueOrDie().adjacency_index(), nullptr)
+      << "the re-opened database rebuilt the adjacency index";
+}
+
 // Task 10b: DatabaseOptions must forward the opt-in meta sequence format to the
 // store. The durable marker and the first committed record are observed through
 // a raw Cedar-CF reader; the reopened Database then proves the default v1

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -1842,22 +1843,57 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
   // Build the Cedar-owned adjacency cache from the authoritative fact lane at
-  // open. QueryDelta supplies the newer commit tail at query time.
+  // open. QueryDelta supplies the newer commit tail at query time. A failed
+  // rebuild is never silent: it is logged, reported through the test observer,
+  // and made fatal only when strict_adjacency_rebuild opts in.
   {
+    const auto rebuild_started = std::chrono::steady_clock::now();
+    AdjacencyRebuildObservation observation;
+    std::vector<FactEvent> events;
     auto adjacency_snapshot = impl->store.BeginSnapshot();
-    if (adjacency_snapshot.ok()) {
-      std::vector<FactEvent> events;
-      const Status scanned = impl->store.ScanFamily(
+    Status rebuild =
+        adjacency_snapshot.ok() ? Status::OK() : adjacency_snapshot.status();
+    if (rebuild.ok() &&
+        impl->adjacency_rebuild_fault_injector_for_testing) {
+      rebuild = impl->adjacency_rebuild_fault_injector_for_testing();
+    }
+    if (rebuild.ok()) {
+      rebuild = impl->store.ScanFamily(
           adjacency_snapshot.ValueOrDie(), FactFamily::kEdgeIdentity,
           [&events](const FactEvent& event) {
             events.push_back(event);
             return Status::OK();
           });
-      if (scanned.ok()) {
-        impl->adjacency_index = std::make_shared<internal::AdjacencyIndex>();
-        impl->adjacency_index
-            ->Build(events, adjacency_snapshot.ValueOrDie().commit_seq(), 0)
-            .IgnoreError();
+    }
+    if (rebuild.ok()) {
+      impl->adjacency_index = std::make_shared<internal::AdjacencyIndex>();
+      rebuild = impl->adjacency_index->Build(
+          events, adjacency_snapshot.ValueOrDie().commit_seq(), 0);
+      if (!rebuild.ok()) impl->adjacency_index.reset();
+    }
+    observation.records = events.size();
+    observation.duration_us =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() -
+                                  rebuild_started)
+                                  .count());
+    observation.failed = !rebuild.ok();
+    if (impl->adjacency_rebuild_observer_for_testing) {
+      impl->adjacency_rebuild_observer_for_testing(observation);
+    }
+    if (observation.failed) {
+      // The kernel owns no logger, so surface the tolerated failure on stderr
+      // instead of dropping it. The observer above is the structured count.
+      std::fprintf(stderr,
+                   "cedar: adjacency rebuild failed; phase=%s records=%llu "
+                   "duration_us=%llu status=%s\n",
+                   observation.phase,
+                   static_cast<unsigned long long>(observation.records),
+                   static_cast<unsigned long long>(observation.duration_us),
+                   rebuild.ToString().c_str());
+      if (impl->strict_adjacency_rebuild) {
+        impl->store.Close().IgnoreError();
+        return rebuild;
       }
     }
   }

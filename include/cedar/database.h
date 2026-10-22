@@ -208,6 +208,19 @@ enum class NPlusOneDiscardReason : uint8_t {
 constexpr size_t kNPlusOneDiscardReasonCount =
     static_cast<size_t>(NPlusOneDiscardReason::kCount);
 
+// Kernel-side report of the P3 adjacency rebuild performed by Database::Open.
+// `phase` is "adjacency_rebuild"; `records` is the number of edge-identity
+// records the scan visited; `duration_us` covers the scan and index build; and
+// `failed` is true when the snapshot, scan, or index build failed. A failed
+// rebuild leaves the adjacency index empty and, by default, only logs and
+// reports the failure; strict_adjacency_rebuild turns it into an open error.
+struct AdjacencyRebuildObservation {
+  const char* phase = "adjacency_rebuild";
+  uint64_t records = 0;
+  uint64_t duration_us = 0;
+  bool failed = false;
+};
+
 struct DatabaseOptions {
   std::string path;
   uint64_t write_buffer_bytes = 64ULL * 1024ULL * 1024ULL;
@@ -357,6 +370,21 @@ struct DatabaseOptions {
   // silently shortening a range. See docs/README.md ("Sequence-record
   // retention") for the compatibility and crash-safety contract.
   bool prune_sequence_records_on_vacuum = false;
+  // Test-only observer fired once per Database::Open after the P3 adjacency
+  // rebuild attempt from the durable edge-identity lane. It runs on the opening
+  // thread and must not call back into the database. Production callers leave
+  // it unset; the default open still logs and tolerates a failed rebuild.
+  std::function<void(const AdjacencyRebuildObservation&)>
+      adjacency_rebuild_observer_for_testing;
+  // Test-only deterministic fault hook for the adjacency rebuild. A non-OK
+  // result simulates a failed edge-identity scan: the observer then reports
+  // failed=true and strict_adjacency_rebuild decides whether Open fails.
+  std::function<Status()> adjacency_rebuild_fault_injector_for_testing;
+  // When true, a failed adjacency rebuild fails Database::Open. The default
+  // (false) preserves the historical tolerant open: the cache stays empty and
+  // the failure is logged and reported through the observer instead of being
+  // silently ignored.
+  bool strict_adjacency_rebuild = false;
 };
 
 struct CommitPipelineMetrics {

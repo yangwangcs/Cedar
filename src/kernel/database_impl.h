@@ -222,6 +222,11 @@ class Database::Impl {
             std::move(options.query_delta_repair_budget_observer_for_testing)),
         query_crash_fault_injector_for_testing(
             std::move(options.query_crash_fault_injector_for_testing)),
+        adjacency_rebuild_observer_for_testing(
+            std::move(options.adjacency_rebuild_observer_for_testing)),
+        adjacency_rebuild_fault_injector_for_testing(
+            std::move(options.adjacency_rebuild_fault_injector_for_testing)),
+        strict_adjacency_rebuild(options.strict_adjacency_rebuild),
         stop_pipeline_before_drain_for_testing(
             options.stop_pipeline_before_drain_for_testing),
         foreground_admission_concurrency(
@@ -447,6 +452,11 @@ class Database::Impl {
   std::function<void(uint64_t)>
       query_delta_repair_budget_observer_for_testing;
   std::function<Status(const char*)> query_crash_fault_injector_for_testing;
+  // P3 adjacency rebuild observation and failure policy (F12).
+  std::function<void(const AdjacencyRebuildObservation&)>
+      adjacency_rebuild_observer_for_testing;
+  std::function<Status()> adjacency_rebuild_fault_injector_for_testing;
+  bool strict_adjacency_rebuild = false;
   bool stop_pipeline_before_drain_for_testing = false;
   bool enforce_disk_pressure = false;
   std::mutex append_commit_mutex;

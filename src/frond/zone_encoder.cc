@@ -40,8 +40,13 @@ void VarintCodec::Encode(uint64_t value, std::string& dst) {
 }
 
 size_t VarintCodec::EncodeSigned(int64_t value, char* buf) {
-  // ZigZag 编码：将符号位移到最低位
-  uint64_t encoded = (value << 1) ^ (value >> 63);
+  // ZigZag 编码：将符号位移到最低位。
+  // 先转无符号再左移：对负值直接左移在 C++17 是未定义行为
+  // （UBSan: left shift of negative value）。下面的写法在二进制补码平台上
+  // 与旧实现的字节输出完全一致（负值等价于 2|v|-1 的 ZigZag 位模式），
+  // 且只用无符号移位，不再依赖有符号右移的实现定义行为。
+  const uint64_t sign_mask = value < 0 ? ~static_cast<uint64_t>(0) : 0;
+  uint64_t encoded = (static_cast<uint64_t>(value) << 1) ^ sign_mask;
   return Encode(encoded, buf);
 }
 

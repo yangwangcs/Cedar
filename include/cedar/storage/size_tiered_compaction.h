@@ -26,8 +26,10 @@
 #define FERN_SIZE_TIERED_COMPACTION_H_
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -146,11 +148,22 @@ struct LevelState {
   // 计算文件数
   size_t file_count() const { return files.size(); }
 
-  // 计算该层容量阈值
+  // 计算该层容量阈值。
+  // 先做范围检查再转换：size_ratio 极大时 raw 会超出 uint64_t 可表示范围，
+  // 直接 static_cast 是未定义行为（UBSan: outside the range of representable
+  // values）。饱和到 UINT64_MAX 表示"该层永不按容量触发"；默认 size_ratio=4.0
+  // 的各层阈值都是 2 的幂（double 精确表示），与旧实现逐位相同。
   uint64_t capacity_threshold(const SizeTieredConfig& config) const {
     if (level == 0) return config.l0_max_size;
-    double multiplier = std::pow(config.size_ratio, level);
-    return static_cast<uint64_t>(config.l0_max_size * multiplier);
+    const double raw = static_cast<double>(config.l0_max_size) *
+                       std::pow(config.size_ratio, level);
+    // 2^64：uint64_t 可表示区间的开上界
+    constexpr double kUint64ExclusiveUpper = 18446744073709551616.0;
+    if (!(raw < kUint64ExclusiveUpper)) {
+      return raw > 0.0 ? std::numeric_limits<uint64_t>::max() : 0;
+    }
+    if (!(raw > 0.0)) return 0;  // 非正或 NaN
+    return static_cast<uint64_t>(raw);
   }
 
   // 是否需要合并

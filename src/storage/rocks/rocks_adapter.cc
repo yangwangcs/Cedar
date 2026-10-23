@@ -534,7 +534,7 @@ class FactStoreImpl {
   // Effective meta sequence writer format resolved by Open from the durable
   // format marker and FactStoreOptions::meta_sequence_format. Fixed for the
   // lifetime of this open store; every commit consults it.
-  uint32_t meta_sequence_format = kMetaSequenceFormatV1;
+  uint32_t meta_sequence_format = kMetaSequenceFormatDefault;
   // Reports one completed reopen validation pass; see FactStoreOptions.
   std::function<void(const ReopenValidationPhaseCounters&)>
       reopen_validation_counters_for_testing;

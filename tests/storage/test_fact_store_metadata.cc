@@ -153,7 +153,9 @@ std::string ReadFactKeyFromSequenceRecord(const std::string& path,
     ADD_FAILURE() << got.ToString();
     return {};
   }
-  const auto record = DecodeSequenceRecord(encoded);
+  // Dual-read: F19 makes v2 the default writer format, so this key reader must
+  // pass the commit sequence instead of using the v1-only decoder.
+  const auto record = DecodeSequenceRecord(encoded, commit_seq);
   if (!record.ok() || record.ValueOrDie().fact_keys.empty()) {
     ADD_FAILURE() << "sequence record has no fact keys";
     return {};
@@ -1783,9 +1785,19 @@ TEST(FactStoreMetaCodecSequenceV2Test, V2RecordDropsNineBytesPerFact) {
 // v2a in the raw meta CF. Reopen validation (default policy), ReadSequence and
 // ReadSequenceRange must read both kinds.
 TEST_F(FactStoreMetadataTest, ReopenAndReadSequenceAcceptMixedV1AndV2Records) {
-  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
-  ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+  const std::string path = path_ + "/mixed_v1_v2";
+  // The fixture's default store is unused here; close it before replacing it.
   ASSERT_TRUE(store_->Close().ok());
+  {
+    // Start from v1 history; F19's default writer is v2.
+    FactStoreOptions options{path};
+    options.meta_sequence_format = kMetaSequenceFormatV1;
+    store_ = std::make_unique<FactStore>(options);
+    ASSERT_TRUE(store_->Open().ok());
+    ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+    ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
+    ASSERT_TRUE(store_->Close().ok());
+  }
 
   const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{2});
   ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
@@ -1793,7 +1805,7 @@ TEST_F(FactStoreMetadataTest, ReopenAndReadSequenceAcceptMixedV1AndV2Records) {
   std::string encoded_v2;
   {
     RawFactDatabase raw;
-    ASSERT_TRUE(OpenRawFactDatabase(path_, &raw));
+    ASSERT_TRUE(OpenRawFactDatabase(path, &raw));
     std::string encoded_v1;
     const rocksdb::Status got = raw.database->Get(
         rocksdb::ReadOptions(), raw.handles[2], sequence_key.ValueOrDie(),
@@ -1822,7 +1834,7 @@ TEST_F(FactStoreMetadataTest, ReopenAndReadSequenceAcceptMixedV1AndV2Records) {
   }
 
   // Default reopen policy validates both kinds and succeeds.
-  store_ = std::make_unique<FactStore>(FactStoreOptions{path_});
+  store_ = std::make_unique<FactStore>(FactStoreOptions{path});
   ASSERT_TRUE(store_->Open().ok());
 
   const auto snapshot = store_->BeginSnapshot();
@@ -1991,21 +2003,56 @@ TEST_F(FactStoreMetadataTest,
 }
 
 TEST_F(FactStoreMetadataTest,
-       DefaultV1WriterWritesNoMarkerAndKeepsV1RecordBytes) {
+       DefaultV2WriterWritesDurableMarkerAndV2Records) {
   ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
   ASSERT_TRUE(store_->Close().ok());
 
-  // No opt-in: no marker record, exactly today's v1 meta layout.
-  EXPECT_FALSE(
-      ReadMetaRecordIfPresent(path_, EncodeSequenceFormatKey()).has_value());
+  // F19: the default open upgrades/writes the durable marker before accepting
+  // commits, so a fresh database with default options is a v2 database.
+  const std::string marker = ReadMetaRecord(path_, EncodeSequenceFormatKey());
+  ASSERT_FALSE(marker.empty());
+  EXPECT_EQ(RawMetaRecordKind(marker), kRawSequenceFormatMarkerKind);
+  const auto decoded_marker = DecodeSequenceFormat(marker);
+  ASSERT_TRUE(decoded_marker.ok()) << decoded_marker.status().ToString();
+  EXPECT_EQ(decoded_marker.ValueOrDie(), kMetaSequenceFormatV2);
 
   const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
   ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
   const std::string record = ReadMetaRecord(path_, sequence_key.ValueOrDie());
   ASSERT_FALSE(record.empty());
+  EXPECT_EQ(RawMetaRecordKind(record), kRawSequenceRecordKindV2);
+  // v2 record: 6-byte header + 22-byte fixed payload + one 23-byte descriptor
+  // + 4-byte CRC.
+  EXPECT_EQ(record.size(), kRawMetaRecordHeaderBytes +
+                               kSequenceV2FixedPayloadBytes +
+                               kSequenceV2DescriptorBytes +
+                               kRawMetaRecordChecksumBytes);
+  const auto decoded = DecodeSequenceRecord(record, CommitSeq{1});
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  EXPECT_EQ(decoded.ValueOrDie().fact_keys.size(), 1U);
+}
+
+TEST_F(FactStoreMetadataTest,
+       ExplicitV1OptOutWritesNoMarkerAndKeepsV1RecordBytes) {
+  const std::string path = path_ + "/explicit_v1";
+  {
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  // Explicit opt-out: no marker record and the pre-v2 encoding stays
+  // byte-identical.
+  EXPECT_FALSE(
+      ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
+
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  const std::string record = ReadMetaRecord(path, sequence_key.ValueOrDie());
+  ASSERT_FALSE(record.empty());
   EXPECT_EQ(RawMetaRecordKind(record), kRawSequenceRecordKindV1);
 
-  // Byte-identity: the default path still emits the pre-v2 encoder output,
   // 6-byte header + 28-byte fixed payload + one 32-byte key + 4-byte CRC.
   const std::string fact_key =
       EncodeFactKey(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
@@ -2076,9 +2123,9 @@ TEST_F(FactStoreMetadataTest,
 TEST_F(FactStoreMetadataTest,
        MixedV1HistoryThenV2EnableWritesReadsAndKernelRecovers) {
   const std::string path = path_ + "/mixed_v1_v2";
-  // v1 history.
+  // v1 history: explicit opt-out because F19 defaults the writer to v2.
   {
-    FactStore store(FactStoreOptions{path});
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
     ASSERT_TRUE(store.Open().ok());
     ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
     ASSERT_TRUE(store.Close().ok());
@@ -2104,8 +2151,8 @@ TEST_F(FactStoreMetadataTest,
   EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq2_key.ValueOrDie())),
             kRawSequenceRecordKindV2);
 
-  // Default-policy reopen (option stays 1): validation and reads cover both
-  // kinds, and the marker keeps the effective writer at v2.
+  // Default-policy reopen: validation and reads cover both kinds, and the
+  // durable marker keeps the effective writer at v2.
   {
     FactStore store(FactStoreOptions{path});
     ASSERT_TRUE(store.Open().ok());
@@ -2177,10 +2224,70 @@ TEST_F(FactStoreMetadataTest,
   }
 }
 
+// F19: opening an existing v1 database with default options upgrades it in
+// place. The marker is written before the next commit, old v1 records remain
+// readable and untouched, and only new commits use v2.
+TEST_F(FactStoreMetadataTest, DefaultOpenUpgradesExistingV1DatabaseInPlace) {
+  const std::string path = path_ + "/upgrade_on_default_open";
+  {
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
+    ASSERT_TRUE(store.Open().ok());
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+  EXPECT_FALSE(ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey())
+                   .has_value())
+      << "the explicit v1 opt-out must not write a marker";
+
+  {
+    // Default open: the marker is upgraded to 2 before this new commit.
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
+    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 20)).ok());
+    ASSERT_TRUE(store.Close().ok());
+  }
+
+  const auto marker =
+      DecodeSequenceFormat(ReadMetaRecord(path, EncodeSequenceFormatKey()));
+  ASSERT_TRUE(marker.ok()) << marker.status().ToString();
+  EXPECT_EQ(marker.ValueOrDie(), kMetaSequenceFormatV2);
+  const auto seq1_key = EncodeSequenceMetaKey(CommitSeq{1});
+  const auto seq2_key = EncodeSequenceMetaKey(CommitSeq{2});
+  ASSERT_TRUE(seq1_key.ok());
+  ASSERT_TRUE(seq2_key.ok());
+  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq1_key.ValueOrDie())),
+            kRawSequenceRecordKindV1)
+      << "the existing v1 record must stay untouched";
+  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq2_key.ValueOrDie())),
+            kRawSequenceRecordKindV2)
+      << "commits after the default open must use v2";
+
+  // Full default reopen validates and reads the mixed history.
+  {
+    FactStore store(FactStoreOptions{path});
+    ASSERT_TRUE(store.Open().ok());
+    {
+      const auto snapshot = store.BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+      const auto seq1 =
+          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
+      const auto seq2 =
+          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{2});
+      ASSERT_TRUE(seq1.ok()) << seq1.status().ToString();
+      ASSERT_TRUE(seq2.ok()) << seq2.status().ToString();
+      EXPECT_EQ(seq1.ValueOrDie().fact_keys.size(), 1U);
+      EXPECT_EQ(seq2.ValueOrDie().fact_keys.size(), 1U);
+    }
+    ASSERT_TRUE(store.Close().ok());
+  }
+}
+
 TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
   const auto create_v1_database = [this](const std::string& name) {
     const std::string path = path_ + "/" + name;
-    FactStore store(FactStoreOptions{path});
+    // Explicit v1: F19's default open would upgrade this fixture to v2.
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
     EXPECT_TRUE(store.Open().ok());
     EXPECT_TRUE(store.Close().ok());
     return path;
@@ -2244,13 +2351,15 @@ TEST_F(FactStoreMetadataTest,
   }
   EXPECT_FALSE(
       ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
-  // No v2 record was written, so the database still opens with the default v1
-  // writer and is unchanged from today's behavior.
+  // No v2 record was written. The database remains a usable v1 database when
+  // the caller explicitly opts out of F19's default v2 writer.
   {
-    FactStore store(FactStoreOptions{path});
+    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
     ASSERT_TRUE(store.Open().ok());
     EXPECT_EQ(store.visible_seq(), CommitSeq{0});
     ASSERT_TRUE(store.Close().ok());
+    EXPECT_FALSE(
+        ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
   }
 }
 

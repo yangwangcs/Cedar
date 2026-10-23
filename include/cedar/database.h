@@ -14,6 +14,7 @@
 
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
+#include "cedar/fact/meta_codec.h"
 #include "cedar/query/result.h"
 #include "cedar/schema.h"
 #include "cedar/snapshot.h"
@@ -286,15 +287,17 @@ struct DatabaseOptions {
   StorageProfile storage_profile = StorageProfile::kDeveloper;
   ProductionStorageOptions production;
   uint64_t validation_cache_bytes = 8ULL * 1024ULL * 1024ULL;
-  // Opt-in durable writer format for committed meta sequence records (F10).
-  // 1 (default, unchanged) keeps every new `kSequence` record byte-identical to
-  // previous releases; 2 writes compact `kSequenceV2` records and durably
-  // records format 2 in the meta format marker during open, before any commit
-  // is accepted. The marker wins on reopen: a database upgraded to 2 keeps
-  // writing v2 even when a later open leaves this at the default. Format 2 is a
-  // one-way compatibility gate for older binaries; see docs/README.md.
-  // Database::Open rejects values other than 1 or 2.
-  uint32_t meta_sequence_format = 1;
+  // Durable writer format for committed meta sequence records. Since F19 the
+  // default is 2: open durably records the format marker (Sync=true) before
+  // accepting commits and writes compact `kSequenceV2` records. An existing v1
+  // database opened with the default is upgraded in place; its old v1 records
+  // stay readable. Set 1 to opt out and keep new databases byte-identical v1
+  // (no marker), but the marker wins on reopen: once a database records 2, a
+  // later open asking for 1 still writes v2. Format 2 is a one-way
+  // compatibility gate for older binaries; back up before upgrading. A v1-only
+  // compatibility build (F17) defaults to 1. Database::Open rejects values
+  // other than 1 or 2. See docs/README.md and docs/release-notes.md.
+  uint32_t meta_sequence_format = kMetaSequenceFormatDefault;
   std::function<void()> validation_scan_observer_for_testing;
   std::function<void()> runtime_sample_observer_for_testing;
   std::function<void(const RuntimeSamplingTiming&)>

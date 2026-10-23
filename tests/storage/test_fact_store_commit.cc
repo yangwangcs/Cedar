@@ -968,7 +968,8 @@ TEST_F(FactStoreCommitTest, NearTwoMiBCapV2BatchIsNotPreRejected) {
 // F13: the effective record format follows the durable marker (which wins) and
 // the configured option, and is stable for the open store.
 TEST_F(FactStoreCommitTest, EffectiveSequenceRecordFormatTracksMarkerAndOption) {
-  EXPECT_EQ(store_->EffectiveSequenceRecordFormat(), kMetaSequenceFormatV1);
+  // F19: the default writer format is v2.
+  EXPECT_EQ(store_->EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
 
   const std::string path = path_ + "/format_marker";
   {
@@ -988,6 +989,15 @@ TEST_F(FactStoreCommitTest, EffectiveSequenceRecordFormatTracksMarkerAndOption) 
     FactStore store(options);
     ASSERT_TRUE(store.Open().ok());
     EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
+  }
+  {
+    // The explicit v1 opt-out on a fresh database keeps the v1 writer.
+    FactStoreOptions options;
+    options.path = path_ + "/format_marker_v1";
+    options.meta_sequence_format = kMetaSequenceFormatV1;
+    FactStore store(options);
+    ASSERT_TRUE(store.Open().ok());
+    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV1);
   }
 }
 

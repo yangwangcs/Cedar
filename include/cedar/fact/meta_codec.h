@@ -25,6 +25,16 @@ enum class IdKind : uint8_t { kVertex = 1, kEdge = 2, kTransaction = 3 };
 // other marker value is rejected at open as Corruption.
 inline constexpr uint32_t kMetaSequenceFormatV1 = 1;
 inline constexpr uint32_t kMetaSequenceFormatV2 = 2;
+// Default writer format (F19). Normal builds write v2 and durably record the
+// marker on the first open, which is a one-way upgrade for older binaries; a
+// caller opts out with meta_sequence_format = kMetaSequenceFormatV1 before the
+// database is upgraded. The v1-only compatibility build (F17) simulates a
+// pre-v2 binary and therefore keeps the historical v1 default.
+#if defined(CEDAR_META_SEQUENCE_V1_ONLY)
+inline constexpr uint32_t kMetaSequenceFormatDefault = kMetaSequenceFormatV1;
+#else
+inline constexpr uint32_t kMetaSequenceFormatDefault = kMetaSequenceFormatV2;
+#endif
 
 struct IdAllocatorState {
   IdKind kind = IdKind::kVertex;

@@ -156,11 +156,19 @@ StoreCommitBatch VertexStateBatch(TxnId txn_id, VertexId vertex_id,
       false};
 }
 
+FactStoreOptions V1Options(const std::string& path) {
+  FactStoreOptions options;
+  options.path = path;
+  // F19 made v2 the default; this fixture is an explicit pre-v2 database.
+  options.meta_sequence_format = kMetaSequenceFormatV1;
+  return options;
+}
+
 std::vector<SequenceRecord> CreateV1History(const std::string& path,
                                             size_t count) {
   std::vector<SequenceRecord> records;
   records.reserve(count);
-  FactStore store(FactStoreOptions{path});
+  FactStore store(V1Options(path));
   EXPECT_TRUE(store.Open().ok());
   for (size_t sequence = 1; sequence <= count; ++sequence) {
     const auto committed = store.Commit(VertexStateBatch(
@@ -234,7 +242,14 @@ TEST_F(MetaCompatTest, V1DatabaseOpensAndAcceptsV1CommitsInV1OnlyMode) {
   CreateV1History(path, 3);
 
   ScopedV1OnlyMode v1_only(true);
+#if defined(CEDAR_META_SEQUENCE_V1_ONLY)
+  // The compatibility build simulates a pre-v2 binary, so its default options
+  // must be the v1 writer. A normal build enables the same gate at runtime and
+  // therefore has to opt out explicitly to keep the fixture a v1 database.
   FactStore store(FactStoreOptions{path});
+#else
+  FactStore store(V1Options(path));
+#endif
   ASSERT_TRUE(store.Open().ok()) << "a v1 database must stay readable";
   {
     const auto snapshot = store.BeginSnapshot();
@@ -250,7 +265,7 @@ TEST_F(MetaCompatTest, V1DatabaseOpensAndAcceptsV1CommitsInV1OnlyMode) {
   ASSERT_TRUE(store.Close().ok());
 
   // The new v1 record stays readable in the same one-way mode.
-  FactStore reopened(FactStoreOptions{path});
+  FactStore reopened(V1Options(path));
   ASSERT_TRUE(reopened.Open().ok());
   {
     const auto snapshot = reopened.BeginSnapshot();
@@ -269,7 +284,7 @@ TEST_F(MetaCompatTest, V1OnlyDecoderRejectsFormat2MarkerWithActionableCorruption
   WriteFormatMarker(path, kMetaSequenceFormatV2);
 
   ScopedV1OnlyMode v1_only(true);
-  FactStore store(FactStoreOptions{path});
+  FactStore store(V1Options(path));
   const Status opened = store.Open();
   ASSERT_FALSE(opened.ok()) << "a v1-only decoder must refuse a format-2 database";
   EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
@@ -298,7 +313,7 @@ TEST_F(MetaCompatTest, V1OnlyDecoderRejectsStrayV2RecordWithoutMarker) {
 
   ScopedV1OnlyMode v1_only(true);
   {
-    FactStore store(FactStoreOptions{path});
+    FactStore store(V1Options(path));
     const Status opened = store.Open();
     ASSERT_FALSE(opened.ok())
         << "a v2 record must not be misread when the marker is missing";
@@ -339,8 +354,8 @@ TEST_F(MetaCompatTest, V1OnlyDecoderRefusesToEnableTheFormat2Writer) {
   EXPECT_FALSE(
       ReadRawRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
 
-  // The database remains a normal v1 database.
-  FactStore v1_store(FactStoreOptions{path});
+  // The database remains a normal v1 database for an explicit v1 opt-out.
+  FactStore v1_store(V1Options(path));
   ASSERT_TRUE(v1_store.Open().ok());
   ASSERT_TRUE(v1_store.Close().ok());
 }

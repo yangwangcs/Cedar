@@ -14,9 +14,9 @@ Cedar Kernel bitemporal graph database.
    recovery, sanitizer, projection, and space gates.
 4. Read the [development-host performance report](query-performance.md) for
    measured write, read, and sustained mixed-workload results.
-5. Read the [follow-up release notes](release-notes.md) for the F11-F18 changes
-   and the F14 retention milestone, including the reopen-validation default
-   switch and its rollback option.
+5. Read the [follow-up release notes](release-notes.md) for the F11-F19 changes
+   and the F14 retention milestone, including the default v2 writer, the
+   reopen-validation default switch, and their rollback/opt-out options.
 
 ## Public Storage Model
 
@@ -31,45 +31,62 @@ Cedar combines:
 The public storage contract is described in the root README and is reflected
 in the acceptance and performance evidence linked above.
 
-## Opt-in Meta Sequence v2 (One-Way Format Gate)
+## Meta Sequence v2 (Default Writer Format, One-Way Gate)
 
 Cedar's meta column family stores one `sequence/<seq>` record per commit.
-The default **v1** record (`kind 7`) repeats every 32-byte fact key. **Meta
-sequence v2** (`kSequenceV2`, on-disk record kind **9**) is an opt-in writer
-format that stores a 23-byte descriptor per fact instead; the reader rebuilds
-the 32-byte fact key deterministically from the descriptor and the record key's
-commit sequence. The saving is `6 + 9 * fact_count` bytes per sequence record.
-Record framing, meta version, CRC32C, and all other record kinds are unchanged,
-so v1 and v2 records coexist in one database and every read path dual-reads
-both.
+The default writer format is now **v2** (`kSequenceV2`, on-disk record kind
+**9**): it stores a 23-byte descriptor per fact instead of repeating the
+32-byte fact key, and the reader rebuilds the fact key deterministically from
+the descriptor and the record key's commit sequence. The saving is
+`6 + 9 * fact_count` bytes per sequence record versus the v1 `kSequence`
+record (`kind 7`). Record framing, meta version, CRC32C, and all other record
+kinds are unchanged, so v1 and v2 records coexist in one database and every
+read path dual-reads both.
 
-### Durable marker and opt-in
+### Durable marker and default
 
 - The durable marker is the meta-CF key
   `format/sequence-record-format`: a normal framed meta record (`kind 10`)
   whose 4-byte big-endian payload is `1` (v1) or `2` (v2). Any other value is
   rejected at open as corruption.
-- An open that opts into format 2 writes the marker with `Sync=true` before it
-  accepts any commit, so a crash cannot leave a v2 record that a later v1 open
-  would not expect. The marker is authoritative: a database that recorded 2
-  keeps writing v2 even when a later open uses the default option.
+- Since F19 the default is 2. An open with default options writes the marker
+  with `Sync=true` before it accepts any commit, so a crash cannot leave a v2
+  record that a later v1 open would not expect.
+- **Existing v1 databases are upgraded in place** when opened with default
+  options: the marker is written as 2 (before the next commit), all new commits
+  use `kSequenceV2`, and existing v1 records remain readable. This is the
+  accepted one-way upgrade. Back up the database before opening it with a
+  v2-default build, and do not do so while any older binary may still need to
+  open the database.
+- The marker is authoritative: a database that recorded 2 keeps writing v2
+  even when a later open asks for 1. There is no downgrade path in this
+  milestone; `cedar-meta-v2-reclaim` rewrites v1 records forward, never back.
 - `DatabaseOptions::meta_sequence_format` selects the writer format for the
-  kernel (`1` is the default). `Database::Open` validates it and rejects any
-  value other than 1 or 2 with `InvalidArgument`. The storage-internal
+  kernel. `Database::Open` validates it and rejects any value other than 1 or 2
+  with `InvalidArgument`. The storage-internal
   `FactStoreOptions::meta_sequence_format` has the same meaning.
-- The default (1) writes no marker and keeps new v1 records byte-identical to
-  previous releases. Enabling 2 changes only newly committed records; existing
-  v1 records stay v1 until reclaimed.
+- **Explicit v1 opt-out:** set `meta_sequence_format = 1` to keep a database
+  (or a new database) on the v1 writer. That writes no marker and keeps new v1
+  records byte-identical to previous releases. It only works while the durable
+  marker is absent or 1; once a database records 2, asking for 1 is ignored.
+- The v1-only compatibility build (F17) defaults to 1, because it simulates a
+  pre-v2 binary.
 
 ```cpp
+// Default since F19: write (or upgrade to) meta sequence v2.
 cedar::DatabaseOptions options;
 options.path = "/path/to/db";
-options.meta_sequence_format = 2;  // kMetaSequenceFormatV2
 auto database = cedar::Database::Open(std::move(options));
+
+// Explicit v1 opt-out for a database that must stay v1-readable by old binaries.
+cedar::DatabaseOptions v1_options;
+v1_options.path = "/path/to/db";
+v1_options.meta_sequence_format = 1;  // kMetaSequenceFormatV1
+auto v1_database = cedar::Database::Open(std::move(v1_options));
 ```
 
-Rollout order matters: first deploy the dual-read release, then opt the
-database in. Do not enable format 2 while any older binary can open the
+A build that defaults to v2 must not open a database that any older v1-only
+binary still needs to read; the first default open makes that database a v2
 database.
 
 ### Reclaiming existing v1 records (offline)
@@ -81,9 +98,9 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
                       [--profile=NAME] [--wal-dir=PATH]
 ```
 
-- The database must already record marker 2. Opt it in and open it once
-  (format 2) before running the tool; it refuses a missing or v1 marker before
-  writing anything.
+- The database must already record marker 2. A default open (F19) writes it, so
+  upgraded databases are ready for reclamation; an explicit v1 database still
+  has no marker and the tool refuses it before writing anything.
 - The database must be offline: the caller must ensure no Cedar process has it
   open, and the tool fails if the engine is already locked.
 - Each batch of at most `--batch` records (default 1024) is one atomic write.
@@ -109,9 +126,10 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
 
 ### ONE-WAY GATE: old binaries reject v2 records
 
-> **WARNING: enabling meta sequence format 2 is a one-way upgrade.**
+> **WARNING: meta sequence format 2 is the default and is a one-way upgrade.**
 > Once the format marker is 2 and/or v2 records exist, binaries that predate
-> the dual-read release cannot open the database.
+> the dual-read release cannot open the database. A default open upgrades the
+> database immediately, so back up and complete the binary rollout first.
 
 - A real pre-v2 binary's v1-only sequence decoder sees record kind 9, fails the
   framing check (`kSequence` expected), and reports `Corruption`. Recovery
@@ -130,9 +148,9 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
   v1 requires rewriting every v2 record back to v1 with a dedicated offline
   tool that does not exist yet. Restoring a v1-era binary over a v2 database is
   unsupported and fails open rather than degrading silently. Back up before
-  opting in, and treat the opt-in as irreversible.
-- Databases that never opt in remain fully readable by old binaries; the
-  default writer format is unchanged.
+  the first default open, and treat the upgrade as irreversible.
+- A database opened with the explicit v1 opt-out (`meta_sequence_format = 1`)
+  and never upgraded remains fully readable by old binaries.
 
 ### Verifying the gate with a v1-only compatibility build
 
@@ -156,7 +174,8 @@ ctest --test-dir build-meta-v1-only -R '^MetaCompat' --output-on-failure
   payload, so wrong 32-byte fact keys cannot be rebuilt silently.
 - v1 databases still open, read their contiguous history, and accept new v1
   commits under the v1-only build; the gate is not a generic sequence-record
-  rejection.
+  rejection. That build defaults to `meta_sequence_format = 1`, mirroring a
+  pre-v2 release.
 - The v1-only build also refuses to opt a database into format 2
   (`InvalidArgument` before any engine write), so it cannot leave behind a
   marker it will be unable to read back.
@@ -201,8 +220,9 @@ which keeps every `sequence/*` record and the historical contiguous
   `BeginSnapshot`/`GetPointAtAt` already reject `as_of` below
   `oldest_readable`.
 - **Compatibility:** the extra meta key is invisible to binaries that predate
-  it, and a database that never opts in is byte-compatible and fully readable
-  by them. Once pruning removes sequence history, however, an old binary's
+  it, and a database kept on the explicit v1 opt-out is byte-compatible and
+  fully readable by them. (The default v2 writer is itself a one-way gate; see
+  above.) Once pruning removes sequence history, however, an old binary's
   strict `[1..visible]` reopen (or a new binary opened without ever reading the
   watermark) would report missing durable sequence records. Treat enabling
   retention as a one-way operational choice for the retention policy, just like

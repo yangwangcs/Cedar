@@ -185,6 +185,9 @@ FactStoreOptions LayoutOptions(const std::string& path,
   options.path = path;
   options.storage_profile = layout.storage_profile;
   options.production.wal_directory = layout.wal_directory;
+  // Reclamation fixtures start from v1 history; they opt into v2 explicitly
+  // (F19 made v2 the default writer format).
+  options.meta_sequence_format = kMetaSequenceFormatV1;
   if (layout.storage_profile == StorageProfile::kProductionAppend) {
     // Match the constrained production profile the fact-store tests use so the
     // test does not derive a budget from the host.

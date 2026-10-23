@@ -69,7 +69,7 @@ std::optional<std::string> ReadRawMetaRecord(const std::string& path,
       store_options, /*is_new_database=*/false, /*resolved=*/nullptr, &cache);
   options.create_if_missing = false;
   options.create_missing_column_families = false;
-  // The default v1 close may already have flushed Cedar Parquet facts SSTs, so
+  // The default close may already have flushed Cedar Parquet facts SSTs, so
   // install the same read resources FactStore::Open uses. The flush-suppression
   // flags keep this inspection from rewriting what the next Cedar open sees.
   options.atomic_flush = true;
@@ -677,10 +677,11 @@ TEST_F(KernelLifecycleTest, ForwardsMetaSequenceFormatV2ThroughDatabaseOptions) 
   ASSERT_TRUE(database_);
   auto transaction = Begin();
   ASSERT_TRUE(transaction);
-  ASSERT_TRUE(transaction
-                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
-                           ValidTime{1})
-                  .ok());
+  ASSERT_TRUE(
+      transaction
+          ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
+                   ValidTime{1})
+          .ok());
   ASSERT_TRUE(transaction->Commit().ok());
   ASSERT_TRUE(database_->Close().ok());
   database_.reset();
@@ -699,8 +700,8 @@ TEST_F(KernelLifecycleTest, ForwardsMetaSequenceFormatV2ThroughDatabaseOptions) 
   EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 9)  // kSequenceV2
       << "the first committed sequence record was not written in v2 format";
 
-  // The marker is authoritative: a plain Database::Open with the default v1
-  // option must dual-read the v2 record and expose the committed fact.
+  // The marker is authoritative: a plain Database::Open (default option, now v2
+  // as well) must dual-read the v2 record and expose the committed fact.
   database_ = Open();
   ASSERT_TRUE(database_);
   const auto snapshot = database_->BeginSnapshot();
@@ -711,10 +712,8 @@ TEST_F(KernelLifecycleTest, ForwardsMetaSequenceFormatV2ThroughDatabaseOptions) 
   EXPECT_TRUE(exists.ValueOrDie());
 }
 
-// Task 10b: Database::Open validates the format before constructing the store,
-// and the default remains byte-identical v1 (no marker, kind 7 records).
-TEST_F(KernelLifecycleTest,
-       RejectsUnsupportedMetaSequenceFormatAndKeepsV1Default) {
+// Task 10b: Database::Open validates the format before constructing the store.
+TEST_F(KernelLifecycleTest, RejectsUnsupportedMetaSequenceFormat) {
   DatabaseOptions invalid;
   invalid.path = path_;
   invalid.meta_sequence_format = 3;
@@ -725,28 +724,86 @@ TEST_F(KernelLifecycleTest,
   EXPECT_NE(rejected.status().ToString().find("meta sequence format"),
             std::string::npos)
       << rejected.status().ToString();
+}
 
+// F19: the default writer format is v2. A database opened with default options
+// writes the durable marker during Open and commits kSequenceV2 records.
+TEST_F(KernelLifecycleTest, DefaultMetaSequenceFormatWritesV2Records) {
   database_ = Open();
   ASSERT_TRUE(database_);
   auto transaction = Begin();
   ASSERT_TRUE(transaction);
-  ASSERT_TRUE(transaction
-                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
-                           ValidTime{1})
-                  .ok());
+  ASSERT_TRUE(
+      transaction
+          ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
+                   ValidTime{1})
+          .ok());
+  ASSERT_TRUE(transaction->Commit().ok());
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  const auto marker = ReadRawMetaRecord(path_, EncodeSequenceFormatKey());
+  ASSERT_TRUE(marker.has_value())
+      << "the default v2 writer must create the durable format marker";
+  const auto decoded_marker = DecodeSequenceFormat(*marker);
+  ASSERT_TRUE(decoded_marker.ok()) << decoded_marker.status().ToString();
+  EXPECT_EQ(decoded_marker.ValueOrDie(), kMetaSequenceFormatV2);
+
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  const auto record = ReadRawMetaRecord(path_, sequence_key.ValueOrDie());
+  ASSERT_TRUE(record.has_value());
+  ASSERT_GE(record->size(), 2U);
+  EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 9)  // kSequenceV2
+      << "the default writer must produce v2 sequence records";
+
+  // A default reopen keeps reading the upgraded database.
+  database_ = Open();
+  ASSERT_TRUE(database_);
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto exists = snapshot.ValueOrDie().Exists(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{1});
+  ASSERT_TRUE(exists.ok()) << exists.status().ToString();
+  EXPECT_TRUE(exists.ValueOrDie());
+}
+
+// F19: meta_sequence_format=1 is the explicit opt-out. A fresh database opened
+// with it writes no marker and keeps the byte-identical v1 record encoding.
+TEST_F(KernelLifecycleTest, ExplicitV1OptOutKeepsV1DatabaseByteCompatible) {
+  DatabaseOptions options;
+  options.meta_sequence_format = kMetaSequenceFormatV1;
+  database_ = Open(options);
+  ASSERT_TRUE(database_);
+  auto transaction = Begin();
+  ASSERT_TRUE(transaction);
+  ASSERT_TRUE(
+      transaction
+          ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
+                   ValidTime{1})
+          .ok());
   ASSERT_TRUE(transaction->Commit().ok());
   ASSERT_TRUE(database_->Close().ok());
   database_.reset();
 
   EXPECT_FALSE(ReadRawMetaRecord(path_, EncodeSequenceFormatKey()).has_value())
-      << "the default v1 writer must not create a format marker";
+      << "the explicit v1 opt-out must not create a format marker";
   const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
   ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
   const auto record = ReadRawMetaRecord(path_, sequence_key.ValueOrDie());
   ASSERT_TRUE(record.has_value());
   ASSERT_GE(record->size(), 2U);
   EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 7)  // kSequence (v1)
-      << "the default writer must keep producing v1 sequence records";
+      << "the explicit v1 opt-out must keep producing v1 sequence records";
+
+  database_ = Open(options);
+  ASSERT_TRUE(database_);
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto exists = snapshot.ValueOrDie().Exists(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{1});
+  ASSERT_TRUE(exists.ok()) << exists.status().ToString();
+  EXPECT_TRUE(exists.ValueOrDie());
 }
 
 // F18: DatabaseOptions defaults to the bounded recent fact window, and
@@ -781,7 +838,7 @@ TEST_F(KernelLifecycleTest, DefaultReopenValidationIsBoundedAndDeepRollsBack) {
   const auto sequence_record =
       ReadRawMetaRecord(path_, sequence_key.ValueOrDie());
   ASSERT_TRUE(sequence_record.has_value());
-  const auto decoded = DecodeSequenceRecord(*sequence_record);
+  const auto decoded = DecodeSequenceRecord(*sequence_record, CommitSeq{1});
   ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
   ASSERT_FALSE(decoded.ValueOrDie().fact_keys.empty());
   ASSERT_TRUE(

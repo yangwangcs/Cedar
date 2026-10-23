@@ -1,8 +1,37 @@
 # Cedar Follow-ups Release Notes
 
-Status: local release candidate (not pushed). This note covers the F11-F18
+Status: local release candidate (not pushed). This note covers the F11-F19
 follow-ups plus the F14 retention milestone that landed after the meta sequence
 v2 work.
+
+## Meta sequence v2 is now the default writer format (F19)
+
+`FactStoreOptions::meta_sequence_format` and
+`DatabaseOptions::meta_sequence_format` now default to **2**
+(`kMetaSequenceFormatV2`). The format itself is unchanged; only which format a
+fresh or still-v1 database writes by default changed.
+
+- **New databases:** the first default `Open` writes the durable
+  `format/sequence-record-format` marker with `Sync=true` before accepting any
+  commit, then writes compact `kSequenceV2` records.
+- **Existing v1 databases:** the same default `Open` upgrades them in place.
+  The marker becomes 2, all later commits are v2, and the old v1 records remain
+  readable through the dual-read paths. Reclamation
+  (`cedar-meta-v2-reclaim`) can convert that v1 history forward.
+- **Explicit v1 opt-out:** set `meta_sequence_format = 1` (storage or kernel
+  API) to keep a database on v1. That writes no marker and keeps v1 record
+  bytes identical to previous releases. It works only while the database has
+  no v2 marker; after an upgrade the marker is authoritative and asking for 1
+  is ignored.
+- **One-way warning:** a default open is an upgrade. Binaries that predate
+  dual-read support cannot open the database afterwards, and there is no
+  downgrade path in this milestone. Back up before the first default open and
+  finish the binary rollout first.
+- The v1-only compatibility build (`CEDAR_META_SEQUENCE_V1_ONLY`) defaults to
+  1 because it simulates a pre-v2 binary.
+
+See `docs/README.md` ("Meta Sequence v2 (Default Writer Format, One-Way
+Gate)") for the operator-facing contract.
 
 ## Reopen fact validation now defaults to a bounded recent window (F18)
 
@@ -111,7 +140,7 @@ while still opening and committing to v1 databases. It also refuses to opt a
 database into format 2. `test_meta_compat` and
 `tests/storage/run_meta_compat_v1_only_ci.sh` exercise the gate end-to-end in
 the normal and compatibility builds. The operational contract remains in
-`docs/README.md` ("Opt-in Meta Sequence v2 (One-Way Format Gate)").
+`docs/README.md` ("Meta Sequence v2 (Default Writer Format, One-Way Gate)").
 
 ### F15 - measurement-only follow-up
 
@@ -122,27 +151,37 @@ report rather than in these release notes.
 ## Compatibility summary
 
 - No persistent format, key-encoding, WAL, or digest change.
-- `meta_sequence_format` still defaults to v1; the v2 writer and its one-way
-  gate are unchanged.
+- `meta_sequence_format` now defaults to v2 (F19); the v2 record encoding and
+  its one-way gate are unchanged. Use `meta_sequence_format = 1` before an
+  upgrade to opt out.
 - Sequence-record retention is still opt-in and has the same one-way
   operational caveat as before.
-- The only default change is the F18 reopen validation policy; the documented
-  `deep_recovery_validation = true` option restores the previous behavior.
+- The default behavior changes are the F19 writer format and the F18 reopen
+  validation policy. `meta_sequence_format = 1` and
+  `deep_recovery_validation = true` restore the previous behavior where the
+  database has not already been upgraded.
 
 ## Verification
 
 Final gates on the merged tree (Debug container `cedar-final-debug`, ASan
 `cedar-final-asan`, UBSan `cedar-final-ubsan`):
 
-- Debug: full `ctest` **1115/1115 passed** (427 s), including
-  `FactStoreMetadata` 49/49, `KernelLifecycle` 15/15,
+- Debug: full `ctest` **1119/1119 passed** (566.8 s), including
+  `FactStoreMetadata` 51/51, `KernelLifecycle` 17/17,
   `RecoveryCrashMatrix` 9/9, `Vacuum` 16/16, `SequenceRetention` 11/11,
-  `MetaCompat`, and `CedarInstallConsumer`.
-- ASan (leak detection on): **100/100 passed** across those five
-  reopen/recovery/retention/vacuum suites, with no AddressSanitizer or
-  LeakSanitizer reports.
-- UBSan (`halt_on_error=1`): **100/100 passed** across the same five suites,
+  `FactStoreCommit` 32/32, `MetaCompat` 6/6, `MetaV2Reclaim` 7/7, and
+  `CedarInstallConsumer`.
+- ASan (leak detection on): **149/149 passed** across `FactStoreMetadata`,
+  `KernelLifecycle`, `RecoveryCrashMatrix`, `Vacuum`, `SequenceRetention`,
+  `FactStoreCommit`, `MetaCompat`, and `MetaV2Reclaim`, with no
+  AddressSanitizer or LeakSanitizer reports.
+- UBSan (`halt_on_error=1`): **149/149 passed** across the same eight suites,
   with no runtime errors.
+- v1-only compatibility build (`CEDAR_META_SEQUENCE_V1_ONLY=ON`):
+  `MetaCompat` **5/5 passed**, including a default-option open of a v1
+  database (the compatibility build defaults to the v1 writer).
+- Python contract tests (`python -m unittest discover -s benchmarks -p
+  "test_*.py"`): **101 tests, 94 passed + 7 skipped**, exit 0.
 - The final acceptance gate (t10) re-runs Debug, ASan, UBSan, and the Python
   contracts on the merged tree; its report is the authoritative evidence for
   this release.

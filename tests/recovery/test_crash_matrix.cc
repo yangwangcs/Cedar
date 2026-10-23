@@ -732,8 +732,8 @@ TEST_F(RecoveryCrashMatrixTest, ReopenResumesVacuumWithoutAnIndependentFactsStor
 // F10 Task 10: the opt-in v2 writer (marker + kSequenceV2 records) must survive
 // the same post-fsync crash boundary as the v1 writer. The child writes the
 // durable marker during FactStore::Open, commits one transaction, and dies
-// inside the post-write injector; the parent reopens with the default v1 option
-// and must recover, validate, and keep writing v2 from the marker.
+// inside the post-write injector; the parent reopens with default options and
+// must recover, validate, and keep writing v2 from the marker.
 TEST_F(RecoveryCrashMatrixTest,
        V2WriterRecoversPostFsyncCrashAndKeepsMarkerAuthoritative) {
 #if CEDAR_THREAD_SANITIZER_ENABLED
@@ -767,8 +767,8 @@ TEST_F(RecoveryCrashMatrixTest,
   ASSERT_TRUE(WIFEXITED(status));
   ASSERT_EQ(WEXITSTATUS(status), kCrashExitCode);
 
-  // The default v1 option still recovers and validates the v2 record: the
-  // marker written before the first v2 commit is authoritative.
+  // Default options recover and validate the v2 record: the marker written
+  // before the first v2 commit is authoritative.
   ExpectFactStoreRecovered(path, kReopenValidationPolicies[0], TxnId{1},
                            kVertexId, kValidTime, true);
   const auto marker = ReadRawMetaRecord(path, EncodeSequenceFormatKey());

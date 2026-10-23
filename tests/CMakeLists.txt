@@ -366,20 +366,11 @@ target_link_libraries(test_fact_store_metadata
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_fact_store_metadata)
 
-add_executable(test_meta_v2_reclaim storage/test_meta_v2_reclaim.cc)
-target_include_directories(test_meta_v2_reclaim PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(test_meta_v2_reclaim
+add_executable(test_legacy_meta_sequence storage/test_legacy_meta_sequence.cc)
+target_include_directories(test_legacy_meta_sequence PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_legacy_meta_sequence
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
-gtest_discover_tests(test_meta_v2_reclaim)
-
-# One-way gate end-to-end. In a CEDAR_META_SEQUENCE_V1_ONLY build this target
-# links the compatibility library and exercises the real compiled gate; in a
-# normal build it enables the same gate through the internal test hook.
-add_executable(test_meta_compat storage/test_meta_compat.cc)
-target_include_directories(test_meta_compat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(test_meta_compat
-    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
-gtest_discover_tests(test_meta_compat)
+gtest_discover_tests(test_legacy_meta_sequence)
 
 add_executable(test_kernel_interface public/test_kernel_interface.cc)
 target_link_libraries(test_kernel_interface

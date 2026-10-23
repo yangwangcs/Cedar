@@ -927,9 +927,9 @@ TEST_F(FactStoreCommitTest,
 }
 
 // F13: admission must reserve the sequence record the writer actually emits.
-// This batch of property facts encodes to 2,068,149 bytes in meta sequence v2
-// (under the default 2 MiB group cap) but its v1-based estimate is 2,112,630
-// (over the cap): a format-unaware admission rejects it before encoding.
+// This batch of property facts encodes below the 2 MiB group cap under the
+// only supported (v2) encoding; a format-unaware estimate would reject it
+// before encoding.
 TEST_F(FactStoreCommitTest, NearTwoMiBCapV2BatchIsNotPreRejected) {
   constexpr size_t kFactCount = 4000;
   constexpr size_t kPayloadBytes = 442;
@@ -944,12 +944,8 @@ TEST_F(FactStoreCommitTest, NearTwoMiBCapV2BatchIsNotPreRejected) {
         ValidTime{10}, FactOperation::kPut, /*schema_epoch=*/1,
         Value::String(std::string(kPayloadBytes, 'x'))});
   }
-  const size_t v1_estimate = internal::EstimateCommitBatchBytes(batch);
-  const size_t v2_estimate = internal::EstimateCommitBatchBytes(
-      batch, kMetaSequenceFormatV2);
-  ASSERT_GT(v1_estimate, kByteCap);
-  ASSERT_LE(v2_estimate, kByteCap);
-  ASSERT_LT(v2_estimate, v1_estimate);
+  const size_t estimate = internal::EstimateCommitBatchBytes(batch);
+  ASSERT_LE(estimate, kByteCap);
 
   const std::string path = path_ + "/format_v2_cap";
   FactStoreOptions options;
@@ -958,46 +954,33 @@ TEST_F(FactStoreCommitTest, NearTwoMiBCapV2BatchIsNotPreRejected) {
   options.group_commit_max_batch_bytes = kByteCap;
   FactStore store(options);
   ASSERT_TRUE(store.Open().ok());
-  EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
   const auto committed = store.Commit(batch);
   ASSERT_TRUE(committed.ok()) << committed.status().ToString();
   EXPECT_EQ(committed.ValueOrDie().commit_seq, CommitSeq{1});
   ASSERT_TRUE(store.Close().ok());
 }
 
-// F13: the effective record format follows the durable marker (which wins) and
-// the configured option, and is stable for the open store.
-TEST_F(FactStoreCommitTest, EffectiveSequenceRecordFormatTracksMarkerAndOption) {
-  // F19: the default writer format is v2.
-  EXPECT_EQ(store_->EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
-
-  const std::string path = path_ + "/format_marker";
+// Meta sequence v2 is the only accepted writer format. The option is kept for
+// source compatibility, but v1 is rejected up front and an unsupported value is
+// still an InvalidArgument.
+TEST_F(FactStoreCommitTest, V1MetaSequenceFormatOptionIsRejected) {
   {
     FactStoreOptions options;
-    options.path = path;
-    options.meta_sequence_format = kMetaSequenceFormatV2;
-    FactStore store(options);
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
-  }
-  {
-    // The durable marker is authoritative: reopening while the option asks for
-    // v1 still writes (and reports) v2.
-    FactStoreOptions options;
-    options.path = path;
+    options.path = path_ + "/format_v1_option";
     options.meta_sequence_format = kMetaSequenceFormatV1;
     FactStore store(options);
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
+    const Status opened = store.Open();
+    EXPECT_TRUE(opened.IsInvalidArgument()) << opened.ToString();
+    EXPECT_NE(opened.ToString().find("no longer supported"), std::string::npos)
+        << opened.ToString();
   }
   {
-    // The explicit v1 opt-out on a fresh database keeps the v1 writer.
     FactStoreOptions options;
-    options.path = path_ + "/format_marker_v1";
-    options.meta_sequence_format = kMetaSequenceFormatV1;
+    options.path = path_ + "/format_unsupported";
+    options.meta_sequence_format = 3;
     FactStore store(options);
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV1);
+    const Status opened = store.Open();
+    EXPECT_TRUE(opened.IsInvalidArgument()) << opened.ToString();
   }
 }
 

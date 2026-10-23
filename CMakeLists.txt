@@ -11,11 +11,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(CEDAR_ENABLE_ASAN "Build Cedar with AddressSanitizer" OFF)
 option(CEDAR_ENABLE_UBSAN "Build Cedar with UndefinedBehaviorSanitizer" OFF)
 option(CEDAR_ENABLE_TSAN "Build Cedar with ThreadSanitizer" OFF)
-# Compatibility profile for the meta sequence one-way gate: produces a binary
-# that refuses to read meta sequence format 2 instead of decoding it, mirroring
-# a pre-v2 release. The default build is v2-capable and unchanged.
-option(CEDAR_META_SEQUENCE_V1_ONLY
-       "Build a v1-only compatibility binary that rejects meta sequence format 2" OFF)
 
 set(CEDAR_SANITIZER_COUNT 0)
 foreach(CEDAR_SANITIZER_OPTION
@@ -117,7 +112,6 @@ add_library(cedar_core STATIC
     src/storage/rocks/rocksdb_config.cc
     src/storage/rocks/storage_file_inspection.cc
     src/storage/facts/vacuum.cc
-    src/storage/rocks/meta_v2_reclaim.cc
     src/storage/rocks/rocks_adapter.cc
     src/runtime/pressure_controller.cc
     src/kernel/adaptive_epoch_controller.cc
@@ -142,12 +136,6 @@ target_compile_features(cedar_core PUBLIC cxx_std_20)
 set_target_properties(cedar_core PROPERTIES EXPORT_NAME cedar)
 add_library(Cedar::cedar ALIAS cedar_core)
 
-if(CEDAR_META_SEQUENCE_V1_ONLY)
-    # PUBLIC so tools, tests and installed consumers of a compatibility build
-    # all observe the same one-way read gate.
-    target_compile_definitions(cedar_core PUBLIC CEDAR_META_SEQUENCE_V1_ONLY=1)
-endif()
-
 add_executable(cedar tools/cedar_main.cc)
 target_link_libraries(cedar PRIVATE cedar_core)
 
@@ -155,10 +143,6 @@ add_executable(cedar-server tools/cedar_server_main.cc)
 target_link_libraries(cedar-server PRIVATE cedar_core)
 add_executable(cedar-admin tools/cedar_admin_main.cc)
 target_link_libraries(cedar-admin PRIVATE cedar_core)
-
-# Offline maintenance tool; independent of the test/benchmark build options.
-add_executable(cedar-meta-v2-reclaim tools/cedar-meta-v2-reclaim.cc)
-target_link_libraries(cedar-meta-v2-reclaim PRIVATE cedar_core)
 
 add_library(cedar_kernel_bench_options STATIC
     benchmarks/cedar_kernel_bench_options.cc)
@@ -222,7 +206,7 @@ install(TARGETS cedar_core EXPORT CedarTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS cedar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(TARGETS cedar-server cedar-admin cedar-meta-v2-reclaim
+install(TARGETS cedar-server cedar-admin
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES "${CEDAR_ROCKSDB_LIBRARY}"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cedar/internal"

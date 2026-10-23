@@ -262,9 +262,10 @@ TEST(MetaCodecTest, UsesStableKeysAndRoundTripsTypedMetadata) {
       CommitSeq{3}, TxnId{4}, 99,
       {EncodeFactKey(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref(), ValidTime{10},
                      CommitSeq{3})}};
-  const auto sequence_bytes = EncodeSequenceRecord(sequence);
+  const auto sequence_bytes = EncodeSequenceRecordV2(sequence);
   ASSERT_TRUE(sequence_bytes.ok()) << sequence_bytes.status().ToString();
-  EXPECT_EQ(DecodeSequenceRecord(sequence_bytes.ValueOrDie()).ValueOrDie(),
+  EXPECT_EQ(DecodeSequenceRecord(sequence_bytes.ValueOrDie(), sequence.commit_seq)
+                .ValueOrDie(),
             sequence);
 }
 

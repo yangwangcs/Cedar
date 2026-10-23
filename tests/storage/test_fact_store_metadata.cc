@@ -825,26 +825,26 @@ TEST_F(FactStoreMetadataTest,
       << "reopen validation re-read a sequence record the iterator already held";
 }
 
-// S1 must not lose a failure: a sequence record whose stored value disagrees
-// with its key is still rejected with the same corruption the per-key Get
-// produced, even though the validator now trusts the iterator's value.
+// S1 must not lose a failure: replacing a committed v2 sequence record with
+// another valid v2 record still fails reopen validation, because the rebuilt
+// fact keys no longer match any stored fact.
 TEST_F(FactStoreMetadataTest,
-       ReopenValidationRejectsSequenceRecordWithWrongCommitSequence) {
+       ReopenValidationRejectsSequenceRecordMovedFromAnotherCommit) {
   ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
   ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
   ASSERT_TRUE(store_->Close().ok());
-  const FactRef first =
-      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
-  const auto mismatched = EncodeSequenceRecord(SequenceRecord{
-      CommitSeq{2}, TxnId{1}, 10,
-      {EncodeFactKey(first, ValidTime{10}, CommitSeq{2})}});
-  ASSERT_TRUE(mismatched.ok()) << mismatched.status().ToString();
+  const FactRef second =
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{2}}).ref();
+  const auto moved = EncodeSequenceRecordV2(SequenceRecord{
+      CommitSeq{2}, TxnId{2}, 11,
+      {EncodeFactKey(second, ValidTime{11}, CommitSeq{2})}});
+  ASSERT_TRUE(moved.ok()) << moved.status().ToString();
   const auto key = EncodeSequenceMetaKey(CommitSeq{1});
   ASSERT_TRUE(key.ok()) << key.status().ToString();
-  PutMetaRecord(path_, key.ValueOrDie(), mismatched.ValueOrDie());
+  PutMetaRecord(path_, key.ValueOrDie(), moved.ValueOrDie());
   const Status status = store_->Open();
   ASSERT_TRUE(status.IsCorruption()) << status.ToString();
-  EXPECT_NE(status.ToString().find("wrong commit sequence"), std::string::npos)
+  EXPECT_NE(status.ToString().find("missing fact"), std::string::npos)
       << status.ToString();
 }
 
@@ -1079,7 +1079,7 @@ TEST(FactStoreSnapshotSchemaLookupTest, RejectsSnapshotFromAnotherStore) {
 }
 
 TEST(FactStoreMetaCodecSequenceViewTest,
-     DecodesPackedSequenceWithoutOwningFactKeys) {
+     DecodesV2SequenceIntoOwnedFactKeys) {
   const FactRef first(PartId{1}, FactFamily::kVertexProperty, PropertyId{2}, 42);
   const FactRef second(PartId{1}, FactFamily::kVertexProperty, PropertyId{3}, 43);
   const std::string key1 =
@@ -1088,19 +1088,22 @@ TEST(FactStoreMetaCodecSequenceViewTest,
       EncodeFactKey(second, ValidTime{10}, CommitSeq{7});
   ASSERT_EQ(key1.size(), kEncodedFactKeyBytes);
   const SequenceRecord record{CommitSeq{7}, TxnId{9}, 123, {key1, key2}};
-  const auto encoded = EncodeSequenceRecord(record);
+  const auto encoded = EncodeSequenceRecordV2(record);
   ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
 
-  const auto view = DecodeSequenceRecordView(encoded.ValueOrDie());
+  const auto view =
+      DecodeSequenceRecordView(encoded.ValueOrDie(), record.commit_seq);
   ASSERT_TRUE(view.ok()) << view.status().ToString();
   EXPECT_EQ(view.ValueOrDie().commit_seq, CommitSeq{7});
   EXPECT_EQ(view.ValueOrDie().txn_id, TxnId{9});
   EXPECT_EQ(view.ValueOrDie().system_hlc, 123U);
   EXPECT_EQ(view.ValueOrDie().fact_count, 2U);
-  ASSERT_EQ(view.ValueOrDie().identities.size(), 2 * kEncodedFactKeyBytes);
+  ASSERT_NE(view.ValueOrDie().owned_identities, nullptr);
+  EXPECT_EQ(std::string(view.ValueOrDie().identities), key1 + key2);
   EXPECT_TRUE(view.ValueOrDie().Validate().ok());
 
-  const auto owning = DecodeSequenceRecord(encoded.ValueOrDie());
+  const auto owning =
+      DecodeSequenceRecord(encoded.ValueOrDie(), record.commit_seq);
   ASSERT_TRUE(owning.ok()) << owning.status().ToString();
   EXPECT_EQ(owning.ValueOrDie().fact_keys.size(), 2U);
   EXPECT_EQ(owning.ValueOrDie().commit_seq, CommitSeq{7});
@@ -1115,19 +1118,21 @@ TEST(FactStoreMetaCodecSequenceViewTest,
   const std::string stale_key =
       EncodeFactKey(other, ValidTime{10}, CommitSeq{6});
   const SequenceRecord record{CommitSeq{7}, TxnId{9}, 0, {key1}};
-  const auto encoded = EncodeSequenceRecord(record);
+  const auto encoded = EncodeSequenceRecordV2(record);
   ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
   const std::string bytes = encoded.ValueOrDie();
 
-  EXPECT_FALSE(
-      DecodeSequenceRecordView(std::string_view(bytes).substr(
-          0, bytes.size() - 2))
-          .ok());
+  EXPECT_FALSE(DecodeSequenceRecordView(
+                   std::string_view(bytes).substr(0, bytes.size() - 2),
+                   record.commit_seq)
+                   .ok());
   std::string bad_crc = bytes;
   bad_crc.back() = static_cast<char>(bad_crc.back() ^ 0x1);
-  EXPECT_FALSE(DecodeSequenceRecordView(bad_crc).ok());
+  EXPECT_FALSE(
+      DecodeSequenceRecordView(bad_crc, record.commit_seq).ok());
 
-  const auto good_view = DecodeSequenceRecordView(bytes);
+  const auto good_view =
+      DecodeSequenceRecordView(bytes, record.commit_seq);
   ASSERT_TRUE(good_view.ok()) << good_view.status().ToString();
   SequenceRecordView stale_view = good_view.ValueOrDie();
   stale_view.identities = std::string_view(stale_key);
@@ -1577,8 +1582,6 @@ TEST(FactStoreMetaCodecSequenceV2Test,
     SCOPED_TRACE(::testing::Message() << "fact_count=" << fact_count);
     const SequenceRecord record = SequenceV2FixtureRecord(fact_count);
     ASSERT_TRUE(record.Validate().ok()) << record.Validate().ToString();
-    const auto v1 = EncodeSequenceRecord(record);
-    ASSERT_TRUE(v1.ok()) << v1.status().ToString();
     const auto v2 = EncodeSequenceRecordV2(record);
     ASSERT_TRUE(v2.ok()) << v2.status().ToString();
 
@@ -1590,8 +1593,8 @@ TEST(FactStoreMetaCodecSequenceV2Test,
     for (uint64_t index = 0; index < fact_count; ++index) {
       const std::string& rebuilt = decoded.ValueOrDie().fact_keys[index];
       EXPECT_EQ(rebuilt.size(), kEncodedFactKeyBytes);
-      // Full 32-byte identity: the rebuilt key must equal the v1 key for the
-      // same (ref, valid_from, commit_seq), not merely decode to it.
+      // Full 32-byte identity: the rebuilt key must be byte-identical to the
+      // key the writer encoded, not merely decode to the same fields.
       EXPECT_EQ(rebuilt, record.fact_keys[index]);
       const auto decoded_key = DecodeFactKey(rebuilt);
       ASSERT_TRUE(decoded_key.ok()) << decoded_key.status().ToString();
@@ -1601,47 +1604,31 @@ TEST(FactStoreMetaCodecSequenceV2Test,
                               record.commit_seq),
                 rebuilt);
     }
-
-    // The v1 writer's records still decode unchanged.
-    const auto decoded_v1 = DecodeSequenceRecord(v1.ValueOrDie());
-    ASSERT_TRUE(decoded_v1.ok()) << decoded_v1.status().ToString();
-    EXPECT_EQ(decoded_v1.ValueOrDie(), record);
   }
 }
 
 TEST(FactStoreMetaCodecSequenceV2Test,
-     DecodesBothRecordKindsAndRejectsCorruptV2Records) {
+     DecodesV2RecordsAndRejectsCorruptRecords) {
   const SequenceRecord record = SequenceV2FixtureRecord(3);
-  const auto v1 = EncodeSequenceRecord(record);
   const auto v2 = EncodeSequenceRecordV2(record);
-  ASSERT_TRUE(v1.ok()) << v1.status().ToString();
   ASSERT_TRUE(v2.ok()) << v2.status().ToString();
-  const std::string v1_bytes = v1.ValueOrDie();
   const std::string v2_bytes = v2.ValueOrDie();
 
-  // Both kinds decode through the key-aware entry point; v1 keeps its
-  // single-argument decoder.
-  EXPECT_TRUE(DecodeSequenceRecord(v1_bytes, record.commit_seq).ok());
-  EXPECT_TRUE(DecodeSequenceRecord(v1_bytes).ok());
   const auto decoded_v2 =
       DecodeSequenceRecord(v2_bytes, record.commit_seq);
   ASSERT_TRUE(decoded_v2.ok()) << decoded_v2.status().ToString();
   EXPECT_EQ(decoded_v2.ValueOrDie(), record);
 
   // A v2 record does not carry commit_seq: the sequence key must be supplied.
-  // The key-less decoders reject with an actionable corruption instead of
-  // guessing and silently rebuilding wrong fact keys.
-  const auto keyless = DecodeSequenceRecord(v2_bytes);
-  ASSERT_TRUE(keyless.status().IsCorruption()) << keyless.status().ToString();
-  EXPECT_NE(keyless.status().ToString().find("commit sequence"),
-            std::string::npos)
-      << keyless.status().ToString();
-  EXPECT_TRUE(DecodeSequenceRecordView(v2_bytes).status().IsCorruption());
+  // A zero sequence (no usable key) is rejected rather than rebuilding wrong
+  // fact keys.
+  EXPECT_TRUE(
+      DecodeSequenceRecord(v2_bytes, CommitSeq{0}).status().IsCorruption());
   EXPECT_TRUE(
       DecodeSequenceRecordView(v2_bytes, CommitSeq{0}).status().IsCorruption());
 
-  // The materializing view rebuilds the packed identities a v1 view would have
-  // borrowed, and still validates (duplicate/commit checks included).
+  // The view rebuilds the packed identities into its owned buffer and still
+  // validates (duplicate/commit checks included).
   const auto view = DecodeSequenceRecordView(v2_bytes, record.commit_seq);
   ASSERT_TRUE(view.ok()) << view.status().ToString();
   EXPECT_EQ(view.ValueOrDie().commit_seq, record.commit_seq);
@@ -1652,13 +1639,7 @@ TEST(FactStoreMetaCodecSequenceV2Test,
   for (const std::string& key : record.fact_keys) expected_identities += key;
   EXPECT_EQ(std::string(view.ValueOrDie().identities), expected_identities);
   EXPECT_TRUE(view.ValueOrDie().Validate().ok());
-  // v2 materializes the rebuilt keys; v1 stays zero-copy.
   EXPECT_NE(view.ValueOrDie().owned_identities, nullptr);
-  const auto v1_view = DecodeSequenceRecordView(v1_bytes);
-  ASSERT_TRUE(v1_view.ok()) << v1_view.status().ToString();
-  EXPECT_EQ(v1_view.ValueOrDie().owned_identities, nullptr);
-  EXPECT_EQ(std::string(v1_view.ValueOrDie().identities), expected_identities);
-  EXPECT_TRUE(v1_view.ValueOrDie().Validate().ok());
 
   // CRC mismatch.
   std::string bad_crc = v2_bytes;
@@ -1679,11 +1660,23 @@ TEST(FactStoreMetaCodecSequenceV2Test,
                   .status()
                   .IsCorruption());
 
-  // A v2 payload re-tagged as a v1 sequence record must not be silently decoded
-  // as a v1 record; the framing checks catch the mismatch.
+  // A v2 payload re-tagged as a retired v1 sequence record is recognized as a
+  // legacy kind-7 record and rejected with the actionable migration error; it is
+  // never decoded as either format.
   std::string retagged_v1 = v2_bytes;
   SetMetaRecordKind(&retagged_v1, 7);
-  EXPECT_TRUE(DecodeSequenceRecord(retagged_v1).status().IsCorruption());
+  const auto legacy = DecodeSequenceRecord(retagged_v1, record.commit_seq);
+  ASSERT_FALSE(legacy.ok());
+  EXPECT_TRUE(legacy.status().IsNotSupportedError())
+      << legacy.status().ToString();
+  EXPECT_NE(legacy.status().ToString().find("cedar-meta-v2-reclaim"),
+            std::string::npos)
+      << legacy.status().ToString();
+  const auto legacy_view =
+      DecodeSequenceRecordView(retagged_v1, record.commit_seq);
+  ASSERT_FALSE(legacy_view.ok());
+  EXPECT_TRUE(legacy_view.status().IsNotSupportedError())
+      << legacy_view.status().ToString();
 
   // Unsupported payload version.
   std::string bad_payload_version = v2_bytes;
@@ -1723,141 +1716,11 @@ TEST(FactStoreMetaCodecSequenceV2Test,
                   .IsCorruption());
 }
 
-// Task 12: the one-way gate's expected failure. A pre-v2 binary cannot decode a
-// `kSequenceV2` record; in a dual-read binary the v1-only entry point must still
-// reject it explicitly instead of guessing commit_seq (which would silently
-// rebuild wrong fact keys). Pin the documented Corruption text and prove v1
-// decoding is not over-rejected, so an operator sees an actionable error rather
-// than a silent downgrade.
-TEST(FactStoreMetaCodecSequenceV2Test,
-     V1OnlyDecoderRejectsV2RecordWithDocumentedCorruption) {
-  const SequenceRecord record = SequenceV2FixtureRecord(3);
-  const auto encoded_v2 = EncodeSequenceRecordV2(record);
-  ASSERT_TRUE(encoded_v2.ok()) << encoded_v2.status().ToString();
-  // Sanity: the same bytes decode once the record key supplies commit_seq.
-  EXPECT_TRUE(
-      DecodeSequenceRecord(encoded_v2.ValueOrDie(), record.commit_seq).ok());
-
-  const auto rejected = DecodeSequenceRecord(encoded_v2.ValueOrDie());
-  ASSERT_FALSE(rejected.ok()) << "v2 must not decode without its commit sequence";
-  EXPECT_TRUE(rejected.status().IsCorruption())
-      << rejected.status().ToString();
-  EXPECT_EQ(rejected.status().ToString(),
-            "Corruption: sequence record: v2 sequence record requires its "
-            "commit sequence");
-
-  // The v1-only path keeps decoding v1 records; the gate is not a generic
-  // sequence-record rejection.
-  const auto encoded_v1 = EncodeSequenceRecord(record);
-  ASSERT_TRUE(encoded_v1.ok()) << encoded_v1.status().ToString();
-  EXPECT_TRUE(DecodeSequenceRecord(encoded_v1.ValueOrDie()).ok());
-}
-
-TEST(FactStoreMetaCodecSequenceV2Test, V2RecordDropsNineBytesPerFact) {
-  size_t delta_for_one = 0;
-  size_t delta_for_many = 0;
-  for (uint64_t fact_count : {1U, 182U}) {
-    SCOPED_TRACE(::testing::Message() << "fact_count=" << fact_count);
-    const SequenceRecord record = SequenceV2FixtureRecord(fact_count);
-    const auto v1 = EncodeSequenceRecord(record);
-    const auto v2 = EncodeSequenceRecordV2(record);
-    ASSERT_TRUE(v1.ok()) << v1.status().ToString();
-    ASSERT_TRUE(v2.ok()) << v2.status().ToString();
-    const size_t v1_bytes = v1.ValueOrDie().size();
-    const size_t v2_bytes = v2.ValueOrDie().size();
-    ASSERT_GT(v1_bytes, v2_bytes);
-    const size_t delta = v1_bytes - v2_bytes;
-    // Same 10-byte framing. The v1 payload is 28 + 32*N; the v2 payload is
-    // 22 + 23*N. v2 drops v1's 8-byte commit_seq and adds two 1-byte version
-    // fields (a fixed -6 bytes per record), then saves 9 bytes per fact.
-    EXPECT_EQ(delta, 6U + 9U * static_cast<size_t>(fact_count));
-    if (fact_count == 1) {
-      delta_for_one = delta;
-    } else {
-      delta_for_many = delta;
-    }
-  }
-  // The per-fact slope is exactly 9 bytes: (32 - 23).
-  EXPECT_EQ(delta_for_many - delta_for_one, 9U * (182U - 1U));
-}
-
-// Mixed v1/v2 database: one sequence record stays v1 and one is rewritten as
-// v2a in the raw meta CF. Reopen validation (default policy), ReadSequence and
-// ReadSequenceRange must read both kinds.
-TEST_F(FactStoreMetadataTest, ReopenAndReadSequenceAcceptMixedV1AndV2Records) {
-  const std::string path = path_ + "/mixed_v1_v2";
-  // The fixture's default store is unused here; close it before replacing it.
-  ASSERT_TRUE(store_->Close().ok());
-  {
-    // Start from v1 history; F19's default writer is v2.
-    FactStoreOptions options{path};
-    options.meta_sequence_format = kMetaSequenceFormatV1;
-    store_ = std::make_unique<FactStore>(options);
-    ASSERT_TRUE(store_->Open().ok());
-    ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
-    ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 11)).ok());
-    ASSERT_TRUE(store_->Close().ok());
-  }
-
-  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{2});
-  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
-  SequenceRecord expected;
-  std::string encoded_v2;
-  {
-    RawFactDatabase raw;
-    ASSERT_TRUE(OpenRawFactDatabase(path, &raw));
-    std::string encoded_v1;
-    const rocksdb::Status got = raw.database->Get(
-        rocksdb::ReadOptions(), raw.handles[2], sequence_key.ValueOrDie(),
-        &encoded_v1);
-    ASSERT_TRUE(got.ok()) << got.ToString();
-    const auto decoded = DecodeSequenceRecord(encoded_v1);
-    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
-    expected = decoded.ValueOrDie();
-    // Reopen validation does not cross-check system_hlc, so a sentinel here
-    // distinguishes "the reopened store read the v2 record" from "it re-read a
-    // stale v1 record" (which would decode to the same fact keys).
-    expected.system_hlc = 424242;
-    const auto v2 = EncodeSequenceRecordV2(expected);
-    ASSERT_TRUE(v2.ok()) << v2.status().ToString();
-    encoded_v2 = v2.ValueOrDie();
-    ASSERT_TRUE(raw.database
-                    ->Put(rocksdb::WriteOptions(), raw.handles[2],
-                          sequence_key.ValueOrDie(), encoded_v2)
-                    .ok());
-    std::string stored;
-    const rocksdb::Status stored_status = raw.database->Get(
-        rocksdb::ReadOptions(), raw.handles[2], sequence_key.ValueOrDie(),
-        &stored);
-    ASSERT_TRUE(stored_status.ok()) << stored_status.ToString();
-    EXPECT_EQ(stored, encoded_v2);
-  }
-
-  // Default reopen policy validates both kinds and succeeds.
-  store_ = std::make_unique<FactStore>(FactStoreOptions{path});
-  ASSERT_TRUE(store_->Open().ok());
-
-  const auto snapshot = store_->BeginSnapshot();
-  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-  const auto read_v2 = store_->ReadSequence(snapshot.ValueOrDie(), CommitSeq{2});
-  ASSERT_TRUE(read_v2.ok()) << read_v2.status().ToString();
-  EXPECT_EQ(read_v2.ValueOrDie(), expected);
-  const auto read_v1 = store_->ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
-  ASSERT_TRUE(read_v1.ok()) << read_v1.status().ToString();
-
-  const auto range =
-      store_->ReadSequenceRange(snapshot.ValueOrDie(), CommitSeq{1}, CommitSeq{2});
-  ASSERT_TRUE(range.ok()) << range.status().ToString();
-  ASSERT_EQ(range.ValueOrDie().size(), 2U);
-  EXPECT_EQ(range.ValueOrDie()[1], expected);
-}
-
 // ---------------------------------------------------------------------------
-// Meta sequence format marker + opt-in v2 writer (F10 Task 10)
+// Meta sequence format marker (v2-only)
 // ---------------------------------------------------------------------------
 // `MetaRecordKind` stays private to meta_codec.cc; these tests pin the on-disk
-// kind bytes the same way the v1/v2 codec tests pin payload offsets.
-constexpr uint8_t kRawSequenceRecordKindV1 = 7;
+// kind bytes the same way the codec tests pin payload offsets.
 constexpr uint8_t kRawSequenceRecordKindV2 = 9;
 constexpr uint8_t kRawSequenceFormatMarkerKind = 10;
 constexpr size_t kRawMetaRecordHeaderBytes = 6;
@@ -1905,9 +1768,8 @@ TEST(FactStoreMetaSequenceFormatCodecTest,
      RoundTripsFormatMarkersAndRejectsCorruptFraming) {
   // The marker key is part of the durable format contract.
   EXPECT_EQ(EncodeSequenceFormatKey(), "format/sequence-record-format");
-  for (uint32_t format : {kMetaSequenceFormatV1, kMetaSequenceFormatV2}) {
-    SCOPED_TRACE(::testing::Message() << "format=" << format);
-    const auto encoded = EncodeSequenceFormat(format);
+  {
+    const auto encoded = EncodeSequenceFormat(kMetaSequenceFormatV2);
     ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
     EXPECT_EQ(RawMetaRecordKind(encoded.ValueOrDie()),
               kRawSequenceFormatMarkerKind);
@@ -1916,7 +1778,7 @@ TEST(FactStoreMetaSequenceFormatCodecTest,
     EXPECT_EQ(encoded.ValueOrDie().size(), 14U);
     const auto decoded = DecodeSequenceFormat(encoded.ValueOrDie());
     ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
-    EXPECT_EQ(decoded.ValueOrDie(), format);
+    EXPECT_EQ(decoded.ValueOrDie(), kMetaSequenceFormatV2);
   }
 
   const auto encoded = EncodeSequenceFormat(kMetaSequenceFormatV2);
@@ -1947,23 +1809,11 @@ TEST(FactStoreMetaSequenceFormatCodecTest,
 }
 
 TEST_F(FactStoreMetadataTest,
-       OptInWriterWritesDurableMarkerAndV2RecordsOnFreshDatabase) {
+       FreshDatabaseWritesMarkerAndV2RecordsForMultipleFacts) {
   const std::string path = path_ + "/fresh_v2";
-  std::atomic<uint32_t> marker_writes{0};
-  std::atomic<bool> marker_sync{false};
   {
-    FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV2);
-    options.meta_sequence_format_marker_write_observer_for_testing =
-        [&](bool sync) {
-          marker_writes.fetch_add(1, std::memory_order_relaxed);
-          marker_sync.store(sync, std::memory_order_relaxed);
-        };
-    FactStore store(options);
+    FactStore store(FactStoreOptions{path});
     ASSERT_TRUE(store.Open().ok());
-    // The opt-in upgrade records the marker once, with Sync=true, before the
-    // store accepts commits.
-    EXPECT_EQ(marker_writes.load(), 1U);
-    EXPECT_TRUE(marker_sync.load());
     ASSERT_TRUE(store.Commit(VertexFactsBatch(TxnId{1}, 100, 3, 10)).ok());
     ASSERT_TRUE(store.Close().ok());
   }
@@ -2007,8 +1857,8 @@ TEST_F(FactStoreMetadataTest,
   ASSERT_TRUE(store_->Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
   ASSERT_TRUE(store_->Close().ok());
 
-  // F19: the default open upgrades/writes the durable marker before accepting
-  // commits, so a fresh database with default options is a v2 database.
+  // A fresh database with default options is a v2 database: the marker is
+  // written with the initialization batch, before the store accepts commits.
   const std::string marker = ReadMetaRecord(path_, EncodeSequenceFormatKey());
   ASSERT_FALSE(marker.empty());
   EXPECT_EQ(RawMetaRecordKind(marker), kRawSequenceFormatMarkerKind);
@@ -2032,263 +1882,62 @@ TEST_F(FactStoreMetadataTest,
   EXPECT_EQ(decoded.ValueOrDie().fact_keys.size(), 1U);
 }
 
-TEST_F(FactStoreMetadataTest,
-       ExplicitV1OptOutWritesNoMarkerAndKeepsV1RecordBytes) {
+TEST_F(FactStoreMetadataTest, V1WriterOptionIsRejectedBeforeOpening) {
   const std::string path = path_ + "/explicit_v1";
-  {
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
-    ASSERT_TRUE(store.Open().ok());
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
-
-  // Explicit opt-out: no marker record and the pre-v2 encoding stays
-  // byte-identical.
-  EXPECT_FALSE(
-      ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
-
-  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
-  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
-  const std::string record = ReadMetaRecord(path, sequence_key.ValueOrDie());
-  ASSERT_FALSE(record.empty());
-  EXPECT_EQ(RawMetaRecordKind(record), kRawSequenceRecordKindV1);
-
-  // 6-byte header + 28-byte fixed payload + one 32-byte key + 4-byte CRC.
-  const std::string fact_key =
-      EncodeFactKey(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
-                    ValidTime{10}, CommitSeq{1});
-  const auto expected = EncodeSequenceRecord(
-      SequenceRecord{CommitSeq{1}, TxnId{1}, 10, {fact_key}});
-  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
-  EXPECT_EQ(record, expected.ValueOrDie());
-  EXPECT_EQ(record.size(), 38U + 32U);
+  FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
+  const Status opened = store.Open();
+  ASSERT_FALSE(opened.ok());
+  EXPECT_TRUE(opened.IsInvalidArgument()) << opened.ToString();
+  EXPECT_NE(opened.ToString().find("no longer supported"), std::string::npos)
+      << opened.ToString();
+  EXPECT_NE(opened.ToString().find("format 2 (v2)"), std::string::npos)
+      << opened.ToString();
+  // The rejected open must not create a database at the requested path.
+  EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(path) / "CURRENT"));
 }
 
 TEST_F(FactStoreMetadataTest,
-       ReopenWithV1OptionKeepsWritingV2FromDurableMarker) {
+       ReopenWithV1OptionIsRejectedEvenForAV2Database) {
   const std::string path = path_ + "/marker_authoritative";
   {
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV2));
+    FactStore store(FactStoreOptions{path});
     ASSERT_TRUE(store.Open().ok());
     ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
     ASSERT_TRUE(store.Close().ok());
   }
 
-  std::atomic<uint32_t> marker_writes{0};
-  {
-    // The option asks for v1, but the durable marker says 2: the format is a
-    // one-way door and the store keeps writing v2 without rewriting the marker.
-    FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV1);
-    options.meta_sequence_format_marker_write_observer_for_testing =
-        [&](bool) { marker_writes.fetch_add(1, std::memory_order_relaxed); };
-    FactStore store(options);
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(marker_writes.load(), 0U);
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 20)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
+  // The removed v1 option must not silently reopen an existing v2 database as
+  // a read-only or degraded store: it is rejected before the engine is opened.
+  FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV1);
+  FactStore store(options);
+  const Status opened = store.Open();
+  ASSERT_FALSE(opened.ok());
+  EXPECT_TRUE(opened.IsInvalidArgument()) << opened.ToString();
 
-  const auto decoded_marker =
-      DecodeSequenceFormat(ReadMetaRecord(path, EncodeSequenceFormatKey()));
-  ASSERT_TRUE(decoded_marker.ok()) << decoded_marker.status().ToString();
-  EXPECT_EQ(decoded_marker.ValueOrDie(), kMetaSequenceFormatV2);
-  for (uint64_t sequence = 1; sequence <= 2; ++sequence) {
-    const auto key = EncodeSequenceMetaKey(CommitSeq{sequence});
-    ASSERT_TRUE(key.ok()) << key.status().ToString();
-    EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, key.ValueOrDie())),
-              kRawSequenceRecordKindV2)
-        << "sequence " << sequence;
-  }
-
-  // All reads and reopen validation still pass on the v2 history.
+  // The database itself is untouched and remains a valid v2 database.
+  FactStore reopened{FactStoreOptions{path}};
+  ASSERT_TRUE(reopened.Open().ok());
   {
-    FactStore store(FactStoreOptions{path});
-    ASSERT_TRUE(store.Open().ok());
-    {
-      const auto snapshot = store.BeginSnapshot();
-      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-      const auto seq1 =
-          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
-      ASSERT_TRUE(seq1.ok()) << seq1.status().ToString();
-      EXPECT_EQ(seq1.ValueOrDie().fact_keys.size(), 1U);
-      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
-                                                 CommitSeq{1}, CommitSeq{2});
-      ASSERT_TRUE(range.ok()) << range.status().ToString();
-      EXPECT_EQ(range.ValueOrDie().size(), 2U);
-    }
-    ASSERT_TRUE(store.Close().ok());
+    const auto snapshot = reopened.BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    const auto range = reopened.ReadSequenceRange(snapshot.ValueOrDie(),
+                                                  CommitSeq{1}, CommitSeq{1});
+    ASSERT_TRUE(range.ok()) << range.status().ToString();
+    EXPECT_EQ(range.ValueOrDie().size(), 1U);
   }
+  ASSERT_TRUE(reopened.Close().ok());
 }
 
-TEST_F(FactStoreMetadataTest,
-       MixedV1HistoryThenV2EnableWritesReadsAndKernelRecovers) {
-  const std::string path = path_ + "/mixed_v1_v2";
-  // v1 history: explicit opt-out because F19 defaults the writer to v2.
-  {
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
-    ASSERT_TRUE(store.Open().ok());
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
-  // Opt-in upgrade: only new records are v2; the v1 history stays untouched.
-  {
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV2));
-    ASSERT_TRUE(store.Open().ok());
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 20)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
-
-  const auto marker =
-      DecodeSequenceFormat(ReadMetaRecord(path, EncodeSequenceFormatKey()));
-  ASSERT_TRUE(marker.ok()) << marker.status().ToString();
-  EXPECT_EQ(marker.ValueOrDie(), kMetaSequenceFormatV2);
-  const auto seq1_key = EncodeSequenceMetaKey(CommitSeq{1});
-  const auto seq2_key = EncodeSequenceMetaKey(CommitSeq{2});
-  ASSERT_TRUE(seq1_key.ok());
-  ASSERT_TRUE(seq2_key.ok());
-  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq1_key.ValueOrDie())),
-            kRawSequenceRecordKindV1);
-  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq2_key.ValueOrDie())),
-            kRawSequenceRecordKindV2);
-
-  // Default-policy reopen: validation and reads cover both kinds, and the
-  // durable marker keeps the effective writer at v2.
-  {
-    FactStore store(FactStoreOptions{path});
-    ASSERT_TRUE(store.Open().ok());
-    {
-      const auto snapshot = store.BeginSnapshot();
-      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-      const auto seq1 =
-          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
-      ASSERT_TRUE(seq1.ok()) << seq1.status().ToString();
-      EXPECT_EQ(seq1.ValueOrDie().fact_keys.size(), 1U);
-      const auto seq2 =
-          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{2});
-      ASSERT_TRUE(seq2.ok()) << seq2.status().ToString();
-      EXPECT_EQ(seq2.ValueOrDie().fact_keys.size(), 1U);
-      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
-                                                 CommitSeq{1}, CommitSeq{2});
-      ASSERT_TRUE(range.ok()) << range.status().ToString();
-      EXPECT_EQ(range.ValueOrDie().size(), 2U);
-    }
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{3}, VertexId{3}, 30)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
-  const auto seq3_key = EncodeSequenceMetaKey(CommitSeq{3});
-  ASSERT_TRUE(seq3_key.ok());
-  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq3_key.ValueOrDie())),
-            kRawSequenceRecordKindV2);
-
-  // Kernel open on the mixed database: the transaction-ID allocator cold path
-  // rebuilds from v1+v2 sequence records, and the kernel commit itself goes
-  // through the same opt-in v2 writer branch.
-  {
-    DatabaseOptions options;
-    options.path = path;
-    auto opened = Database::Open(std::move(options));
-    ASSERT_TRUE(opened.ok()) << opened.status().ToString();
-    std::unique_ptr<Database> database = std::move(opened).ConsumeValueOrDie();
-    auto begun = database->BeginTransaction();
-    ASSERT_TRUE(begun.ok()) << begun.status().ToString();
-    std::unique_ptr<Transaction> transaction =
-        std::move(begun).ConsumeValueOrDie();
-    ASSERT_TRUE(transaction
-                    ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{4}}),
-                             ValidTime{40})
-                    .ok());
-    const auto committed = transaction->Commit();
-    ASSERT_TRUE(committed.ok()) << committed.status().ToString();
-    EXPECT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
-    ASSERT_TRUE(database->Close().ok());
-  }
-  const auto seq4_key = EncodeSequenceMetaKey(CommitSeq{4});
-  ASSERT_TRUE(seq4_key.ok());
-  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq4_key.ValueOrDie())),
-            kRawSequenceRecordKindV2);
-
-  // Final full reopen: v1 + v2 + kernel-v2 history validates and reads.
-  {
-    FactStore store(FactStoreOptions{path});
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(store.visible_seq(), CommitSeq{4});
-    {
-      const auto snapshot = store.BeginSnapshot();
-      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-      const auto range = store.ReadSequenceRange(snapshot.ValueOrDie(),
-                                                 CommitSeq{1}, CommitSeq{4});
-      ASSERT_TRUE(range.ok()) << range.status().ToString();
-      EXPECT_EQ(range.ValueOrDie().size(), 4U);
-    }
-    ASSERT_TRUE(store.Close().ok());
-  }
-}
-
-// F19: opening an existing v1 database with default options upgrades it in
-// place. The marker is written before the next commit, old v1 records remain
-// readable and untouched, and only new commits use v2.
-TEST_F(FactStoreMetadataTest, DefaultOpenUpgradesExistingV1DatabaseInPlace) {
-  const std::string path = path_ + "/upgrade_on_default_open";
-  {
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
-    ASSERT_TRUE(store.Open().ok());
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
-  EXPECT_FALSE(ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey())
-                   .has_value())
-      << "the explicit v1 opt-out must not write a marker";
-
-  {
-    // Default open: the marker is upgraded to 2 before this new commit.
-    FactStore store(FactStoreOptions{path});
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(store.EffectiveSequenceRecordFormat(), kMetaSequenceFormatV2);
-    ASSERT_TRUE(store.Commit(VertexStateBatch(TxnId{2}, VertexId{2}, 20)).ok());
-    ASSERT_TRUE(store.Close().ok());
-  }
-
-  const auto marker =
-      DecodeSequenceFormat(ReadMetaRecord(path, EncodeSequenceFormatKey()));
-  ASSERT_TRUE(marker.ok()) << marker.status().ToString();
-  EXPECT_EQ(marker.ValueOrDie(), kMetaSequenceFormatV2);
-  const auto seq1_key = EncodeSequenceMetaKey(CommitSeq{1});
-  const auto seq2_key = EncodeSequenceMetaKey(CommitSeq{2});
-  ASSERT_TRUE(seq1_key.ok());
-  ASSERT_TRUE(seq2_key.ok());
-  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq1_key.ValueOrDie())),
-            kRawSequenceRecordKindV1)
-      << "the existing v1 record must stay untouched";
-  EXPECT_EQ(RawMetaRecordKind(ReadMetaRecord(path, seq2_key.ValueOrDie())),
-            kRawSequenceRecordKindV2)
-      << "commits after the default open must use v2";
-
-  // Full default reopen validates and reads the mixed history.
-  {
-    FactStore store(FactStoreOptions{path});
-    ASSERT_TRUE(store.Open().ok());
-    {
-      const auto snapshot = store.BeginSnapshot();
-      ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-      const auto seq1 =
-          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{1});
-      const auto seq2 =
-          store.ReadSequence(snapshot.ValueOrDie(), CommitSeq{2});
-      ASSERT_TRUE(seq1.ok()) << seq1.status().ToString();
-      ASSERT_TRUE(seq2.ok()) << seq2.status().ToString();
-      EXPECT_EQ(seq1.ValueOrDie().fact_keys.size(), 1U);
-      EXPECT_EQ(seq2.ValueOrDie().fact_keys.size(), 1U);
-    }
-    ASSERT_TRUE(store.Close().ok());
-  }
-}
-
-TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
-  const auto create_v1_database = [this](const std::string& name) {
+// A database written by this release always records marker 2. A marker that
+// does not decode (CRC/truncation), a marker with a value this release does not
+// know, and a legacy (missing or 1-valued) marker all fail Open before any
+// commit is accepted.
+TEST_F(FactStoreMetadataTest, CorruptUnsupportedOrLegacyMarkerFailsOpen) {
+  const auto create_v2_database = [this](const std::string& name) {
     const std::string path = path_ + "/" + name;
-    // Explicit v1: F19's default open would upgrade this fixture to v2.
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
+    FactStore store(FactStoreOptions{path});
     EXPECT_TRUE(store.Open().ok());
+    EXPECT_TRUE(store.Commit(VertexStateBatch(TxnId{1}, VertexId{1}, 10)).ok());
     EXPECT_TRUE(store.Close().ok());
     return path;
   };
@@ -2296,14 +1945,14 @@ TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
 
   // Structurally valid marker with a value this binary does not support.
   {
-    const std::string path = create_v1_database("marker_unsupported");
+    const std::string path = create_v2_database("marker_unsupported");
     const auto marker = EncodeSequenceFormat(3);
     ASSERT_TRUE(marker.ok()) << marker.status().ToString();
     PutMetaRecord(path, marker_key, marker.ValueOrDie());
     FactStore store(FactStoreOptions{path});
     const Status opened = store.Open();
     EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
-    EXPECT_NE(opened.ToString().find("unsupported meta sequence format marker"),
+    EXPECT_NE(opened.ToString().find("unsupported meta sequence format marker: 3"),
               std::string::npos)
         << opened.ToString();
     if (opened.ok()) EXPECT_TRUE(store.Close().ok());
@@ -2311,7 +1960,7 @@ TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
 
   // CRC corruption.
   {
-    const std::string path = create_v1_database("marker_bad_crc");
+    const std::string path = create_v2_database("marker_bad_crc");
     const auto marker = EncodeSequenceFormat(kMetaSequenceFormatV2);
     ASSERT_TRUE(marker.ok()) << marker.status().ToString();
     std::string bytes = marker.ValueOrDie();
@@ -2325,7 +1974,7 @@ TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
 
   // Truncated framing.
   {
-    const std::string path = create_v1_database("marker_truncated");
+    const std::string path = create_v2_database("marker_truncated");
     const auto marker = EncodeSequenceFormat(kMetaSequenceFormatV2);
     ASSERT_TRUE(marker.ok()) << marker.status().ToString();
     const std::string bytes = marker.ValueOrDie();
@@ -2335,31 +1984,44 @@ TEST_F(FactStoreMetadataTest, CorruptOrUnsupportedFormatMarkerFailsOpen) {
     EXPECT_TRUE(opened.IsCorruption()) << opened.ToString();
     if (opened.ok()) EXPECT_TRUE(store.Close().ok());
   }
-}
 
-TEST_F(FactStoreMetadataTest,
-       MarkerWriteFailureFailsOpenAndLeavesV1DatabaseUsable) {
-  const std::string path = path_ + "/marker_write_failure";
-  FactStoreOptions options = StoreOptionsAt(path, kMetaSequenceFormatV2);
-  options.meta_sequence_format_marker_write_fault_injector_for_testing = [] {
-    return Status::IOError("test", "marker write failed");
-  };
+  // A legacy v1 marker is refused with the actionable migration error.
   {
-    FactStore store(options);
+    const std::string path = create_v2_database("marker_v1");
+    const auto marker = EncodeSequenceFormat(kMetaSequenceFormatV1);
+    ASSERT_TRUE(marker.ok()) << marker.status().ToString();
+    PutMetaRecord(path, marker_key, marker.ValueOrDie());
+    FactStore store(FactStoreOptions{path});
     const Status opened = store.Open();
-    EXPECT_TRUE(opened.IsIOError()) << opened.ToString();
+    ASSERT_FALSE(opened.ok());
+    EXPECT_TRUE(opened.IsNotSupportedError()) << opened.ToString();
+    EXPECT_NE(opened.ToString().find("format 1 (v1)"), std::string::npos)
+        << opened.ToString();
+    EXPECT_NE(opened.ToString().find("cedar-meta-v2-reclaim"),
+              std::string::npos)
+        << opened.ToString();
+    EXPECT_NE(opened.ToString().find("previous Cedar release"),
+              std::string::npos)
+        << opened.ToString();
+    if (opened.ok()) EXPECT_TRUE(store.Close().ok());
   }
-  EXPECT_FALSE(
-      ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
-  // No v2 record was written. The database remains a usable v1 database when
-  // the caller explicitly opts out of F19's default v2 writer.
+
+  // A database that predates the marker is a legacy v1 database and gets the
+  // same actionable error; it is never opened as an empty/v1 store.
   {
-    FactStore store(StoreOptionsAt(path, kMetaSequenceFormatV1));
-    ASSERT_TRUE(store.Open().ok());
-    EXPECT_EQ(store.visible_seq(), CommitSeq{0});
-    ASSERT_TRUE(store.Close().ok());
-    EXPECT_FALSE(
-        ReadMetaRecordIfPresent(path, EncodeSequenceFormatKey()).has_value());
+    const std::string path = create_v2_database("marker_missing");
+    DeleteMetaRecord(path, marker_key);
+    FactStore store(FactStoreOptions{path});
+    const Status opened = store.Open();
+    ASSERT_FALSE(opened.ok());
+    EXPECT_TRUE(opened.IsNotSupportedError()) << opened.ToString();
+    EXPECT_NE(opened.ToString().find("no durable meta sequence format marker"),
+              std::string::npos)
+        << opened.ToString();
+    EXPECT_NE(opened.ToString().find("cedar-meta-v2-reclaim"),
+              std::string::npos)
+        << opened.ToString();
+    if (opened.ok()) EXPECT_TRUE(store.Close().ok());
   }
 }
 

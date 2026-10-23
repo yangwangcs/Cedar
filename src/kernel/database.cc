@@ -1353,8 +1353,7 @@ StatusOr<StoreCommitResult> Database::Impl::SubmitSyncCommit(
   request->batch = std::move(batch);
   request->txn_id = request->batch.txn_id;
   request->estimated_bytes =
-      internal::EstimateCommitBatchBytes(request->batch,
-                                         sequence_record_format);
+      internal::EstimateCommitBatchBytes(request->batch);
   request->preflight_footprint = internal::BuildCommitFootprint(request->batch);
   request->enqueued_at = std::chrono::steady_clock::now();
   if (request->estimated_bytes > append_commit_max_batch_bytes) {
@@ -1584,8 +1583,7 @@ Status Database::Impl::SubmitAsyncCommit(
   request->batch = std::move(batch);
   request->txn_id = request->batch.txn_id;
   request->estimated_bytes =
-      internal::EstimateCommitBatchBytes(request->batch,
-                                         sequence_record_format);
+      internal::EstimateCommitBatchBytes(request->batch);
   request->preflight_footprint = internal::BuildCommitFootprint(request->batch);
   request->enqueued_at = std::chrono::steady_clock::now();
   if (request->estimated_bytes > append_commit_max_batch_bytes) {
@@ -1777,10 +1775,20 @@ Status QueryMaintenanceHandle::Await() {
 
 StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   if (options.path.empty()) return Status::InvalidArgument("database", "missing path");
-  if (options.meta_sequence_format != kMetaSequenceFormatV1 &&
-      options.meta_sequence_format != kMetaSequenceFormatV2) {
-    return Status::InvalidArgument("database",
-                                   "meta sequence format must be 1 or 2");
+  if (options.meta_sequence_format != kMetaSequenceFormatV2) {
+    // v1 support was removed; the option is kept for source compatibility but
+    // only meta sequence format 2 (the default) is accepted.
+    if (options.meta_sequence_format == kMetaSequenceFormatV1) {
+      return Status::InvalidArgument(
+          "database",
+          "meta sequence format 1 (v1) is no longer supported; this release "
+          "writes and reads only format 2 (v2), which is the default");
+    }
+    return Status::InvalidArgument(
+        "database",
+        "unsupported meta sequence format " +
+            std::to_string(options.meta_sequence_format) +
+            "; this release supports only format 2 (v2)");
   }
   if (options.group_commit_max_batch_size == 0 ||
       options.group_commit_max_batch_size > kMaximumGroupCommitBatchCount) {
@@ -1846,11 +1854,6 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   auto impl = std::make_shared<Impl>(std::move(options));
   const Status opened = impl->store.Open();
   if (!opened.ok()) return opened;
-  // The effective sequence format is fixed for this open: the durable marker
-  // (when present) wins over DatabaseOptions::meta_sequence_format. Cache it for
-  // queue admission and group planning so estimates reserve the record the
-  // writer actually emits.
-  impl->sequence_record_format = impl->store.EffectiveSequenceRecordFormat();
   // Build the Cedar-owned adjacency cache from the authoritative fact lane at
   // open. QueryDelta supplies the newer commit tail at query time. A failed
   // rebuild is never silent: it is logged, reported through the test observer,

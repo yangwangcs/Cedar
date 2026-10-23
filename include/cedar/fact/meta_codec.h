@@ -19,22 +19,23 @@ namespace cedar {
 enum class IdKind : uint8_t { kVertex = 1, kEdge = 2, kTransaction = 3 };
 
 // Values of the durable meta sequence-format marker (see
-// EncodeSequenceFormatKey). 1 keeps writing v1 `kSequence` records; 2 enables
-// the compact v2a `kSequenceV2` writer. The marker is a one-way upgrade: an
-// open that observes 2 keeps writing v2 even when the caller asks for 1. Any
-// other marker value is rejected at open as Corruption.
+// EncodeSequenceFormatKey). 2 is the compact v2a `kSequenceV2` format and the
+// only format this release writes or reads. 1 is the retired v1 `kSequence`
+// format: it is recognized only so a legacy database can be rejected with an
+// actionable migration error, never decoded.
 inline constexpr uint32_t kMetaSequenceFormatV1 = 1;
 inline constexpr uint32_t kMetaSequenceFormatV2 = 2;
-// Default writer format (F19). Normal builds write v2 and durably record the
-// marker on the first open, which is a one-way upgrade for older binaries; a
-// caller opts out with meta_sequence_format = kMetaSequenceFormatV1 before the
-// database is upgraded. The v1-only compatibility build (F17) simulates a
-// pre-v2 binary and therefore keeps the historical v1 default.
-#if defined(CEDAR_META_SEQUENCE_V1_ONLY)
-inline constexpr uint32_t kMetaSequenceFormatDefault = kMetaSequenceFormatV1;
-#else
+// The only supported writer format. Kept as a named constant so the public
+// option default and the v2-only validation share one spelling.
 inline constexpr uint32_t kMetaSequenceFormatDefault = kMetaSequenceFormatV2;
-#endif
+
+// The actionable error for a database that still carries the retired v1 meta
+// sequence format: a missing or 1-valued durable format marker, or a legacy
+// `kSequence` (on-disk kind 7) record. `detail` names the artifact that was
+// found. The message tells the operator how to migrate the database with the
+// previous Cedar release and states that downgrade is unsupported; this
+// release never decodes v1 sequence records.
+Status LegacyMetaSequenceFormatError(std::string_view detail);
 
 struct IdAllocatorState {
   IdKind kind = IdKind::kVertex;
@@ -65,11 +66,9 @@ struct SequenceRecord {
   bool operator==(const SequenceRecord&) const = default;
 };
 
-// Zero-copy view of one committed sequence record. For v1 records (`kSequence`)
-// `identities` borrows the caller's encoded record bytes; each entry is
-// kEncodedFactKeyBytes long and the view is valid only while those bytes stay
-// alive. v2 records (`kSequenceV2`) store a 23-byte descriptor per fact instead
-// of the packed key, so the key-aware view decoder rebuilds the keys once into
+// Zero-copy view of one committed sequence record. The only supported record
+// is v2 (`kSequenceV2`): it stores a 23-byte descriptor per fact instead of the
+// packed key, so the view decoder rebuilds the 32-byte keys once into
 // `owned_identities` and `identities` points into that shared buffer; the view
 // keeps the buffer alive through copies and moves.
 struct SequenceRecordView {
@@ -78,7 +77,8 @@ struct SequenceRecordView {
   uint64_t system_hlc = 0;
   uint32_t fact_count = 0;
   std::string_view identities;
-  // Non-null only for v2 records (whose identities are rebuilt, not borrowed).
+  // Rebuilt fact keys owned by the view (non-null for every record this
+  // release can decode). `identities` points at this buffer.
   std::shared_ptr<const std::string> owned_identities;
 
   Status Validate() const;
@@ -152,38 +152,25 @@ StatusOr<std::string> EncodeTransactionOutcome(
     const TransactionOutcomeRecord& record);
 StatusOr<TransactionOutcomeRecord> DecodeTransactionOutcome(
     const std::string& encoded);
-StatusOr<std::string> EncodeSequenceRecord(const SequenceRecord& record);
-// Compact v2a sequence record (`kSequenceV2`). The payload is
+// Compact v2a sequence record (`kSequenceV2`, on-disk kind 9), the only
+// sequence-record encoding this release writes. The payload is
 //   payload_version(1) + fact_key_version(1) + txn_id(8) + system_hlc(8) +
 //   count(4) + N x [part(4) + family(1) + property(2) + entity(8) +
 //   ~valid_from(8)]   // 23 bytes per fact, big-endian
 // commit_seq is not in the payload: it is the sequence/<seq> record key, and the
-// reader rebuilds the 32-byte fact keys from it with EncodeFactKey. The v1
-// writer keeps writing `kSequence`; this encoder exists for the opt-in writer
-// and the migration tool.
+// reader rebuilds the 32-byte fact keys from it with EncodeFactKey.
 StatusOr<std::string> EncodeSequenceRecordV2(const SequenceRecord& record);
-// Decodes a v1 `kSequence` record. Returns Corruption for a v2 `kSequenceV2`
-// record: the v2 payload does not carry commit_seq, so that decoder cannot
-// rebuild the fact keys without the record key. Use the key-aware overload.
-StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded);
-// Decodes either record kind. v1 records carry commit_seq themselves (the
-// argument is unused); v2 records rebuild every fact key with the supplied
-// commit_seq, so callers must pass the sequence number the record was stored
-// under (`sequence/<seq>`). A zero commit_seq for a v2 record is rejected with
-// Corruption.
+// Decodes a v2 `kSequenceV2` record. `commit_seq` is the sequence number the
+// record was stored under (`sequence/<seq>`); the payload omits it, so callers
+// must pass it or the rebuilt fact keys would be wrong. A zero commit_seq is
+// rejected with Corruption. A legacy `kSequence` (kind 7) record is rejected
+// with the actionable LegacyMetaSequenceFormatError and is never decoded; any
+// other record kind is Corruption.
 StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded,
                                               CommitSeq commit_seq);
-// Decodes only the record framing and the packed identity region; fact-key and
-// duplicate checks are Validate()'s job so callers that only need txn_id/count
-// do not pay for them twice. This overload is v1-only (zero-copy) and returns
-// Corruption for a v2 record for the same reason as DecodeSequenceRecord.
-StatusOr<SequenceRecordView> DecodeSequenceRecordView(
-    std::string_view encoded);
-// Dual-kind view decoder. For a v1 record this is the same zero-copy decode as
-// the overload above; for a v2 record it rebuilds the fact keys into
-// `owned_identities` (23 bytes per fact in the payload) and points `identities`
-// at that buffer. `commit_seq` is required for v2 records exactly like the key-
-// aware DecodeSequenceRecord overload.
+// View decoder with the same contract as DecodeSequenceRecord: only a v2 record
+// is accepted, and `commit_seq` is required because the fact keys are rebuilt
+// from the record key. The rebuilt keys are owned by the returned view.
 StatusOr<SequenceRecordView> DecodeSequenceRecordView(
     std::string_view encoded, CommitSeq commit_seq);
 StatusOr<std::string> EncodeVacuumState(const VacuumState& state);

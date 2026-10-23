@@ -146,7 +146,7 @@ TEST(FactEventCanonicalContractTest, SequenceMetadataRejectsDuplicateFactKeys) {
   const std::string key = EncodeFactKey(ref, ValidTime{3}, CommitSeq{2});
   const SequenceRecord record{CommitSeq{2}, TxnId{7}, 11, {key, key}};
 
-  const auto encoded = EncodeSequenceRecord(record);
+  const auto encoded = EncodeSequenceRecordV2(record);
   EXPECT_FALSE(encoded.ok());
 }
 

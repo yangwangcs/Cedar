@@ -57,8 +57,7 @@ class CommitPublisherTest : public ::testing::Test {
   // the visible-watermark record the group write appends, and returns the real
   // RocksDB WriteBatch.
   rocksdb::WriteBatch EncodeGroup(
-      const std::vector<const StoreCommitBatch*>& batches, CommitSeq base,
-      uint32_t sequence_format = kMetaSequenceFormatV1) {
+      const std::vector<const StoreCommitBatch*>& batches, CommitSeq base) {
     rocksdb::WriteBatch write_batch;
     CommitSeq sequence = base;
     for (const StoreCommitBatch* batch : batches) {
@@ -70,7 +69,7 @@ class CommitPublisherTest : public ::testing::Test {
       }
       const Status appended = AppendCandidateToWriteBatch(
           CandidateCommit{batch, sequence, std::move(fact_keys)}, handles_[1],
-          handles_[2], sequence_format, &write_batch);
+          handles_[2], &write_batch);
       EXPECT_TRUE(appended.ok()) << appended.ToString();
       ++sequence.value;
     }
@@ -118,7 +117,7 @@ TEST_F(CommitPublisherTest, AppendsAllFactsAndMetadataForOneCandidate) {
 
   ASSERT_TRUE(AppendCandidateToWriteBatch(
                   CandidateCommit{&batch, sequence, fact_keys}, handles_[1],
-                  handles_[2], kMetaSequenceFormatV1, &write_batch)
+                  handles_[2], &write_batch)
                   .ok());
   ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &write_batch).ok());
 
@@ -146,7 +145,7 @@ TEST_F(CommitPublisherTest, AppendsAllFactsAndMetadataForOneCandidate) {
                        EncodeSequenceMetaKey(sequence).ValueOrDie(),
                        &encoded_sequence)
                   .ok());
-  const auto record = DecodeSequenceRecord(encoded_sequence);
+  const auto record = DecodeSequenceRecord(encoded_sequence, sequence);
   ASSERT_TRUE(record.ok()) << record.status().ToString();
   EXPECT_EQ(record.ValueOrDie().fact_keys, fact_keys);
 }
@@ -168,7 +167,7 @@ TEST_F(CommitPublisherTest, AppendsAuthoritativeEdgeIdentityFactBesideRoutingMet
 
   ASSERT_TRUE(AppendCandidateToWriteBatch(
                   CandidateCommit{&batch, sequence, fact_keys}, handles_[1],
-                  handles_[2], kMetaSequenceFormatV1, &write_batch)
+                  handles_[2], &write_batch)
                   .ok());
   ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &write_batch).ok());
 
@@ -191,27 +190,20 @@ TEST_F(CommitPublisherTest, AppendsAuthoritativeEdgeIdentityFactBesideRoutingMet
                        EncodeSequenceMetaKey(sequence).ValueOrDie(),
                        &encoded_sequence)
                   .ok());
-  const auto sequence_record = DecodeSequenceRecord(encoded_sequence);
+  const auto sequence_record = DecodeSequenceRecord(encoded_sequence, sequence);
   ASSERT_TRUE(sequence_record.ok()) << sequence_record.status().ToString();
   const std::vector<std::string> expected_fact_keys{fact_keys.front(), identity_key};
   EXPECT_EQ(sequence_record.ValueOrDie().fact_keys, expected_fact_keys);
 }
 
-TEST_F(CommitPublisherTest,
-       V2SequenceRecordDropsNineBytesPerFactAndFitsTheExactByteCap) {
+TEST_F(CommitPublisherTest, AlwaysWritesTheCompactV2SequenceRecord) {
   const StoreCommitBatch batch = ForecastBatch(42, 500, 7);
-  const rocksdb::WriteBatch v1 =
-      EncodeGroup({&batch}, CommitSeq{1}, kMetaSequenceFormatV1);
-  rocksdb::WriteBatch v2 =
-      EncodeGroup({&batch}, CommitSeq{1}, kMetaSequenceFormatV2);
-  // v1 sequence payload is 28 + 32N; v2 is 22 + 23N. The record, and therefore
-  // the assembled WriteBatch, shrinks by exactly 6 + 9 bytes per fact.
-  EXPECT_EQ(v1.GetDataSize() - v2.GetDataSize(), 6U + 9U * 7U);
-  // The generic guard measures the real encoded batch, so the smaller record is
+  rocksdb::WriteBatch encoded = EncodeGroup({&batch}, CommitSeq{1});
+  // The generic guard measures the real encoded batch, so the compact record is
   // accepted at the exact hard cap instead of being over-counted.
-  EXPECT_TRUE(CheckCommittedBatchSize(v2, v2.GetDataSize()).ok());
+  EXPECT_TRUE(CheckCommittedBatchSize(encoded, encoded.GetDataSize()).ok());
 
-  ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &v2).ok());
+  ASSERT_TRUE(db_->Write(rocksdb::WriteOptions(), &encoded).ok());
   const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
   ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
   std::string encoded_sequence;
@@ -241,7 +233,7 @@ TEST_F(CommitPublisherTest, RejectsDuplicateCanonicalFactKeysBeforeWriting) {
 
   const Status status = AppendCandidateToWriteBatch(
       CandidateCommit{&batch, sequence, {key, key}}, handles_[1], handles_[2],
-      kMetaSequenceFormatV1, &write_batch);
+      &write_batch);
   EXPECT_FALSE(status.ok());
   EXPECT_EQ(write_batch.Count(), 0U);
 }
@@ -303,23 +295,18 @@ TEST_F(CommitPublisherTest, EstimateCommitBatchBytesMatchesEncodedBatchWithinTol
 
   for (const auto& [name, batch] : cases) {
     SCOPED_TRACE(name);
-    for (uint32_t format :
-         {kMetaSequenceFormatV1, kMetaSequenceFormatV2}) {
-      SCOPED_TRACE(::testing::Message() << "format=" << format);
-      const std::vector<const StoreCommitBatch*> group{&batch};
-      const size_t actual =
-          EncodeGroup(group, CommitSeq{1}, format).GetDataSize();
-      const size_t estimate = EstimateCommitBatchBytes(batch, format);
-      EXPECT_GE(estimate, actual);
-      // The calibrated estimator may only carry a small absolute safety margin
-      // over the real encoder; the former 2x reservation is not allowed back.
-      EXPECT_LE(estimate - actual, actual / 64 + 512)
-          << "estimate=" << estimate << " actual=" << actual;
-    }
+    const std::vector<const StoreCommitBatch*> group{&batch};
+    const size_t actual = EncodeGroup(group, CommitSeq{1}).GetDataSize();
+    const size_t estimate = EstimateCommitBatchBytes(batch);
+    EXPECT_GE(estimate, actual);
+    // The calibrated estimator may only carry a small absolute safety margin
+    // over the real encoder; the former 2x reservation is not allowed back.
+    EXPECT_LE(estimate - actual, actual / 64 + 512)
+        << "estimate=" << estimate << " actual=" << actual;
   }
 }
 
-TEST_F(CommitPublisherTest, EstimateSequenceRecordBytesMatchesBothEncoders) {
+TEST_F(CommitPublisherTest, EstimateSequenceRecordBytesMatchesTheV2Encoder) {
   for (size_t fact_count : {size_t{1}, size_t{5}, size_t{182}}) {
     SCOPED_TRACE(::testing::Message() << "facts=" << fact_count);
     SequenceRecord record{CommitSeq{7}, TxnId{9}, 11, {}};
@@ -329,25 +316,11 @@ TEST_F(CommitPublisherTest, EstimateSequenceRecordBytesMatchesBothEncoders) {
           EntityFact::Vertex(VertexRef{PartId{0}, VertexId{index + 1}}).ref(),
           ValidTime{10}, CommitSeq{7}));
     }
-    const auto v1 = EncodeSequenceRecord(record);
-    ASSERT_TRUE(v1.ok()) << v1.status().ToString();
-    EXPECT_EQ(EstimateSequenceRecordBytes(kMetaSequenceFormatV1, fact_count),
-              v1.ValueOrDie().size());
     const auto v2 = EncodeSequenceRecordV2(record);
     ASSERT_TRUE(v2.ok()) << v2.status().ToString();
-    EXPECT_EQ(EstimateSequenceRecordBytes(kMetaSequenceFormatV2, fact_count),
+    EXPECT_EQ(EstimateSequenceRecordBytes(fact_count),
               v2.ValueOrDie().size());
-    // v2 replaces each duplicated 32-byte canonical key with a 23-byte
-    // descriptor and drops the 8-byte commit_seq from the payload (it is the
-    // record key), i.e. exactly 6 + 9 bytes per fact.
-    EXPECT_EQ(v1.ValueOrDie().size() - v2.ValueOrDie().size(),
-              6U + 9U * fact_count);
   }
-  // The format parameter defaults to v1 so existing callers keep byte-identical
-  // estimates.
-  const StoreCommitBatch batch = ForecastBatch(3, 500, 4);
-  EXPECT_EQ(EstimateCommitBatchBytes(batch),
-            EstimateCommitBatchBytes(batch, kMetaSequenceFormatV1));
 }
 
 TEST_F(CommitPublisherTest, ForecastGroupAtTwoMebibyteCapIsNotCutEarly) {
@@ -357,7 +330,7 @@ TEST_F(CommitPublisherTest, ForecastGroupAtTwoMebibyteCapIsNotCutEarly) {
   batches.reserve(kCountCap);
   for (size_t index = 0; index < kCountCap; ++index) {
     batches.push_back(ForecastBatch(
-        100 + index, 1'000'000 + index * 1000, 182));
+        100 + index, 1'000'000 + index * 1000, 200));
   }
 
   // Replay the collector's byte-limit stop for these independent batches.

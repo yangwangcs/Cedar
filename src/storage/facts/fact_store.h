@@ -181,26 +181,13 @@ struct FactStoreOptions {
   // a no-op).
   std::function<void(const ReopenValidationPhaseCounters&)>
       reopen_validation_counters_for_testing;
-  // Writer format for newly committed sequence records. 2 (default since F19)
-  // writes compact `kSequenceV2` records and durably records format 2 in the
-  // meta-CF format marker during Open, before any commit is accepted. 1 is the
-  // explicit v1 opt-out: it keeps the `kSequence` encoding byte-identical and
-  // writes no marker, but only while the database has not been upgraded. The
-  // marker wins on reopen: a database that recorded 2 keeps writing v2 even
-  // when a later open passes 1. The value is validated by Open; commits never
-  // change the format. A v1-only compatibility build (F17) defaults to 1
-  // because it simulates a pre-v2 binary.
+  // Meta sequence record format. The field is retained for source
+  // compatibility, but meta sequence v2 is the only supported format: the only
+  // accepted value is 2 (the default). Open rejects any other value with
+  // InvalidArgument; in particular 1 (the retired v1 format) is no longer
+  // writable or readable. A database opened by this release always writes
+  // compact `kSequenceV2` records and durably records marker 2.
   uint32_t meta_sequence_format = kMetaSequenceFormatDefault;
-  // Fires immediately before Open writes the durable format marker (only when
-  // the effective writer is v2 and the marker is absent or older) with the
-  // RocksDB Sync flag, which is always true because the marker must reach the
-  // WAL before any v2 record. Must not call back into FactStore.
-  std::function<void(bool)> meta_sequence_format_marker_write_observer_for_testing;
-  // Test-only failure injection for the durable marker write. A non-OK result
-  // fails Open with that status and leaves the marker unwritten; no v2 record
-  // can exist at that point because no commit has been accepted.
-  std::function<Status()>
-      meta_sequence_format_marker_write_fault_injector_for_testing;
   // Opt-in sequence-record retention (F14). Default false: Vacuum keeps every
   // `sequence/*` record and the reopen contract (contiguous [1..visible]) is
   // unchanged. When true, Vacuum advances the durable
@@ -903,13 +890,6 @@ class FactStore {
   // deleted.
   Status Vacuum(CommitSeq oldest_readable);
   CommitSeq visible_seq() const;
-  // Effective meta sequence writer format of this store: resolved by Open from
-  // the durable format marker (which wins) and FactStoreOptions::
-  // meta_sequence_format, and fixed for the lifetime of the open store. When
-  // the store is closed this reports the configured option instead. Admission
-  // and group planning use it so estimates reserve the record the writer
-  // actually emits instead of always assuming v1.
-  uint32_t EffectiveSequenceRecordFormat() const;
   StatusOr<std::optional<StoreCommitResult>> ResolveTransaction(
       TxnId txn_id) const;
   StatusOr<std::optional<StoreAsyncCommitResult>> ResolveAsyncTransaction(

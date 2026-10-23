@@ -1777,11 +1777,10 @@ TEST(KernelGroupCommitTest, RejectsEncodedBatchBeforeDurableWrite) {
   std::filesystem::remove_all(pattern);
 }
 
-// F13: kernel queue admission must reserve the sequence-record format the store
-// actually writes. This transaction's v2 estimate fits the configured byte cap
-// while its v1 estimate (the old behavior) does not, so a v2 database admits it
-// and a v1 database at the same cap still rejects it before any write.
-TEST(KernelGroupCommitTest, FormatAwareAdmissionAdmitsV2BatchThatV1WouldReject) {
+// F13: kernel queue admission must reserve the v2 sequence record the store
+// actually writes. A transaction whose v2 estimate exactly fits the configured
+// byte cap is admitted; one byte less is rejected before any write.
+TEST(KernelGroupCommitTest, V2AdmissionUsesTheExactEncodedEstimate) {
   constexpr size_t kFactCount = 64;
   StoreCommitBatch equivalent{TxnId{1}, 10, {}, {}, {}, {}, true};
   equivalent.mutations.reserve(kFactCount);
@@ -1790,20 +1789,14 @@ TEST(KernelGroupCommitTest, FormatAwareAdmissionAdmitsV2BatchThatV1WouldReject) 
         EntityFact::Vertex(VertexRef{PartId{0}, VertexId{index + 1}}).ref(),
         ValidTime{10}, FactOperation::kPut, 0, std::nullopt});
   }
-  const size_t v1_estimate = internal::EstimateCommitBatchBytes(equivalent);
-  const size_t v2_estimate =
-      internal::EstimateCommitBatchBytes(equivalent, kMetaSequenceFormatV2);
-  ASSERT_GT(v1_estimate, v2_estimate);
-  const uint64_t byte_cap = v2_estimate + (v1_estimate - v2_estimate) / 2;
-  ASSERT_LE(v2_estimate, byte_cap);
-  ASSERT_GT(v1_estimate, byte_cap);
+  const size_t v2_estimate = internal::EstimateCommitBatchBytes(equivalent);
+  ASSERT_GT(v2_estimate, 1U);
 
-  const auto commit_facts = [byte_cap](uint32_t format,
-                                       const std::string& path) {
+  const auto commit_facts = [](uint64_t byte_cap,
+                               const std::string& path) {
     auto opened = Database::Open(DatabaseOptions{
         .path = path,
-        .group_commit_max_batch_bytes = byte_cap,
-        .meta_sequence_format = format});
+        .group_commit_max_batch_bytes = byte_cap});
     if (!opened.ok()) return std::pair<bool, Status>{false, opened.status()};
     std::unique_ptr<Database> database =
         std::move(opened).ConsumeValueOrDie();
@@ -1836,16 +1829,17 @@ TEST(KernelGroupCommitTest, FormatAwareAdmissionAdmitsV2BatchThatV1WouldReject) 
     char pattern[] = "/tmp/cedar_kernel_v2_admission_XXXXXX";
     ASSERT_NE(mkdtemp(pattern), nullptr);
     const std::string path = pattern;
-    const auto [committed, status] = commit_facts(kMetaSequenceFormatV2, path);
+    const auto [committed, status] = commit_facts(v2_estimate, path);
     EXPECT_TRUE(committed) << status.ToString();
     EXPECT_TRUE(status.ok()) << status.ToString();
     std::filesystem::remove_all(path);
   }
   {
-    char pattern[] = "/tmp/cedar_kernel_v1_admission_XXXXXX";
+    char pattern[] = "/tmp/cedar_kernel_v2_rejection_XXXXXX";
     ASSERT_NE(mkdtemp(pattern), nullptr);
     const std::string path = pattern;
-    const auto [committed, status] = commit_facts(kMetaSequenceFormatV1, path);
+    const auto [committed, status] =
+        commit_facts(v2_estimate - 1, path);
     EXPECT_FALSE(committed);
     EXPECT_TRUE(status.IsResourceExhausted()) << status.ToString();
     std::filesystem::remove_all(path);

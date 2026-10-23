@@ -46,7 +46,6 @@
 #include "storage/rocks/decided_epoch.h"
 #include "storage/facts/fact_identity_history.h"
 #include "storage/facts/group_commit_planner.h"
-#include "storage/facts/meta_sequence_compat.h"
 #include "storage/facts/prepared_commit_codec.h"
 #include "storage/facts/recent_fact_write_index.h"
 #include "storage/rocks/rocksdb_config.h"
@@ -531,10 +530,6 @@ class FactStoreImpl {
   // production default to the bounded recent window (K=4096).
   bool deep_recovery_validation = false;
   uint64_t recovery_validation_recent_sequences = 4096;
-  // Effective meta sequence writer format resolved by Open from the durable
-  // format marker and FactStoreOptions::meta_sequence_format. Fixed for the
-  // lifetime of this open store; every commit consults it.
-  uint32_t meta_sequence_format = kMetaSequenceFormatDefault;
   // Reports one completed reopen validation pass; see FactStoreOptions.
   std::function<void(const ReopenValidationPhaseCounters&)>
       reopen_validation_counters_for_testing;
@@ -2151,9 +2146,10 @@ Status LoadTransactionAllocatorState(FactStoreImpl* store,
 }
 
 // Reads the durable meta sequence-format marker. std::nullopt means the
-// database predates the marker (every record so far is v1 or was written by a
-// dual-read writer without the opt-in). A marker that fails framing/CRC or
-// records an unsupported format fails Open as Corruption.
+// database predates the marker; the value is returned as decoded and the
+// v2-only policy is enforced by Open, which shares one actionable error for the
+// missing and v1 cases. A marker that fails framing/CRC or has a malformed
+// payload fails Open as Corruption.
 StatusOr<std::optional<uint32_t>> LoadMetaSequenceFormatMarker(
     FactStoreImpl* store) {
   std::string encoded;
@@ -2166,42 +2162,7 @@ StatusOr<std::optional<uint32_t>> LoadMetaSequenceFormatMarker(
   }
   const auto decoded = DecodeSequenceFormat(encoded);
   if (!decoded.ok()) return decoded.status();
-  const uint32_t format = decoded.ValueOrDie();
-  if (format != kMetaSequenceFormatV1 && format != kMetaSequenceFormatV2) {
-    return Status::Corruption(
-        "fact store",
-        "unsupported meta sequence format marker: " + std::to_string(format));
-  }
-  return std::optional<uint32_t>{format};
-}
-
-// Durably records the meta sequence format. Sync=true is the crash-safety
-// contract: Open must not accept a v2 commit until the marker that makes v2
-// authoritative on every later open has reached the WAL. A failed write fails
-// Open; the caller has not accepted any commit yet.
-Status WriteMetaSequenceFormatMarker(FactStoreImpl* store,
-                                     const FactStoreOptions& options,
-                                     uint32_t format) {
-  const auto encoded = EncodeSequenceFormat(format);
-  if (!encoded.ok()) return encoded.status();
-  rocksdb::WriteOptions write_options;
-  write_options.sync = true;
-  if (options.meta_sequence_format_marker_write_observer_for_testing) {
-    options.meta_sequence_format_marker_write_observer_for_testing(
-        write_options.sync);
-  }
-  if (options.meta_sequence_format_marker_write_fault_injector_for_testing) {
-    const Status injected =
-        options.meta_sequence_format_marker_write_fault_injector_for_testing();
-    if (!injected.ok()) return injected;
-  }
-  const rocksdb::Status written =
-      store->db->Put(write_options, store->meta_cf, EncodeSequenceFormatKey(),
-                     encoded.ValueOrDie());
-  if (!written.ok()) {
-    return FromRocksDb(written, "write meta sequence format marker");
-  }
-  return Status::OK();
+  return std::optional<uint32_t>{decoded.ValueOrDie()};
 }
 
 Status LoadPropertySchemas(FactStoreImpl* store) {
@@ -2677,20 +2638,21 @@ Status FactStore::Open() {
   if (options_.path.empty()) {
     return Status::InvalidArgument("fact store", "missing database path");
   }
-  if (options_.meta_sequence_format != kMetaSequenceFormatV1 &&
-      options_.meta_sequence_format != kMetaSequenceFormatV2) {
-    return Status::InvalidArgument(
-        "fact store", "meta sequence format must be 1 (v1) or 2 (v2a)");
-  }
-  if (options_.meta_sequence_format == kMetaSequenceFormatV2 &&
-      internal::MetaSequenceV2ReadDisabled()) {
-    // A v1-only compatibility binary must never write a marker it cannot read
-    // back. Reject the opt-in before any engine state can change.
+  if (options_.meta_sequence_format != kMetaSequenceFormatV2) {
+    // v1 support was removed: the option is kept for source compatibility, but
+    // only format 2 (the default) is accepted. A caller that explicitly asks
+    // for v1 gets an actionable error instead of a silently ignored setting.
+    if (options_.meta_sequence_format == kMetaSequenceFormatV1) {
+      return Status::InvalidArgument(
+          "fact store",
+          "meta sequence format 1 (v1) is no longer supported; this release "
+          "writes and reads only format 2 (v2), which is the default");
+    }
     return Status::InvalidArgument(
         "fact store",
-        "meta sequence format 2 cannot be enabled by this binary; it was built "
-        "with CEDAR_META_SEQUENCE_V1_ONLY (v1-only compatibility profile). Use "
-        "a binary built with meta sequence v2 support.");
+        "unsupported meta sequence format " +
+            std::to_string(options_.meta_sequence_format) +
+            "; this release supports only format 2 (v2)");
   }
   if (options_.group_commit_max_batch_size == 0 ||
       options_.group_commit_max_batch_size > kMaximumGroupCommitBatchCount) {
@@ -2824,14 +2786,21 @@ Status FactStore::Open() {
         "cedar.authoritative-columnar", 1, "part32.fact.v2",
         "cedar.parquet.facts.v3", "cedar.v2.internal-key.bytewise.v1"});
     const auto empty_watermark = EncodeWatermark(CommitSeq{});
+    const auto sequence_format = EncodeSequenceFormat(kMetaSequenceFormatV2);
     if (!identity.ok()) return identity.status();
     if (!empty_watermark.ok()) return empty_watermark.status();
+    if (!sequence_format.ok()) return sequence_format.status();
     rocksdb::WriteBatch batch;
     batch.Put(store->meta_cf, EncodeCurrentFormatKey(), identity.ValueOrDie());
     batch.Put(store->meta_cf, EncodeVisibleWatermarkKey(),
               empty_watermark.ValueOrDie());
     batch.Put(store->meta_cf, EncodeOldestReadableWatermarkKey(),
               empty_watermark.ValueOrDie());
+    // A fresh database is a v2 database from its first durable state. The
+    // marker is written in the same Sync=true batch as the system identity, so
+    // no commit (and therefore no sequence record) can exist without it.
+    batch.Put(store->meta_cf, EncodeSequenceFormatKey(),
+              sequence_format.ValueOrDie());
     rocksdb::WriteOptions write_options;
     write_options.sync = true;
     const rocksdb::Status initialized = store->db->Write(write_options, &batch);
@@ -2889,38 +2858,37 @@ Status FactStore::Open() {
     store->sequence_retention_watermark.store(sequence_retention.value,
                                               std::memory_order_relaxed);
   }
-  // Resolve the effective meta sequence writer format before reopen validation
-  // and before the store can accept any commit. The durable marker is
-  // authoritative on reopen: once it records 2, this and every later open write
-  // v2 even if the caller asks for v1. Missing marker + v1 option keeps today's
-  // byte-identical v1 behavior; missing marker + v2 option writes the marker
-  // durably below, before any v2 record can exist.
+  // Enforce the v2-only meta sequence contract before reopen validation and
+  // before the store can accept any commit. A database written by this release
+  // always has marker 2, written in the fresh-database initialization batch
+  // above; any existing database must already record 2. A missing or 1-valued
+  // marker is a legacy v1 database, which this release refuses to decode.
   const auto marker = LoadMetaSequenceFormatMarker(store.get());
   if (!marker.ok()) return marker.status();
   const std::optional<uint32_t> marker_format = marker.ValueOrDie();
-  const bool marker_is_v2 =
-      marker_format.has_value() && *marker_format == kMetaSequenceFormatV2;
-  store->meta_sequence_format =
-      marker_is_v2 ? kMetaSequenceFormatV2 : options_.meta_sequence_format;
+  if (!marker_format.has_value()) {
+    return LegacyMetaSequenceFormatError(
+        "database has no durable meta sequence format marker");
+  }
+  if (*marker_format == kMetaSequenceFormatV1) {
+    return LegacyMetaSequenceFormatError(
+        "database records meta sequence format 1 (v1)");
+  }
+  if (*marker_format != kMetaSequenceFormatV2) {
+    return Status::Corruption(
+        "fact store", "unsupported meta sequence format marker: " +
+                          std::to_string(*marker_format));
+  }
   if (!is_new_database) {
-    // Marker loaded, then validation: the sequence scanner is dual-read, but the
-    // open contract is that the durable format is known first. Validation starts
-    // at the durable sequence-retention watermark, so pruned history below it is
-    // accepted while any gap at or above it still fails the open.
+    // Validation starts at the durable sequence-retention watermark, so pruned
+    // history below it is accepted while any gap at or above it still fails the
+    // open. The scanner uses the v2-only decoders, so a legacy kind-7 record is
+    // rejected with the same actionable migration error as a legacy marker.
     const Status sequences_valid = ValidateCommittedSequences(
         store.get(), store->visible_seq, store->oldest_readable_seq,
         CommitSeq{store->sequence_retention_watermark.load(
             std::memory_order_relaxed)});
     if (!sequences_valid.ok()) return sequences_valid;
-  }
-  if (store->meta_sequence_format == kMetaSequenceFormatV2 && !marker_is_v2) {
-    // Opt-in upgrade (or a marker that still records v1): durably record 2
-    // before accepting commits. Sync=true makes a crash-safe ordering guarantee:
-    // no v2 record can be durable without the marker that claims v2.
-    const Status marked =
-        WriteMetaSequenceFormatMarker(store.get(), options_,
-                                      kMetaSequenceFormatV2);
-    if (!marked.ok()) return marked;
   }
   const Status vertex_allocator =
       LoadAllocatorState(store.get(), IdKind::kVertex, &store->vertex_allocator);
@@ -4705,8 +4673,7 @@ StatusOr<StoreCommitResult> FactStore::CommitGrouped(
     bool sync) {
   const Status valid = batch.Validate();
   if (!valid.ok()) return valid;
-  if (internal::EstimateCommitBatchBytes(
-          batch, EffectiveSequenceRecordFormat()) >
+  if (internal::EstimateCommitBatchBytes(batch) >
       options_.group_commit_max_batch_bytes) {
     return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
   }
@@ -4861,7 +4828,7 @@ StatusOr<StoreCommitResult> FactStore::CommitGrouped(
     const Status appended = internal::AppendCandidateToWriteBatch(
         internal::CandidateCommit{&candidate->batch, commit_seq,
                                   std::move(fact_keys)},
-        store->facts_cf, store->meta_cf, store->meta_sequence_format,
+        store->facts_cf, store->meta_cf,
         &write_batch);
     if (!appended.ok()) {
       finish_all(appended);
@@ -4919,8 +4886,7 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
     bool sync) {
   const Status valid = batch.Validate();
   if (!valid.ok()) return valid;
-  if (internal::EstimateCommitBatchBytes(
-          batch, EffectiveSequenceRecordFormat()) >
+  if (internal::EstimateCommitBatchBytes(batch) >
       options_.group_commit_max_batch_bytes) {
     return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
   }
@@ -5066,7 +5032,7 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
   if (!encoded_watermark.ok()) return encoded_watermark.status();
   const Status appended = internal::AppendCandidateToWriteBatch(
       internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-      store->facts_cf, store->meta_cf, store->meta_sequence_format,
+      store->facts_cf, store->meta_cf,
       &write_batch);
   if (!appended.ok()) return appended;
   write_batch.Put(store->meta_cf, EncodeVisibleWatermarkKey(),
@@ -5113,8 +5079,7 @@ StatusOr<StoreCommitResult> FactStore::CommitWithWalCallbackDirect(
     void* callback_context) {
   const Status valid = batch.Validate();
   if (!valid.ok()) return valid;
-  if (internal::EstimateCommitBatchBytes(
-          batch, EffectiveSequenceRecordFormat()) >
+  if (internal::EstimateCommitBatchBytes(batch) >
       options_.group_commit_max_batch_bytes) {
     return Status::ResourceExhausted("commit", "encoded batch exceeds hard byte limit");
   }
@@ -5171,7 +5136,7 @@ StatusOr<StoreCommitResult> FactStore::CommitWithWalCallbackDirect(
   rocksdb::WriteBatch write_batch;
   const Status appended = internal::AppendCandidateToWriteBatch(
       internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-      store->facts_cf, store->meta_cf, store->meta_sequence_format,
+      store->facts_cf, store->meta_cf,
       &write_batch);
   if (!appended.ok()) return appended;
   const auto watermark = EncodeWatermark(commit_seq);
@@ -5287,8 +5252,7 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
     Status validation = batch.Validate();
     bool may_persist_abort = request.persist_async_abort;
     if (validation.ok() &&
-        internal::EstimateCommitBatchBytes(batch,
-                                           store->meta_sequence_format) >
+        internal::EstimateCommitBatchBytes(batch) >
             options.group_commit_max_batch_bytes) {
       validation = Status::ResourceExhausted(
           "commit", "encoded batch exceeds hard byte limit");
@@ -5359,7 +5323,7 @@ StatusOr<internal::DecidedEpoch> DecideAndEncodeGroupLocked(
     }
     const Status appended = internal::AppendCandidateToWriteBatch(
         internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-        store->facts_cf, store->meta_cf, store->meta_sequence_format,
+        store->facts_cf, store->meta_cf,
         write_batch.get());
     if (!appended.ok()) return appended;
     ++committed_count;
@@ -5585,8 +5549,7 @@ FactStore::DecideIndependentAppendGroup(
     (void)required_snapshot_seq;
     const Status validation = batch.Validate();
     if (!validation.ok()) return validation;
-    if (internal::EstimateCommitBatchBytes(batch,
-                                           store->meta_sequence_format) >
+    if (internal::EstimateCommitBatchBytes(batch) >
         options_.group_commit_max_batch_bytes) {
       return Status::ResourceExhausted(
           "commit", "encoded batch exceeds hard byte limit");
@@ -5609,7 +5572,7 @@ FactStore::DecideIndependentAppendGroup(
     }
     const Status appended = internal::AppendCandidateToWriteBatch(
         internal::CandidateCommit{&batch, commit_seq, std::move(fact_keys)},
-        store->facts_cf, store->meta_cf, store->meta_sequence_format,
+        store->facts_cf, store->meta_cf,
         write_batch.get());
     if (!appended.ok()) return appended;
     ++committed_count;
@@ -6203,12 +6166,6 @@ CommitSeq FactStore::visible_seq() const {
   if (!store) return CommitSeq{};
   std::lock_guard<std::mutex> lock(store->publisher_mutex);
   return store->visible_seq;
-}
-
-uint32_t FactStore::EffectiveSequenceRecordFormat() const {
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-  if (impl_) return impl_->meta_sequence_format;
-  return options_.meta_sequence_format;
 }
 
 StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(

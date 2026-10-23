@@ -287,16 +287,14 @@ struct DatabaseOptions {
   StorageProfile storage_profile = StorageProfile::kDeveloper;
   ProductionStorageOptions production;
   uint64_t validation_cache_bytes = 8ULL * 1024ULL * 1024ULL;
-  // Durable writer format for committed meta sequence records. Since F19 the
-  // default is 2: open durably records the format marker (Sync=true) before
-  // accepting commits and writes compact `kSequenceV2` records. An existing v1
-  // database opened with the default is upgraded in place; its old v1 records
-  // stay readable. Set 1 to opt out and keep new databases byte-identical v1
-  // (no marker), but the marker wins on reopen: once a database records 2, a
-  // later open asking for 1 still writes v2. Format 2 is a one-way
-  // compatibility gate for older binaries; back up before upgrading. A v1-only
-  // compatibility build (F17) defaults to 1. Database::Open rejects values
-  // other than 1 or 2. See docs/README.md and docs/release-notes.md.
+  // Meta sequence record format. The field is retained for source
+  // compatibility, but meta sequence v2 is the only supported format: the only
+  // accepted value is 2 (the default), and Database::Open rejects anything else
+  // with InvalidArgument. In particular 1 (the retired v1 format) is neither
+  // writable nor readable; a database that still contains v1 state is rejected
+  // at open with an actionable message to migrate it with the previous Cedar
+  // release. There is no downgrade path. See docs/README.md and
+  // docs/release-notes.md.
   uint32_t meta_sequence_format = kMetaSequenceFormatDefault;
   std::function<void()> validation_scan_observer_for_testing;
   std::function<void()> runtime_sample_observer_for_testing;

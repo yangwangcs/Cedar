@@ -23,11 +23,10 @@ constexpr size_t kMetaRecordHeaderBytes = 6;
 constexpr size_t kMetaRecordChecksumBytes = 4;
 constexpr size_t kEdgeIdentityPayloadBytes = 44;
 constexpr size_t kTransactionOutcomePayloadBytes = 17;
-constexpr size_t kSequenceFixedPayloadBytes = 28;
 // Mirrors meta_codec.cc's v2a sequence payload layout: payload_version(1) +
 // fact_key_version(1) + txn_id(8) + system_hlc(8) + count(4), then one 23-byte
 // [part(4), family(1), property(2), entity(8), ~valid_from(8)] descriptor per
-// fact instead of the v1 32-byte duplicated canonical key.
+// fact.
 constexpr size_t kSequenceV2FixedPayloadBytes = 1 + 1 + 8 + 8 + 4;  // 22
 constexpr size_t kSequenceV2DescriptorBytes = 4 + 1 + 2 + 8 + 8;    // 23
 constexpr size_t kVisibleWatermarkPayloadBytes = 8;
@@ -171,25 +170,15 @@ CommitFootprint BuildCommitFootprint(const StoreCommitBatch& batch) {
   return footprint;
 }
 
-size_t EstimateSequenceRecordBytes(uint32_t sequence_format,
-                                   size_t fact_key_count) {
+size_t EstimateSequenceRecordBytes(size_t fact_key_count) {
   size_t value_bytes = kMetaRecordHeaderBytes;
-  if (sequence_format == kMetaSequenceFormatV2) {
-    SaturatingAdd(kSequenceV2FixedPayloadBytes, &value_bytes);
-    SaturatingAddProduct(kSequenceV2DescriptorBytes, fact_key_count,
-                         &value_bytes);
-  } else {
-    // v1 is the default and remains byte-identical to previous releases,
-    // including the per-fact 32-byte canonical key reservation.
-    SaturatingAdd(kSequenceFixedPayloadBytes, &value_bytes);
-    SaturatingAddProduct(kEncodedFactKeyBytes, fact_key_count, &value_bytes);
-  }
+  SaturatingAdd(kSequenceV2FixedPayloadBytes, &value_bytes);
+  SaturatingAddProduct(kSequenceV2DescriptorBytes, fact_key_count, &value_bytes);
   SaturatingAdd(kMetaRecordChecksumBytes, &value_bytes);
   return value_bytes;
 }
 
-size_t EstimateCommitBatchBytes(const StoreCommitBatch& batch,
-                                uint32_t sequence_format) {
+size_t EstimateCommitBatchBytes(const StoreCommitBatch& batch) {
   // Per committed batch (one transaction) the writer emits: the transaction
   // outcome record, the sequence record (with one duplicated canonical key per
   // fact and per edge identity), the visible watermark, one fact put per
@@ -205,7 +194,7 @@ size_t EstimateCommitBatchBytes(const StoreCommitBatch& batch,
                              kTransactionOutcomePayloadBytes)),
       &total);
   const size_t sequence_value_bytes =
-      EstimateSequenceRecordBytes(sequence_format, fact_key_count);
+      EstimateSequenceRecordBytes(fact_key_count);
   SaturatingAdd(
       WriteBatchPutBytes(kSequenceMetaKeyBytes, sequence_value_bytes), &total);
   SaturatingAdd(WriteBatchPutBytes(kVisibleWatermarkKeyBytes,

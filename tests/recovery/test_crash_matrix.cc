@@ -163,8 +163,7 @@ std::optional<std::string> ReadRawMetaRecord(const std::string& path,
 }
 
 // The crash scenario commits through the storage API directly (no kernel
-// transaction) so the opt-in `meta_sequence_format=2` writer, which is a
-// FactStoreOptions setting in this task, is the writer under test.
+// transaction) so the meta sequence v2 writer is the writer under test.
 StoreCommitBatch VertexStateStoreBatch(TxnId txn_id, uint64_t system_hlc,
                                        uint64_t vertex_id, uint64_t valid_time) {
   return StoreCommitBatch{
@@ -729,11 +728,11 @@ TEST_F(RecoveryCrashMatrixTest, ReopenResumesVacuumWithoutAnIndependentFactsStor
   EXPECT_EQ(events, 2U);
 }
 
-// F10 Task 10: the opt-in v2 writer (marker + kSequenceV2 records) must survive
-// the same post-fsync crash boundary as the v1 writer. The child writes the
-// durable marker during FactStore::Open, commits one transaction, and dies
-// inside the post-write injector; the parent reopens with default options and
-// must recover, validate, and keep writing v2 from the marker.
+// F10 Task 10 / F20: the v2 writer (marker + kSequenceV2 records) must survive
+// the same post-fsync crash boundary as any durable commit. The child opens a
+// fresh v2 database (the only supported format), commits one transaction, and
+// dies inside the post-write injector; the parent reopens with default options
+// and must recover, validate, and keep writing v2.
 TEST_F(RecoveryCrashMatrixTest,
        V2WriterRecoversPostFsyncCrashAndKeepsMarkerAuthoritative) {
 #if CEDAR_THREAD_SANITIZER_ENABLED
@@ -767,8 +766,8 @@ TEST_F(RecoveryCrashMatrixTest,
   ASSERT_TRUE(WIFEXITED(status));
   ASSERT_EQ(WEXITSTATUS(status), kCrashExitCode);
 
-  // Default options recover and validate the v2 record: the marker written
-  // before the first v2 commit is authoritative.
+  // Default options recover and validate the v2 record: the marker written with
+  // the fresh-database initialization batch is authoritative.
   ExpectFactStoreRecovered(path, kReopenValidationPolicies[0], TxnId{1},
                            kVertexId, kValidTime, true);
   const auto marker = ReadRawMetaRecord(path, EncodeSequenceFormatKey());

@@ -666,10 +666,9 @@ TEST_F(KernelLifecycleTest, StrictAdjacencyRebuildFailsOpenAndCleansUp) {
       << "the re-opened database rebuilt the adjacency index";
 }
 
-// Task 10b: DatabaseOptions must forward the opt-in meta sequence format to the
-// store. The durable marker and the first committed record are observed through
-// a raw Cedar-CF reader; the reopened Database then proves the default v1
-// option still reads the upgraded database (the marker stays authoritative).
+// Task 10b: DatabaseOptions forwards the meta sequence format to the store.
+// Meta sequence v2 is the only format, so the option only accepts 2 and the
+// durable marker and first committed record are always v2.
 TEST_F(KernelLifecycleTest, ForwardsMetaSequenceFormatV2ThroughDatabaseOptions) {
   DatabaseOptions options;
   options.meta_sequence_format = kMetaSequenceFormatV2;
@@ -700,8 +699,8 @@ TEST_F(KernelLifecycleTest, ForwardsMetaSequenceFormatV2ThroughDatabaseOptions) 
   EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 9)  // kSequenceV2
       << "the first committed sequence record was not written in v2 format";
 
-  // The marker is authoritative: a plain Database::Open (default option, now v2
-  // as well) must dual-read the v2 record and expose the committed fact.
+  // A plain Database::Open (the default is also v2) reads the v2 record and
+  // exposes the committed fact.
   database_ = Open();
   ASSERT_TRUE(database_);
   const auto snapshot = database_->BeginSnapshot();
@@ -768,42 +767,27 @@ TEST_F(KernelLifecycleTest, DefaultMetaSequenceFormatWritesV2Records) {
   EXPECT_TRUE(exists.ValueOrDie());
 }
 
-// F19: meta_sequence_format=1 is the explicit opt-out. A fresh database opened
-// with it writes no marker and keeps the byte-identical v1 record encoding.
-TEST_F(KernelLifecycleTest, ExplicitV1OptOutKeepsV1DatabaseByteCompatible) {
+// F19/F20: meta sequence v2 is the only supported format. Asking for the
+// removed v1 writer is rejected before the database is created, with an
+// actionable InvalidArgument.
+TEST_F(KernelLifecycleTest, ExplicitV1OptOutIsRejectedAsUnsupported) {
   DatabaseOptions options;
   options.meta_sequence_format = kMetaSequenceFormatV1;
-  database_ = Open(options);
-  ASSERT_TRUE(database_);
-  auto transaction = Begin();
-  ASSERT_TRUE(transaction);
-  ASSERT_TRUE(
-      transaction
-          ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}),
-                   ValidTime{1})
-          .ok());
-  ASSERT_TRUE(transaction->Commit().ok());
-  ASSERT_TRUE(database_->Close().ok());
-  database_.reset();
+  options.path = path_;
+  const auto rejected = Database::Open(std::move(options));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_TRUE(rejected.status().IsInvalidArgument())
+      << rejected.status().ToString();
+  EXPECT_NE(rejected.status().ToString().find("no longer supported"),
+            std::string::npos)
+      << rejected.status().ToString();
+  EXPECT_NE(rejected.status().ToString().find("format 2 (v2)"),
+            std::string::npos)
+      << rejected.status().ToString();
 
-  EXPECT_FALSE(ReadRawMetaRecord(path_, EncodeSequenceFormatKey()).has_value())
-      << "the explicit v1 opt-out must not create a format marker";
-  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
-  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
-  const auto record = ReadRawMetaRecord(path_, sequence_key.ValueOrDie());
-  ASSERT_TRUE(record.has_value());
-  ASSERT_GE(record->size(), 2U);
-  EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 7)  // kSequence (v1)
-      << "the explicit v1 opt-out must keep producing v1 sequence records";
-
-  database_ = Open(options);
-  ASSERT_TRUE(database_);
-  const auto snapshot = database_->BeginSnapshot();
-  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
-  const auto exists = snapshot.ValueOrDie().Exists(
-      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{1});
-  ASSERT_TRUE(exists.ok()) << exists.status().ToString();
-  EXPECT_TRUE(exists.ValueOrDie());
+  // The rejected open must not have created a database.
+  EXPECT_FALSE(std::filesystem::exists(
+      std::filesystem::path(path_) / "CURRENT"));
 }
 
 // F18: DatabaseOptions defaults to the bounded recent fact window, and

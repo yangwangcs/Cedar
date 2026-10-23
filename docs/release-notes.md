@@ -1,37 +1,47 @@
 # Cedar Follow-ups Release Notes
 
-Status: local release candidate (not pushed). This note covers the F11-F19
+Status: local release candidate (not pushed). This note covers the F11-F20
 follow-ups plus the F14 retention milestone that landed after the meta sequence
 v2 work.
 
-## Meta sequence v2 is now the default writer format (F19)
+## Meta sequence v2 is the only supported format (F20)
 
-`FactStoreOptions::meta_sequence_format` and
-`DatabaseOptions::meta_sequence_format` now default to **2**
-(`kMetaSequenceFormatV2`). The format itself is unchanged; only which format a
-fresh or still-v1 database writes by default changed.
+V2 support is now the sole sequence-record path; the v1 `kSequence` format is
+removed from the codebase. This follows F19, which made v2 the default writer.
 
-- **New databases:** the first default `Open` writes the durable
-  `format/sequence-record-format` marker with `Sync=true` before accepting any
-  commit, then writes compact `kSequenceV2` records.
-- **Existing v1 databases:** the same default `Open` upgrades them in place.
-  The marker becomes 2, all later commits are v2, and the old v1 records remain
-  readable through the dual-read paths. Reclamation
-  (`cedar-meta-v2-reclaim`) can convert that v1 history forward.
-- **Explicit v1 opt-out:** set `meta_sequence_format = 1` (storage or kernel
-  API) to keep a database on v1. That writes no marker and keeps v1 record
-  bytes identical to previous releases. It works only while the database has
-  no v2 marker; after an upgrade the marker is authoritative and asking for 1
-  is ignored.
-- **One-way warning:** a default open is an upgrade. Binaries that predate
-  dual-read support cannot open the database afterwards, and there is no
-  downgrade path in this milestone. Back up before the first default open and
-  finish the binary rollout first.
-- The v1-only compatibility build (`CEDAR_META_SEQUENCE_V1_ONLY`) defaults to
-  1 because it simulates a pre-v2 binary.
+- **Writer:** every commit writes a compact `kSequenceV2` record (on-disk kind
+  9). The v1 encoder (`EncodeSequenceRecord`), the format-selection parameter in
+  `AppendCandidateToWriteBatch`, and the format-aware estimate plumbing are
+  gone; `EstimateCommitBatchBytes` always reserves the v2 record.
+- **Fresh databases:** the initialization batch writes the durable
+  `format/sequence-record-format` marker with value 2 (`Sync=true`) together
+  with the system identity and watermarks, before any commit is accepted. Every
+  database written by this release is a v2 database.
+- **Reopen:** the marker must be 2. A missing marker, a marker recording 1, or
+  any legacy kind-7 `kSequence` record fails `Open` with an actionable
+  `NotSupported` error telling the operator to migrate the database with the
+  previous Cedar release (`cedar-meta-v2-reclaim`). v1 records are never
+  decoded.
+- **Option:** `FactStoreOptions::meta_sequence_format` and
+  `DatabaseOptions::meta_sequence_format` remain for source compatibility, but
+  only 2 (the default) is accepted. Value 1 → `InvalidArgument` stating that v1
+  is no longer supported; any other value → `InvalidArgument`.
+- **Removed compatibility machinery:** the `CEDAR_META_SEQUENCE_V1_ONLY` build
+  option and `meta_sequence_compat.h` read gate, `tests/storage/test_meta_compat.cc`,
+  `tests/storage/run_meta_compat_v1_only_ci.sh`, and the v1→v2 reclamation
+  API/CLI/tests (`include/cedar/fact/meta_v2_reclaim.h`,
+  `src/storage/rocks/meta_v2_reclaim.cc`, `tools/cedar-meta-v2-reclaim.cc`,
+  `tests/storage/test_meta_v2_reclaim.cc`). The offline reclamation tool must
+  come from the previous release because it has to read v1 records.
+- **Migration path:** back up, open the database once with the previous
+  release's default v2 writer (that records marker 2 without decoding the old
+  records), run the previous release's `cedar-meta-v2-reclaim` offline to
+  rewrite the v1 sequence records as v2, then open it with this release.
+- **No downgrade:** there is no path back to v1, and v1 binaries cannot read a
+  v2 database. Treat the move to v2 as irreversible.
 
-See `docs/README.md` ("Meta Sequence v2 (Default Writer Format, One-Way
-Gate)") for the operator-facing contract.
+See `docs/README.md` ("Meta Sequence v2 (The Only Supported Format)") for the
+operator-facing contract and the migration procedure.
 
 ## Reopen fact validation now defaults to a bounded recent window (F18)
 
@@ -101,14 +111,13 @@ instead of partially built. `DatabaseOptions::strict_adjacency_rebuild`
 (opt-in, default `false`) makes the same failure fail `Database::Open`. The
 default open remains tolerant.
 
-### F13 - format-aware commit batch estimate
+### F13 - commit batch estimate matches the v2 encoder
 
-`FactStore::EstimateCommitBatchBytes` accepts the effective meta sequence
-record format and mirrors the real encoder (`6 + 9` fewer reserved bytes per
-fact for v2). The default argument keeps the v1 estimate byte-identical to
-previous releases. A near-2 MiB v2 batch that the old v1 reservation
-pre-rejected is now admitted, while v1 databases keep the old rejection
-behavior at the same cap.
+`EstimateCommitBatchBytes` reserves the sequence record the writer actually
+emits: the compact v2 encoding (a 23-byte descriptor per fact). The former
+format parameter and the v1 reservation path were removed with the v2-only
+cleanup. A near-2 MiB v2 batch that an old v1-sized reservation pre-rejected is
+admitted at the same cap.
 
 ### F14 - opt-in sequence-record retention
 
@@ -122,25 +131,23 @@ and the historical contiguous reopen contract. See `docs/README.md`
 ("Sequence-record retention") for the full contract and the one-way
 operational caveat.
 
-### F16 - reclaim tool storage profiles
+### F16 - reclaim tool storage profiles (previous release only)
 
-`cedar-meta-v2-reclaim` accepts
-`--profile=developer|kernel-test|debug-small|production`
-and `--wal-dir=PATH`, and opens the database with the same resolved storage
-profile and WAL placement as the production reader. This lets a database whose
-format marker and v2 records are still WAL-resident be reclaimed offline.
-The default (developer profile, no WAL override) is unchanged.
+The offline `cedar-meta-v2-reclaim` tool accepts
+`--profile=developer|kernel-test|debug-small|production` and
+`--wal-dir=PATH`, and opens the database with the same resolved storage profile
+and WAL placement as the production reader. This lets a database whose format
+marker and v1 records are still WAL-resident be reclaimed offline. The tool is
+not part of this release (it must read v1 records); migration uses the tool
+from the previous Cedar release.
 
-### F17 - v1-only compatibility build end-to-end
+### F17 - v1-only compatibility build (removed in F20)
 
-The build option `-DCEDAR_META_SEQUENCE_V1_ONLY=ON` compiles a binary that
-behaves like a pre-v2 release: it rejects a database whose durable format
-marker is 2 (or that contains a v2 record) with an actionable `Corruption`,
-while still opening and committing to v1 databases. It also refuses to opt a
-database into format 2. `test_meta_compat` and
-`tests/storage/run_meta_compat_v1_only_ci.sh` exercise the gate end-to-end in
-the normal and compatibility builds. The operational contract remains in
-`docs/README.md` ("Meta Sequence v2 (Default Writer Format, One-Way Gate)").
+The `-DCEDAR_META_SEQUENCE_V1_ONLY=ON` build option and its read gate were
+removed together with v1 support. All binaries built from this tree are
+v2-only; there is no compatibility profile that reads v1 or simulates a pre-v2
+binary. The legacy-database rejection is covered by
+`tests/storage/test_legacy_meta_sequence.cc` instead.
 
 ### F15 - measurement-only follow-up
 
@@ -150,38 +157,46 @@ report rather than in these release notes.
 
 ## Compatibility summary
 
-- No persistent format, key-encoding, WAL, or digest change.
-- `meta_sequence_format` now defaults to v2 (F19); the v2 record encoding and
-  its one-way gate are unchanged. Use `meta_sequence_format = 1` before an
-  upgrade to opt out.
+- **Meta sequence v1 is no longer supported.** The sequence-record encoding is
+  v2 (`kSequenceV2`, kind 9) for both writes and reads; the durable marker must
+  be 2. A legacy v1 database (missing/1 marker or any kind-7 record) is rejected
+  at open with an actionable migration error; it is never decoded.
+- Migration uses the previous Cedar release (default open records marker 2, then
+  its `cedar-meta-v2-reclaim` rewrites the old records) and then this release.
+  There is no downgrade path.
+- `meta_sequence_format` remains for source compatibility but accepts only 2;
+  value 1 is an `InvalidArgument`.
 - Sequence-record retention is still opt-in and has the same one-way
   operational caveat as before.
-- The default behavior changes are the F19 writer format and the F18 reopen
-  validation policy. `meta_sequence_format = 1` and
-  `deep_recovery_validation = true` restore the previous behavior where the
-  database has not already been upgraded.
+- The remaining default behavior change is the F18 reopen validation policy;
+  `deep_recovery_validation = true` restores full-history fact validation.
+- No persistent key-encoding, WAL, or digest change outside the removed v1
+  sequence-record encoding.
 
 ## Verification
 
-Final gates on the merged tree (Debug container `cedar-final-debug`, ASan
-`cedar-final-asan`, UBSan `cedar-final-ubsan`):
+Final gates on this tree (`cedar-final-debug`, `cedar-final-asan`,
+`cedar-final-ubsan`):
 
-- Debug: full `ctest` **1119/1119 passed** (566.8 s), including
-  `FactStoreMetadata` 51/51, `KernelLifecycle` 17/17,
-  `RecoveryCrashMatrix` 9/9, `Vacuum` 16/16, `SequenceRetention` 11/11,
-  `FactStoreCommit` 32/32, `MetaCompat` 6/6, `MetaV2Reclaim` 7/7, and
-  `CedarInstallConsumer`.
-- ASan (leak detection on): **149/149 passed** across `FactStoreMetadata`,
-  `KernelLifecycle`, `RecoveryCrashMatrix`, `Vacuum`, `SequenceRetention`,
-  `FactStoreCommit`, `MetaCompat`, and `MetaV2Reclaim`, with no
+- Debug: full `ctest` **1109/1109 passed** (814.3 s). The affected suites
+  passed **182/182**, including `FactStoreMetadataTest` 38,
+  `FactStoreCommitTest` 32, `KernelCommitTest` 11, `KernelSnapshotTest` 21,
+  `KernelLifecycleTest` 17, `RecoveryCrashMatrixTest` 9,
+  `CommitPublisherTest` 8, `VacuumTest` 16, `SequenceRetentionTest` 11, and
+  the new `LegacyMetaSequenceTest` 5.
+- The previous documented full gate was 1119 test cases; this change removes
+  19 gtest cases (`MetaCompat` 6, `MetaV2Reclaim` 7, and six v1-only cases in
+  the `test_fact_store_metadata` binary) and adds the 5 legacy-rejection cases,
+  a change-local net of -14. The remaining difference from the old documented
+  total comes from tests added between that tree and this HEAD.
+- ASan (leak detection on): affected suites **182/182 passed**, with no
   AddressSanitizer or LeakSanitizer reports.
-- UBSan (`halt_on_error=1`): **149/149 passed** across the same eight suites,
-  with no runtime errors.
-- v1-only compatibility build (`CEDAR_META_SEQUENCE_V1_ONLY=ON`):
-  `MetaCompat` **5/5 passed**, including a default-option open of a v1
-  database (the compatibility build defaults to the v1 writer).
+- UBSan (`halt_on_error=1`): affected suites **182/182 passed**, with no
+  runtime errors.
+- The v1-only compatibility build gate is gone with the removed
+  `CEDAR_META_SEQUENCE_V1_ONLY` option; its role is covered by
+  `LegacyMetaSequenceTest`, which builds legacy markers/kind-7 records through
+  raw RocksDB and asserts the actionable rejection.
 - Python contract tests (`python -m unittest discover -s benchmarks -p
-  "test_*.py"`): **101 tests, 94 passed + 7 skipped**, exit 0.
-- The final acceptance gate (t10) re-runs Debug, ASan, UBSan, and the Python
-  contracts on the merged tree; its report is the authoritative evidence for
-  this release.
+  "test_*.py"` run from the workspace root): **101 tests, 94 passed + 7
+  skipped**, exit 0.

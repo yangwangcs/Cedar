@@ -18,10 +18,10 @@ removed from the codebase. This follows F19, which made v2 the default writer.
   with the system identity and watermarks, before any commit is accepted. Every
   database written by this release is a v2 database.
 - **Reopen:** the marker must be 2. A missing marker, a marker recording 1, or
-  any legacy kind-7 `kSequence` record fails `Open` with an actionable
-  `NotSupported` error telling the operator to migrate the database with the
-  previous Cedar release (`cedar-meta-v2-reclaim`). v1 records are never
-  decoded.
+  any legacy kind-7 `kSequence` record fails `Open` with a `NotSupported` error
+  stating that v1 is unsupported and that migration/downgrade is not supported;
+  the database must be deleted and recreated, or restored from a format-2
+  backup. v1 records are never decoded.
 - **Option:** `FactStoreOptions::meta_sequence_format` and
   `DatabaseOptions::meta_sequence_format` remain for source compatibility, but
   only 2 (the default) is accepted. Value 1 → `InvalidArgument` stating that v1
@@ -29,19 +29,14 @@ removed from the codebase. This follows F19, which made v2 the default writer.
 - **Removed compatibility machinery:** the `CEDAR_META_SEQUENCE_V1_ONLY` build
   option and `meta_sequence_compat.h` read gate, `tests/storage/test_meta_compat.cc`,
   `tests/storage/run_meta_compat_v1_only_ci.sh`, and the v1→v2 reclamation
-  API/CLI/tests (`include/cedar/fact/meta_v2_reclaim.h`,
-  `src/storage/rocks/meta_v2_reclaim.cc`, `tools/cedar-meta-v2-reclaim.cc`,
-  `tests/storage/test_meta_v2_reclaim.cc`). The offline reclamation tool must
-  come from the previous release because it has to read v1 records.
-- **Migration path:** back up, open the database once with the previous
-  release's default v2 writer (that records marker 2 without decoding the old
-  records), run the previous release's `cedar-meta-v2-reclaim` offline to
-  rewrite the v1 sequence records as v2, then open it with this release.
-- **No downgrade:** there is no path back to v1, and v1 binaries cannot read a
-  v2 database. Treat the move to v2 as irreversible.
+  API, CLI tool, and tests. This release has no migration tool and no downgrade
+  path; delete and recreate a v1 database, or restore a format-2 backup.
+- **Unsupported, not migratable:** v1 is no longer supported. There is no
+  migration and no downgrade in this release, and v1 binaries cannot read a v2
+  database. Delete and recreate a v1 database, or restore a format-2 backup.
 
 See `docs/README.md` ("Meta Sequence v2 (The Only Supported Format)") for the
-operator-facing contract and the migration procedure.
+operator-facing contract.
 
 ## Reopen fact validation now defaults to a bounded recent window (F18)
 
@@ -131,15 +126,15 @@ and the historical contiguous reopen contract. See `docs/README.md`
 ("Sequence-record retention") for the full contract and the one-way
 operational caveat.
 
-### F16 - reclaim tool storage profiles (previous release only)
+### F16 - reclaim tool storage profiles (removed with v1 support)
 
-The offline `cedar-meta-v2-reclaim` tool accepts
+The F16 reclaim tooling accepted
 `--profile=developer|kernel-test|debug-small|production` and
-`--wal-dir=PATH`, and opens the database with the same resolved storage profile
-and WAL placement as the production reader. This lets a database whose format
-marker and v1 records are still WAL-resident be reclaimed offline. The tool is
-not part of this release (it must read v1 records); migration uses the tool
-from the previous Cedar release.
+`--wal-dir=PATH`, and opened the database with the same resolved storage
+profile and WAL placement as the production reader. It existed only in the
+release that still read v1 records and is not part of this release: there is no
+reclaim tool and no migration path for v1 databases. Delete and recreate the
+database, or restore a format-2 backup.
 
 ### F17 - v1-only compatibility build (removed in F20)
 
@@ -160,10 +155,9 @@ report rather than in these release notes.
 - **Meta sequence v1 is no longer supported.** The sequence-record encoding is
   v2 (`kSequenceV2`, kind 9) for both writes and reads; the durable marker must
   be 2. A legacy v1 database (missing/1 marker or any kind-7 record) is rejected
-  at open with an actionable migration error; it is never decoded.
-- Migration uses the previous Cedar release (default open records marker 2, then
-  its `cedar-meta-v2-reclaim` rewrites the old records) and then this release.
-  There is no downgrade path.
+  at open as unsupported; it is never decoded.
+- v1 is unsupported: there is no migration tool and no downgrade path in this
+  release. Delete and recreate a v1 database, or restore a format-2 backup.
 - `meta_sequence_format` remains for source compatibility but accepts only 2;
   value 1 is an `InvalidArgument`.
 - Sequence-record retention is still opt-in and has the same one-way
@@ -196,7 +190,7 @@ Final gates on this tree (`cedar-final-debug`, `cedar-final-asan`,
 - The v1-only compatibility build gate is gone with the removed
   `CEDAR_META_SEQUENCE_V1_ONLY` option; its role is covered by
   `LegacyMetaSequenceTest`, which builds legacy markers/kind-7 records through
-  raw RocksDB and asserts the actionable rejection.
+  raw RocksDB and asserts that the rejection is `NotSupported`.
 - Python contract tests (`python -m unittest discover -s benchmarks -p
   "test_*.py"` run from the workspace root): **101 tests, 94 passed + 7
   skipped**, exit 0.

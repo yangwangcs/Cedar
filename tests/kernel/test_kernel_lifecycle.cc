@@ -769,7 +769,7 @@ TEST_F(KernelLifecycleTest, DefaultMetaSequenceFormatWritesV2Records) {
 
 // F19/F20: meta sequence v2 is the only supported format. Asking for the
 // removed v1 writer is rejected before the database is created, with an
-// actionable InvalidArgument.
+// InvalidArgument stating that v1 is no longer supported.
 TEST_F(KernelLifecycleTest, ExplicitV1OptOutIsRejectedAsUnsupported) {
   DatabaseOptions options;
   options.meta_sequence_format = kMetaSequenceFormatV1;

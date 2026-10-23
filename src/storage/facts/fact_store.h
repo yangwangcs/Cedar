@@ -185,8 +185,10 @@ struct FactStoreOptions {
   // compatibility, but meta sequence v2 is the only supported format: the only
   // accepted value is 2 (the default). Open rejects any other value with
   // InvalidArgument; in particular 1 (the retired v1 format) is no longer
-  // writable or readable. A database opened by this release always writes
-  // compact `kSequenceV2` records and durably records marker 2.
+  // writable or readable. v1 is unsupported; there is no migration or
+  // downgrade, so a v1 database must be deleted and recreated or restored from
+  // a format-2 backup. A database opened by this release always writes compact
+  // `kSequenceV2` records and durably records marker 2.
   uint32_t meta_sequence_format = kMetaSequenceFormatDefault;
   // Opt-in sequence-record retention (F14). Default false: Vacuum keeps every
   // `sequence/*` record and the reopen contract (contiguous [1..visible]) is

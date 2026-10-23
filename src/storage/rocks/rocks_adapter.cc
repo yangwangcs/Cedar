@@ -2147,9 +2147,9 @@ Status LoadTransactionAllocatorState(FactStoreImpl* store,
 
 // Reads the durable meta sequence-format marker. std::nullopt means the
 // database predates the marker; the value is returned as decoded and the
-// v2-only policy is enforced by Open, which shares one actionable error for the
-// missing and v1 cases. A marker that fails framing/CRC or has a malformed
-// payload fails Open as Corruption.
+// v2-only policy is enforced by Open, which shares one unsupported-format error
+// for the missing and v1 cases. A marker that fails framing/CRC or has a
+// malformed payload fails Open as Corruption.
 StatusOr<std::optional<uint32_t>> LoadMetaSequenceFormatMarker(
     FactStoreImpl* store) {
   std::string encoded;
@@ -2641,7 +2641,7 @@ Status FactStore::Open() {
   if (options_.meta_sequence_format != kMetaSequenceFormatV2) {
     // v1 support was removed: the option is kept for source compatibility, but
     // only format 2 (the default) is accepted. A caller that explicitly asks
-    // for v1 gets an actionable error instead of a silently ignored setting.
+    // for v1 gets InvalidArgument instead of a silently ignored setting.
     if (options_.meta_sequence_format == kMetaSequenceFormatV1) {
       return Status::InvalidArgument(
           "fact store",
@@ -2862,7 +2862,9 @@ Status FactStore::Open() {
   // before the store can accept any commit. A database written by this release
   // always has marker 2, written in the fresh-database initialization batch
   // above; any existing database must already record 2. A missing or 1-valued
-  // marker is a legacy v1 database, which this release refuses to decode.
+  // marker is a legacy v1 database, which is unsupported: this release never
+  // decodes it, and there is no migration or downgrade. Delete and recreate the
+  // database, or restore a format-2 backup.
   const auto marker = LoadMetaSequenceFormatMarker(store.get());
   if (!marker.ok()) return marker.status();
   const std::optional<uint32_t> marker_format = marker.ValueOrDie();
@@ -2883,7 +2885,7 @@ Status FactStore::Open() {
     // Validation starts at the durable sequence-retention watermark, so pruned
     // history below it is accepted while any gap at or above it still fails the
     // open. The scanner uses the v2-only decoders, so a legacy kind-7 record is
-    // rejected with the same actionable migration error as a legacy marker.
+    // rejected with the same unsupported-format error as a legacy marker.
     const Status sequences_valid = ValidateCommittedSequences(
         store.get(), store->visible_seq, store->oldest_readable_seq,
         CommitSeq{store->sequence_retention_watermark.load(

@@ -1661,15 +1661,19 @@ TEST(FactStoreMetaCodecSequenceV2Test,
                   .IsCorruption());
 
   // A v2 payload re-tagged as a retired v1 sequence record is recognized as a
-  // legacy kind-7 record and rejected with the actionable migration error; it is
-  // never decoded as either format.
+  // legacy kind-7 record and rejected as unsupported; it is never decoded as
+  // either format.
   std::string retagged_v1 = v2_bytes;
   SetMetaRecordKind(&retagged_v1, 7);
   const auto legacy = DecodeSequenceRecord(retagged_v1, record.commit_seq);
   ASSERT_FALSE(legacy.ok());
   EXPECT_TRUE(legacy.status().IsNotSupportedError())
       << legacy.status().ToString();
-  EXPECT_NE(legacy.status().ToString().find("cedar-meta-v2-reclaim"),
+  EXPECT_NE(legacy.status().ToString().find("v1"), std::string::npos)
+      << legacy.status().ToString();
+  EXPECT_NE(legacy.status().ToString().find("unsupported"), std::string::npos)
+      << legacy.status().ToString();
+  EXPECT_NE(legacy.status().ToString().find("Delete and recreate the database"),
             std::string::npos)
       << legacy.status().ToString();
   const auto legacy_view =
@@ -1985,7 +1989,7 @@ TEST_F(FactStoreMetadataTest, CorruptUnsupportedOrLegacyMarkerFailsOpen) {
     if (opened.ok()) EXPECT_TRUE(store.Close().ok());
   }
 
-  // A legacy v1 marker is refused with the actionable migration error.
+  // A legacy v1 marker is refused as unsupported.
   {
     const std::string path = create_v2_database("marker_v1");
     const auto marker = EncodeSequenceFormat(kMetaSequenceFormatV1);
@@ -1997,17 +2001,19 @@ TEST_F(FactStoreMetadataTest, CorruptUnsupportedOrLegacyMarkerFailsOpen) {
     EXPECT_TRUE(opened.IsNotSupportedError()) << opened.ToString();
     EXPECT_NE(opened.ToString().find("format 1 (v1)"), std::string::npos)
         << opened.ToString();
-    EXPECT_NE(opened.ToString().find("cedar-meta-v2-reclaim"),
+    EXPECT_NE(opened.ToString().find("unsupported"), std::string::npos)
+        << opened.ToString();
+    EXPECT_NE(opened.ToString().find("migration/downgrade is not supported"),
               std::string::npos)
         << opened.ToString();
-    EXPECT_NE(opened.ToString().find("previous Cedar release"),
+    EXPECT_NE(opened.ToString().find("Delete and recreate the database"),
               std::string::npos)
         << opened.ToString();
     if (opened.ok()) EXPECT_TRUE(store.Close().ok());
   }
 
   // A database that predates the marker is a legacy v1 database and gets the
-  // same actionable error; it is never opened as an empty/v1 store.
+  // same unsupported-format error; it is never opened as an empty/v1 store.
   {
     const std::string path = create_v2_database("marker_missing");
     DeleteMetaRecord(path, marker_key);
@@ -2018,7 +2024,7 @@ TEST_F(FactStoreMetadataTest, CorruptUnsupportedOrLegacyMarkerFailsOpen) {
     EXPECT_NE(opened.ToString().find("no durable meta sequence format marker"),
               std::string::npos)
         << opened.ToString();
-    EXPECT_NE(opened.ToString().find("cedar-meta-v2-reclaim"),
+    EXPECT_NE(opened.ToString().find("Delete and recreate the database"),
               std::string::npos)
         << opened.ToString();
     if (opened.ok()) EXPECT_TRUE(store.Close().ok());

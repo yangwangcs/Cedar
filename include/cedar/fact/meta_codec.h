@@ -21,20 +21,20 @@ enum class IdKind : uint8_t { kVertex = 1, kEdge = 2, kTransaction = 3 };
 // Values of the durable meta sequence-format marker (see
 // EncodeSequenceFormatKey). 2 is the compact v2a `kSequenceV2` format and the
 // only format this release writes or reads. 1 is the retired v1 `kSequence`
-// format: it is recognized only so a legacy database can be rejected with an
-// actionable migration error, never decoded.
+// format: it is recognized only so a legacy database can be rejected as
+// unsupported; it is never decoded, and there is no migration or downgrade.
 inline constexpr uint32_t kMetaSequenceFormatV1 = 1;
 inline constexpr uint32_t kMetaSequenceFormatV2 = 2;
 // The only supported writer format. Kept as a named constant so the public
 // option default and the v2-only validation share one spelling.
 inline constexpr uint32_t kMetaSequenceFormatDefault = kMetaSequenceFormatV2;
 
-// The actionable error for a database that still carries the retired v1 meta
-// sequence format: a missing or 1-valued durable format marker, or a legacy
-// `kSequence` (on-disk kind 7) record. `detail` names the artifact that was
-// found. The message tells the operator how to migrate the database with the
-// previous Cedar release and states that downgrade is unsupported; this
-// release never decodes v1 sequence records.
+// The error for a database that still carries the retired v1 meta sequence
+// format: a missing or 1-valued durable format marker, or a legacy `kSequence`
+// (on-disk kind 7) record. `detail` names the artifact that was found. The
+// message states that v1 is unsupported and that no migration or downgrade
+// exists; the database must be deleted and recreated, or restored from a
+// format-2 backup. This release never decodes v1 sequence records.
 Status LegacyMetaSequenceFormatError(std::string_view detail);
 
 struct IdAllocatorState {
@@ -164,8 +164,8 @@ StatusOr<std::string> EncodeSequenceRecordV2(const SequenceRecord& record);
 // record was stored under (`sequence/<seq>`); the payload omits it, so callers
 // must pass it or the rebuilt fact keys would be wrong. A zero commit_seq is
 // rejected with Corruption. A legacy `kSequence` (kind 7) record is rejected
-// with the actionable LegacyMetaSequenceFormatError and is never decoded; any
-// other record kind is Corruption.
+// with LegacyMetaSequenceFormatError (v1 is unsupported; no migration or
+// downgrade) and is never decoded; any other record kind is Corruption.
 StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded,
                                               CommitSeq commit_seq);
 // View decoder with the same contract as DecodeSequenceRecord: only a v2 record

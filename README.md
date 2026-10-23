@@ -380,10 +380,10 @@ Cedar uses a versioned clean-break database format. On open, Cedar validates
 the format record, expected column families, visible watermarks, and sequence
 metadata.
 
-Legacy Cedar directories are rejected without modification. There is no online
-migration path. Existing data must be exported by a binary that understands
-its old format and imported into a fresh Cedar directory through the public
-transaction API.
+Legacy Cedar directories are rejected without modification. v1 meta sequence
+databases are unsupported: there is no migration tool and no downgrade path in
+this release. Delete and recreate the database, or restore a format-2 (v2)
+backup.
 
 ## Performance and Benchmarks
 

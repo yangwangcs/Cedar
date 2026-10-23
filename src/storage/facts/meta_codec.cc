@@ -17,12 +17,10 @@ Status LegacyMetaSequenceFormatError(std::string_view detail) {
   return Status::NotSupported(
       "meta sequence",
       std::string(detail) +
-          "; this Cedar release supports only meta sequence format 2 (v2) and "
-          "no longer reads v1 sequence records. Migrate the database with the "
-          "previous Cedar release before opening it here: open it once with "
-          "that release's default v2 writer (which records the format-2 marker) "
-          "and rewrite the old records with its `cedar-meta-v2-reclaim` tool. "
-          "Downgrade to a v1 binary is not supported.");
+          "; this Cedar release supports only meta sequence format 2 (v2); v1 "
+          "sequence records are unsupported, and migration/downgrade is not "
+          "supported. Delete and recreate the database, or restore a format-2 "
+          "backup.");
 }
 
 namespace {
@@ -510,7 +508,7 @@ StatusOr<uint32_t> DecodeSequenceFormat(const std::string& encoded) {
                               "invalid sequence format marker record");
   }
   // The codec returns the encoded value; Open enforces that only format 2 is
-  // supported so a legacy marker produces the actionable migration error.
+  // supported so a legacy marker produces the unsupported-format error.
   return format;
 }
 
@@ -740,8 +738,9 @@ StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded,
   if (!kind.ok()) return kind.status();
   if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequence)) {
     // A v1 record must never be decoded by this release: its payload carries
-    // the commit sequence, but the v1 encoding is retired. Report the migration
-    // path instead of a generic framing error so an operator can act on it.
+    // the commit sequence, but the v1 encoding is retired. Report that v1
+    // databases are unsupported instead of a generic framing error so an
+    // operator can act on it.
     return LegacyMetaSequenceFormatError(
         "database contains a legacy v1 meta sequence record (on-disk kind 7)");
   }

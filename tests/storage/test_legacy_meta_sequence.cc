@@ -4,9 +4,9 @@
 // v2-only meta sequence contract: a database written by this release always
 // records marker 2 and kind-9 (`kSequenceV2`) records, while any database that
 // still carries the retired v1 format (missing/1 marker or a kind-7 record) is
-// rejected at Open with an actionable migration error. The v1 record is built
-// locally from the documented on-disk framing because this release has no v1
-// encoder.
+// rejected at Open as unsupported (v1 is unsupported; there is no migration or
+// downgrade). The v1 record is built locally from the documented on-disk
+// framing because this release has no v1 encoder.
 
 #include <gtest/gtest.h>
 
@@ -37,6 +37,16 @@ constexpr uint8_t kSequenceFormatMarkerKind = 10;
 void ExpectContains(const std::string& text, const std::string& needle) {
   EXPECT_NE(text.find(needle), std::string::npos)
       << "missing '" << needle << "' in: " << text;
+}
+
+// v1 is unsupported: the rejection must say so, state that no migration or
+// downgrade exists, and tell the operator to delete and recreate the database
+// (or restore a format-2 backup).
+void ExpectV1UnsupportedMessage(const std::string& text) {
+  ExpectContains(text, "v1");
+  ExpectContains(text, "unsupported");
+  ExpectContains(text, "migration/downgrade is not supported");
+  ExpectContains(text, "Delete and recreate the database");
 }
 
 void AppendU32(std::string* out, uint32_t value) {
@@ -218,9 +228,7 @@ TEST_F(LegacyMetaSequenceTest, OpenRejectsMissingMarkerAsLegacyV1Database) {
   ASSERT_FALSE(opened.ok());
   EXPECT_TRUE(opened.IsNotSupportedError()) << opened.ToString();
   ExpectContains(opened.ToString(), "no durable meta sequence format marker");
-  ExpectContains(opened.ToString(), "cedar-meta-v2-reclaim");
-  ExpectContains(opened.ToString(), "previous Cedar release");
-  ExpectContains(opened.ToString(), "Downgrade to a v1 binary is not supported");
+  ExpectV1UnsupportedMessage(opened.ToString());
   if (opened.ok()) EXPECT_TRUE(store.Close().ok());
 }
 
@@ -234,8 +242,7 @@ TEST_F(LegacyMetaSequenceTest, OpenRejectsFormat1MarkerAsLegacyV1Database) {
   ASSERT_FALSE(opened.ok());
   EXPECT_TRUE(opened.IsNotSupportedError()) << opened.ToString();
   ExpectContains(opened.ToString(), "format 1 (v1)");
-  ExpectContains(opened.ToString(), "cedar-meta-v2-reclaim");
-  ExpectContains(opened.ToString(), "previous Cedar release");
+  ExpectV1UnsupportedMessage(opened.ToString());
   if (opened.ok()) EXPECT_TRUE(store.Close().ok());
 }
 
@@ -256,8 +263,7 @@ TEST_F(LegacyMetaSequenceTest, OpenRejectsLegacyKind7SequenceRecord) {
   ASSERT_FALSE(opened.ok()) << "a kind-7 record must never be decoded";
   EXPECT_TRUE(opened.IsNotSupportedError()) << opened.ToString();
   ExpectContains(opened.ToString(), "legacy v1 meta sequence record");
-  ExpectContains(opened.ToString(), "cedar-meta-v2-reclaim");
-  ExpectContains(opened.ToString(), "previous Cedar release");
+  ExpectV1UnsupportedMessage(opened.ToString());
   if (opened.ok()) EXPECT_TRUE(store.Close().ok());
 
   // The rejected open must not have rewritten or removed the legacy record.
@@ -267,7 +273,7 @@ TEST_F(LegacyMetaSequenceTest, OpenRejectsLegacyKind7SequenceRecord) {
   EXPECT_EQ(*stored, legacy);
 }
 
-TEST_F(LegacyMetaSequenceTest, DecodersRejectLegacyKind7RecordWithMigrationError) {
+TEST_F(LegacyMetaSequenceTest, DecodersRejectLegacyKind7RecordAsUnsupported) {
   const FactRef ref =
       EntityFact::Vertex(VertexRef{PartId{0}, VertexId{7}}).ref();
   const std::string fact_key = EncodeFactKey(ref, ValidTime{10}, CommitSeq{3});
@@ -278,8 +284,7 @@ TEST_F(LegacyMetaSequenceTest, DecodersRejectLegacyKind7RecordWithMigrationError
   ASSERT_FALSE(record.ok());
   EXPECT_TRUE(record.status().IsNotSupportedError())
       << record.status().ToString();
-  ExpectContains(record.status().ToString(), "v1");
-  ExpectContains(record.status().ToString(), "cedar-meta-v2-reclaim");
+  ExpectV1UnsupportedMessage(record.status().ToString());
 
   const auto view = DecodeSequenceRecordView(legacy, CommitSeq{3});
   ASSERT_FALSE(view.ok());

@@ -61,9 +61,9 @@ std::unique_ptr<cedar::Database> database =
 ```
 
 The directory must use the current Cedar format. This is a clean-break format:
-legacy directories are rejected without mutation and there is no in-place
-migration command. Export old data with a binary that understands its old
-format, then write it into a new Cedar directory through transactions.
+legacy directories are rejected without mutation, and v1 meta sequence
+databases are unsupported. There is no migration tool and no downgrade path;
+delete and recreate the database, or restore a format-2 (v2) backup.
 
 ### 3.2 Register typed properties
 

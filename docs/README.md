@@ -16,8 +16,7 @@ Cedar Kernel bitemporal graph database.
    measured write, read, and sustained mixed-workload results.
 5. Read the [follow-up release notes](release-notes.md) for the F11-F20 changes
    and the F14 retention milestone, including the v2-only meta sequence
-   contract, the reopen-validation default switch, and their migration and
-   rollback options.
+   contract, the reopen-validation default switch, and the rollback options.
 
 ## Public Storage Model
 
@@ -54,8 +53,8 @@ framing, meta version, CRC32C, and all other record kinds are unchanged.
   therefore always has marker 2.
 - **Reopen:** the marker must decode and record 2. A missing marker, a
   marker recording 1 (v1), or any kind-7 `kSequence` record found by reopen
-  validation fails the open with an actionable error; v1 records are never
-  decoded. Other marker values fail as `Corruption`.
+  validation fails the open as unsupported; v1 records are never decoded. Other
+  marker values fail as `Corruption`.
 - **No downgrade:** there is no path that returns a v2 database to v1. A v1
   binary cannot read a v2 database, and this release cannot read a v1 database.
 - **Retention is independent:** the opt-in sequence-record retention policy
@@ -77,7 +76,7 @@ options.path = "/path/to/db";
 auto database = cedar::Database::Open(std::move(options));
 ```
 
-### Opening a legacy v1 database
+### Legacy v1 databases are unsupported
 
 A database written by a release that predates v2 (no marker, marker 1, or
 kind-7 sequence records) is rejected at open with a `NotSupported` error such
@@ -85,29 +84,13 @@ as:
 
 ```text
 NotSupported: meta sequence: database has no durable meta sequence format
-marker; this Cedar release supports only meta sequence format 2 (v2) and no
-longer reads v1 sequence records. Migrate the database with the previous Cedar
-release before opening it here: open it once with that release's default v2
-writer (which records the format-2 marker) and rewrite the old records with its
-`cedar-meta-v2-reclaim` tool. Downgrade to a v1 binary is not supported.
+marker; this Cedar release supports only meta sequence format 2 (v2); v1
+sequence records are unsupported, and migration/downgrade is not supported.
+Delete and recreate the database, or restore a format-2 backup.
 ```
 
-Migration must use the **previous Cedar release**, which is the last release
-that reads v1 sequence records and ships the offline reclamation tool:
-
-1. Back up the database, and make sure no older binary still needs to open it.
-2. Open it once with the previous release's default v2 writer. That open
-   records marker 2; old v1 records remain untouched.
-3. Run the previous release's `cedar-meta-v2-reclaim` offline (no Cedar process
-   has the database open) to rewrite the v1 sequence records as v2. The tool is
-   resumable and idempotent.
-4. Open the database with this release. Every record is now kind 9 and the
-   marker is 2.
-
-This release intentionally does **not** ship the offline reclamation API, tool,
-or tests (`MetaV2ReclaimOptions`, `ReclaimSequenceRecordsV2`,
-`cedar-meta-v2-reclaim`, `test_meta_v2_reclaim`); they exist only in the
-previous release because they must read v1 records.
+v1 is unsupported: this release ships no migration tool and has no downgrade
+path. Delete and recreate the database, or restore a format-2 (v2) backup.
 
 ### Removed v1 compatibility machinery
 
@@ -120,7 +103,8 @@ previous release because they must read v1 records.
   `meta_sequence_compat.h` read gate, `test_meta_compat`, and
   `run_meta_compat_v1_only_ci.sh` were removed. The v1-only compatibility
   profile no longer exists.
-- The v1→v2 reclamation API/CLI/tests were removed as described above.
+- The v1→v2 reclamation API, CLI tool, and tests were removed with v1 support;
+  this release has no migration tool.
 
 ### Sequence-record retention below the Vacuum watermark — opt-in
 

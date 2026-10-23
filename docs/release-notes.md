@@ -1,6 +1,6 @@
 # Cedar Follow-ups Release Notes
 
-Status: local release candidate (not pushed). This note covers the F11-F20
+Status: pushed to `origin/main` (`7b3f55a`). This note covers the F11-F20
 follow-ups plus the F14 retention milestone that landed after the meta sequence
 v2 work.
 

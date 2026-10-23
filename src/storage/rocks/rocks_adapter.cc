@@ -46,6 +46,7 @@
 #include "storage/rocks/decided_epoch.h"
 #include "storage/facts/fact_identity_history.h"
 #include "storage/facts/group_commit_planner.h"
+#include "storage/facts/meta_sequence_compat.h"
 #include "storage/facts/prepared_commit_codec.h"
 #include "storage/facts/recent_fact_write_index.h"
 #include "storage/rocks/rocksdb_config.h"
@@ -2673,6 +2674,16 @@ Status FactStore::Open() {
       options_.meta_sequence_format != kMetaSequenceFormatV2) {
     return Status::InvalidArgument(
         "fact store", "meta sequence format must be 1 (v1) or 2 (v2a)");
+  }
+  if (options_.meta_sequence_format == kMetaSequenceFormatV2 &&
+      internal::MetaSequenceV2ReadDisabled()) {
+    // A v1-only compatibility binary must never write a marker it cannot read
+    // back. Reject the opt-in before any engine state can change.
+    return Status::InvalidArgument(
+        "fact store",
+        "meta sequence format 2 cannot be enabled by this binary; it was built "
+        "with CEDAR_META_SEQUENCE_V1_ONLY (v1-only compatibility profile). Use "
+        "a binary built with meta sequence v2 support.");
   }
   if (options_.group_commit_max_batch_size == 0 ||
       options_.group_commit_max_batch_size > kMaximumGroupCommitBatchCount) {

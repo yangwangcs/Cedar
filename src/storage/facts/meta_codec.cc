@@ -3,14 +3,59 @@
 
 #include "cedar/fact/meta_codec.h"
 
+#include <atomic>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_set>
 
 #include "cedar/core/crc32c.h"
 #include "cedar/fact/fact_codec.h"
+#include "storage/facts/meta_sequence_compat.h"
 
 namespace cedar {
+
+namespace internal {
+namespace {
+
+#if defined(CEDAR_META_SEQUENCE_V1_ONLY)
+constexpr bool kMetaSequenceV2ReadDisabledAtBuild = true;
+#else
+constexpr bool kMetaSequenceV2ReadDisabledAtBuild = false;
+#endif
+
+std::atomic<bool> g_meta_sequence_v2_read_disabled{
+    kMetaSequenceV2ReadDisabledAtBuild};
+
+}  // namespace
+
+bool MetaSequenceV2ReadDisabled() {
+  return g_meta_sequence_v2_read_disabled.load(std::memory_order_relaxed);
+}
+
+void SetMetaSequenceV2ReadDisabledForTesting(bool disabled) {
+#if defined(CEDAR_META_SEQUENCE_V1_ONLY)
+  // A compatibility build is one-way by construction: tests can exercise the
+  // gate but cannot turn the compiled-out v2 read path back on.
+  (void)disabled;
+  g_meta_sequence_v2_read_disabled.store(true, std::memory_order_relaxed);
+#else
+  g_meta_sequence_v2_read_disabled.store(disabled, std::memory_order_relaxed);
+#endif
+}
+
+Status V1OnlyMetaSequenceCorruption(std::string_view detail) {
+  return Status::Corruption(
+      "meta sequence",
+      std::string(detail) +
+          "; this Cedar binary was built with CEDAR_META_SEQUENCE_V1_ONLY "
+          "(v1-only compatibility profile) and cannot read meta sequence "
+          "format 2. Reopen the database with a binary built with meta "
+          "sequence v2 support.");
+}
+
+}  // namespace internal
+
 namespace {
 
 constexpr uint8_t kMetaVersion = 1;
@@ -492,6 +537,11 @@ StatusOr<uint32_t> DecodeSequenceFormat(const std::string& encoded) {
     return Status::Corruption("sequence format",
                               "invalid sequence format marker record");
   }
+  if (format == kMetaSequenceFormatV2 &&
+      internal::MetaSequenceV2ReadDisabled()) {
+    return internal::V1OnlyMetaSequenceCorruption(
+        "database records meta sequence format 2");
+  }
   return format;
 }
 
@@ -732,6 +782,10 @@ StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded) {
   const auto kind = PeekRecordKind(encoded);
   if (!kind.ok()) return kind.status();
   if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    if (internal::MetaSequenceV2ReadDisabled()) {
+      return internal::V1OnlyMetaSequenceCorruption(
+          "database contains a meta sequence v2 record");
+    }
     // The v2 payload intentionally omits commit_seq (it is the record key).
     // Guessing it would rebuild wrong 32-byte keys, so reject explicitly.
     return Status::Corruption(
@@ -769,6 +823,10 @@ StatusOr<SequenceRecord> DecodeSequenceRecord(const std::string& encoded,
   const auto kind = PeekRecordKind(encoded);
   if (!kind.ok()) return kind.status();
   if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    if (internal::MetaSequenceV2ReadDisabled()) {
+      return internal::V1OnlyMetaSequenceCorruption(
+          "database contains a meta sequence v2 record");
+    }
     return DecodeSequenceRecordV2(encoded, commit_seq);
   }
   // v1 records carry commit_seq in the payload; decoding stays identical so the
@@ -809,6 +867,10 @@ StatusOr<SequenceRecordView> DecodeSequenceRecordView(
   const auto kind = PeekRecordKind(encoded);
   if (!kind.ok()) return kind.status();
   if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    if (internal::MetaSequenceV2ReadDisabled()) {
+      return internal::V1OnlyMetaSequenceCorruption(
+          "database contains a meta sequence v2 record");
+    }
     // A v2 view cannot borrow packed keys: the payload stores descriptors and
     // rebuilding them needs the commit_seq from the record key.
     return Status::Corruption(
@@ -846,6 +908,10 @@ StatusOr<SequenceRecordView> DecodeSequenceRecordView(
   const auto kind = PeekRecordKind(encoded);
   if (!kind.ok()) return kind.status();
   if (kind.ValueOrDie() == static_cast<uint8_t>(MetaRecordKind::kSequenceV2)) {
+    if (internal::MetaSequenceV2ReadDisabled()) {
+      return internal::V1OnlyMetaSequenceCorruption(
+          "database contains a meta sequence v2 record");
+    }
     return DecodeSequenceRecordViewV2(encoded, commit_seq);
   }
   // v1 stays the zero-copy view decoder; the sequence key is unused because the

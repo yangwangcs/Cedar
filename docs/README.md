@@ -75,6 +75,7 @@ The bundled migration tool rewrites existing `sequence/<seq>` records in place:
 
 ```text
 cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
+                      [--profile=NAME] [--wal-dir=PATH]
 ```
 
 - The database must already record marker 2. Opt it in and open it once
@@ -91,10 +92,17 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
   the v1 source before the batch is written.
 - The tool prints `scanned`, `rewritten`, `already_v2`, `bytes_before`, and
   `bytes_after`. Per rewritten record it saves exactly `6 + 9 * facts` bytes.
-- Current assumption: the tool opens with Cedar's default storage profile and
-  does not accept custom production-profile or WAL-directory placement
-  options. Production-profile/custom-WAL support is a follow-up; use the tool
-  only on databases created and opened with the default storage layout.
+- The tool accepts the database's storage layout. `--profile` selects the
+  `developer` (default), `kernel-test`, `debug-small`, or `production` profile
+  the database was written with, and `--wal-dir=ABSOLUTE_PATH` names a WAL
+  directory outside the database directory; the offline open recovers it
+  exactly like a Cedar process does. `MetaV2ReclaimOptions::storage_profile`
+  and `MetaV2ReclaimOptions::production` expose the same settings to callers.
+  A non-empty WAL directory must be absolute, and the default layout (Developer
+  profile, WAL inside the database directory) is unchanged.
+- Omitting a matching WAL directory is unsafe: the format marker and recent
+  sequence records may still live in the WAL, so the tool can see a stale
+  SST-only view (and refuses a WAL-only marker before writing anything).
 
 ### ONE-WAY GATE: old binaries reject v2 records
 
@@ -102,9 +110,12 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
 > Once the format marker is 2 and/or v2 records exist, binaries that predate
 > the dual-read release cannot open the database.
 
-- An old binary's v1-only sequence decoder sees record kind 9, fails the
+- A real pre-v2 binary's v1-only sequence decoder sees record kind 9, fails the
   framing check (`kSequence` expected), and reports `Corruption`. Recovery
   fails at open; it does not silently skip or misread sequence records.
+- The repository ships a build profile that reproduces such a binary for
+  end-to-end verification: `-DCEDAR_META_SEQUENCE_V1_ONLY=ON` (see the next
+  subsection).
 - The dual-read release keeps a v1-only API (`DecodeSequenceRecord(encoded)`)
   for callers that do not supply the record key. It rejects a v2 record with
   the actionable
@@ -119,6 +130,38 @@ cedar-meta-v2-reclaim --db=PATH [--batch=N] [--sync] [--no-verify]
   opting in, and treat the opt-in as irreversible.
 - Databases that never opt in remain fully readable by old binaries; the
   default writer format is unchanged.
+
+### Verifying the gate with a v1-only compatibility build
+
+`CEDAR_META_SEQUENCE_V1_ONLY=ON` compiles a binary that refuses to read meta
+sequence format 2, mirroring a pre-v2 release while leaving the default build
+unchanged:
+
+```bash
+cmake -S . -B build-meta-v1-only -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+      -DBUILD_TESTS=ON -DCEDAR_META_SEQUENCE_V1_ONLY=ON
+cmake --build build-meta-v1-only --target test_meta_compat
+ctest --test-dir build-meta-v1-only -R '^MetaCompat' --output-on-failure
+```
+
+- Opening a database whose durable marker records 2 fails with an actionable
+  `Corruption`: the message names the rejected format, the
+  `CEDAR_META_SEQUENCE_V1_ONLY` build switch, and the recovery action
+  ("reopen the database with a binary built with meta sequence v2 support").
+- A stray `kSequenceV2` record in a database whose marker is missing is
+  rejected the same way. Reopen validation never decodes the descriptor
+  payload, so wrong 32-byte fact keys cannot be rebuilt silently.
+- v1 databases still open, read their contiguous history, and accept new v1
+  commits under the v1-only build; the gate is not a generic sequence-record
+  rejection.
+- The v1-only build also refuses to opt a database into format 2
+  (`InvalidArgument` before any engine write), so it cannot leave behind a
+  marker it will be unable to read back.
+- The default build is v2-capable and unchanged. `tests/storage/test_meta_compat.cc`
+  runs the same end-to-end checks in every normal build by enabling the gate
+  through an internal test hook, and
+  `tests/storage/run_meta_compat_v1_only_ci.sh` runs them against the real
+  compatibility build in CI.
 
 ### Sequence-record retention below the Vacuum watermark — opt-in
 

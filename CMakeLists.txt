@@ -11,6 +11,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(CEDAR_ENABLE_ASAN "Build Cedar with AddressSanitizer" OFF)
 option(CEDAR_ENABLE_UBSAN "Build Cedar with UndefinedBehaviorSanitizer" OFF)
 option(CEDAR_ENABLE_TSAN "Build Cedar with ThreadSanitizer" OFF)
+# Compatibility profile for the meta sequence one-way gate: produces a binary
+# that refuses to read meta sequence format 2 instead of decoding it, mirroring
+# a pre-v2 release. The default build is v2-capable and unchanged.
+option(CEDAR_META_SEQUENCE_V1_ONLY
+       "Build a v1-only compatibility binary that rejects meta sequence format 2" OFF)
 
 set(CEDAR_SANITIZER_COUNT 0)
 foreach(CEDAR_SANITIZER_OPTION
@@ -136,6 +141,12 @@ set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
 target_compile_features(cedar_core PUBLIC cxx_std_20)
 set_target_properties(cedar_core PROPERTIES EXPORT_NAME cedar)
 add_library(Cedar::cedar ALIAS cedar_core)
+
+if(CEDAR_META_SEQUENCE_V1_ONLY)
+    # PUBLIC so tools, tests and installed consumers of a compatibility build
+    # all observe the same one-way read gate.
+    target_compile_definitions(cedar_core PUBLIC CEDAR_META_SEQUENCE_V1_ONLY=1)
+endif()
 
 add_executable(cedar tools/cedar_main.cc)
 target_link_libraries(cedar PRIVATE cedar_core)

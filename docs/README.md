@@ -14,6 +14,9 @@ Cedar Kernel bitemporal graph database.
    recovery, sanitizer, projection, and space gates.
 4. Read the [development-host performance report](query-performance.md) for
    measured write, read, and sustained mixed-workload results.
+5. Read the [follow-up release notes](release-notes.md) for the F11-F18 changes
+   and the F14 retention milestone, including the reopen-validation default
+   switch and its rollback option.
 
 ## Public Storage Model
 

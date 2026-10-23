@@ -385,6 +385,19 @@ struct DatabaseOptions {
   // the failure is logged and reported through the observer instead of being
   // silently ignored.
   bool strict_adjacency_rebuild = false;
+  // Reopen fact cross-check policy (F18). The default is the bounded recent
+  // window: the structural [1..visible] sequence checks still run for every
+  // committed sequence, while fact contents are cross-checked only for
+  // sequences at or above
+  // max(oldest_readable, visible - recovery_validation_recent_sequences + 1).
+  // Damage to an older fact is detected when that fact is read instead of
+  // failing Open. Set deep_recovery_validation = true to roll back to the
+  // previous full-history reopen validation.
+  // recovery_validation_recent_sequences configures K (production default
+  // 4096, clamped to at least 1). This option never changes the on-disk format
+  // or the crash-recovery contract.
+  bool deep_recovery_validation = false;
+  uint64_t recovery_validation_recent_sequences = 4096;
 };
 
 struct CommitPipelineMetrics {

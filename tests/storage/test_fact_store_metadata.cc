@@ -1186,6 +1186,50 @@ TEST_F(FactStoreMetadataTest,
       << status.ToString();
 }
 
+// F18: the production default is now the bounded recent window. An old fact
+// that the window skips no longer fails Open; damage to it is observed when the
+// fact is read instead. The explicit deep option remains the documented
+// rollback to the previous full-history reopen validation.
+TEST_F(FactStoreMetadataTest, DefaultReopenValidationUsesBoundedWindow) {
+  constexpr uint64_t kTransactions = 5;
+  for (uint64_t index = 1; index <= kTransactions; ++index) {
+    ASSERT_TRUE(store_
+                    ->Commit(VertexStateBatch(TxnId{index}, VertexId{index},
+                                              10 + index))
+                    .ok());
+  }
+  ASSERT_TRUE(store_->Close().ok());
+  const std::string old_fact =
+      ReadFactKeyFromSequenceRecord(path_, CommitSeq{1});
+  ASSERT_FALSE(old_fact.empty());
+  DeleteFactRecord(path_, old_fact);
+
+  // Only K is overridden to keep the test cheap (production K=4096); the
+  // cross-check policy is the default one.
+  FactStoreOptions defaults{path_};
+  defaults.recovery_validation_recent_sequences = 2;
+  store_ = std::make_unique<FactStore>(defaults);
+  ASSERT_TRUE(store_->Open().ok())
+      << "default reopen validation must not check facts outside the recent "
+         "window";
+  const auto read = store_->ReadCurrent(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
+      ValidTime{11});
+  ASSERT_TRUE(read.ok()) << read.status().ToString();
+  EXPECT_FALSE(read.ValueOrDie().has_value())
+      << "the deleted fact is detected on read, not at reopen";
+  ASSERT_TRUE(store_->Close().ok());
+
+  // Documented rollback: deep=true restores the previous full-history policy.
+  FactStoreOptions deep{path_};
+  deep.deep_recovery_validation = true;
+  store_ = std::make_unique<FactStore>(deep);
+  const Status status = store_->Open();
+  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(status.ToString().find("missing fact"), std::string::npos)
+      << status.ToString();
+}
+
 TEST_F(FactStoreMetadataTest,
        BoundedValidationSkipsFactsBeforeTheRecentWindow) {
   constexpr uint64_t kTransactions = 5;
@@ -1208,7 +1252,10 @@ TEST_F(FactStoreMetadataTest,
   ASSERT_TRUE(store_->Open().ok());
   ASSERT_TRUE(store_->Close().ok());
 
-  store_ = std::make_unique<FactStore>(FactStoreOptions{path_});
+  // Explicit opt-in: the default is now the bounded policy (F18).
+  FactStoreOptions deep_options{path_};
+  deep_options.deep_recovery_validation = true;
+  store_ = std::make_unique<FactStore>(deep_options);
   const Status deep = store_->Open();
   EXPECT_TRUE(deep.IsCorruption()) << deep.ToString();
   EXPECT_NE(deep.ToString().find("missing fact"), std::string::npos)
@@ -1266,6 +1313,7 @@ TEST_F(FactStoreMetadataTest, ReopenValidationCountersReportPhasesAndWindow) {
   };
 
   FactStoreOptions deep{path_};
+  deep.deep_recovery_validation = true;
   deep.reopen_validation_counters_for_testing = collect;
   store_ = std::make_unique<FactStore>(deep);
   ASSERT_TRUE(store_->Open().ok());

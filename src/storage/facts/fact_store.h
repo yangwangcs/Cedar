@@ -157,12 +157,19 @@ struct FactStoreOptions {
   // (0 keeps the production batch of 1024). Small values let tests exercise
   // MultiGet batch boundaries without committing thousands of transactions.
   size_t sequence_validation_outcome_batch_size_for_testing = 0;
-  // Reopen fact cross-check policy. When deep_recovery_validation is true
-  // (default) every fact referenced by a committed sequence is read and
-  // decoded. When false only facts at or above
+  // Reopen fact cross-check policy (F18). When deep_recovery_validation is true
+  // every fact referenced by a committed sequence at or above the oldest
+  // readable boundary is read and decoded. When false (default) only facts at
+  // or above
   // max(oldest_readable, visible - recovery_validation_recent_sequences + 1)
-  // are cross-checked; older corruption is detected on read instead.
-  bool deep_recovery_validation = true;
+  // are cross-checked; older corruption is detected on read instead. The
+  // default therefore keeps a bounded recent window of K=4096 committed
+  // sequences. Set this to true to roll back to the previous full-history
+  // reopen validation without changing the on-disk format or the unconditional
+  // structural [1..visible] sequence checks. See docs/release-notes.md.
+  bool deep_recovery_validation = false;
+  // Bounded recent window size K used when deep_recovery_validation is false.
+  // Clamped to at least 1 by Open; the production default is 4096.
   uint64_t recovery_validation_recent_sequences = 4096;
   // Fires once at the end of each successful reopen validation pass that
   // FactStore::Open performs: "P1_sequence_validation" and

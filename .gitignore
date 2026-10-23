@@ -18,6 +18,7 @@ docs/*
 !docs/README.md
 !docs/query-acceptance.md
 !docs/query-performance.md
+!docs/release-notes.md
 docs/superpowers/
 
 # IDE

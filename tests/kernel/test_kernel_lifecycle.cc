@@ -110,6 +110,54 @@ std::optional<std::string> ReadRawMetaRecord(const std::string& path,
   return value;
 }
 
+// Deletes one facts-CF key through a vanilla RocksDB handle. The close and
+// recovery flags mirror ReadRawMetaRecord so the raw edit does not flush the
+// recovered facts memtable into a block-based SST the Cedar table factory would
+// later reject.
+bool DeleteRawFactRecord(const std::string& path, const std::string& key) {
+  FactStoreOptions store_options;
+  store_options.path = path;
+  std::shared_ptr<rocksdb::Cache> cache;
+  rocksdb::Options options = internal::MakeRocksDbOptions(
+      store_options, /*is_new_database=*/false, /*resolved=*/nullptr, &cache);
+  options.create_if_missing = false;
+  options.create_missing_column_families = false;
+  options.atomic_flush = true;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  auto page_metrics =
+      std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
+  std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
+      internal::MakeRocksDbColumnFamilyDescriptors(
+          store_options, options, /*resolved=*/nullptr, {cache, page_metrics});
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  std::unique_ptr<rocksdb::DB> database;
+  const rocksdb::Status opened =
+      rocksdb::DB::Open(options, path, descriptors, &handles, &database);
+  if (!opened.ok()) {
+    ADD_FAILURE() << "raw open failed: " << opened.ToString();
+    return false;
+  }
+  if (handles.size() != 3U) {
+    ADD_FAILURE() << "unexpected column family count: " << handles.size();
+    for (rocksdb::ColumnFamilyHandle* handle : handles) {
+      database->DestroyColumnFamilyHandle(handle);
+    }
+    return false;
+  }
+  const rocksdb::Status deleted =
+      database->Delete(rocksdb::WriteOptions(), handles[1], key);
+  for (rocksdb::ColumnFamilyHandle* handle : handles) {
+    database->DestroyColumnFamilyHandle(handle);
+  }
+  database.reset();
+  if (!deleted.ok()) {
+    ADD_FAILURE() << "raw fact delete failed: " << deleted.ToString();
+    return false;
+  }
+  return true;
+}
+
 TEST_F(KernelLifecycleTest, UsesIndependentDurableVertexAndEdgeLeases) {
   database_ = Open();
   ASSERT_TRUE(database_);
@@ -699,6 +747,74 @@ TEST_F(KernelLifecycleTest,
   ASSERT_GE(record->size(), 2U);
   EXPECT_EQ(static_cast<uint8_t>((*record)[1]), 7)  // kSequence (v1)
       << "the default writer must keep producing v1 sequence records";
+}
+
+// F18: DatabaseOptions defaults to the bounded recent fact window, and
+// deep_recovery_validation=true is the documented rollback. The raw delete
+// removes one old fact that the bounded window skips; the structural sequence
+// checks still pass, the kernel opens, and the missing fact is observed on
+// read. The rollback open re-checks every fact and fails with the historical
+// "missing fact" Corruption.
+TEST_F(KernelLifecycleTest, DefaultReopenValidationIsBoundedAndDeepRollsBack) {
+  DatabaseOptions bounded;
+  bounded.recovery_validation_recent_sequences = 2;
+  database_ = Open(bounded);
+  ASSERT_TRUE(database_);
+  constexpr uint64_t kTransactions = 3;
+  for (uint64_t index = 1; index <= kTransactions; ++index) {
+    auto transaction = Begin();
+    ASSERT_TRUE(transaction);
+    ASSERT_TRUE(
+        transaction
+            ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{index}}),
+                     ValidTime{100 + index})
+            .ok());
+    const auto committed = transaction->Commit();
+    ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+    ASSERT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  }
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  const auto sequence_key = EncodeSequenceMetaKey(CommitSeq{1});
+  ASSERT_TRUE(sequence_key.ok()) << sequence_key.status().ToString();
+  const auto sequence_record =
+      ReadRawMetaRecord(path_, sequence_key.ValueOrDie());
+  ASSERT_TRUE(sequence_record.has_value());
+  const auto decoded = DecodeSequenceRecord(*sequence_record);
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  ASSERT_FALSE(decoded.ValueOrDie().fact_keys.empty());
+  ASSERT_TRUE(
+      DeleteRawFactRecord(path_, decoded.ValueOrDie().fact_keys.front()));
+
+  // Default policy: visible=3 and K=2 put sequence 1 outside the fact window.
+  database_ = Open(bounded);
+  ASSERT_TRUE(database_)
+      << "the default bounded reopen must not fail on an old missing fact";
+  {
+    const auto snapshot = database_->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+    const auto exists = snapshot.ValueOrDie().Exists(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{101});
+    ASSERT_TRUE(exists.ok()) << exists.status().ToString();
+    EXPECT_FALSE(exists.ValueOrDie())
+        << "the deleted old fact must be observed as missing on read";
+  }
+  ASSERT_TRUE(database_->Close().ok());
+  database_.reset();
+
+  // Rollback option: deep validation covers every fact from the oldest
+  // readable boundary and therefore rejects the same database.
+  DatabaseOptions rollback = bounded;
+  rollback.deep_recovery_validation = true;
+  rollback.path = path_;
+  const auto rejected = Database::Open(std::move(rollback));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_TRUE(rejected.status().IsCorruption())
+      << rejected.status().ToString();
+  EXPECT_NE(rejected.status().ToString().find("missing fact"),
+            std::string::npos)
+      << rejected.status().ToString();
 }
 
 }  // namespace

@@ -527,8 +527,9 @@ class FactStoreImpl {
   // Reopen outcome validation batch size (production 1024). Tests override it
   // to exercise MultiGet batch boundaries with a handful of transactions.
   size_t sequence_validation_outcome_batch_size = 1024;
-  // Reopen fact cross-check policy; see FactStoreOptions.
-  bool deep_recovery_validation = true;
+  // Reopen fact cross-check policy; see FactStoreOptions. F18 flips the
+  // production default to the bounded recent window (K=4096).
+  bool deep_recovery_validation = false;
   uint64_t recovery_validation_recent_sequences = 4096;
   // Effective meta sequence writer format resolved by Open from the durable
   // format marker and FactStoreOptions::meta_sequence_format. Fixed for the

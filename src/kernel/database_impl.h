@@ -278,6 +278,13 @@ class Database::Impl {
           store_options.meta_sequence_format = options.meta_sequence_format;
           store_options.prune_sequence_records_on_vacuum =
               options.prune_sequence_records_on_vacuum;
+          // F18: forward the reopen fact cross-check policy. The kernel default
+          // is the bounded recent window (K=4096); deep=true is the documented
+          // rollback to full-history validation.
+          store_options.deep_recovery_validation =
+              options.deep_recovery_validation;
+          store_options.recovery_validation_recent_sequences =
+              options.recovery_validation_recent_sequences;
           return store_options;
         }()),
         async_executor(ResolveAsyncExecutorOptions(options)),

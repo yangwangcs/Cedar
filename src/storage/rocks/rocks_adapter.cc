@@ -1499,15 +1499,6 @@ bool MatchesStrictReadDependency(const StrictReadIdentity& identity,
          identity.successor == dependency.successor;
 }
 
-bool IntervalsOverlap(ValidTime left_from, std::optional<ValidTime> left_to,
-                      ValidTime right_from, std::optional<ValidTime> right_to) {
-  const bool left_before_right_end =
-      !right_to.has_value() || left_from.value < right_to->value;
-  const bool right_before_left_end =
-      !left_to.has_value() || right_from.value < left_to->value;
-  return left_before_right_end && right_before_left_end;
-}
-
 Status RunVacuumFaultInjector(const FactStoreOptions& options,
                               VacuumFaultPoint point) {
   if (!options.vacuum_fault_injector_for_testing) return Status::OK();
@@ -1965,11 +1956,26 @@ Status ValidateSnapshotWriteDependencies(
       const SnapshotWriteDependency& dependency = dependencies[pending[position]];
       for (const CurrentFactInterval& interval : *intervals) {
         if (interval.commit_seq.value <= dependency.snapshot_seq.value) continue;
-        if (IntervalsOverlap(dependency.valid_from, dependency.successor,
-                             interval.valid_from, interval.valid_to)) {
-          return Status::Conflict(
-              "commit", "snapshot write conflicts with a later overlapping event");
+        if (interval.valid_from.value < dependency.valid_from.value) {
+          // A newer commit at an earlier valid-time boundary is the preceding
+          // version. When no later boundary has been committed yet, its
+          // interval is still open-ended and this write simply truncates that
+          // open tail: the two writes are adjacent, not overlapping. A
+          // preceding version already bounded at or across this write's
+          // boundary means both writes target the same bounded interval, which
+          // still conflicts.
+          if (!interval.valid_to.has_value() ||
+              interval.valid_to->value <= dependency.valid_from.value) {
+            continue;
+          }
+        } else if (dependency.successor.has_value() &&
+                   interval.valid_from.value >= dependency.successor->value) {
+          // A newer commit at or beyond the captured successor is outside the
+          // interval this write observed and cannot overlap it.
+          continue;
         }
+        return Status::Conflict(
+            "commit", "snapshot write conflicts with a later overlapping event");
       }
     }
     begin = end;

@@ -87,6 +87,46 @@ TEST_F(KernelCommitTest, CommitsMultipleFactsAndResolvesThePublicTransaction) {
                   .ValueOrDie());
 }
 
+TEST_F(KernelCommitTest,
+       AllowsAdjacentLaterValidTimeWriteToTheSameFactFromAnOlderSnapshot) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+                        PropertyId{7}, 0, "load", PropertyEntityKind::kVertex,
+                        PhysicalType::kInt64, 4096})
+                  .ok());
+  const PropertyFact fact =
+      PropertyFact::Vertex(VertexRef{PartId{0}, VertexId{81}}, PropertyId{7});
+  auto seed = Begin();
+  ASSERT_TRUE(seed->Set(fact, ValidTime{10}, Value::Int64(10)).ok());
+  const auto seeded = seed->Commit();
+  ASSERT_TRUE(seeded.ok()) << seeded.status().ToString();
+  ASSERT_EQ(seeded.ValueOrDie().outcome, CommitOutcome::kCommitted);
+
+  // Both transactions pin their snapshot before the earlier valid-time write
+  // commits, exactly as adjacent-hour writes do in a pipelined writer.
+  std::unique_ptr<Transaction> earlier = Begin();
+  std::unique_ptr<Transaction> later = Begin();
+  ASSERT_TRUE(earlier->Set(fact, ValidTime{11}, Value::Int64(11)).ok());
+  ASSERT_TRUE(later->Set(fact, ValidTime{12}, Value::Int64(12)).ok());
+
+  const auto earlier_committed = earlier->Commit();
+  ASSERT_TRUE(earlier_committed.ok()) << earlier_committed.status().ToString();
+  EXPECT_EQ(earlier_committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  const auto later_committed = later->Commit();
+  ASSERT_TRUE(later_committed.ok()) << later_committed.status().ToString();
+  EXPECT_EQ(later_committed.ValueOrDie().outcome, CommitOutcome::kCommitted)
+      << later_committed.ValueOrDie().status.ToString();
+
+  // Both versions are observable at their own valid times afterwards.
+  const auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  const auto at_eleven = snapshot.ValueOrDie().Get(fact, ValidTime{11});
+  ASSERT_TRUE(at_eleven.ok()) << at_eleven.status().ToString();
+  EXPECT_EQ(at_eleven.ValueOrDie(), std::optional<Value>{Value::Int64(11)});
+  const auto at_twelve = snapshot.ValueOrDie().Get(fact, ValidTime{12});
+  ASSERT_TRUE(at_twelve.ok()) << at_twelve.status().ToString();
+  EXPECT_EQ(at_twelve.ValueOrDie(), std::optional<Value>{Value::Int64(12)});
+}
+
 TEST_F(KernelCommitTest, AcceptsAsyncCommitDurablyThenWaitsForItsTerminalResult) {
   std::unique_ptr<Transaction> transaction = Begin();
   ASSERT_TRUE(transaction->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{71}}), ValidTime{10}).ok());
@@ -3162,7 +3202,7 @@ TEST(KernelGroupCommitTest, CommitsFullBatchWithoutWaitingForCollectionWindow) {
   std::filesystem::remove_all(path);
 }
 
-TEST(KernelGroupCommitTest, DoesNotGroupOverlappingIntervalsForOneFact) {
+TEST(KernelGroupCommitTest, DoesNotGroupCompetingWritesForOneFact) {
   char pattern[] = "/tmp/cedar_kernel_group_conflict_XXXXXX";
   ASSERT_NE(mkdtemp(pattern), nullptr);
   const std::string path = pattern;
@@ -3181,7 +3221,7 @@ TEST(KernelGroupCommitTest, DoesNotGroupOverlappingIntervalsForOneFact) {
                   ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10})
                   .ok());
   ASSERT_TRUE(second.ValueOrDie()
-                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{20})
+                  ->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10})
                   .ok());
 
   std::optional<StatusOr<CommitResult>> first_result;

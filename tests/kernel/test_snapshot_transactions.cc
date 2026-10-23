@@ -56,7 +56,77 @@ class SnapshotTransactionTest : public ::testing::Test {
   std::unique_ptr<FactStore> store_;
 };
 
-TEST_F(SnapshotTransactionTest, ConflictsWhenConcurrentWritesShareInterval) {
+TEST_F(SnapshotTransactionTest, AllowsAdjacentLaterValidFromWriteToTheSameFact) {
+  ASSERT_TRUE(store_->Commit(StoreCommitBatch{
+                         TxnId{1}, 1, {VertexPut(1, 10)}, {}, {}})
+                  .ok());
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  const FactRef ref = EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref();
+  StoreCommitBatch earlier_hour =
+      BatchFromSnapshot(TxnId{2}, snapshot.ValueOrDie(), {VertexPut(1, 11)});
+  StoreCommitBatch later_hour =
+      BatchFromSnapshot(TxnId{3}, snapshot.ValueOrDie(), {VertexPut(1, 12)});
+
+  ASSERT_TRUE(store_->Commit(earlier_hour).ok());
+  const auto committed = store_->Commit(later_hour);
+  ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+
+  // The later boundary truncates the earlier version instead of overlapping it:
+  // a later snapshot sees one version per valid time.
+  const auto after = store_->BeginSnapshot();
+  ASSERT_TRUE(after.ok()) << after.status().ToString();
+  const auto at_eleven = store_->Read(after.ValueOrDie(), ref, ValidTime{11});
+  ASSERT_TRUE(at_eleven.ok()) << at_eleven.status().ToString();
+  ASSERT_TRUE(at_eleven.ValueOrDie().has_value());
+  EXPECT_EQ(at_eleven.ValueOrDie()->valid_from, ValidTime{11});
+  EXPECT_EQ(at_eleven.ValueOrDie()->commit_seq, CommitSeq{2});
+  const auto at_twelve = store_->Read(after.ValueOrDie(), ref, ValidTime{12});
+  ASSERT_TRUE(at_twelve.ok()) << at_twelve.status().ToString();
+  ASSERT_TRUE(at_twelve.ValueOrDie().has_value());
+  EXPECT_EQ(at_twelve.ValueOrDie()->valid_from, ValidTime{12});
+  EXPECT_EQ(at_twelve.ValueOrDie()->commit_seq, CommitSeq{3});
+}
+
+TEST_F(SnapshotTransactionTest, ConflictsWhenEarlierConcurrentWriteCoversLaterBoundary) {
+  ASSERT_TRUE(store_->Commit(StoreCommitBatch{
+                         TxnId{1}, 1, {VertexPut(1, 10), VertexPut(1, 30)}, {}, {}})
+                  .ok());
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  StoreCommitBatch earlier =
+      BatchFromSnapshot(TxnId{2}, snapshot.ValueOrDie(), {VertexPut(1, 15)});
+  StoreCommitBatch later =
+      BatchFromSnapshot(TxnId{3}, snapshot.ValueOrDie(), {VertexPut(1, 20)});
+  ASSERT_EQ(earlier.snapshot_write_dependencies.size(), 1U);
+  EXPECT_EQ(earlier.snapshot_write_dependencies[0].successor,
+            std::optional<ValidTime>{ValidTime{30}});
+
+  ASSERT_TRUE(store_->Commit(earlier).ok());
+  const auto conflicted = store_->Commit(later);
+  EXPECT_TRUE(conflicted.status().IsConflict()) << conflicted.status().ToString();
+}
+
+TEST_F(SnapshotTransactionTest, ConflictsWhenLaterBoundaryCommitsBeforeEarlierBoundary) {
+  ASSERT_TRUE(store_->Commit(StoreCommitBatch{
+                         TxnId{1}, 1, {VertexPut(1, 10)}, {}, {}})
+                  .ok());
+  const auto snapshot = store_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+
+  StoreCommitBatch later =
+      BatchFromSnapshot(TxnId{2}, snapshot.ValueOrDie(), {VertexPut(1, 20)});
+  StoreCommitBatch earlier =
+      BatchFromSnapshot(TxnId{3}, snapshot.ValueOrDie(), {VertexPut(1, 15)});
+
+  ASSERT_TRUE(store_->Commit(later).ok());
+  const auto conflicted = store_->Commit(earlier);
+  EXPECT_TRUE(conflicted.status().IsConflict()) << conflicted.status().ToString();
+}
+
+TEST_F(SnapshotTransactionTest, ConflictsWhenConcurrentWritesShareBoundary) {
   ASSERT_TRUE(store_->Commit(StoreCommitBatch{
                          TxnId{1}, 1, {VertexPut(1, 10)}, {}, {}})
                   .ok());
@@ -66,7 +136,7 @@ TEST_F(SnapshotTransactionTest, ConflictsWhenConcurrentWritesShareInterval) {
   StoreCommitBatch first =
       BatchFromSnapshot(TxnId{2}, snapshot.ValueOrDie(), {VertexPut(1, 15)});
   StoreCommitBatch second =
-      BatchFromSnapshot(TxnId{3}, snapshot.ValueOrDie(), {VertexPut(1, 16)});
+      BatchFromSnapshot(TxnId{3}, snapshot.ValueOrDie(), {VertexPut(1, 15)});
 
   ASSERT_TRUE(store_->Commit(first).ok());
   const auto conflicted = store_->Commit(second);
@@ -171,7 +241,7 @@ TEST_F(SnapshotTransactionTest, RepeatedConcurrentContendersHaveOneWinner) {
     StoreCommitBatch first = BatchFromSnapshot(
         TxnId{seed_id.value + 1}, snapshot.ValueOrDie(), {VertexPut(vertex_id, 15)});
     StoreCommitBatch second = BatchFromSnapshot(
-        TxnId{seed_id.value + 2}, snapshot.ValueOrDie(), {VertexPut(vertex_id, 16)});
+        TxnId{seed_id.value + 2}, snapshot.ValueOrDie(), {VertexPut(vertex_id, 15)});
 
     std::barrier start(3);
     std::array<StatusOr<StoreCommitResult>, 2> results;

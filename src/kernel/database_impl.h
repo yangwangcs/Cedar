@@ -275,11 +275,12 @@ class Database::Impl {
           // Forward the kernel's meta sequence format option. It is v2-only:
           // both Database::Open and FactStore::Open reject anything but 2.
           store_options.meta_sequence_format = options.meta_sequence_format;
+          store_options.storage_read_working_bytes = options.storage_read_working_bytes;
+          store_options.storage_reader_metadata_bytes = options.storage_reader_metadata_bytes;
           store_options.prune_sequence_records_on_vacuum =
               options.prune_sequence_records_on_vacuum;
-          // F18: forward the reopen fact cross-check policy. The kernel default
-          // is the bounded recent window (K=4096); deep=true is the documented
-          // rollback to full-history validation.
+          // Forward the reopen fact cross-check policy. Full-history validation
+          // is the default; deep=false explicitly selects the bounded window.
           store_options.deep_recovery_validation =
               options.deep_recovery_validation;
           store_options.recovery_validation_recent_sequences =
@@ -317,6 +318,8 @@ class Database::Impl {
     pool_options.visited_vertices = UINT64_MAX;
     pool_options.cpu_us = UINT64_MAX;
     pool_options.max_parallelism = query_runtime_options.query_workers;
+    pool_options.reserved_interactive_workers =
+        query_runtime_options.reserved_interactive_workers;
     pool_options.wal_sync_critical = &wal_sync_critical;
     query_resource_pool = std::make_unique<internal::QueryResourcePool>(pool_options);
   }

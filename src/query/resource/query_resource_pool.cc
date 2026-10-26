@@ -115,7 +115,8 @@ StatusOr<QueryReservation> QueryResourcePool::Admit(const QueryBudget& budget,
   const uint32_t worker_limit =
       mode == QueryExecutionMode::kAnalytical
           ? options_.max_parallelism -
-                std::min(options_.max_parallelism,
+                std::min(options_.max_parallelism == 0
+                             ? 0 : options_.max_parallelism - 1,
                          options_.reserved_interactive_workers)
           : options_.max_parallelism;
   if (budget.max_parallelism == 0 || budget.max_parallelism > worker_limit) {

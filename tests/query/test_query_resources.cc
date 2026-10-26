@@ -4,7 +4,10 @@
 #include <filesystem>
 #include <fstream>
 #include <atomic>
+#include <barrier>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "query/resource/query_resource_pool.h"
 #include "query/resource/query_scratch.h"
@@ -46,12 +49,103 @@ QueryBudget InteractiveBudget(uint64_t memory) {
   return budget;
 }
 
+TEST(QueryResourcePoolTest, SingleWorkerAllowsEitherModeButNeverBoth) {
+  QueryResourcePool pool(OptionsWithMemory(1024));
+  for (auto mode : {QueryExecutionMode::kAnalytical,
+                    QueryExecutionMode::kInteractive}) {
+    {
+      auto first = pool.Admit(InteractiveBudget(128), mode);
+      ASSERT_TRUE(first.ok()) << first.status().ToString();
+      for (auto competing : {QueryExecutionMode::kAnalytical,
+                             QueryExecutionMode::kInteractive}) {
+        EXPECT_TRUE(pool.Admit(InteractiveBudget(128), competing)
+                        .status().IsResourceExhausted());
+      }
+    }
+    EXPECT_TRUE(pool.Admit(InteractiveBudget(1024), mode).ok());
+  }
+}
+
+TEST(QueryResourcePoolTest, ReservedWorkersAreClampedToLeaveAnalyticalCapacity) {
+  for (uint32_t workers : {1U, 2U, 5U}) {
+    auto options = OptionsWithMemory(1024);
+    options.max_parallelism = workers;
+    options.reserved_interactive_workers = workers;
+    QueryResourcePool pool(options);
+    auto analytical = pool.Admit(InteractiveBudget(128),
+                                 QueryExecutionMode::kAnalytical);
+    ASSERT_TRUE(analytical.ok()) << analytical.status().ToString();
+    EXPECT_TRUE(pool.Admit(InteractiveBudget(128),
+                           QueryExecutionMode::kAnalytical)
+                    .status().IsResourceExhausted());
+    if (workers > 1) {
+      auto interactive = InteractiveBudget(128);
+      interactive.max_parallelism = workers - 1;
+      EXPECT_TRUE(pool.Admit(interactive).ok());
+    }
+  }
+}
+
 TEST(QueryResourcePoolTest, NeverAllocatesBeyondReservation) {
   QueryResourcePool pool(OptionsWithMemory(1024));
   auto query = pool.Admit(InteractiveBudget(768));
   ASSERT_TRUE(query.ok()) << query.status().ToString();
   EXPECT_TRUE(query.ValueOrDie().ReserveMemory(512).ok());
   EXPECT_TRUE(query.ValueOrDie().ReserveMemory(513).IsResourceExhausted());
+}
+
+TEST(QueryResourcePoolTest, ParallelPageReservationsShareOneQueryLimit) {
+  constexpr size_t workers = 8;
+  constexpr size_t attempts = 8192;
+  QueryReservation query(workers * attempts);
+  std::barrier start(workers);
+  std::atomic<size_t> accepted{0};
+  std::vector<std::thread> threads;
+  for (size_t worker = 0; worker < workers; ++worker) {
+    threads.emplace_back([&, reservation = query]() mutable {
+      start.arrive_and_wait();
+      for (size_t i = 0; i < attempts; ++i) {
+        if (reservation.ReserveMemory(1).ok()) ++accepted;
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(accepted.load(), workers * attempts);
+  EXPECT_EQ(query.used_bytes(), accepted.load());
+  EXPECT_EQ(query.used(ResourceDimension::kMemory), accepted.load());
+  EXPECT_EQ(query.peak_bytes(), accepted.load());
+  EXPECT_TRUE(query.ReserveMemory(1).IsResourceExhausted());
+  query.ReleaseMemory(accepted.load());
+  EXPECT_EQ(query.used_bytes(), 0U);
+}
+
+TEST(QueryResourcePoolTest, ConcurrentOwnerPinsSharePayloadAndReleaseExactly) {
+  QueryReservation query(1 << 20);
+  int owner = 0;
+  constexpr size_t workers = 8;
+  std::barrier pinned(workers);
+  std::barrier released(workers);
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  for (size_t worker = 0; worker < workers; ++worker) {
+    threads.emplace_back([&, worker, reservation = query]() mutable {
+      for (size_t round = 0; round < 1000; ++round) {
+        auto lease = reservation.TryRetainOwner(&owner, 4096);
+        if (!lease) failed = true;
+        pinned.arrive_and_wait();
+        if (worker == 0 && reservation.used_bytes() != 4096 + 128) failed = true;
+        released.arrive_and_wait();
+        lease.reset();
+        pinned.arrive_and_wait();
+        if (worker == 0 && reservation.used_bytes() != 0) failed = true;
+        released.arrive_and_wait();
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  EXPECT_FALSE(failed.load());
+  EXPECT_EQ(query.used_bytes(), 0U);
+  EXPECT_EQ(query.peak_bytes(), 4096U + 128);
 }
 
 TEST(QueryResourcePoolTest, OverflowIsResourceExhausted) {

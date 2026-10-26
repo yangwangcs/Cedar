@@ -18,6 +18,7 @@
 #include <sstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include "cedar/cypher/schema_manifest.h"
 #include "cedar/cypher/write.h"
 #include "cedar/server/bolt_codec.h"
+#include "test_util/sync_point.h"
 
 namespace cedar::server {
 namespace {
@@ -538,7 +540,8 @@ class Server::State {
   std::atomic<bool> live{false};
   std::atomic<bool> ready{false};
   std::atomic<bool> stopping{false};
-  std::atomic<int> active_client_fd{-1};
+  std::mutex active_clients_mutex;
+  std::set<int> active_clients;
 };
 
 Server::Server(ServerConfig config)
@@ -654,13 +657,16 @@ Status Server::Stop() {
   if (!state_->live.load(std::memory_order_acquire) && state_->database == nullptr) return Status::OK();
   state_->stopping.store(true, std::memory_order_release);
   state_->ready.store(false, std::memory_order_release);
+  TEST_SYNC_POINT("CedarServer::Stop:Stopping");
   if (state_->listen_fd >= 0) {
     ::shutdown(state_->listen_fd, SHUT_RDWR);
     ::close(state_->listen_fd);
     state_->listen_fd = -1;
   }
-  const int active_client = state_->active_client_fd.load(std::memory_order_acquire);
-  if (active_client >= 0) ::shutdown(active_client, SHUT_RDWR);
+  {
+    std::lock_guard<std::mutex> clients_lock(state_->active_clients_mutex);
+    for (int fd : state_->active_clients) ::shutdown(fd, SHUT_RDWR);
+  }
   if (state_->accept_thread.joinable()) state_->accept_thread.join();
   {
     std::lock_guard<std::mutex> queue_lock(state_->queue_mutex);
@@ -729,9 +735,11 @@ void Server::AcceptLoop() {
       if (state_->stopping.load(std::memory_order_acquire)) break;
       continue;
     }
+    TEST_SYNC_POINT("CedarServer::Accept:BeforeQueue");
     {
       std::lock_guard<std::mutex> lock(state_->queue_mutex);
-      if (state_->client_queue.size() >= state_->config.max_sessions) {
+      if (state_->stopping.load(std::memory_order_acquire) ||
+          state_->client_queue.size() >= state_->config.max_sessions) {
         ::close(fd);
         continue;
       }
@@ -756,10 +764,22 @@ void Server::WorkerLoop() {
       fd = state_->client_queue.front();
       state_->client_queue.pop_front();
     }
-    state_->active_client_fd.store(fd, std::memory_order_release);
+    TEST_SYNC_POINT("CedarServer::Worker:BeforeRegister");
+    {
+      std::lock_guard<std::mutex> clients_lock(state_->active_clients_mutex);
+      if (state_->stopping.load(std::memory_order_acquire)) {
+        ::close(fd);
+        continue;
+      }
+      state_->active_clients.insert(fd);
+    }
     HandleClient(fd);
-    state_->active_client_fd.store(-1, std::memory_order_release);
-    ::close(fd);
+    TEST_SYNC_POINT("CedarServer::Worker:BeforeClose");
+    {
+      std::lock_guard<std::mutex> clients_lock(state_->active_clients_mutex);
+      state_->active_clients.erase(fd);
+      ::close(fd);
+    }
   }
 }
 

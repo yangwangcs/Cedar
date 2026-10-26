@@ -3,6 +3,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
+#include <future>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -10,9 +13,75 @@
 #include <unistd.h>
 
 #include "cedar/server.h"
+#include "test_util/sync_point.h"
 
 namespace cedar::server {
 namespace {
+
+#ifndef NDEBUG
+TEST(ServerLifecycleTest, StopRacingClientRegistrationAndExit) {
+  for (const char* point : {"CedarServer::Accept:BeforeQueue",
+                            "CedarServer::Worker:BeforeRegister",
+                            "CedarServer::Worker:BeforeClose"}) {
+    SCOPED_TRACE(point);
+    char pattern[] = "/tmp/cedar_server_stop_race_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    ServerConfig config;
+    config.database_path = pattern;
+    config.lock_path = std::string(pattern) + ".lock";
+    config.pid_path = std::string(pattern) + ".pid";
+    config.port = 0;
+    config.worker_threads = 2;
+    Server server(config);
+    ASSERT_TRUE(server.Start().ok());
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(server.port());
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+    std::promise<void> reached, release, stopping;
+    auto reached_future = reached.get_future();
+    auto release_future = release.get_future().share();
+    auto stopping_future = stopping.get_future();
+    auto* sync = rocksdb::SyncPoint::GetInstance();
+    sync->SetCallBack(point, [&](void*) {
+      reached.set_value();
+      release_future.wait();
+    });
+    sync->SetCallBack("CedarServer::Stop:Stopping", [&](void*) { stopping.set_value(); });
+    sync->EnableProcessing();
+    const int connected = ::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    EXPECT_EQ(connected, 0);
+    if (connected != 0) {
+      sync->DisableProcessing();
+      sync->ClearAllCallBacks();
+      ::close(fd);
+      server.Stop().IgnoreError();
+      std::filesystem::remove_all(pattern);
+      continue;
+    }
+    if (std::string(point) == "CedarServer::Worker:BeforeClose") {
+      // EOF makes recv return before the worker's unregister/close section.
+      ::shutdown(fd, SHUT_RDWR);
+    }
+    EXPECT_EQ(reached_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto stopped = std::async(std::launch::async, [&] { return server.Stop(); });
+    EXPECT_EQ(stopping_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    release.set_value();
+    const auto completed = stopped.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(completed, std::future_status::ready);
+    // Release an implementation that missed registration before joining it.
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+    EXPECT_TRUE(stopped.get().ok());
+    sync->DisableProcessing();
+    sync->ClearAllCallBacks();
+    EXPECT_TRUE(server.Stop().ok());
+    std::filesystem::remove_all(pattern);
+  }
+}
+#endif
 
 void SendBoltMessage(int fd, const std::string& payload) {
   std::string frame;
@@ -59,6 +128,53 @@ uint64_t PrepareFingerprint(Server& server) {
     return 0;
   }
   return std::stoull(std::string(response + 7, static_cast<size_t>(count - 8)));
+}
+
+TEST(ServerLifecycleTest, StopWakesAllIdleClients) {
+  for (uint32_t workers : {2U, 4U}) {
+    char pattern[] = "/tmp/cedar_server_idle_XXXXXX";
+    ASSERT_NE(mkdtemp(pattern), nullptr);
+    ServerConfig config;
+    config.database_path = pattern;
+    config.lock_path = std::string(pattern) + ".lock";
+    config.pid_path = std::string(pattern) + ".pid";
+    config.port = 0;
+    config.worker_threads = workers;
+    Server server(config);
+    ASSERT_TRUE(server.Start().ok());
+    std::vector<int> clients;
+    for (uint32_t index = 0; index < workers; ++index) {
+      const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      ASSERT_GE(fd, 0);
+      clients.push_back(fd);
+      timeval timeout{2, 0};
+      ASSERT_EQ(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                            &timeout, sizeof(timeout)), 0);
+      sockaddr_in address{};
+      address.sin_family = AF_INET;
+      address.sin_port = htons(server.port());
+      ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+      ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&address),
+                          sizeof(address)), 0);
+      const std::string handshake(
+          "\x60\x60\xB0\x17\x00\x00\x04\x05\x00\x00\x00\x00"
+          "\x00\x00\x00\x00\x00\x00\x00\x00", 20);
+      ASSERT_EQ(::send(fd, handshake.data(), handshake.size(), 0), 20);
+      char response[4]{};
+      ASSERT_EQ(::recv(fd, response, sizeof(response), MSG_WAITALL), 4);
+    }
+    auto stopped = std::async(std::launch::async, [&] { return server.Stop(); });
+    const auto result = stopped.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(result, std::future_status::ready);
+    // Always unblock a broken implementation so the regression itself terminates.
+    for (int fd : clients) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+    }
+    EXPECT_TRUE(stopped.get().ok());
+    EXPECT_TRUE(server.Stop().ok());
+    std::filesystem::remove_all(pattern);
+  }
 }
 
 TEST(ServerLifecycleTest, OwnsOneDatabaseAndStopsIdempotently) {

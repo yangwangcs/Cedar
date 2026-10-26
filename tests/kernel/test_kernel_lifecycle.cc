@@ -16,6 +16,7 @@
 
 #include "cedar/database.h"
 #include "cedar/fact/meta_codec.h"
+#include "cedar/query/query.h"
 #include "query/runtime/graph_frontier.h"
 #include "storage/rocks/rocksdb_config.h"
 
@@ -56,6 +57,75 @@ class KernelLifecycleTest : public ::testing::Test {
   std::string path_;
   std::unique_ptr<Database> database_;
 };
+
+TEST_F(KernelLifecycleTest, SingleWorkerAnalyticalSelectCompletes) {
+  DatabaseOptions options;
+  options.query_runtime.query_workers = 1;
+  options.query_runtime.reserved_interactive_workers = 1;
+  database_ = Open(options);
+  ASSERT_TRUE(database_);
+  auto transaction = Begin();
+  ASSERT_TRUE(transaction);
+  ASSERT_TRUE(transaction->Assert(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{1}).ok());
+  ASSERT_TRUE(transaction->Commit().ok());
+  const auto vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), {},
+      QueryOptions{.mode = QueryExecutionMode::kAnalytical});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  size_t rows = 0;
+  while (true) {
+    auto batch = cursor.ValueOrDie().Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    if (!batch.ValueOrDie()) break;
+    rows += batch.ValueOrDie()->row_count();
+  }
+  EXPECT_EQ(rows, 1U);
+  EXPECT_TRUE(cursor.ValueOrDie().terminal_info().complete);
+  EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+}
+
+TEST_F(KernelLifecycleTest, NondefaultReservedWorkersReachQueryAdmission) {
+  DatabaseOptions options;
+  options.query_runtime.query_workers = 4;
+  options.query_runtime.reserved_interactive_workers = 3;
+  database_ = Open(options);
+  ASSERT_TRUE(database_);
+  const auto vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  QueryOptions execution;
+  execution.mode = QueryExecutionMode::kAnalytical;
+  execution.budget.max_parallelism = 2;
+  {
+    auto snapshot = database_->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    const auto rejected = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), {}, execution);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_TRUE(rejected.status().IsResourceExhausted());
+  }
+  execution.budget.max_parallelism = 1;
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto accepted = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), {}, execution);
+  ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+  EXPECT_TRUE(accepted.ValueOrDie().Close().ok());
+}
 
 // Opens one already-created database with Cedar's column-family descriptors and
 // reads one meta-CF value. Tests use this to observe the durable format marker
@@ -258,6 +328,8 @@ TEST_F(KernelLifecycleTest, KernelDataReopensThroughKernelProfile) {
     options.storage_profile = StorageProfile::kProductionAppend;
     options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
     options.production.kernel_mode = true;
+    options.storage_read_working_bytes = 32ULL << 20;
+    options.storage_reader_metadata_bytes = 16ULL << 20;
     options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
     options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
     options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;
@@ -299,6 +371,48 @@ TEST_F(KernelLifecycleTest, KernelDataReopensThroughKernelProfile) {
   ASSERT_TRUE(reopened);
   expect_fact_and_transaction(reopened.get(), txn_id);
   ASSERT_TRUE(reopened->Close().ok());
+}
+
+TEST_F(KernelLifecycleTest, ReadWorkingPoolCountsAgainstProductionCapacity) {
+  DatabaseOptions options;
+  options.path = path_;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 1ULL << 30;
+  options.production.kernel_mode = true;
+  options.query_runtime.query_memory_bytes = 32ULL << 20;
+  options.query_runtime.projection_cache_bytes = 32ULL << 20;
+  options.query_runtime.query_delta_bytes = 32ULL << 20;
+  options.storage_reader_metadata_bytes = 16ULL << 20;
+  options.storage_read_working_bytes = 64ULL << 20;
+  auto too_large = Database::Open(options);
+  ASSERT_FALSE(too_large.ok());
+  EXPECT_TRUE(too_large.status().IsInvalidArgument());
+  EXPECT_NE(too_large.status().ToString().find("query allocations exceed"), std::string::npos);
+  options.storage_read_working_bytes = 32ULL << 20;
+  auto valid = Database::Open(options);
+  ASSERT_TRUE(valid.ok()) << valid.status().ToString();
+  EXPECT_TRUE(valid.ValueOrDie()->Close().ok());
+}
+
+TEST_F(KernelLifecycleTest, ReaderMetadataPoolCountsAgainstProductionCapacity) {
+  DatabaseOptions options;
+  options.path = path_;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes = 1ULL << 30;
+  options.production.kernel_mode = true;
+  options.query_runtime.query_memory_bytes = 32ULL << 20;
+  options.query_runtime.projection_cache_bytes = 32ULL << 20;
+  options.query_runtime.query_delta_bytes = 32ULL << 20;
+  options.storage_read_working_bytes = 16ULL << 20;
+  options.storage_reader_metadata_bytes = 64ULL << 20;
+  auto too_large = Database::Open(options);
+  ASSERT_FALSE(too_large.ok());
+  EXPECT_TRUE(too_large.status().IsInvalidArgument());
+  EXPECT_NE(too_large.status().ToString().find("query allocations exceed"), std::string::npos);
+  options.storage_reader_metadata_bytes = 32ULL << 20;
+  auto valid = Database::Open(options);
+  ASSERT_TRUE(valid.ok()) << valid.status().ToString();
+  EXPECT_TRUE(valid.ValueOrDie()->Close().ok());
 }
 
 TEST_F(KernelLifecycleTest, RecoveryRepairUsesConfiguredQueryDeltaByteBudget) {
@@ -790,16 +904,13 @@ TEST_F(KernelLifecycleTest, ExplicitV1OptOutIsRejectedAsUnsupported) {
       std::filesystem::path(path_) / "CURRENT"));
 }
 
-// F18: DatabaseOptions defaults to the bounded recent fact window, and
-// deep_recovery_validation=true is the documented rollback. The raw delete
-// removes one old fact that the bounded window skips; the structural sequence
-// checks still pass, the kernel opens, and the missing fact is observed on
-// read. The rollback open re-checks every fact and fails with the historical
-// "missing fact" Corruption.
-TEST_F(KernelLifecycleTest, DefaultReopenValidationIsBoundedAndDeepRollsBack) {
-  DatabaseOptions bounded;
-  bounded.recovery_validation_recent_sequences = 2;
-  database_ = Open(bounded);
+// The default checks every retained fact. Applications may explicitly select
+// the bounded recent window when startup time matters more than a full check.
+TEST_F(KernelLifecycleTest, DefaultReopenValidationIsFullAndBoundedIsExplicit) {
+  DatabaseOptions defaults;
+  defaults.path = path_;
+  defaults.recovery_validation_recent_sequences = 2;
+  database_ = Open(defaults);
   ASSERT_TRUE(database_);
   constexpr uint64_t kTransactions = 3;
   for (uint64_t index = 1; index <= kTransactions; ++index) {
@@ -828,10 +939,21 @@ TEST_F(KernelLifecycleTest, DefaultReopenValidationIsBoundedAndDeepRollsBack) {
   ASSERT_TRUE(
       DeleteRawFactRecord(path_, decoded.ValueOrDie().fact_keys.front()));
 
-  // Default policy: visible=3 and K=2 put sequence 1 outside the fact window.
+  // The default policy rejects a missing retained fact, regardless of K.
+  auto default_reopen = Database::Open(defaults);
+  ASSERT_FALSE(default_reopen.ok());
+  EXPECT_TRUE(default_reopen.status().IsCorruption())
+      << default_reopen.status().ToString();
+  EXPECT_NE(default_reopen.status().ToString().find("missing fact"),
+            std::string::npos)
+      << default_reopen.status().ToString();
+
+  // Explicit bounded policy: visible=3 and K=2 put sequence 1 outside its
+  // cross-check window.
+  DatabaseOptions bounded = defaults;
+  bounded.deep_recovery_validation = false;
   database_ = Open(bounded);
-  ASSERT_TRUE(database_)
-      << "the default bounded reopen must not fail on an old missing fact";
+  ASSERT_TRUE(database_);
   {
     const auto snapshot = database_->BeginSnapshot();
     ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
@@ -843,19 +965,6 @@ TEST_F(KernelLifecycleTest, DefaultReopenValidationIsBoundedAndDeepRollsBack) {
   }
   ASSERT_TRUE(database_->Close().ok());
   database_.reset();
-
-  // Rollback option: deep validation covers every fact from the oldest
-  // readable boundary and therefore rejects the same database.
-  DatabaseOptions rollback = bounded;
-  rollback.deep_recovery_validation = true;
-  rollback.path = path_;
-  const auto rejected = Database::Open(std::move(rollback));
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_TRUE(rejected.status().IsCorruption())
-      << rejected.status().ToString();
-  EXPECT_NE(rejected.status().ToString().find("missing fact"),
-            std::string::npos)
-      << rejected.status().ToString();
 }
 
 }  // namespace

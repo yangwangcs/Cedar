@@ -193,8 +193,12 @@ TEST(TemporalExpandTest, KHopDeduplicatesAtMinimumDepthAndHonorsBound) {
   GraphFrontierOptions bounded{nullptr, &delta, 2};
   bounded.adjacency_seek = [&delta](const std::vector<VertexRef>&,
                                     ExpandDirection,
-                                    std::optional<uint64_t>) {
-    return StatusOr<std::vector<EdgeIdentity>>(delta.edge_identities);
+                                    std::optional<uint64_t>,
+                                    const std::function<Status(const EdgeIdentity&)>& visitor) {
+    for (const auto& identity : delta.edge_identities) {
+      if (Status status = visitor(identity); !status.ok()) return status;
+    }
+    return Status::OK();
   };
   bounded.candidates_examined = &candidates;
   auto result = KHopExpand(snapshot.ValueOrDie(), request, bounded);
@@ -279,8 +283,12 @@ TEST(TemporalExpandTest, KHopBothUsesFrontierEndpointAndDeduplicatesDiamond) {
   GraphFrontierOptions options{nullptr, &delta, 1};
   options.adjacency_seek = [&delta](const std::vector<VertexRef>&,
                                     ExpandDirection,
-                                    std::optional<uint64_t>) {
-    return StatusOr<std::vector<EdgeIdentity>>(delta.edge_identities);
+                                    std::optional<uint64_t>,
+                                    const std::function<Status(const EdgeIdentity&)>& visitor) {
+    for (const auto& identity : delta.edge_identities) {
+      if (Status status = visitor(identity); !status.ok()) return status;
+    }
+    return Status::OK();
   };
   GraphExpansionRequest incoming{{two}, ValidTimeInterval{ValidTime{0}, ValidTime{10}},
                                  ExpandDirection::kBoth, std::nullopt};
@@ -337,8 +345,12 @@ TEST(TemporalExpandTest, KHopCarriesCommonIntervalAcrossLayers) {
   GraphFrontierOptions options{nullptr, &delta, 2};
   options.adjacency_seek = [&delta](const std::vector<VertexRef>&,
                                     ExpandDirection,
-                                    std::optional<uint64_t>) {
-    return StatusOr<std::vector<EdgeIdentity>>(delta.edge_identities);
+                                    std::optional<uint64_t>,
+                                    const std::function<Status(const EdgeIdentity&)>& visitor) {
+    for (const auto& identity : delta.edge_identities) {
+      if (Status status = visitor(identity); !status.ok()) return status;
+    }
+    return Status::OK();
   };
   GraphExpansionRequest request{{one}, ValidTimeInterval{ValidTime{0}, ValidTime{20}},
                                 ExpandDirection::kOut, std::nullopt};

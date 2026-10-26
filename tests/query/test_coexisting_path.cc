@@ -10,6 +10,7 @@
 #include "cedar/query/result.h"
 #include "cedar/transaction.h"
 #include "query/runtime/graph_frontier.h"
+#include "query/runtime/journey.h"
 
 namespace cedar::internal {
 namespace {
@@ -111,6 +112,171 @@ TEST(CoexistingPathTest, BudgetExhaustionIsResourceExhausted) {
                                        options);
   ASSERT_FALSE(result.ok());
   EXPECT_TRUE(result.status().IsResourceExhausted());
+}
+
+TEST(CoexistingPathTest, ExpansionHistoryRespectsMemoryBudgetAndReleasesScratch) {
+  for (const bool delta_history : {false, true}) {
+    SCOPED_TRACE(delta_history ? "delta history" : "canonical history");
+    GraphFixture graph;
+    graph.Vertex(graph.b);
+    graph.Edge({EdgeRef{PartId{0}, EdgeId{32}}, graph.a, graph.b, 1}, 0, 1024);
+    if (!delta_history) {
+      graph.Commit([&](Transaction& txn) {
+        for (uint64_t time = 0; time < 512; ++time) {
+          const auto fact = EntityFact::Vertex(graph.a);
+          const Status status = time % 2 == 0
+              ? txn.Assert(fact, ValidTime{time})
+              : txn.Retract(fact, ValidTime{time});
+          if (!status.ok()) return status;
+        }
+        return Status::OK();
+      });
+    }
+    auto snapshot = graph.database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    QueryDeltaView delta;
+    if (delta_history) {
+      for (uint64_t time = 0; time < 512; ++time) {
+        delta.facts.push_back(FactEvent{
+            EntityFact::Vertex(graph.a).ref(), ValidTime{time},
+            snapshot.ValueOrDie().commit_seq(),
+            time % 2 == 0 ? FactOperation::kPut : FactOperation::kDelete,
+            0, std::nullopt});
+      }
+    }
+    GraphExpansionRequest request{{graph.a}, {ValidTime{0}, ValidTime{512}},
+                                  ExpandDirection::kOut, std::nullopt};
+    for (const uint64_t bytes : {uint64_t{32 << 10}, uint64_t{8 << 20}}) {
+      SCOPED_TRACE(bytes);
+      QueryReservation reservation(bytes);
+      GraphFrontierOptions options;
+      options.reservation = &reservation;
+      options.delta = delta_history ? &delta : nullptr;
+      auto result = ExpandTemporal(snapshot.ValueOrDie(), request, options);
+      if (bytes == (32 << 10)) {
+        ASSERT_FALSE(result.ok());
+        EXPECT_TRUE(result.status().IsResourceExhausted()) << result.status().ToString();
+      } else {
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        ASSERT_EQ(result.ValueOrDie().size(), 256U);
+        EXPECT_EQ(result.ValueOrDie().front().effective,
+                  (ValidTimeInterval{ValidTime{0}, ValidTime{1}}));
+        EXPECT_EQ(result.ValueOrDie().back().effective,
+                  (ValidTimeInterval{ValidTime{510}, ValidTime{511}}));
+        EXPECT_GT(reservation.used(ResourceDimension::kMemory), 0U);
+      }
+      result = Status::NotFound("test", "released expansion result");
+      EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+    }
+    for (const uint64_t bytes : {uint64_t{32 << 10}, uint64_t{8 << 20}}) {
+      SCOPED_TRACE(bytes);
+      QueryReservation reservation(bytes);
+      GraphFrontierOptions options;
+      options.reservation = &reservation;
+      options.delta = delta_history ? &delta : nullptr;
+      auto result = CoexistingShortestPath(snapshot.ValueOrDie(), request,
+                                           graph.b, options);
+      if (bytes == (32 << 10)) {
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(result.status().IsResourceExhausted()) << result.status().ToString();
+      } else {
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        ASSERT_EQ(result.ValueOrDie().paths.size(), 256U);
+        EXPECT_EQ(result.ValueOrDie().paths.front().common,
+                  (ValidTimeInterval{ValidTime{0}, ValidTime{1}}));
+        EXPECT_EQ(result.ValueOrDie().paths.back().common,
+                  (ValidTimeInterval{ValidTime{510}, ValidTime{511}}));
+        EXPECT_GT(reservation.used(ResourceDimension::kMemory), 0U);
+      }
+      result = Status::NotFound("test", "released path result");
+      EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+      QueryReservation journey_reservation(bytes);
+      JourneyRequest journey_request{graph.a, graph.b, request.interval};
+      journey_request.max_hops = 1;
+      journey_request.duration_at = [](EdgeRef, ValidTime)
+          -> StatusOr<std::optional<ValidDuration>> {
+        return std::optional<ValidDuration>{ValidDuration{0}};
+      };
+      JourneyOptions journey_options;
+      journey_options.reservation = &journey_reservation;
+      journey_options.delta = options.delta;
+      auto journey = EarliestArrival(snapshot.ValueOrDie(), journey_request,
+                                      journey_options);
+      if (bytes == (32 << 10)) {
+        EXPECT_FALSE(journey.ok());
+        EXPECT_TRUE(journey.status().IsResourceExhausted()) << journey.status().ToString();
+      } else {
+        ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+        EXPECT_EQ(journey.ValueOrDie().edges,
+                  (std::vector<EdgeRef>{{PartId{0}, EdgeId{32}}}));
+        EXPECT_EQ(journey.ValueOrDie().arrival, ValidTime{0});
+        EXPECT_GT(journey_reservation.used(ResourceDimension::kMemory), 0U);
+      }
+      journey = Status::NotFound("test", "released journey result");
+      EXPECT_EQ(journey_reservation.used(ResourceDimension::kMemory), 0U);
+    }
+    if (delta_history) {
+      QueryReservation reservation(8 << 20);
+      GraphFrontierOptions options;
+      options.reservation = &reservation;
+      options.delta = &delta;
+      size_t checks = 0;
+      options.check_abort = [&checks] {
+        return ++checks == 64 ? Status::QueryCancelled("graph history test") : Status::OK();
+      };
+      auto cancelled = ExpandTemporal(snapshot.ValueOrDie(), request, options);
+      ASSERT_FALSE(cancelled.ok());
+      EXPECT_TRUE(cancelled.status().IsQueryCancelled());
+      EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+    }
+  }
+}
+
+TEST(CoexistingPathTest, GraphResultsKeepMemoryThroughMoveAndReplacement) {
+  GraphFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b); graph.Vertex(graph.c);
+  const EdgeRef first{PartId{0}, EdgeId{801}};
+  const EdgeRef second{PartId{0}, EdgeId{802}};
+  graph.Edge({first, graph.a, graph.b, 1}, 0, 20);
+  graph.Edge({second, graph.b, graph.c, 1}, 0, 20);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  GraphExpansionRequest request{{graph.a}, {ValidTime{0}, ValidTime{20}},
+                                  ExpandDirection::kOut, std::nullopt};
+  QueryReservation reservation(8 << 20);
+  GraphFrontierOptions options;
+  options.reservation = &reservation;
+  options.max_hops = 2;
+  auto hops = KHopExpand(snapshot.ValueOrDie(), request, options);
+  ASSERT_TRUE(hops.ok()) << hops.status().ToString();
+  ASSERT_EQ(hops.ValueOrDie().traversals.size(), 2U);
+  const uint64_t hop_bytes = reservation.used(ResourceDimension::kMemory);
+  EXPECT_GT(hop_bytes, 0U);
+  KHopResult moved_hops = std::move(hops).ConsumeValueOrDie();
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), hop_bytes);
+  moved_hops = KHopResult{};
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+
+  auto paths = CoexistingShortestPath(snapshot.ValueOrDie(), request, graph.c, options);
+  ASSERT_TRUE(paths.ok()) << paths.status().ToString();
+  ASSERT_EQ(paths.ValueOrDie().paths.size(), 1U);
+  EXPECT_EQ(paths.ValueOrDie().paths.front().edges, (std::vector<EdgeRef>{first, second}));
+  const uint64_t path_bytes = reservation.used(ResourceDimension::kMemory);
+  EXPECT_GT(path_bytes, 0U);
+  CoexistingPathResult moved_paths = std::move(paths).ConsumeValueOrDie();
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), path_bytes);
+  moved_paths = CoexistingPathResult{};
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+
+  QueryReservation tiny(1);
+  options.reservation = &tiny;
+  auto rejected_hops = KHopExpand(snapshot.ValueOrDie(), request, options);
+  ASSERT_FALSE(rejected_hops.ok());
+  EXPECT_TRUE(rejected_hops.status().IsResourceExhausted());
+  auto rejected_paths = CoexistingShortestPath(snapshot.ValueOrDie(), request, graph.c, options);
+  ASSERT_FALSE(rejected_paths.ok());
+  EXPECT_TRUE(rejected_paths.status().IsResourceExhausted());
+  EXPECT_EQ(tiny.used(ResourceDimension::kMemory), 0U);
 }
 
 TEST(CoexistingPathTest, KeepsDisjointMaximalWitnessIntervals) {

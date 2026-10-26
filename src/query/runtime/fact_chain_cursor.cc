@@ -33,6 +33,21 @@ bool OrderedBefore(const FactEvent& left, const FactEvent& right,
               : left.commit_seq.value < right.commit_seq.value;
 }
 
+Status ReserveCorrection(const std::vector<FactEvent>& events,
+                         FactReadMemoryScope* workspace) {
+  // Covers filtering/sorting copies, geometric boundary/state growth and
+  // the overlapping coalescing buffer in the existing correction helpers.
+  Status status = workspace->ReserveElements(
+      events.size(), 3 * sizeof(FactEvent) + 2 * sizeof(CorrectedBoundary) +
+                         3 * sizeof(StateInterval));
+  if (!status.ok()) return status;
+  for (const auto& event : events) {
+    status = workspace->ReserveElements(FactValueHeapBytes(event.value), 6);
+    if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
 }  // namespace
 
 Status FactChainCursor::Consume(const std::vector<FactEvent>& events) {
@@ -48,6 +63,10 @@ Status FactChainCursor::Consume(const FactEvent& event) {
   const Status valid = event.Validate();
   if (!valid.ok()) return valid;
   if (order_ == FactBatchOrder::kUnknown) {
+    Status status = ReserveFactAppend(&events_, &history_memory_);
+    if (!status.ok()) return status;
+    status = history_payload_.Reserve(FactValueHeapBytes(event.value));
+    if (!status.ok()) return status;
     events_.push_back(event);
     ordered_ = false;
     return Status::OK();
@@ -70,8 +89,14 @@ Status FactChainCursor::Consume(const FactEvent& event) {
     }
     ordered_ = false;
   }
-  last_event_ = event;
+  // Order checking only needs identity and timestamps, not another payload.
+  last_event_ = FactEvent{event.ref, event.valid_from, event.commit_seq,
+                          event.operation, event.schema_epoch, std::nullopt};
   if (!ordered_) {
+    Status status = ReserveFactAppend(&events_, &history_memory_);
+    if (!status.ok()) return status;
+    status = history_payload_.Reserve(FactValueHeapBytes(event.value));
+    if (!status.ok()) return status;
     events_.push_back(event);
     return Status::OK();
   }
@@ -84,8 +109,16 @@ Status FactChainCursor::Consume(const FactEvent& event) {
     has_active_ = true;
   }
   if (snapshot_seq_.has_value()) {
+    Status status = ReserveFactAppend(&active_events_, &history_memory_);
+    if (!status.ok()) return status;
+    status = history_payload_.Reserve(FactValueHeapBytes(event.value));
+    if (!status.ok()) return status;
     active_events_.push_back(event);
   } else {
+    Status status = ReserveFactAppend(&events_, &history_memory_);
+    if (!status.ok()) return status;
+    status = history_payload_.Reserve(FactValueHeapBytes(event.value));
+    if (!status.ok()) return status;
     events_.push_back(event);
   }
   return Status::OK();
@@ -102,6 +135,9 @@ Status FactChainCursor::Finish(CommitSeq snapshot_seq) {
   }
   if (!ordered_) {
     ++sort_fallbacks_;
+    FactReadMemoryScope sort_memory(memory_.get());
+    Status reserved = sort_memory.ReserveElements(events_.size(), sizeof(FactEvent));
+    if (!reserved.ok()) return reserved;
     std::stable_sort(events_.begin(), events_.end(),
                      [this](const FactEvent& left, const FactEvent& right) {
                        return OrderedBefore(left, right,
@@ -114,6 +150,9 @@ Status FactChainCursor::Finish(CommitSeq snapshot_seq) {
 Status FactChainCursor::FlushActive() {
   if (!has_active_) return Status::OK();
   if (!snapshot_seq_.has_value()) return Status::OK();
+  FactReadMemoryScope workspace(memory_.get());
+  Status reserved = ReserveCorrection(active_events_, &workspace);
+  if (!reserved.ok()) return reserved;
   std::vector<FactEvent> visible;
   visible.reserve(active_events_.size());
   for (const FactEvent& event : active_events_) {
@@ -123,16 +162,20 @@ Status FactChainCursor::FlushActive() {
     auto boundaries = ResolveCorrectedBoundaries(visible, *snapshot_seq_);
     if (!boundaries.ok()) return boundaries.status();
     auto present = MaterializePresentState(boundaries.ValueOrDie());
-    chains_.push_back(FactChainView{visible.front().ref,
-                                    boundaries.ConsumeValueOrDie(),
-                                    std::move(present)});
+    Status status = AppendChain(visible.front().ref,
+                                boundaries.ConsumeValueOrDie(), std::move(present));
+    if (!status.ok()) return status;
   }
   active_events_.clear();
+  history_payload_.Reset();
   has_active_ = false;
   return Status::OK();
 }
 
 Status FactChainCursor::FinishBuffered(CommitSeq snapshot_seq) {
+  FactReadMemoryScope workspace(memory_.get());
+  Status reserved = ReserveCorrection(events_, &workspace);
+  if (!reserved.ok()) return reserved;
   for (const FactEvent& event : events_) {
     const Status status = event.Validate();
     if (!status.ok()) return status;
@@ -148,13 +191,53 @@ Status FactChainCursor::FinishBuffered(CommitSeq snapshot_seq) {
     if (!chain_events.empty()) {
       auto boundaries = ResolveCorrectedBoundaries(chain_events, snapshot_seq);
       if (!boundaries.ok()) return boundaries.status();
-      chains_.push_back(FactChainView{chain_events.front().ref,
-                                      boundaries.ConsumeValueOrDie(), {}});
-      chains_.back().present = MaterializePresentState(chains_.back().boundaries);
+      auto present = MaterializePresentState(boundaries.ValueOrDie());
+      Status status = AppendChain(chain_events.front().ref,
+                                  boundaries.ConsumeValueOrDie(), std::move(present));
+      if (!status.ok()) return status;
     }
     begin = end;
   }
   return Status::OK();
+}
+
+Status FactChainCursor::AppendChain(
+    FactRef ref, std::vector<CorrectedBoundary> boundaries,
+    std::vector<StateInterval> present) {
+  Status status = ReserveFactAppend(&chains_, &chain_memory_);
+  if (!status.ok()) return status;
+  status = chain_memory_.ReserveElements(boundaries.capacity(), sizeof(CorrectedBoundary));
+  if (!status.ok()) return status;
+  status = chain_memory_.ReserveElements(present.capacity(), sizeof(StateInterval));
+  if (!status.ok()) return status;
+  for (const auto& boundary : boundaries) {
+    status = chain_memory_.Reserve(FactValueHeapBytes(boundary.value));
+    if (!status.ok()) return status;
+  }
+  for (const auto& state : present) {
+    status = chain_memory_.Reserve(FactValueHeapBytes(state.value));
+    if (!status.ok()) return status;
+  }
+  chains_.push_back({ref, std::move(boundaries), std::move(present)});
+  return Status::OK();
+}
+
+StatusOr<std::shared_ptr<const std::vector<FactChainView>>> FactChainCursor::TakeChains(
+    uint64_t extra_owner_bytes) {
+  if (!finished_) return Status::InvalidArgument("fact chain cursor", "not finished");
+  struct Owner {
+    std::shared_ptr<const void> lease;
+    std::vector<FactChainView> chains;
+  };
+  Status status = chain_memory_.Reserve(extra_owner_bytes);
+  if (!status.ok()) return status;
+  status = chain_memory_.Reserve(sizeof(Owner) + 64);
+  if (!status.ok()) return status;
+  auto retained = chain_memory_.Retain(memory_);
+  if (!retained.ok()) return retained.status();
+  auto owner = std::make_shared<Owner>(retained.ConsumeValueOrDie(), std::move(chains_));
+  const auto* chains = &owner->chains;
+  return std::shared_ptr<const std::vector<FactChainView>>(std::move(owner), chains);
 }
 
 }  // namespace cedar::internal

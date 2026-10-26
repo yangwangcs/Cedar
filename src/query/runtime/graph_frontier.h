@@ -20,6 +20,7 @@
 #include "query/projection/query_delta.h"
 #include "query/read/read_catalog.h"
 #include "query/resource/query_resource_pool.h"
+#include "query/runtime/budgeted_rows.h"
 
 namespace cedar::internal {
 
@@ -59,12 +60,13 @@ class AdjacencyIndex {
   Status Build(const std::vector<FactEvent>& events, CommitSeq snapshot_seq,
                uint64_t generation = 0);
   Status ApplyDelta(const QueryDeltaView& delta, uint64_t generation = 0);
-  StatusOr<std::vector<EdgeIdentity>> Seek(
+  StatusOr<BudgetedRows<EdgeIdentity>> Seek(
       const std::vector<VertexRef>& frontier, ExpandDirection direction,
       std::optional<uint64_t> edge_type, CommitSeq snapshot_seq,
       std::optional<uint64_t> generation = std::nullopt,
       const QueryDeltaView* delta = nullptr,
-      const std::function<Status()>& check_abort = {}) const;
+      const std::function<Status()>& check_abort = {},
+      std::shared_ptr<FactReadMemory> memory = {}) const;
   bool covers(CommitSeq snapshot_seq) const { return built_through_.value >= snapshot_seq.value; }
   CommitSeq built_through() const { return built_through_; }
   std::shared_ptr<const ReadCatalog> read_catalog() const { return read_catalog_; }
@@ -106,9 +108,10 @@ struct GraphFrontierOptions {
   // Projection-backed adjacency seek. When present, canonical identity
   // scanning is bypassed and the callback is responsible for returning only
   // postings for the requested frontier.
-  std::function<StatusOr<std::vector<EdgeIdentity>>(
+  std::function<Status(
       const std::vector<VertexRef>&, ExpandDirection,
-      std::optional<uint64_t>)> adjacency_seek;
+      std::optional<uint64_t>,
+      const std::function<Status(const EdgeIdentity&)>&)> adjacency_seek;
   std::shared_ptr<const AdjacencyIndex> adjacency_index;
   std::optional<uint64_t> projection_generation;
   PartScope part_scope = PartScope::All();
@@ -117,6 +120,9 @@ struct GraphFrontierOptions {
   // explicitly once the authoritative fallback would exceed this count.
   uint64_t fallback_candidate_limit = 0;
   uint64_t* candidates_examined = nullptr;
+  // Nested discovery counts only surviving path labels, but still uses the
+  // reservation's memory budget for every authoritative read.
+  bool count_expansion_resources = true;
 };
 
 struct GraphLabel {
@@ -130,6 +136,18 @@ struct GraphLabel {
 };
 
 struct KHopResult {
+  KHopResult() = default;
+  KHopResult(const KHopResult&) = delete;
+  KHopResult& operator=(const KHopResult&) = delete;
+  KHopResult(KHopResult&&) noexcept = default;
+  KHopResult& operator=(KHopResult&& other) noexcept {
+    KHopResult previous(std::move(other));
+    memory.swap(previous.memory);
+    labels.swap(previous.labels);
+    traversals.swap(previous.traversals);
+    return *this;
+  }
+  std::shared_ptr<const void> memory;
   std::vector<GraphLabel> labels;
   std::vector<TemporalTraversal> traversals;
 };
@@ -146,6 +164,18 @@ struct CoexistingLabel {
 };
 
 struct CoexistingPathResult {
+  CoexistingPathResult() = default;
+  CoexistingPathResult(const CoexistingPathResult&) = delete;
+  CoexistingPathResult& operator=(const CoexistingPathResult&) = delete;
+  CoexistingPathResult(CoexistingPathResult&&) noexcept = default;
+  CoexistingPathResult& operator=(CoexistingPathResult&& other) noexcept {
+    CoexistingPathResult previous(std::move(other));
+    memory.swap(previous.memory);
+    labels.swap(previous.labels);
+    paths.swap(previous.paths);
+    return *this;
+  }
+  std::shared_ptr<const void> memory;
   std::vector<CoexistingLabel> labels;
   std::vector<PathValue> paths;
 };
@@ -154,7 +184,7 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
     Snapshot& snapshot, const GraphExpansionRequest& request,
     const VertexRef& target, const GraphFrontierOptions& options = {});
 
-StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
+StatusOr<BudgetedRows<TemporalTraversal>> ExpandTemporal(
     Snapshot& snapshot, const GraphExpansionRequest& request,
     const GraphFrontierOptions& options = {});
 

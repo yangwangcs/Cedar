@@ -521,6 +521,119 @@ TEST(TemporalJourneyTest, IntervalFragmentBudgetAccumulatesAcrossExpansions) {
       << journey.status().ToString();
 }
 
+TEST(TemporalJourneyTest, DurationHistoryUsesQueryMemoryAndReleasesScratch) {
+  for (const bool delta_history : {false, true}) {
+    SCOPED_TRACE(delta_history ? "delta duration" : "canonical duration");
+    JourneyFixture graph;
+    ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{
+        PropertyId{7}, 0, "duration", PropertyEntityKind::kEdge,
+        PhysicalType::kInt64, 4096}).ok());
+    graph.Vertex(graph.a, 0, 1024);
+    graph.Vertex(graph.b, 0, 1024);
+    const EdgeRef edge{PartId{0}, EdgeId{91}};
+    graph.Edge(edge, graph.a, graph.b, 0, 1024);
+    if (!delta_history) {
+      graph.Commit([&](Transaction& transaction) {
+        for (uint64_t time = 0; time < 512; ++time) {
+          auto status = transaction.Set(PropertyFact::Edge(edge, PropertyId{7}),
+                                         ValidTime{time}, Value::Int64(1));
+          if (!status.ok()) return status;
+        }
+        return Status::OK();
+      });
+    }
+    auto snapshot = graph.database->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    QueryDeltaView delta;
+    if (delta_history) {
+      auto definition = graph.database->LookupProperty(PropertyId{7});
+      ASSERT_TRUE(definition.ok());
+      ASSERT_TRUE(definition.ValueOrDie().has_value());
+      for (uint64_t time = 0; time < 512; ++time) {
+        delta.facts.push_back(FactEvent{
+            PropertyFact::Edge(edge, PropertyId{7}).ref(), ValidTime{time},
+            snapshot.ValueOrDie().commit_seq(), FactOperation::kPut,
+            definition.ValueOrDie()->schema_epoch,
+            Value::Int64(1)});
+      }
+    }
+    JourneyRequest request{graph.a, graph.b, {ValidTime{0}, ValidTime{512}}};
+    request.duration_property = PropertyId{7};
+    request.max_hops = 1;
+    for (const uint64_t bytes : {uint64_t{32 << 10}, uint64_t{8 << 20}}) {
+      QueryReservation reservation(bytes);
+      JourneyOptions options;
+      options.reservation = &reservation;
+      options.delta = delta_history ? &delta : nullptr;
+      auto result = EarliestArrival(snapshot.ValueOrDie(), request, options);
+      if (bytes == (32 << 10)) {
+        ASSERT_FALSE(result.ok());
+        EXPECT_TRUE(result.status().IsResourceExhausted()) << result.status().ToString();
+      } else {
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_EQ(result.ValueOrDie().edges, (std::vector<EdgeRef>{edge}));
+        EXPECT_EQ(result.ValueOrDie().arrival, ValidTime{1});
+        EXPECT_GT(reservation.used(ResourceDimension::kMemory), 0U);
+      }
+      result = Status::NotFound("test", "released journey result");
+      EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+    }
+    QueryReservation reservation(8 << 20);
+    JourneyOptions options;
+    options.reservation = &reservation;
+    options.delta = delta_history ? &delta : nullptr;
+    size_t checks = 0;
+    options.check_abort = [&] {
+      return ++checks == 16 ? Status::QueryCancelled("duration history test")
+                             : Status::OK();
+    };
+    auto cancelled = EarliestArrival(snapshot.ValueOrDie(), request, options);
+    ASSERT_FALSE(cancelled.ok());
+    EXPECT_TRUE(cancelled.status().IsQueryCancelled());
+    EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+  }
+}
+
+TEST(TemporalJourneyTest, EveryObjectiveRetainsResultAndRejectsTinyMemory) {
+  JourneyFixture graph;
+  graph.Vertex(graph.a); graph.Vertex(graph.b); graph.Vertex(graph.c);
+  const EdgeRef first{PartId{0}, EdgeId{811}};
+  const EdgeRef second{PartId{0}, EdgeId{812}};
+  graph.Edge(first, graph.a, graph.b, 0, 20);
+  graph.Edge(second, graph.b, graph.c, 0, 20);
+  auto snapshot = graph.database->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  for (const auto objective : {JourneyObjective::kEarliestArrival,
+                               JourneyObjective::kLatestDeparture,
+                               JourneyObjective::kFastestDuration}) {
+    SCOPED_TRACE(static_cast<int>(objective));
+    JourneyRequest request{graph.a, graph.c, {ValidTime{0}, ValidTime{20}}, objective};
+    request.max_hops = 2;
+    request.duration_at = [](EdgeRef, ValidTime)
+        -> StatusOr<std::optional<ValidDuration>> {
+      return std::optional<ValidDuration>{ValidDuration{1}};
+    };
+    QueryReservation reservation(8 << 20);
+    JourneyOptions options;
+    options.reservation = &reservation;
+    auto journey = FindJourney(snapshot.ValueOrDie(), request, options);
+    ASSERT_TRUE(journey.ok()) << journey.status().ToString();
+    EXPECT_EQ(journey.ValueOrDie().edges, (std::vector<EdgeRef>{first, second}));
+    const uint64_t bytes = reservation.used(ResourceDimension::kMemory);
+    EXPECT_GT(bytes, 0U);
+    JourneyResult moved = std::move(journey).ConsumeValueOrDie();
+    EXPECT_EQ(reservation.used(ResourceDimension::kMemory), bytes);
+    moved = JourneyResult{};
+    EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+    QueryReservation tiny(1);
+    options.reservation = &tiny;
+    auto rejected = FindJourney(snapshot.ValueOrDie(), request, options);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+    EXPECT_EQ(tiny.used(ResourceDimension::kMemory), 0U);
+  }
+}
+
 TEST(TemporalJourneyTest, PublicRegisteredDurationJourneyExecutesAtSnapshot) {
   JourneyFixture graph;
   ASSERT_TRUE(graph.database->RegisterProperty(PropertyDefinition{
@@ -821,7 +934,7 @@ TEST(TemporalJourneyTest, ExhaustiveOracleMatchesThreeObjectivesFor200Seeds) {
       request.duration_at = duration_at;
       if (objective == JourneyObjective::kLatestDeparture)
         request.arrival_deadline = test.interval.to;
-      StatusOr<JourneyValue> actual = FindJourney(
+      auto actual = FindJourney(
           snapshot.ValueOrDie(), request);
       if (test.overflow) {
         ASSERT_FALSE(actual.ok()) << "seed " << seed << " objective "

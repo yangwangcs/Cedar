@@ -8,10 +8,94 @@
 
 #include "query/temporal/corrected_chain.h"
 #include "query/temporal/interval.h"
+#include "query/temporal/state_reader.h"
+#include "query/resource/query_read_memory.h"
 #include "tests/model/bitemporal_fact_oracle.h"
 
 namespace cedar {
 namespace {
+
+TEST(TemporalModelTest, StateStreamBudgetsOwnedHistoryAndReleasesAfterCancellation) {
+  const FactRef ref = EntityFact::Vertex({PartId{0}, VertexId{1}}).ref();
+  const FactEventBatch input{{
+      {ref, ValidTime{0}, CommitSeq{1}, FactOperation::kPut, 0, std::nullopt}}};
+  CanonicalStateReadSpec spec;
+  spec.snapshot_seq = CommitSeq{1};
+  spec.valid_time = ValidTime{5};
+  internal::QueryReservation tiny(1);
+  spec.facts.read_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+  {
+    internal::StateRowStream stream(spec, [](const auto&) { return Status::OK(); });
+    EXPECT_TRUE(stream.Consume(input).IsResourceExhausted());
+  }
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+
+  internal::QueryReservation adequate(1 << 20);
+  spec.facts.read_memory = std::make_shared<internal::QueryReadMemory>(adequate);
+  size_t calls = 0;
+  {
+    internal::StateRowStream stream(spec, [&](const auto& rows) {
+      ++calls;
+      EXPECT_EQ(rows.size(), 1U);
+      EXPECT_GE(adequate.used_bytes(), sizeof(CanonicalStateRow));
+      return Status::Conflict("test", "stop visitor");
+    });
+    ASSERT_TRUE(stream.Consume(input).ok());
+    EXPECT_GE(adequate.used_bytes(), sizeof(FactEvent));
+    EXPECT_TRUE(stream.Finish().IsConflict());
+  }
+  EXPECT_EQ(calls, 1U);
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+}
+
+TEST(TemporalModelTest, StateStreamRejectsCorrectionWorkspaceBeforeVisiting) {
+  const FactRef ref = PropertyFact::Vertex({PartId{0}, VertexId{1}}, PropertyId{7}).ref();
+  const FactEventBatch input{{
+      {ref, ValidTime{0}, CommitSeq{1}, FactOperation::kPut, 1,
+       Value::String(std::string(4096, 'x'))}}};
+  CanonicalStateReadSpec spec;
+  spec.snapshot_seq = CommitSeq{1};
+  spec.valid_time = ValidTime{5};
+  internal::QueryReservation budget(12 * 1024);
+  spec.facts.read_memory = std::make_shared<internal::QueryReadMemory>(budget);
+  size_t calls = 0;
+  {
+    internal::StateRowStream stream(spec, [&](const auto&) {
+      ++calls;
+      return Status::OK();
+    });
+    ASSERT_TRUE(stream.Consume(input).ok());
+    EXPECT_GE(budget.used_bytes(), 4096U);
+    const auto status = stream.Finish();
+    EXPECT_TRUE(status.IsResourceExhausted()) << status.ToString();
+    EXPECT_EQ(calls, 0U);
+  }
+  EXPECT_EQ(budget.used_bytes(), 0U);
+}
+
+TEST(TemporalModelTest, StateRowLimitCountsPreviouslyDeliveredBatches) {
+  FactEventBatch input;
+  for (uint64_t id : {1, 2, 3}) {
+    input.events.push_back({EntityFact::Vertex({PartId{0}, VertexId{id}}).ref(),
+                            ValidTime{0}, CommitSeq{1}, FactOperation::kPut, 0,
+                            std::nullopt});
+  }
+  CanonicalStateReadSpec spec;
+  spec.snapshot_seq = CommitSeq{1};
+  spec.valid_time = ValidTime{5};
+  spec.facts.batch_row_limit = 1;
+  spec.max_rows = 2;
+  std::vector<uint64_t> delivered;
+  internal::StateRowStream stream(spec, [&](const auto& rows) {
+    EXPECT_EQ(rows.size(), 1U);
+    delivered.push_back(rows.front().ref.entity_id());
+    return Status::OK();
+  });
+  const auto consumed = stream.Consume(input);
+  EXPECT_TRUE(consumed.ok() || consumed.IsQueryCancelled()) << consumed.ToString();
+  EXPECT_TRUE(stream.Finish().ok());
+  EXPECT_EQ(delivered, (std::vector<uint64_t>{1, 2}));
+}
 
 TEST(TemporalModelTest, PreservesAFormerlyRedundantBoundary) {
   const FactRef ref =

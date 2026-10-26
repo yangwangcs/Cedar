@@ -25,18 +25,18 @@ struct BoundPropertyRow {
 
 class PropertyBinder {
  public:
-  static StatusOr<std::vector<BoundPropertyRow>> BindIntervals(
+  static StatusOr<BudgetedRows<BoundPropertyRow>> BindIntervals(
       const QueryReadContext& context, const std::vector<StateRow>& entities,
       const PropertyDefinition& definition);
-  static StatusOr<std::vector<BoundPropertyRow>> BindIntervals(
+  static StatusOr<BudgetedRows<BoundPropertyRow>> BindIntervals(
       Snapshot& snapshot, const std::vector<StateRow>& entities,
       const PropertyDefinition& definition,
       const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<BoundPropertyRow>> BindAt(
+  static StatusOr<BudgetedRows<BoundPropertyRow>> BindAt(
       Snapshot& snapshot, const std::vector<StateRow>& entities,
       ValidTime valid_time, const PropertyDefinition& definition,
       const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<BoundPropertyRow>> BindAt(
+  static StatusOr<BudgetedRows<BoundPropertyRow>> BindAt(
       const QueryReadContext& context, const std::vector<StateRow>& entities,
       ValidTime valid_time, const PropertyDefinition& definition);
 };

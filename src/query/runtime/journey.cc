@@ -3,11 +3,10 @@
 #include <algorithm>
 #include <limits>
 #include <map>
-#include <queue>
-#include <set>
 #include <tuple>
 
-#include "query/temporal/corrected_chain.h"
+#include "query/runtime/fact_history.h"
+#include "query/resource/query_read_memory.h"
 
 namespace cedar::internal {
 namespace {
@@ -67,28 +66,10 @@ Status Charge(const JourneyOptions& options) {
   return options.reservation->ReserveGraphLabels(1);
 }
 
-StatusOr<std::vector<StateInterval>> VertexIntervals(
-    Snapshot& snapshot, VertexRef vertex, const QueryDeltaView* delta) {
-  const FactRef ref = EntityFact::Vertex(vertex).ref();
-  std::vector<FactEvent> events;
-  FactScanSpec spec;
-  spec.part_id = ref.part_id();
-  spec.family = ref.family();
-  spec.property_id = ref.property_id();
-  spec.entity_id_min = ref.entity_id();
-  spec.entity_id_max = ref.entity_id();
-  Status scanned = snapshot.EventScan(spec, [&events](const FactEventBatch& batch) {
-    events.insert(events.end(), batch.events.begin(), batch.events.end());
-    return Status::OK();
-  });
-  if (!scanned.ok()) return scanned;
-  if (delta != nullptr) {
-    auto tail = delta->EventsFor(ref);
-    events.insert(events.end(), tail.begin(), tail.end());
-  }
-  auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
-  if (!corrected.ok()) return corrected.status();
-  return MaterializePresentState(corrected.ValueOrDie());
+StatusOr<std::shared_ptr<const std::vector<StateInterval>>> VertexIntervals(
+    Snapshot& snapshot, VertexRef vertex, const JourneyOptions& options) {
+  return ReadPresentIntervals(snapshot, EntityFact::Vertex(vertex).ref(),
+                               options.delta, options.check_abort, options.reservation);
 }
 
 bool CoversWaitingInterval(const std::vector<StateInterval>& intervals,
@@ -146,29 +127,11 @@ Status ValidateCallbackFifo(const JourneyRequest& request,
   return Status::OK();
 }
 
-StatusOr<std::vector<StateInterval>> DurationIntervals(
+StatusOr<std::shared_ptr<const std::vector<StateInterval>>> DurationIntervals(
     Snapshot& snapshot, EdgeRef edge, PropertyId property,
-    const QueryDeltaView* delta) {
-  const FactRef ref = PropertyFact::Edge(edge, property).ref();
-  std::vector<FactEvent> events;
-  FactScanSpec spec;
-  spec.part_id = ref.part_id();
-  spec.family = ref.family();
-  spec.property_id = ref.property_id();
-  spec.entity_id_min = ref.entity_id();
-  spec.entity_id_max = ref.entity_id();
-  Status scanned = snapshot.EventScan(spec, [&events](const FactEventBatch& batch) {
-    events.insert(events.end(), batch.events.begin(), batch.events.end());
-    return Status::OK();
-  });
-  if (!scanned.ok()) return scanned;
-  if (delta != nullptr) {
-    auto tail = delta->EventsFor(ref);
-    events.insert(events.end(), tail.begin(), tail.end());
-  }
-  auto corrected = ResolveCorrectedBoundaries(events, snapshot.commit_seq());
-  if (!corrected.ok()) return corrected.status();
-  return MaterializePresentState(corrected.ValueOrDie());
+    const JourneyOptions& options) {
+  return ReadPresentIntervals(snapshot, PropertyFact::Edge(edge, property).ref(),
+                               options.delta, options.check_abort, options.reservation);
 }
 
 StatusOr<ValidDuration> DurationValue(const Value& raw) {
@@ -196,11 +159,12 @@ StatusOr<ValidDuration> DurationValue(const Value& raw) {
 // segment is complete because t + duration is monotone inside a segment.
 Status ValidatePropertyFifo(Snapshot& snapshot, EdgeRef edge,
                             const ValidTimeInterval& effective,
-                            PropertyId property, const QueryDeltaView* delta) {
-  auto intervals = DurationIntervals(snapshot, edge, property, delta);
+                            PropertyId property, const JourneyOptions& options) {
+  auto intervals = DurationIntervals(snapshot, edge, property, options);
   if (!intervals.ok()) return intervals.status();
   std::optional<uint64_t> previous_arrival;
-  for (const StateInterval& state : intervals.ValueOrDie()) {
+  for (const StateInterval& state : *intervals.ValueOrDie()) {
+    if (Status status = Check(options); !status.ok()) return status;
     auto clipped = Intersect(state.interval, effective);
     if (!clipped || !state.value) continue;
     auto duration = DurationValue(*state.value);
@@ -232,16 +196,17 @@ Status ValidatePropertyFifo(Snapshot& snapshot, EdgeRef edge,
 
 StatusOr<std::optional<ValidDuration>> PropertyDuration(
     Snapshot& snapshot, EdgeRef edge, ValidTime time,
-    const JourneyRequest& request, const QueryDeltaView* delta) {
+    const JourneyRequest& request, const JourneyOptions& options) {
   if (request.duration_at) return request.duration_at(edge, time);
   if (!request.duration_property) return std::optional<ValidDuration>{};
-  auto intervals = DurationIntervals(snapshot, edge, *request.duration_property, delta);
+  auto intervals = DurationIntervals(snapshot, edge, *request.duration_property, options);
   if (!intervals.ok()) return intervals.status();
-  std::optional<Value> value;
-  for (const auto& interval : intervals.ValueOrDie()) {
+  const Value* value = nullptr;
+  for (const auto& interval : *intervals.ValueOrDie()) {
+    if (Status status = Check(options); !status.ok()) return status;
     if (time.value < interval.interval.from.value) continue;
     if (interval.interval.to && time.value >= interval.interval.to->value) continue;
-    value = interval.value;
+    value = interval.value ? &*interval.value : nullptr;
     break;
   }
   if (!value) return std::optional<ValidDuration>{};
@@ -250,13 +215,19 @@ StatusOr<std::optional<ValidDuration>> PropertyDuration(
   return std::optional<ValidDuration>{duration.ValueOrDie()};
 }
 
-StatusOr<std::vector<JourneyTraversal>> ExpandAt(
+StatusOr<BudgetedRows<JourneyTraversal>> ExpandAt(
     Snapshot& snapshot, const JourneyRequest& request, VertexRef vertex,
     ValidTime arrival, const JourneyOptions& options) {
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope graph_memory(memory.get());
+  FactReadMemoryScope output_memory(memory.get());
+  if (Status status = graph_memory.Reserve(sizeof(VertexRef)); !status.ok()) return status;
   GraphExpansionRequest graph{{vertex}, request.interval, request.direction,
                               request.edge_type};
   GraphFrontierOptions graph_options;
-  graph_options.reservation = nullptr;
+  graph_options.reservation = options.reservation;
+  graph_options.count_expansion_resources = false;
   graph_options.delta = options.delta;
   graph_options.adjacency_index = options.adjacency_index
                                       ? options.adjacency_index
@@ -289,7 +260,7 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
       if (effective.has_value()) {
         Status fifo = ValidatePropertyFifo(snapshot, oriented.edge, *effective,
                                            *request.duration_property,
-                                           options.delta);
+                                           options);
         if (!fifo.ok()) return fifo;
       }
     }
@@ -298,15 +269,15 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
       departure = oriented.effective.from;
     if (departure.value > arrival.value) {
       auto source_intervals = VertexIntervals(snapshot, oriented.source,
-                                              options.delta);
+                                              options);
       if (!source_intervals.ok()) return source_intervals.status();
-      if (!CoversWaitingInterval(source_intervals.ValueOrDie(), arrival,
+      if (!CoversWaitingInterval(*source_intervals.ValueOrDie(), arrival,
                                  departure)) {
         continue;
       }
     }
     auto duration = PropertyDuration(snapshot, oriented.edge, departure, request,
-                                     options.delta);
+                                     options);
     if (!duration.ok()) return duration.status();
     if (!duration.ValueOrDie()) continue;
     auto end = AddDuration(departure, *duration.ValueOrDie());
@@ -315,9 +286,10 @@ StatusOr<std::vector<JourneyTraversal>> ExpandAt(
       continue;
     if (request.interval.to && end.ValueOrDie().value >= request.interval.to->value)
       continue;
+    if (Status status = ReserveFactAppend(&result, &output_memory); !status.ok()) return status;
     result.push_back({oriented, departure, end.ValueOrDie(), *duration.ValueOrDie()});
   }
-  return result;
+  return RetainRows(std::move(result), &output_memory, std::move(memory));
 }
 
 bool TraversalLess(const JourneyTraversal& a, const JourneyTraversal& b) {
@@ -364,7 +336,7 @@ Status CheckFragmentBudget(const JourneyOptions& options, uint64_t count) {
   return Status::OK();
 }
 
-StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
+StatusOr<BudgetedRows<JourneyTraversal>> LatestIncoming(
     Snapshot& snapshot, const JourneyRequest& request,
     const JourneyOptions& options, VertexRef target, ValidTime deadline,
     bool final_target) {
@@ -372,10 +344,16 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
       request.direction == ExpandDirection::kOut ? ExpandDirection::kIn
       : request.direction == ExpandDirection::kIn ? ExpandDirection::kOut
                                                   : ExpandDirection::kBoth;
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope graph_memory(memory.get());
+  FactReadMemoryScope output_memory(memory.get());
+  if (Status status = graph_memory.Reserve(sizeof(VertexRef)); !status.ok()) return status;
   GraphExpansionRequest graph{{target}, request.interval, reverse_direction,
                               request.edge_type};
   GraphFrontierOptions graph_options;
-  graph_options.reservation = nullptr;
+  graph_options.reservation = options.reservation;
+  graph_options.count_expansion_resources = false;
   graph_options.delta = options.delta;
   graph_options.adjacency_index = options.adjacency_index
                                       ? options.adjacency_index
@@ -411,7 +389,7 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
       if (effective.has_value()) {
         Status fifo = ValidatePropertyFifo(snapshot, oriented.edge, *effective,
                                            *request.duration_property,
-                                           options.delta);
+                                           options);
         if (!fifo.ok()) return fifo;
       }
     }
@@ -429,7 +407,7 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     if (upper < lower) continue;
     auto feasible = [&](uint64_t point) -> StatusOr<bool> {
       auto duration = PropertyDuration(snapshot, oriented.edge, ValidTime{point},
-                                       request, options.delta);
+                                       request, options);
       if (!duration.ok()) return duration.status();
       if (!duration.ValueOrDie()) return false;
       auto arrival = AddDuration(ValidTime{point}, *duration.ValueOrDie());
@@ -447,6 +425,7 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     // assuming lower is feasible and binary-searching a false predicate.
     std::optional<uint64_t> latest;
     for (uint64_t point = upper;; --point) {
+      if (Status status = Check(options); !status.ok()) return status;
       auto ok = feasible(point);
       if (!ok.ok()) return ok.status();
       if (ok.ValueOrDie()) {
@@ -458,12 +437,12 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     if (!latest) continue;
     const uint64_t departure = *latest;
     auto duration = PropertyDuration(snapshot, oriented.edge, ValidTime{departure},
-                                     request, options.delta);
+                                     request, options);
     if (!duration.ok()) return duration.status();
     if (!duration.ValueOrDie()) continue;
     auto arrival = AddDuration(ValidTime{departure}, *duration.ValueOrDie());
     if (!arrival.ok()) return arrival.status();
-    auto target_intervals = VertexIntervals(snapshot, target, options.delta);
+    auto target_intervals = VertexIntervals(snapshot, target, options);
     if (!target_intervals.ok()) return target_intervals.status();
     // The requested destination only needs to be visible at the instant the
     // journey arrives.  A reverse search's deadline is a bound on the
@@ -472,14 +451,15 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
     // wait until the next reverse expansion and therefore remain continuously
     // visible over [arrival, deadline).
     if (final_target) {
-      if (!VisibleAt(target_intervals.ValueOrDie(), arrival.ValueOrDie()))
+      if (!VisibleAt(*target_intervals.ValueOrDie(), arrival.ValueOrDie()))
         continue;
-    } else if (!CoversWaitingInterval(target_intervals.ValueOrDie(),
+    } else if (!CoversWaitingInterval(*target_intervals.ValueOrDie(),
                                       arrival.ValueOrDie(), deadline)) {
       continue;
     }
     JourneyTraversal candidate{oriented, ValidTime{departure}, arrival.ValueOrDie(),
                                *duration.ValueOrDie()};
+    if (Status status = ReserveFactAppend(&candidates, &output_memory); !status.ok()) return status;
     candidates.push_back(std::move(candidate));
   }
   std::sort(candidates.begin(), candidates.end(),
@@ -488,18 +468,30 @@ StatusOr<std::vector<JourneyTraversal>> LatestIncoming(
                 return a.departure.value > b.departure.value;
               return TraversalLess(a, b);
             });
-  return candidates;
+  return RetainRows(std::move(candidates), &output_memory, std::move(memory));
 }
 
-JourneyValue BuildJourney(const std::vector<JourneyTraversal>& edges,
-                          ValidTime initial) {
-  JourneyValue result;
+StatusOr<JourneyResult> BuildJourney(const std::vector<JourneyTraversal>& edges,
+                                     ValidTime initial,
+                                     std::shared_ptr<FactReadMemory> memory) {
+  FactReadMemoryScope output_memory(memory.get());
+  JourneyResult result;
   result.initial_departure = initial;
   result.departure = initial;
   result.final_arrival = initial;
   result.arrival = initial;
   result.duration = ValidDuration{0};
   if (edges.empty()) return result;
+  if (edges.size() == SIZE_MAX)
+    return Status::ResourceExhausted("journey", "path size overflow");
+  if (Status status = output_memory.ReserveElements(edges.size() + 1, sizeof(VertexRef));
+      !status.ok()) return status;
+  if (Status status = output_memory.ReserveElements(edges.size(), sizeof(EdgeRef) + 2 * sizeof(ValidTime));
+      !status.ok()) return status;
+  result.vertices.reserve(edges.size() + 1);
+  result.edges.reserve(edges.size());
+  result.departures.reserve(edges.size());
+  result.arrivals.reserve(edges.size());
   result.vertices.push_back(edges.front().traversal.source);
   for (const auto& edge : edges) {
     result.edges.push_back(edge.traversal.edge);
@@ -511,6 +503,9 @@ JourneyValue BuildJourney(const std::vector<JourneyTraversal>& edges,
   result.departure = result.initial_departure;
   result.arrival = result.final_arrival;
   result.duration = ValidDuration{result.final_arrival.value - result.initial_departure.value};
+  auto owner = output_memory.Retain(std::move(memory));
+  if (!owner.ok()) return owner.status();
+  result.memory = owner.ConsumeValueOrDie();
   return result;
 }
 
@@ -531,11 +526,14 @@ bool TraversalFits(const ValidTimeInterval& effective, ValidTime departure,
   return duration.value < effective.to->value - departure.value;
 }
 
-StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
+StatusOr<JourneyResult> EarliestArrival(Snapshot& snapshot,
                                        const JourneyRequest& request,
                                        const JourneyOptions& options) {
   if (!request.interval.Validate().ok())
     return Status::InvalidArgument("journey", "invalid interval");
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope working_memory(memory.get());
   JourneyOptions scoped = options;
   scoped.interval_fragments_used = std::make_shared<uint64_t>(0);
   struct Label { VertexRef vertex; ValidTime arrival; uint32_t depth; uint64_t predecessor; JourneyTraversal edge; };
@@ -546,13 +544,24 @@ StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
   // correctness while still collapsing duplicate zero-duration states.
   std::map<JourneyTimedStateKey, uint64_t, JourneyTimedStateLess> best;
   using HeapEntry = std::pair<uint64_t, uint64_t>;
-  std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<>> heap;
+  std::vector<HeapEntry> heap;
+  const auto enqueue = [&](HeapEntry entry) -> Status {
+    if (Status status = ReserveFactAppend(&heap, &working_memory); !status.ok()) return status;
+    heap.push_back(entry);
+    std::push_heap(heap.begin(), heap.end(), std::greater<>{});
+    return Status::OK();
+  };
+  if (Status status = ReserveFactAppend(&labels, &working_memory); !status.ok()) return status;
+  if (Status status = working_memory.Reserve(sizeof(decltype(best)::value_type) + 4 * sizeof(void*));
+      !status.ok()) return status;
   labels.push_back({request.source, request.interval.from, 0, std::numeric_limits<uint64_t>::max(), {}});
   best[{request.source, 0U, request.interval.from.value}] = 0;
-  heap.push({request.interval.from.value, 0});
+  if (Status status = enqueue({request.interval.from.value, 0}); !status.ok()) return status;
   while (!heap.empty()) {
     if (Status status = Check(options); !status.ok()) return status;
-    const auto [time, id] = heap.top(); heap.pop();
+    std::pop_heap(heap.begin(), heap.end(), std::greater<>{});
+    const auto [time, id] = heap.back();
+    heap.pop_back();
     const Label current = labels[id];
     const auto current_key = JourneyTimedStateKey{
         current.vertex, request.max_hops == 0 ? 0U : current.depth,
@@ -560,8 +569,21 @@ StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
     auto best_current = best.find(current_key);
     if (best_current == best.end() || best_current->second != id)
       continue;
-    if (current.vertex == request.target)
-      return BuildJourney([&] { std::vector<JourneyTraversal> path; for (uint64_t i = id; i != 0 && labels[i].predecessor != std::numeric_limits<uint64_t>::max(); i = labels[i].predecessor) path.push_back(labels[i].edge); std::reverse(path.begin(), path.end()); return path; }(), request.interval.from);
+    if (current.vertex == request.target) {
+      FactReadMemoryScope path_memory(memory.get());
+      std::vector<JourneyTraversal> path;
+      for (uint64_t i = id; labels[i].predecessor != std::numeric_limits<uint64_t>::max();
+           i = labels[i].predecessor) {
+        if (Status status = Check(options); !status.ok()) return status;
+        if (Status status = ReserveFactAppend(&path, &path_memory); !status.ok()) return status;
+        path.push_back(labels[i].edge);
+      }
+      std::reverse(path.begin(), path.end());
+      return BuildJourney(path, request.interval.from, memory);
+    }
+    if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
+    if (current.depth == UINT32_MAX)
+      return Status::ResourceExhausted("journey", "path depth overflow");
     auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, scoped);
     if (!next.ok()) return next.status();
     if (Status budget = CheckFragmentBudget(scoped, next.ValueOrDie().size());
@@ -578,15 +600,18 @@ StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
         return Status::ResourceExhausted("journey", "label budget exceeded");
       if (Status status = Charge(scoped); !status.ok()) return status;
       const uint64_t next_id = labels.size();
+      if (Status status = working_memory.Reserve(sizeof(decltype(best)::value_type) + 4 * sizeof(void*));
+          !status.ok()) return status;
+      if (Status status = ReserveFactAppend(&labels, &working_memory); !status.ok()) return status;
       best[state_key] = next_id;
       labels.push_back({edge.traversal.target, edge.arrival, depth, id, edge});
-      heap.push({edge.arrival.value, next_id});
+      if (Status status = enqueue({edge.arrival.value, next_id}); !status.ok()) return status;
     }
   }
   return Status::NotFound("journey", "target is unreachable");
 }
 
-StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
+StatusOr<JourneyResult> LatestDeparture(Snapshot& snapshot,
                                         const JourneyRequest& request,
                                         const JourneyOptions& options) {
   if (!request.interval.to && !request.arrival_deadline)
@@ -595,6 +620,9 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
       request.interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}));
   if (deadline.value <= request.interval.from.value)
     return Status::NotFound("journey", "target is unreachable");
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope working_memory(memory.get());
   JourneyOptions scoped = options;
   scoped.interval_fragments_used = std::make_shared<uint64_t>(0);
   struct Label {
@@ -612,15 +640,25 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
   // are unbounded).
   std::map<JourneyTimedStateKey, uint64_t, JourneyTimedStateLess> best;
   using HeapEntry = std::pair<uint64_t, uint64_t>;
-  std::priority_queue<HeapEntry> heap;
+  std::vector<HeapEntry> heap;
+  const auto enqueue = [&](HeapEntry entry) -> Status {
+    if (Status status = ReserveFactAppend(&heap, &working_memory); !status.ok()) return status;
+    heap.push_back(entry);
+    std::push_heap(heap.begin(), heap.end());
+    return Status::OK();
+  };
+  if (Status status = ReserveFactAppend(&labels, &working_memory); !status.ok()) return status;
+  if (Status status = working_memory.Reserve(sizeof(decltype(best)::value_type) + 4 * sizeof(void*));
+      !status.ok()) return status;
   labels.push_back({request.target, deadline, 0,
                     std::numeric_limits<uint64_t>::max(), {}});
   best[{request.target, 0, deadline.value}] = 0;
-  heap.push({deadline.value, 0});
+  if (Status status = enqueue({deadline.value, 0}); !status.ok()) return status;
   while (!heap.empty()) {
     if (Status status = Check(options); !status.ok()) return status;
-    const auto [time, id] = heap.top();
-    heap.pop();
+    std::pop_heap(heap.begin(), heap.end());
+    const auto [time, id] = heap.back();
+    heap.pop_back();
     const Label current = labels[id];
     auto found = best.find({current.vertex,
                             request.max_hops == 0 ? 0U : current.depth,
@@ -628,15 +666,20 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
     if (found == best.end() || found->second != id || current.time.value != time)
       continue;
     if (current.vertex == request.source) {
+      FactReadMemoryScope path_memory(memory.get());
       std::vector<JourneyTraversal> path;
       uint64_t cursor = id;
       while (labels[cursor].successor != std::numeric_limits<uint64_t>::max()) {
+        if (Status status = Check(options); !status.ok()) return status;
+        if (Status status = ReserveFactAppend(&path, &path_memory); !status.ok()) return status;
         path.push_back(labels[cursor].edge);
         cursor = labels[cursor].successor;
       }
-      return BuildJourney(path, current.time);
+      return BuildJourney(path, current.time, memory);
     }
     if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
+    if (current.depth == UINT32_MAX)
+      return Status::ResourceExhausted("journey", "path depth overflow");
     auto incoming = LatestIncoming(snapshot, request, scoped, current.vertex,
                                    current.time, current.depth == 0);
     if (!incoming.ok()) return incoming.status();
@@ -657,22 +700,30 @@ StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
         return Status::ResourceExhausted("journey", "label budget exceeded");
       if (Status status = Charge(scoped); !status.ok()) return status;
       const uint64_t next = labels.size();
+      if (Status status = ReserveFactAppend(&labels, &working_memory); !status.ok()) return status;
+      if (existing == best.end()) {
+        if (Status status = working_memory.Reserve(sizeof(decltype(best)::value_type) + 4 * sizeof(void*));
+            !status.ok()) return status;
+      }
       labels.push_back({predecessor, candidate.departure, depth,
                         id, candidate});
       best[{predecessor, state_depth, candidate.departure.value}] = next;
-      heap.push({candidate.departure.value, next});
+      if (Status status = enqueue({candidate.departure.value, next}); !status.ok()) return status;
     }
   }
   return Status::NotFound("journey", "target is unreachable");
 }
 
-StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
+StatusOr<JourneyResult> FastestDuration(Snapshot& snapshot,
                                        const JourneyRequest& request,
                                        const JourneyOptions& options) {
   if (!request.interval.to)
     return Status::NotSupported("journey", "fastest duration requires a finite time bound");
   if (request.interval.to->value <= request.interval.from.value)
     return Status::NotFound("journey", "target is unreachable");
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope working_memory(memory.get());
   JourneyOptions scoped = options;
   scoped.interval_fragments_used = std::make_shared<uint64_t>(0);
   struct Label {
@@ -690,25 +741,51 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
   // later-arriving label remains feasible.  Exact duplicate states are still
   // collapsed below, and max_labels/graph reservations bound resource use.
   std::map<JourneyStateKey, std::vector<uint64_t>, JourneyStateLess> frontier;
-  auto path_for = [&](uint64_t id) {
+  auto path_for = [&](uint64_t id) -> StatusOr<BudgetedRows<JourneyTraversal>> {
+    FactReadMemoryScope path_memory(memory.get());
     std::vector<JourneyTraversal> path;
     for (uint64_t cursor = id;
          cursor != std::numeric_limits<uint64_t>::max() && labels[cursor].predecessor != std::numeric_limits<uint64_t>::max();
-         cursor = labels[cursor].predecessor)
+         cursor = labels[cursor].predecessor) {
+      if (Status status = Check(options); !status.ok()) return status;
+      if (Status status = ReserveFactAppend(&path, &path_memory); !status.ok()) return status;
       path.push_back(labels[cursor].edge);
+    }
     std::reverse(path.begin(), path.end());
-    return path;
+    return RetainRows(std::move(path), &path_memory, memory);
   };
+  const auto labels_for = [&](JourneyStateKey key) -> StatusOr<std::vector<uint64_t>*> {
+    auto found = frontier.find(key);
+    if (found == frontier.end()) {
+      if (Status status = working_memory.Reserve(sizeof(decltype(frontier)::value_type) + 4 * sizeof(void*));
+          !status.ok()) return status;
+      found = frontier.emplace(key, std::vector<uint64_t>{}).first;
+    }
+    return &found->second;
+  };
+  if (Status status = ReserveFactAppend(&labels, &working_memory); !status.ok()) return status;
   labels.push_back({request.source, request.interval.from, request.interval.from,
                     0, std::numeric_limits<uint64_t>::max(), {}});
-  frontier[StateKey(request.source, 0, request.max_hops)].push_back(0);
-  std::queue<uint64_t> pending;
-  pending.push(0);
+  auto source_labels = labels_for(StateKey(request.source, 0, request.max_hops));
+  if (!source_labels.ok()) return source_labels.status();
+  if (Status status = ReserveFactAppend(source_labels.ValueOrDie(), &working_memory); !status.ok()) return status;
+  source_labels.ValueOrDie()->push_back(0);
+  std::vector<uint64_t> pending;
+  size_t pending_head = 0;
+  const auto enqueue = [&](uint64_t id) -> Status {
+    if (pending_head > pending.size() / 2) {
+      pending.erase(pending.begin(), pending.begin() + pending_head);
+      pending_head = 0;
+    }
+    if (Status status = ReserveFactAppend(&pending, &working_memory); !status.ok()) return status;
+    pending.push_back(id);
+    return Status::OK();
+  };
+  if (Status status = enqueue(0); !status.ok()) return status;
   std::optional<uint64_t> answer;
-  while (!pending.empty()) {
+  while (pending_head < pending.size()) {
     if (Status status = Check(options); !status.ok()) return status;
-    const uint64_t id = pending.front();
-    pending.pop();
+    const uint64_t id = pending[pending_head++];
     const Label current = labels[id];
     if (current.vertex == request.target && current.depth != 0) {
       const uint64_t duration = current.arrival.value - current.departure.value;
@@ -717,15 +794,21 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
         const Label& prior = labels[*answer];
         const uint64_t prior_duration = prior.arrival.value - prior.departure.value;
         better = duration < prior_duration ||
-                 (duration == prior_duration &&
-                  (current.departure.value < prior.departure.value ||
-                   (current.departure == prior.departure &&
-                    PathLess(path_for(id), path_for(*answer)))));
+                 (duration == prior_duration && current.departure.value < prior.departure.value);
+        if (duration == prior_duration && current.departure == prior.departure) {
+          auto candidate_path = path_for(id);
+          if (!candidate_path.ok()) return candidate_path.status();
+          auto prior_path = path_for(*answer);
+          if (!prior_path.ok()) return prior_path.status();
+          better = PathLess(candidate_path.ValueOrDie(), prior_path.ValueOrDie());
+        }
       }
       if (better)
         answer = id;
     }
     if (request.max_hops != 0 && current.depth >= request.max_hops) continue;
+    if (current.depth == UINT32_MAX)
+      return Status::ResourceExhausted("journey", "path depth overflow");
     auto next = ExpandAt(snapshot, request, current.vertex, current.arrival, scoped);
     if (!next.ok()) return next.status();
     std::sort(next.ValueOrDie().begin(), next.ValueOrDie().end(), TraversalLess);
@@ -736,8 +819,9 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
       Label candidate{edge.traversal.target,
                       current.depth == 0 ? edge.departure : current.departure,
                       edge.arrival, current.depth + 1, id, edge};
-      auto& labels_at_vertex = frontier[StateKey(candidate.vertex, candidate.depth,
-                                                  request.max_hops)];
+      auto at_vertex = labels_for(StateKey(candidate.vertex, candidate.depth, request.max_hops));
+      if (!at_vertex.ok()) return at_vertex.status();
+      auto& labels_at_vertex = *at_vertex.ValueOrDie();
       bool rejected = false;
       for (uint64_t prior_id : labels_at_vertex) {
         if (labels[prior_id].departure == candidate.departure &&
@@ -751,16 +835,20 @@ StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
         return Status::ResourceExhausted("journey", "Pareto label budget exceeded");
       if (Status status = Charge(scoped); !status.ok()) return status;
       const uint64_t next_id = labels.size();
+      if (Status status = ReserveFactAppend(&labels, &working_memory); !status.ok()) return status;
+      if (Status status = ReserveFactAppend(&labels_at_vertex, &working_memory); !status.ok()) return status;
       labels.push_back(std::move(candidate));
       labels_at_vertex.push_back(next_id);
-      pending.push(next_id);
+      if (Status status = enqueue(next_id); !status.ok()) return status;
     }
   }
   if (!answer) return Status::NotFound("journey", "target is unreachable");
-  return BuildJourney(path_for(*answer), labels[*answer].departure);
+  auto path = path_for(*answer);
+  if (!path.ok()) return path.status();
+  return BuildJourney(path.ValueOrDie(), labels[*answer].departure, memory);
 }
 
-StatusOr<JourneyValue> FindJourney(Snapshot& snapshot,
+StatusOr<JourneyResult> FindJourney(Snapshot& snapshot,
                                    const JourneyRequest& request,
                                    const JourneyOptions& options) {
   switch (request.objective) {

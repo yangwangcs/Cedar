@@ -174,6 +174,7 @@ class QueryReservation {
                            uint32_t admitted_workers);
   void Release(size_t bytes);
   std::shared_ptr<QueryReservationLease> TryRetain(size_t bytes);
+  std::shared_ptr<QueryReservationLease> TryRetainOwner(const void* owner, size_t bytes);
   size_t limit_bytes() const;
   size_t used_bytes() const;
   size_t peak_bytes() const;
@@ -195,6 +196,7 @@ class QueryReservationLease {
 
   std::shared_ptr<QueryReservation::State> state_;
   size_t bytes_ = 0;
+  const void* owner_ = nullptr;
 
   friend class QueryReservation;
 };

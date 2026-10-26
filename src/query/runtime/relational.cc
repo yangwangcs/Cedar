@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <string_view>
@@ -62,6 +63,9 @@ struct QueryReservation::State {
     }
   }
 
+  // Owner retention uses the same reserve/lease APIs while holding this lock;
+  // allocation failure may also destroy a lease before that operation unwinds.
+  mutable std::recursive_mutex mutex;
   size_t limit_bytes = 0;
   size_t used_bytes = 0;
   size_t peak_bytes = 0;
@@ -73,6 +77,7 @@ struct QueryReservation::State {
   std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)>
       admitted_dimensions{};
   uint32_t admitted_workers = 0;
+  std::map<const void*, std::weak_ptr<QueryReservationLease>> retained_owners;
 };
 
 namespace {
@@ -1177,6 +1182,7 @@ QueryReservation::QueryReservation(
 }
 
 bool QueryReservation::TryGrow(size_t bytes) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   if (bytes > state_->limit_bytes ||
       state_->used_bytes > state_->limit_bytes - bytes) return false;
   state_->used_bytes += bytes;
@@ -1189,6 +1195,7 @@ namespace {
 Status ReserveDimension(const std::shared_ptr<QueryReservation::State>& state,
                         ResourceDimension dimension, uint64_t amount,
                         const char* name) {
+  std::lock_guard<std::recursive_mutex> lock(state->mutex);
   const size_t index = static_cast<size_t>(dimension);
   if (amount > state->limits[index] ||
       state->used[index] > state->limits[index] - amount) {
@@ -1249,23 +1256,28 @@ Status QueryReservation::ReserveCpuMicros(uint64_t micros) {
                           "cpu_us");
 }
 void QueryReservation::ReleaseMemory(uint64_t bytes) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   const size_t index = static_cast<size_t>(ResourceDimension::kMemory);
   const uint64_t released = std::min<uint64_t>(bytes, state_->used[index]);
   state_->used[index] -= released;
   state_->used_bytes = static_cast<size_t>(state_->used[index]);
 }
 void QueryReservation::ReleaseScratch(uint64_t bytes) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   const size_t index = static_cast<size_t>(ResourceDimension::kScratch);
   state_->used[index] = bytes >= state_->used[index] ? 0 : state_->used[index] - bytes;
 }
 void QueryReservation::ReleaseReadBytes(uint64_t bytes) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   const size_t index = static_cast<size_t>(ResourceDimension::kReadBytes);
   state_->used[index] = bytes >= state_->used[index] ? 0 : state_->used[index] - bytes;
 }
 uint64_t QueryReservation::used(ResourceDimension dimension) const {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   return state_->used[static_cast<size_t>(dimension)];
 }
 uint64_t QueryReservation::limit(ResourceDimension dimension) const {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   return state_->limits[static_cast<size_t>(dimension)];
 }
 void QueryReservation::AttachPoolAdmission(
@@ -1275,6 +1287,7 @@ void QueryReservation::AttachPoolAdmission(
     std::array<uint64_t, static_cast<size_t>(ResourceDimension::kCount)>
         admitted_dimensions,
     uint32_t admitted_workers) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   state_->pool_dimensions = std::move(dimensions);
   state_->pool_workers = std::move(workers);
   state_->admitted_dimensions = admitted_dimensions;
@@ -1282,6 +1295,7 @@ void QueryReservation::AttachPoolAdmission(
 }
 
 void QueryReservation::Release(size_t bytes) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
   state_->used_bytes =
       bytes >= state_->used_bytes ? 0 : state_->used_bytes - bytes;
   state_->used[static_cast<size_t>(ResourceDimension::kMemory)] = state_->used_bytes;
@@ -1299,15 +1313,47 @@ std::shared_ptr<QueryReservationLease> QueryReservation::TryRetain(
   }
 }
 
-size_t QueryReservation::limit_bytes() const { return state_->limit_bytes; }
-size_t QueryReservation::used_bytes() const { return state_->used_bytes; }
-size_t QueryReservation::peak_bytes() const { return state_->peak_bytes; }
+size_t QueryReservation::limit_bytes() const {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
+  return state_->limit_bytes;
+}
+std::shared_ptr<QueryReservationLease> QueryReservation::TryRetainOwner(
+    const void* owner, size_t bytes) {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
+  if (owner == nullptr) return TryRetain(bytes);
+  const auto found = state_->retained_owners.find(owner);
+  if (found != state_->retained_owners.end()) {
+    if (auto existing = found->second.lock()) return existing;
+  }
+  if (bytes > std::numeric_limits<size_t>::max() - 128) return {};
+  auto lease = TryRetain(bytes + 128);
+  if (!lease) return {};
+  state_->retained_owners[owner] = lease;
+  lease->owner_ = owner;
+  return lease;
+}
+size_t QueryReservation::used_bytes() const {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
+  return state_->used_bytes;
+}
+size_t QueryReservation::peak_bytes() const {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
+  return state_->peak_bytes;
+}
 
 QueryReservationLease::QueryReservationLease(
     std::shared_ptr<QueryReservation::State> state, size_t bytes)
     : state_(std::move(state)), bytes_(bytes) {}
 
 QueryReservationLease::~QueryReservationLease() {
+  std::lock_guard<std::recursive_mutex> lock(state_->mutex);
+  if (owner_) {
+    const auto found = state_->retained_owners.find(owner_);
+    // A concurrent pin may replace an expired weak reference while this final
+    // destructor waits for the lock. Keep that newer, live owner's entry.
+    if (found != state_->retained_owners.end() && found->second.expired())
+      state_->retained_owners.erase(found);
+  }
   state_->used_bytes =
       bytes_ >= state_->used_bytes ? 0 : state_->used_bytes - bytes_;
   state_->used[static_cast<size_t>(ResourceDimension::kMemory)] = state_->used_bytes;

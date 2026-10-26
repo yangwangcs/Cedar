@@ -10,6 +10,7 @@
 #include "cedar/query/types.h"
 #include "cedar/snapshot.h"
 #include "cedar/fact/read_spec.h"
+#include "query/runtime/budgeted_rows.h"
 
 namespace cedar::internal {
 
@@ -45,45 +46,45 @@ struct StateRow {
 
 class TemporalSource {
  public:
-  static StatusOr<std::vector<EventRow>> ReadEvents(
+  static StatusOr<BudgetedRows<EventRow>> ReadEvents(
       const QueryReadContext& context, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval);
-  static StatusOr<std::vector<ChangeRow>> ReadChanges(
+  static StatusOr<BudgetedRows<ChangeRow>> ReadChanges(
       const QueryReadContext& context, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval);
-  static StatusOr<std::vector<StateRow>> ReadAt(
+  static StatusOr<BudgetedRows<StateRow>> ReadAt(
       const QueryReadContext& context, FactFamily family, PropertyId property,
       ValidTime valid_time);
-  static StatusOr<std::vector<StateRow>> ReadHistory(
+  static StatusOr<BudgetedRows<StateRow>> ReadHistory(
       const QueryReadContext& context, FactFamily family, PropertyId property,
       std::optional<ValidTimeInterval> interval);
-  static StatusOr<std::vector<StateRow>> ReadOverlaps(
+  static StatusOr<BudgetedRows<StateRow>> ReadOverlaps(
       const QueryReadContext& context, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval);
-  static StatusOr<std::vector<StateRow>> ReadThroughout(
+  static StatusOr<BudgetedRows<StateRow>> ReadThroughout(
       const QueryReadContext& context, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval);
 
-  static StatusOr<std::vector<EventRow>> ReadEvents(
+  static StatusOr<BudgetedRows<EventRow>> ReadEvents(
       Snapshot& snapshot, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval,
       const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<ChangeRow>> ReadChanges(
+  static StatusOr<BudgetedRows<ChangeRow>> ReadChanges(
       Snapshot& snapshot, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval,
       const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<StateRow>> ReadAt(
+  static StatusOr<BudgetedRows<StateRow>> ReadAt(
       Snapshot& snapshot, FactFamily family, PropertyId property,
       ValidTime valid_time, const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<StateRow>> ReadHistory(
+  static StatusOr<BudgetedRows<StateRow>> ReadHistory(
       Snapshot& snapshot, FactFamily family, PropertyId property,
       std::optional<ValidTimeInterval> interval,
       const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<StateRow>> ReadOverlaps(
+  static StatusOr<BudgetedRows<StateRow>> ReadOverlaps(
       Snapshot& snapshot, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval,
       const PartScope& part_scope = PartScope::All());
-  static StatusOr<std::vector<StateRow>> ReadThroughout(
+  static StatusOr<BudgetedRows<StateRow>> ReadThroughout(
       Snapshot& snapshot, FactFamily family, PropertyId property,
       const ValidTimeInterval& interval,
       const PartScope& part_scope = PartScope::All());

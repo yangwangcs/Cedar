@@ -89,7 +89,7 @@ struct PreparedQueryPlan {
         physical_plan(other.physical_plan),
         projection_generation(other.projection_generation),
         projection_stats(other.projection_stats),
-        projection_reader(other.projection_reader),
+        projection_visitor(other.projection_visitor),
         property_index_reader(other.property_index_reader),
         delta_reader(other.delta_reader),
         bound_delta_view(other.bound_delta_view),
@@ -129,7 +129,7 @@ struct PreparedQueryPlan {
     physical_plan = other.physical_plan;
     projection_generation = other.projection_generation;
     projection_stats = other.projection_stats;
-    projection_reader = other.projection_reader;
+    projection_visitor = other.projection_visitor;
     property_index_reader = other.property_index_reader;
     delta_reader = other.delta_reader;
     bound_delta_view = other.bound_delta_view;
@@ -172,8 +172,7 @@ struct PreparedQueryPlan {
   std::shared_ptr<const PhysicalPlan> physical_plan;
   std::optional<ProjectionGeneration> projection_generation;
   std::shared_ptr<ProjectionReadStats> projection_stats;
-  std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>
-      projection_reader;
+  ProjectionVisitor projection_visitor;
   PropertyIndexReader property_index_reader;
   std::function<StatusOr<QueryDeltaView>()> delta_reader;
   std::shared_ptr<const QueryDeltaView> bound_delta_view;

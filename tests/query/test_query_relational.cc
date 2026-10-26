@@ -1042,11 +1042,13 @@ TEST(QueryRuntimeRelationalTest,
       {FactEvent{FactRef{PartId{0}, FactFamily::kVertexProperty, PropertyId{7},
                            1},
                   ValidTime{5}, second_commit.ValueOrDie().commit_seq,
-                  FactOperation::kPut, 0, Value::Int64(3), std::nullopt},
+                  FactOperation::kPut, property.ValueOrDie().schema_epoch,
+                  Value::Int64(3), std::nullopt},
        FactEvent{FactRef{PartId{0}, FactFamily::kVertexProperty, PropertyId{7},
                            1},
                   ValidTime{15}, third_commit.ValueOrDie().commit_seq,
-                  FactOperation::kPut, 0, Value::Int64(4), std::nullopt}},
+                  FactOperation::kPut, property.ValueOrDie().schema_epoch,
+                  Value::Int64(4), std::nullopt}},
       {},
       {},
       {}};
@@ -1058,6 +1060,7 @@ TEST(QueryRuntimeRelationalTest,
   first_chain.header.base_seq = base_seq;
   first_chain.header.part_id = PartId{0};
   first_chain.header.property_id = PropertyId{7};
+  first_chain.header.schema_epoch = property.ValueOrDie().schema_epoch;
   first_chain.intervals = {
       {ValidTimeInterval{ValidTime{0}, ValidTime{15}}, Value::Int64(1), 1}};
   ProjectionChain second_chain = first_chain;
@@ -1079,10 +1082,13 @@ TEST(QueryRuntimeRelationalTest,
       UINT64_MAX,
       {}});
   delta_plan.physical_plan = std::make_shared<const PhysicalPlan>(physical);
-  delta_plan.projection_reader = [first_chain, second_chain](
-                                    const CoverageSlice&) {
-    return StatusOr<std::vector<ProjectionChain>>(
-        std::vector<ProjectionChain>{first_chain, second_chain});
+  delta_plan.projection_visitor = [first_chain, second_chain](
+      const CoverageSlice&, QueryReservation&, const ProjectionChainVisitor& visitor) {
+    for (const auto* chain : {&first_chain, &second_chain}) {
+      const Status status = visitor(*chain);
+      if (!status.ok()) return status;
+    }
+    return Status::OK();
   };
 
   auto run = [&](PreparedQueryPlan plan) {
@@ -1116,6 +1122,45 @@ TEST(QueryRuntimeRelationalTest,
   EXPECT_EQ(merged.Get<int64_t>(score_slot, 1), 3);
   EXPECT_EQ(merged.Get<int64_t>(score_slot, 2), 2);
   EXPECT_EQ(merged.Get<int64_t>(score_slot, 3), 4);
+
+  auto visitor_plan = delta_plan;
+  size_t visited_pages = 0;
+  visitor_plan.projection_visitor =
+      [&, first_chain, second_chain](const CoverageSlice&, QueryReservation&,
+                                     const ProjectionChainVisitor& visitor) {
+    for (const auto* chain : {&first_chain, &second_chain}) {
+      ++visited_pages;
+      const auto status = visitor(*chain);
+      if (!status.ok()) return status;
+    }
+    return Status::OK();
+  };
+  auto visitor_cursor = run(visitor_plan);
+  ASSERT_TRUE(visitor_cursor.ok()) << visitor_cursor.status().ToString();
+  auto visitor_batch = visitor_cursor.ValueOrDie().Next();
+  ASSERT_TRUE(visitor_batch.ok()) << visitor_batch.status().ToString();
+  ASSERT_TRUE(visitor_batch.ValueOrDie());
+  ASSERT_EQ(visitor_batch.ValueOrDie()->row_count(), merged.row_count());
+  for (size_t index = 0; index < merged.row_count(); ++index)
+    EXPECT_EQ(visitor_batch.ValueOrDie()->Get<int64_t>(score_slot, index),
+              merged.Get<int64_t>(score_slot, index));
+  EXPECT_EQ(visited_pages, 2U);
+  EXPECT_TRUE(visitor_cursor.ValueOrDie().Close().ok());
+
+  auto bounded_snapshot = database.ValueOrDie()->BeginSnapshot(SnapshotOptions{snapshot_seq});
+  ASSERT_TRUE(bounded_snapshot.ok());
+  QueryOptions bounded_options;
+  bounded_options.budget.memory_bytes = 128;
+  auto bounded_cursor = QueryRuntime::Execute(visitor_plan,
+      std::move(bounded_snapshot).ConsumeValueOrDie(), {}, bounded_options);
+  if (bounded_cursor.ok()) {
+    auto failed = bounded_cursor.ValueOrDie().Next();
+    ASSERT_FALSE(failed.ok());
+    EXPECT_TRUE(failed.status().IsResourceExhausted()) << failed.status().ToString();
+    EXPECT_TRUE(bounded_cursor.ValueOrDie().Close().ok());
+  } else {
+    EXPECT_TRUE(bounded_cursor.status().IsResourceExhausted()) << bounded_cursor.status().ToString();
+  }
 
   auto run_at = [&](uint64_t time, bool merged_source) {
     PreparedQueryPlan point_plan = merged_source ? delta_plan : canonical_plan;
@@ -1151,9 +1196,9 @@ TEST(QueryRuntimeRelationalTest,
                     ValidTimeInterval{ValidTime{20}, ValidTime{30}}}};
   gap_plan.physical_plan =
       std::make_shared<const PhysicalPlan>(std::move(gap_physical));
-  gap_plan.projection_reader = [](const CoverageSlice&) {
-    return StatusOr<std::vector<ProjectionChain>>(
-        Status::NotFound("query test", "canonical-only slice"));
+  gap_plan.projection_visitor = [](const CoverageSlice&, QueryReservation&,
+                                  const ProjectionChainVisitor&) {
+    return Status::NotFound("query test", "canonical-only slice");
   };
   auto gap_cursor = run(std::move(gap_plan));
   ASSERT_TRUE(gap_cursor.ok()) << gap_cursor.status().ToString();

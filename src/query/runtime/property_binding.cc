@@ -47,7 +47,7 @@ Status ValidateEvents(const std::vector<EventRow>& events,
 
 }  // namespace
 
-StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
+StatusOr<BudgetedRows<BoundPropertyRow>> PropertyBinder::BindIntervals(
     Snapshot& snapshot, const std::vector<StateRow>& entities,
     const PropertyDefinition& definition, const PartScope& part_scope) {
   return BindIntervals(QueryReadContext{snapshot.canonical_reader(),
@@ -55,7 +55,7 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
                        entities, definition);
 }
 
-StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
+StatusOr<BudgetedRows<BoundPropertyRow>> PropertyBinder::BindIntervals(
     const QueryReadContext& context, const std::vector<StateRow>& entities,
     const PropertyDefinition& definition) {
   const Status valid = definition.Validate();
@@ -72,13 +72,33 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
       context, family, definition.property_id, std::nullopt);
   if (!property_states.ok()) return property_states.status();
   using PropertyKey = std::pair<uint32_t, uint64_t>;
-  std::map<PropertyKey, std::vector<StateRow>> states_by_entity;
-  for (StateRow& state : property_states.ValueOrDie()) {
-    states_by_entity[{state.ref.part_id().value, state.ref.entity_id()}].push_back(
-        std::move(state));
+  FactReadMemoryScope index_memory(context.runtime_memory.get());
+  std::map<PropertyKey, std::vector<const StateRow*>> states_by_entity;
+  for (const StateRow& state : property_states.ValueOrDie()) {
+    const PropertyKey key{state.ref.part_id().value, state.ref.entity_id()};
+    auto found = states_by_entity.find(key);
+    if (found == states_by_entity.end()) {
+      const Status status = index_memory.Reserve(
+          sizeof(decltype(states_by_entity)::value_type) + 4 * sizeof(void*));
+      if (!status.ok()) return status;
+      found = states_by_entity.emplace(key, std::vector<const StateRow*>{}).first;
+    }
+    const Status status = ReserveFactAppend(&found->second, &index_memory);
+    if (!status.ok()) return status;
+    found->second.push_back(&state);
   }
 
+  FactReadMemoryScope output(context.runtime_memory.get());
   std::vector<BoundPropertyRow> result;
+  auto append = [&](const FactRef& ref, ValidTimeInterval interval,
+                    const std::optional<Value>& value) {
+    Status status = ReserveFactAppend(&result, &output);
+    if (!status.ok()) return status;
+    status = output.Reserve(FactValueHeapBytes(value));
+    if (!status.ok()) return status;
+    result.push_back({ref, interval, value});
+    return Status::OK();
+  };
   for (const StateRow& entity : entities) {
     const PropertyEntityKind entity_kind =
         entity.ref.family() == FactFamily::kVertexState
@@ -93,14 +113,16 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
     const auto found = states_by_entity.find(
         {entity.ref.part_id().value, entity.ref.entity_id()});
     if (found != states_by_entity.end()) {
-      for (const StateRow& property : found->second) {
+      for (const StateRow* property_ptr : found->second) {
+        const StateRow& property = *property_ptr;
         const auto clipped = Intersect(entity.effective, property.effective);
         if (!clipped.has_value()) continue;
         if (Before(cursor, clipped->from)) {
-          result.push_back(
-              {entity.ref, ValidTimeInterval{cursor, clipped->from}, std::nullopt});
+          const Status status = append(entity.ref, {cursor, clipped->from}, std::nullopt);
+          if (!status.ok()) return status;
         }
-        result.push_back({entity.ref, *clipped, property.value});
+        const Status status = append(entity.ref, *clipped, property.value);
+        if (!status.ok()) return status;
         if (!clipped->to.has_value()) {
           cursor = clipped->from;
           break;
@@ -114,16 +136,15 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindIntervals(
                                      result.back().ref == entity.ref &&
                                      !result.back().effective.to.has_value();
       if (!already_unbounded) {
-        result.push_back({entity.ref,
-                          ValidTimeInterval{cursor, entity.effective.to},
-                          std::nullopt});
+        const Status status = append(entity.ref, {cursor, entity.effective.to}, std::nullopt);
+        if (!status.ok()) return status;
       }
     }
   }
-  return result;
+  return RetainRows(std::move(result), &output, context.runtime_memory);
 }
 
-StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindAt(
+StatusOr<BudgetedRows<BoundPropertyRow>> PropertyBinder::BindAt(
     Snapshot& snapshot, const std::vector<StateRow>& entities,
     ValidTime valid_time, const PropertyDefinition& definition,
     const PartScope& part_scope) {
@@ -132,16 +153,15 @@ StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindAt(
                 definition);
 }
 
-StatusOr<std::vector<BoundPropertyRow>> PropertyBinder::BindAt(
+StatusOr<BudgetedRows<BoundPropertyRow>> PropertyBinder::BindAt(
     const QueryReadContext& context, const std::vector<StateRow>& entities,
     ValidTime valid_time, const PropertyDefinition& definition) {
   auto rows = BindIntervals(context, entities, definition);
   if (!rows.ok()) return rows.status();
-  std::vector<BoundPropertyRow> result;
-  for (BoundPropertyRow& row : rows.ValueOrDie()) {
-    if (Contains(row.effective, valid_time)) result.push_back(std::move(row));
-  }
-  return result;
+  rows.ValueOrDie().EraseIf([&](const BoundPropertyRow& row) {
+    return !Contains(row.effective, valid_time);
+  });
+  return rows.ConsumeValueOrDie();
 }
 
 }  // namespace cedar::internal

@@ -4,15 +4,15 @@
 #include "query/runtime/graph_frontier.h"
 
 #include <algorithm>
-#include <deque>
+#include <array>
 #include <limits>
 #include <map>
-#include <set>
 #include <tuple>
-#include <unordered_set>
 
 #include "query/temporal/corrected_chain.h"
 #include "query/temporal/interval.h"
+#include "query/runtime/fact_history.h"
+#include "query/resource/query_read_memory.h"
 
 namespace cedar::internal {
 namespace {
@@ -51,122 +51,109 @@ struct IdentityKey {
   }
 };
 
-struct VertexHash {
-  size_t operator()(const VertexRef& ref) const noexcept {
-    return std::hash<uint64_t>{}(ref.part_id.value) * 1315423911ULL ^
-           std::hash<uint64_t>{}(ref.vertex_id.value);
-  }
-};
-
 std::optional<ValidTimeInterval> RequestInterval(const ValidTimeInterval& value) {
   if (!value.Validate().ok()) return std::nullopt;
   return value;
 }
 
-StatusOr<std::vector<FactEvent>> ReadEvents(Snapshot& snapshot,
-                                             const FactRef& ref,
-                                             const QueryDeltaView* delta,
-                                             const std::function<Status()>& check_abort = {}) {
-  std::vector<FactEvent> events;
-  FactReadSpec read_spec;
-  read_spec.part_scope = PartScope::Exact(ref.part_id());
-  read_spec.family = ref.family();
-  read_spec.property_id = ref.property_id();
-  read_spec.entity_range = EntityRange{
-      ref.entity_id(),
-      ref.entity_id() == UINT64_MAX
-          ? std::nullopt
-          : std::optional<uint64_t>(ref.entity_id() + 1)};
-  Status status = snapshot.canonical_reader().ReadEvents(
-      read_spec, [&events, &check_abort](const FactEventBatch& batch) {
-    if (check_abort) {
-      if (Status status = check_abort(); !status.ok()) return status;
-    }
-    events.insert(events.end(), batch.events.begin(), batch.events.end());
-    return Status::OK();
-      });
-  if (!status.ok()) return status;
-  if (delta != nullptr) {
-    auto tail = delta->EventsFor(ref);
-    if (check_abort) {
-      if (Status status = check_abort(); !status.ok()) return status;
-    }
-    events.insert(events.end(), tail.begin(), tail.end());
-  }
-  return events;
+Status InsertIdentity(std::map<IdentityKey, EdgeIdentity>* unique,
+                      const EdgeIdentity& identity, FactReadMemoryScope* memory) {
+  const IdentityKey key{identity.edge_ref(), identity.source_ref(),
+                         identity.target_ref(), identity.edge_type};
+  if (unique->find(key) != unique->end()) return Status::OK();
+  const Status reserved = memory->Reserve(
+      sizeof(std::pair<const IdentityKey, EdgeIdentity>) + 4 * sizeof(void*));
+  if (!reserved.ok()) return reserved;
+  unique->emplace(key, identity);
+  return Status::OK();
 }
 
-StatusOr<std::vector<StateInterval>> VisibleIntervals(
-    Snapshot& snapshot, const FactRef& ref, const QueryDeltaView* delta,
-    const std::function<Status()>& check_abort = {}) {
-  auto events = ReadEvents(snapshot, ref, delta, check_abort);
-  if (!events.ok()) return events.status();
-  if (events.ValueOrDie().empty()) return std::vector<StateInterval>{};
-  auto corrected = ResolveCorrectedBoundaries(events.ValueOrDie(),
-                                               snapshot.commit_seq());
-  if (!corrected.ok()) return corrected.status();
-  return MaterializePresentState(corrected.ValueOrDie());
-}
-
-StatusOr<std::vector<EdgeIdentity>> Identities(Snapshot& snapshot,
+StatusOr<BudgetedRows<EdgeIdentity>> Identities(Snapshot& snapshot,
                                              const QueryDeltaView* delta,
-                                             uint64_t max_candidates = 0,
-                                             const std::function<Status()>& check_abort = {},
-                                             const PartScope& part_scope = PartScope::All()) {
+                                             uint64_t max_candidates,
+                                             const std::function<Status()>& check_abort,
+                                             const PartScope& part_scope,
+                                             std::shared_ptr<FactReadMemory> memory) {
+  FactReadMemoryScope nodes(memory.get());
+  FactReadMemoryScope output(memory.get());
   std::map<IdentityKey, EdgeIdentity> unique;
   FactReadSpec spec;
   spec.part_scope = part_scope;
   spec.family = FactFamily::kEdgeIdentity;
   spec.commit_seq_max = snapshot.commit_seq();
+  spec.read_memory = memory;
   Status status = snapshot.canonical_reader().ReadEvents(
-      spec, [&unique, max_candidates, &check_abort](const FactEventBatch& batch) {
+      spec, [&unique, &nodes, max_candidates, &check_abort](const FactEventBatch& batch) {
     for (const FactEvent& event : batch.events) {
-    if (check_abort) {
-      if (Status status = check_abort(); !status.ok()) return status;
-    }
-    if (!event.edge_identity.has_value()) return Status::OK();
-    const EdgeIdentity& identity = *event.edge_identity;
-    const EdgeIdentity copy = identity;
-    unique.emplace(IdentityKey{copy.edge_ref(), copy.source_ref(),
-                                copy.target_ref(), copy.edge_type}, copy);
-    if (max_candidates != 0 && unique.size() > max_candidates) {
-      return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
-    }
+      if (check_abort) {
+        if (Status status = check_abort(); !status.ok()) return status;
+      }
+      if (!event.edge_identity.has_value()) continue;
+      const EdgeIdentity& identity = *event.edge_identity;
+      if (Status status = InsertIdentity(&unique, identity, &nodes); !status.ok())
+        return status;
+      if (max_candidates != 0 && unique.size() > max_candidates) {
+        return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
+      }
     }
     return Status::OK();
   });
   if (!status.ok()) return status;
   if (delta != nullptr) {
-    for (const EdgeIdentity& identity : delta->EdgeIdentitiesThrough(
-             snapshot.commit_seq())) {
+    const auto append = [&](CommitSeq seq, const EdgeIdentity& identity) -> Status {
+      if (seq.value > snapshot.commit_seq().value) return Status::OK();
       if (check_abort) {
         if (Status status = check_abort(); !status.ok()) return status;
       }
-      unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
-                                 identity.target_ref(), identity.edge_type},
-                     identity);
+      if (Status status = InsertIdentity(&unique, identity, &nodes); !status.ok())
+        return status;
+      if (max_candidates && unique.size() > max_candidates)
+        return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
+      return Status::OK();
+    };
+    if (delta->edge_identity_records.empty()) {
+      for (const auto& identity : delta->edge_identities) {
+        if (Status status = append(delta->through, identity); !status.ok()) return status;
+      }
+    } else {
+      for (const auto& [seq, identity] : delta->edge_identity_records) {
+        if (Status status = append(seq, identity); !status.ok()) return status;
+      }
     }
   }
   std::vector<EdgeIdentity> result;
+  if (Status status = output.ReserveElements(unique.size(), sizeof(EdgeIdentity));
+      !status.ok()) return status;
   result.reserve(unique.size());
   for (const auto& entry : unique) result.push_back(entry.second);
-  return result;
+  return RetainRows(std::move(result), &output, std::move(memory));
 }
 
-bool Contains(const VertexRef& ref, const std::vector<VertexRef>& frontier) {
-  return std::find(frontier.begin(), frontier.end(), ref) != frontier.end();
+StatusOr<BudgetedRows<VertexRef>> SortedFrontier(
+    const std::vector<VertexRef>& frontier, std::shared_ptr<FactReadMemory> memory) {
+  FactReadMemoryScope working(memory.get());
+  if (Status status = working.ReserveElements(frontier.size(), sizeof(VertexRef));
+      !status.ok()) return status;
+  std::vector<VertexRef> sorted;
+  sorted.reserve(frontier.size());
+  sorted.assign(frontier.begin(), frontier.end());
+  std::sort(sorted.begin(), sorted.end(), [](const VertexRef& a, const VertexRef& b) {
+    return VertexKey{a} < VertexKey{b};
+  });
+  return RetainRows(std::move(sorted), &working, std::move(memory));
 }
 
-bool Contains(const VertexRef& ref,
-              const std::unordered_set<VertexRef, VertexHash>& frontier) {
-  return frontier.find(ref) != frontier.end();
+bool Contains(const VertexRef& ref, const BudgetedRows<VertexRef>& frontier) {
+  return std::binary_search(frontier.begin(), frontier.end(), ref,
+      [](const VertexRef& a, const VertexRef& b) { return VertexKey{a} < VertexKey{b}; });
 }
 
 Status ChargeTraversal(const GraphFrontierOptions& options) {
   if (options.check_abort) {
     if (Status status = options.check_abort(); !status.ok()) return status;
   }
-  if (options.reservation == nullptr) return Status::OK();
+  if (options.reservation == nullptr || !options.count_expansion_resources)
+    return Status::OK();
   if (Status status = options.reservation->ReserveGraphLabels(1); !status.ok())
     return status;
   return options.reservation->ReserveIntervalFragments(1);
@@ -285,11 +272,12 @@ Status AdjacencyIndex::ApplyDelta(const QueryDeltaView& delta,
   return Status::OK();
 }
 
-StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
+StatusOr<BudgetedRows<EdgeIdentity>> AdjacencyIndex::Seek(
     const std::vector<VertexRef>& frontier, ExpandDirection direction,
     std::optional<uint64_t> edge_type, CommitSeq snapshot_seq,
     std::optional<uint64_t> generation, const QueryDeltaView* delta,
-    const std::function<Status()>& check_abort) const {
+    const std::function<Status()>& check_abort,
+    std::shared_ptr<FactReadMemory> memory) const {
   const bool delta_has_identity =
       delta != nullptr && (!delta->edge_identities.empty() ||
                            !delta->edge_identity_records.empty());
@@ -306,6 +294,8 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
       (generation.has_value() && generation_ != *generation)) {
     return Status::NotFound("adjacency index", "posting generation is unavailable");
   }
+  FactReadMemoryScope nodes(memory.get());
+  FactReadMemoryScope output(memory.get());
   std::map<IdentityKey, EdgeIdentity> unique;
   auto collect = [&](const VertexRef& vertex, ExpandDirection posting_direction) -> Status {
     const Key key{vertex, posting_direction, edge_type};
@@ -319,9 +309,8 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
           if (check_abort) {
             if (Status status = check_abort(); !status.ok()) return status;
           }
-          unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
-                                     identity.target_ref(), identity.edge_type},
-                        identity);
+          if (Status status = InsertIdentity(&unique, identity, &nodes); !status.ok())
+            return status;
         }
         return Status::OK();
       }
@@ -335,9 +324,8 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
       if (entry.commit_seq.value > snapshot_seq.value) continue;
       if (generation.has_value() && entry.generation != *generation) continue;
       const EdgeIdentity& identity = entry.identity;
-      unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
-                                 identity.target_ref(), identity.edge_type},
-                     identity);
+      if (Status status = InsertIdentity(&unique, identity, &nodes); !status.ok())
+        return status;
     }
     return Status::OK();
   };
@@ -353,68 +341,89 @@ StatusOr<std::vector<EdgeIdentity>> AdjacencyIndex::Seek(
     }
   }
   if (delta != nullptr) {
-    std::unordered_set<VertexRef, VertexHash> frontier_set(
-        frontier.begin(), frontier.end());
-    auto add_delta = [&](CommitSeq seq, const EdgeIdentity& identity) {
-      if (seq.value > snapshot_seq.value) return;
-      const bool out = Contains(identity.source_ref(), frontier_set);
-      const bool in = Contains(identity.target_ref(), frontier_set);
+    auto sorted = SortedFrontier(frontier, memory);
+    if (!sorted.ok()) return sorted.status();
+    auto add_delta = [&](CommitSeq seq, const EdgeIdentity& identity) -> Status {
+      if (seq.value > snapshot_seq.value) return Status::OK();
+      const bool out = Contains(identity.source_ref(), sorted.ValueOrDie());
+      const bool in = Contains(identity.target_ref(), sorted.ValueOrDie());
       if ((direction == ExpandDirection::kOut && !out) ||
           (direction == ExpandDirection::kIn && !in) ||
-          (direction == ExpandDirection::kBoth && !out && !in)) return;
-      if (edge_type.has_value() && identity.edge_type != *edge_type) return;
-      unique.emplace(IdentityKey{identity.edge_ref(), identity.source_ref(),
-                                 identity.target_ref(), identity.edge_type},
-                     identity);
+          (direction == ExpandDirection::kBoth && !out && !in)) return Status::OK();
+      if (edge_type.has_value() && identity.edge_type != *edge_type) return Status::OK();
+      return InsertIdentity(&unique, identity, &nodes);
     };
     if (delta->edge_identity_records.empty()) {
       for (const EdgeIdentity& identity : delta->edge_identities) {
         if (check_abort) {
           if (Status status = check_abort(); !status.ok()) return status;
         }
-        add_delta(delta->through, identity);
+        if (Status status = add_delta(delta->through, identity); !status.ok()) return status;
       }
     } else {
       for (const auto& record : delta->edge_identity_records) {
         if (check_abort) {
           if (Status status = check_abort(); !status.ok()) return status;
         }
-        add_delta(record.first, record.second);
+        if (Status status = add_delta(record.first, record.second); !status.ok()) return status;
       }
     }
   }
   std::vector<EdgeIdentity> result;
+  if (Status status = output.ReserveElements(unique.size(), sizeof(EdgeIdentity));
+      !status.ok()) return status;
   result.reserve(unique.size());
   for (const auto& item : unique) result.push_back(item.second);
-  return result;
+  return RetainRows(std::move(result), &output, std::move(memory));
 }
 
-StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
+StatusOr<BudgetedRows<TemporalTraversal>> ExpandTemporal(
     Snapshot& snapshot, const GraphExpansionRequest& request,
     const GraphFrontierOptions& options) {
   const auto interval = RequestInterval(request.interval);
   if (!interval.has_value()) {
     return Status::InvalidArgument("graph expansion", "invalid request interval");
   }
-  StatusOr<std::vector<EdgeIdentity>> identities =
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope output_memory(memory.get());
+  StatusOr<BudgetedRows<EdgeIdentity>> identities =
       options.adjacency_index
           ? options.adjacency_index->Seek(request.frontier, request.direction,
                                          request.edge_type, snapshot.commit_seq(),
                                          options.projection_generation,
                                          options.delta,
-                                         options.check_abort)
+                                         options.check_abort, memory)
           : options.adjacency_seek
-          ? options.adjacency_seek(request.frontier, request.direction,
-                                   request.edge_type)
+          ? [&]() -> StatusOr<BudgetedRows<EdgeIdentity>> {
+              FactReadMemoryScope candidates(memory.get());
+              std::vector<EdgeIdentity> rows;
+              const Status status = options.adjacency_seek(
+                  request.frontier, request.direction, request.edge_type,
+                  [&](const EdgeIdentity& identity) {
+                    if (options.check_abort) {
+                      if (Status status = options.check_abort(); !status.ok()) return status;
+                    }
+                    if (options.fallback_candidate_limit &&
+                        rows.size() >= options.fallback_candidate_limit)
+                      return Status::ResourceExhausted("adjacency", "bounded fallback candidate limit exceeded");
+                    const Status reserved = ReserveFactAppend(&rows, &candidates);
+                    if (!reserved.ok()) return reserved;
+                    rows.push_back(identity);
+                    return Status::OK();
+                  });
+              if (!status.ok()) return status;
+              return RetainRows(std::move(rows), &candidates, memory);
+            }()
       : Identities(snapshot, options.delta, options.fallback_candidate_limit,
-                   options.check_abort, options.part_scope);
+                   options.check_abort, options.part_scope, memory);
   if (!identities.ok() && identities.status().IsNotFound()) {
     // Cache misses are explicit: the canonical lane is only used when the
     // caller supplied a finite fallback bound (or left it unlimited for an
     // analytical query).
     identities = Identities(snapshot, options.delta,
                             options.fallback_candidate_limit,
-                            options.check_abort, options.part_scope);
+                            options.check_abort, options.part_scope, memory);
   }
   if (!identities.ok()) return identities.status();
   if (options.fallback_candidate_limit != 0 &&
@@ -425,43 +434,45 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
     *options.candidates_examined += identities.ValueOrDie().size();
   }
   std::vector<TemporalTraversal> output;
-  const std::unordered_set<VertexRef, VertexHash> frontier_set(
-      request.frontier.begin(), request.frontier.end());
+  auto sorted = SortedFrontier(request.frontier, memory);
+  if (!sorted.ok()) return sorted.status();
   for (const EdgeIdentity& identity : identities.ValueOrDie()) {
     if (options.check_abort) {
       if (Status status = options.check_abort(); !status.ok()) return status;
     }
     if (request.edge_type.has_value() &&
         identity.edge_type != *request.edge_type) continue;
-    const bool out = Contains(identity.source_ref(), frontier_set);
-    const bool in = Contains(identity.target_ref(), frontier_set);
+    const bool out = Contains(identity.source_ref(), sorted.ValueOrDie());
+    const bool in = Contains(identity.target_ref(), sorted.ValueOrDie());
     if ((request.direction == ExpandDirection::kOut && !out) ||
         (request.direction == ExpandDirection::kIn && !in) ||
         (request.direction == ExpandDirection::kBoth && !out && !in)) {
       continue;
     }
-    auto edge_intervals = VisibleIntervals(
+    auto edge_intervals = ReadPresentIntervals(
         snapshot, EntityFact::Edge(identity.edge_ref()).ref(), options.delta,
-        options.check_abort);
+        options.check_abort, options.reservation);
     if (!edge_intervals.ok()) return edge_intervals.status();
-    auto source_intervals = VisibleIntervals(
+    auto source_intervals = ReadPresentIntervals(
         snapshot, EntityFact::Vertex(identity.source_ref()).ref(), options.delta,
-        options.check_abort);
+        options.check_abort, options.reservation);
     if (!source_intervals.ok()) return source_intervals.status();
-    auto target_intervals = VisibleIntervals(
+    auto target_intervals = ReadPresentIntervals(
         snapshot, EntityFact::Vertex(identity.target_ref()).ref(), options.delta,
-        options.check_abort);
+        options.check_abort, options.reservation);
     if (!target_intervals.ok()) return target_intervals.status();
-    for (const StateInterval& edge : edge_intervals.ValueOrDie()) {
-      for (const StateInterval& source : source_intervals.ValueOrDie()) {
+    for (const StateInterval& edge : *edge_intervals.ValueOrDie()) {
+      for (const StateInterval& source : *source_intervals.ValueOrDie()) {
         auto effective = Intersect(*interval, edge.interval);
         if (!effective) continue;
         effective = Intersect(*effective, source.interval);
         if (!effective) continue;
-        for (const StateInterval& target : target_intervals.ValueOrDie()) {
+        for (const StateInterval& target : *target_intervals.ValueOrDie()) {
           auto clipped = Intersect(*effective, target.interval);
           if (!clipped) continue;
           if (Status status = ChargeTraversal(options); !status.ok()) return status;
+          if (Status status = ReserveFactAppend(&output, &output_memory); !status.ok())
+            return status;
           output.push_back({identity.source_ref(), identity.edge_ref(),
                             identity.target_ref(), identity.edge_type, *clipped});
         }
@@ -477,75 +488,121 @@ StatusOr<std::vector<TemporalTraversal>> ExpandTemporal(
       return a.source.vertex_id.value < b.source.vertex_id.value;
     return a.edge.edge_id.value < b.edge.edge_id.value;
   });
-  return output;
+  return RetainRows(std::move(output), &output_memory, std::move(memory));
 }
 
 StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
                                 const GraphExpansionRequest& request,
                                 const GraphFrontierOptions& options) {
   if (options.max_hops == 0) return KHopResult{};
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope output_memory(memory.get());
+  FactReadMemoryScope visited_memory(memory.get());
+  FactReadMemoryScope initial_memory(memory.get());
   KHopResult result;
   std::map<VertexKey, std::pair<uint32_t, std::vector<ValidTimeInterval>>> visited;
+  std::shared_ptr<const void> frontier_owner;
   std::vector<GraphLabel> frontier;
+  if (Status status = initial_memory.ReserveElements(request.frontier.size(), sizeof(GraphLabel));
+      !status.ok()) return status;
   frontier.reserve(request.frontier.size());
   for (const VertexRef& vertex : request.frontier) {
+    if (visited.find(VertexKey{vertex}) == visited.end()) {
+      if (Status status = visited_memory.Reserve(sizeof(decltype(visited)::value_type) +
+                                                  4 * sizeof(void*)); !status.ok()) return status;
+    }
     visited.emplace(VertexKey{vertex}, std::make_pair(0, std::vector<ValidTimeInterval>{}));
     frontier.push_back(GraphLabel{vertex, 0, std::nullopt, request.interval});
   }
-  for (uint32_t depth = 1; depth <= options.max_hops && !frontier.empty(); ++depth) {
+  auto retained_frontier = initial_memory.Retain(memory);
+  if (!retained_frontier.ok()) return retained_frontier.status();
+  frontier_owner = retained_frontier.ConsumeValueOrDie();
+  const auto append_label = [](std::vector<GraphLabel>* labels, FactReadMemoryScope* scope,
+                                const GraphLabel& prior, const TemporalTraversal& traversal,
+                                VertexRef destination, VertexRef predecessor,
+                                uint32_t depth, ValidTimeInterval effective) -> Status {
+    if (Status status = ReserveFactAppend(labels, scope); !status.ok()) return status;
+    if (prior.trail_edges.size() == SIZE_MAX)
+      return Status::ResourceExhausted("graph", "trail capacity overflow");
+    if (Status status = scope->ReserveElements(prior.trail_edges.size() + 1, sizeof(EdgeRef));
+        !status.ok()) return status;
+    std::vector<EdgeRef> edges;
+    edges.reserve(prior.trail_edges.size() + 1);
+    edges.insert(edges.end(), prior.trail_edges.begin(), prior.trail_edges.end());
+    edges.push_back(traversal.edge);
+    labels->push_back(GraphLabel{destination, depth, predecessor, effective, std::move(edges)});
+    return Status::OK();
+  };
+  for (uint64_t depth = 1; depth <= options.max_hops && !frontier.empty(); ++depth) {
     auto interval_end = [](const ValidTimeInterval& interval) {
       return interval.to.value_or(ValidTime{std::numeric_limits<uint64_t>::max()}).value;
     };
     auto subtract_covered = [&](const ValidTimeInterval& current,
-                                const std::vector<ValidTimeInterval>& prior) {
-      std::vector<ValidTimeInterval> pieces{current};
+                                const std::vector<ValidTimeInterval>& prior,
+                                FactReadMemoryScope* scratch)
+        -> StatusOr<std::vector<ValidTimeInterval>> {
+      std::vector<ValidTimeInterval> pieces;
+      if (Status status = ReserveFactAppend(&pieces, scratch); !status.ok()) return status;
+      pieces.push_back(current);
       for (const auto& cover : prior) {
         std::vector<ValidTimeInterval> remaining;
         for (const auto& piece : pieces) {
           const auto overlap = Intersect(piece, cover);
           if (!overlap) {
+            if (Status status = ReserveFactAppend(&remaining, scratch); !status.ok()) return status;
             remaining.push_back(piece);
             continue;
           }
-          if (piece.from.value < overlap->from.value)
+          if (piece.from.value < overlap->from.value) {
+            if (Status status = ReserveFactAppend(&remaining, scratch); !status.ok()) return status;
             remaining.push_back({piece.from, overlap->from});
+          }
           const auto overlap_to = interval_end(*overlap);
           const auto piece_to = interval_end(piece);
           if (overlap_to < piece_to) {
+            if (Status status = ReserveFactAppend(&remaining, scratch); !status.ok()) return status;
             remaining.push_back({ValidTime{overlap_to}, piece.to});
           }
         }
+        const uint64_t released = pieces.capacity() * sizeof(ValidTimeInterval);
         pieces = std::move(remaining);
+        scratch->Release(released);
         if (pieces.empty()) break;
       }
       return pieces;
     };
     auto merge_interval = [&](std::vector<ValidTimeInterval>* intervals,
-                              const ValidTimeInterval& added) {
+                              const ValidTimeInterval& added) -> Status {
+      if (Status status = ReserveFactAppend(intervals, &visited_memory); !status.ok()) return status;
       intervals->push_back(added);
       std::sort(intervals->begin(), intervals->end(),
                 [](const auto& a, const auto& b) { return a.from.value < b.from.value; });
-      std::vector<ValidTimeInterval> merged;
+      size_t kept = 0;
       for (const auto& interval : *intervals) {
-        if (merged.empty() || interval.from.value > interval_end(merged.back())) {
-          merged.push_back(interval);
+        if (kept == 0 || interval.from.value > interval_end((*intervals)[kept - 1])) {
+          (*intervals)[kept++] = interval;
           continue;
         }
-        auto& last = merged.back();
+        auto& last = (*intervals)[kept - 1];
         if (!last.to.has_value() || !interval.to.has_value() ||
             interval_end(interval) > interval_end(last)) {
           last.to = interval.to;
         }
       }
-      *intervals = std::move(merged);
+      intervals->resize(kept);
+      return Status::OK();
     };
+    FactReadMemoryScope next_memory(memory.get());
     std::vector<GraphLabel> next;
     for (const GraphLabel& prior : frontier) {
       if (options.check_abort) {
         if (Status status = options.check_abort(); !status.ok()) return status;
       }
-      GraphExpansionRequest layer = request;
-      layer.frontier = {prior.vertex};
+      FactReadMemoryScope layer_memory(memory.get());
+      if (Status status = layer_memory.Reserve(sizeof(VertexRef)); !status.ok()) return status;
+      GraphExpansionRequest layer{{prior.vertex}, request.interval,
+                                   request.direction, request.edge_type};
       // Every hop is constrained by the common interval carried by its
       // predecessor label.  Reusing request.interval here would admit time
       // periods that were not present on the preceding path.
@@ -561,64 +618,73 @@ StatusOr<KHopResult> KHopExpand(Snapshot& snapshot,
                       traversal.edge) != prior.trail_edges.end()) {
           continue;
         }
-        std::vector<std::pair<VertexRef, VertexRef>> moves;
+        std::array<std::pair<VertexRef, VertexRef>, 2> moves;
+        size_t move_count = 0;
         const bool out = traversal.source == prior.vertex;
         const bool in = traversal.target == prior.vertex;
         if ((request.direction == ExpandDirection::kOut && out) ||
             (request.direction == ExpandDirection::kBoth && out))
-          moves.emplace_back(traversal.target, traversal.source);
+          moves[move_count++] = {traversal.target, traversal.source};
         if ((request.direction == ExpandDirection::kIn && in) ||
             (request.direction == ExpandDirection::kBoth && in)) {
-          if (moves.empty() || moves.front().first != traversal.source)
-            moves.emplace_back(traversal.source, traversal.target);
+          if (move_count == 0 || moves.front().first != traversal.source)
+            moves[move_count++] = {traversal.source, traversal.target};
         }
-        for (const auto& move : moves) {
+        for (size_t move_index = 0; move_index < move_count; ++move_index) {
+          const auto& move = moves[move_index];
           const VertexRef destination = move.first;
           const VertexRef predecessor = move.second;
           auto found = visited.find(VertexKey{destination});
           if (found != visited.end() && found->second.first < depth) continue;
+          FactReadMemoryScope piece_memory(memory.get());
           std::vector<ValidTimeInterval> pieces;
           if (found == visited.end()) {
+            if (Status status = visited_memory.Reserve(sizeof(decltype(visited)::value_type) +
+                                                        4 * sizeof(void*)); !status.ok()) return status;
             found = visited.emplace(
                 VertexKey{destination},
                 std::make_pair(depth, std::vector<ValidTimeInterval>{}))
                         .first;
-            if (options.reservation != nullptr) {
+            if (options.reservation != nullptr && options.count_expansion_resources) {
               if (Status status = options.reservation->ReserveVisitedVertices(1);
                   !status.ok())
                 return status;
             }
+            if (Status status = ReserveFactAppend(&pieces, &piece_memory); !status.ok()) return status;
             pieces.push_back(traversal.effective);
           } else if (found->second.first == depth) {
-            pieces = subtract_covered(traversal.effective,
-                                       found->second.second);
+            auto uncovered = subtract_covered(traversal.effective, found->second.second,
+                                               &piece_memory);
+            if (!uncovered.ok()) return uncovered.status();
+            pieces = uncovered.ConsumeValueOrDie();
           }
           if (pieces.empty()) continue;
-          merge_interval(&found->second.second, traversal.effective);
+          if (Status status = merge_interval(&found->second.second, traversal.effective);
+              !status.ok()) return status;
           for (const auto& piece : pieces) {
             TemporalTraversal emitted = traversal;
             emitted.effective = piece;
+            if (Status status = ReserveFactAppend(&result.traversals, &output_memory);
+                !status.ok()) return status;
             result.traversals.push_back(emitted);
-            result.labels.push_back(GraphLabel{
-                destination, depth, std::optional<VertexRef>{predecessor}, piece,
-                [&prior, &traversal] {
-                  std::vector<EdgeRef> edges = prior.trail_edges;
-                  edges.push_back(traversal.edge);
-                  return edges;
-                }()});
-            next.push_back(GraphLabel{
-                destination, depth, std::optional<VertexRef>{predecessor}, piece,
-                [&prior, &traversal] {
-                  std::vector<EdgeRef> edges = prior.trail_edges;
-                  edges.push_back(traversal.edge);
-                  return edges;
-                }()});
+            if (Status status = append_label(&result.labels, &output_memory, prior, traversal,
+                                               destination, predecessor, depth, piece);
+                !status.ok()) return status;
+            if (Status status = append_label(&next, &next_memory, prior, traversal,
+                                               destination, predecessor, depth, piece);
+                !status.ok()) return status;
           }
         }
       }
     }
+    auto next_owner = next_memory.Retain(memory);
+    if (!next_owner.ok()) return next_owner.status();
     frontier = std::move(next);
+    frontier_owner = next_owner.ConsumeValueOrDie();
   }
+  auto output_owner = output_memory.Retain(memory);
+  if (!output_owner.ok()) return output_owner.status();
+  result.memory = output_owner.ConsumeValueOrDie();
   return result;
 }
 
@@ -638,23 +704,22 @@ bool EdgeRefLess(const EdgeRef& left, const EdgeRef& right) {
   return left.edge_id.value < right.edge_id.value;
 }
 
-std::vector<EdgeRef> LabelEdges(const std::vector<CoexistingLabel>& labels,
-                                uint64_t id) {
-  std::vector<EdgeRef> edges;
+void LabelEdges(const std::vector<CoexistingLabel>& labels, uint64_t id,
+                std::vector<EdgeRef>* edges) {
+  edges->clear();
   while (id != std::numeric_limits<uint64_t>::max() && id < labels.size()) {
     const CoexistingLabel& label = labels[id];
-    if (label.depth != 0) edges.push_back(label.incoming_edge);
+    if (label.depth != 0) edges->push_back(label.incoming_edge);
     id = label.predecessor_label;
   }
-  std::reverse(edges.begin(), edges.end());
-  return edges;
+  std::reverse(edges->begin(), edges->end());
 }
 
 bool LabelPathLess(const std::vector<CoexistingLabel>& labels, uint64_t left,
-                  uint64_t right) {
-  const std::vector<EdgeRef> a = LabelEdges(labels, left);
-  const std::vector<EdgeRef> b = LabelEdges(labels, right);
-  return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                  uint64_t right, std::vector<EdgeRef>* a, std::vector<EdgeRef>* b) {
+  LabelEdges(labels, left, a);
+  LabelEdges(labels, right, b);
+  return std::lexicographical_compare(a->begin(), a->end(), b->begin(), b->end(),
                                        EdgeRefLess);
 }
 
@@ -672,23 +737,23 @@ uint64_t IntervalLength(const ValidTimeInterval& interval) {
   return interval.to->value - interval.from.value;
 }
 
-PathValue ReconstructPath(const std::vector<CoexistingLabel>& labels,
-                          uint64_t id) {
+StatusOr<PathValue> ReconstructPath(const std::vector<CoexistingLabel>& labels,
+                                    uint64_t id, FactReadMemoryScope* memory) {
   PathValue path;
   if (id >= labels.size()) return path;
   path.common = labels[id].common;
-  std::vector<uint64_t> chain;
-  for (uint64_t current = id; current != std::numeric_limits<uint64_t>::max() &&
-                               current < labels.size();
-       current = labels[current].predecessor_label) {
-    chain.push_back(current);
-  }
-  std::reverse(chain.begin(), chain.end());
-  path.vertices.reserve(chain.size());
-  for (uint64_t label_id : chain) {
-    path.vertices.push_back(labels[label_id].vertex);
-    if (labels[label_id].depth != 0)
-      path.edges.push_back(labels[label_id].incoming_edge);
+  const uint64_t depth = labels[id].depth;
+  if (Status status = memory->ReserveElements(depth + 1, sizeof(VertexRef));
+      !status.ok()) return status;
+  if (Status status = memory->ReserveElements(depth, sizeof(EdgeRef));
+      !status.ok()) return status;
+  path.vertices.resize(depth + 1);
+  path.edges.resize(depth);
+  for (uint64_t position = depth;; --position) {
+    path.vertices[position] = labels[id].vertex;
+    if (position == 0) break;
+    path.edges[position - 1] = labels[id].incoming_edge;
+    id = labels[id].predecessor_label;
   }
   return path;
 }
@@ -722,35 +787,63 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
     return Status::InvalidArgument("coexisting shortest path",
                                    "invalid request interval");
   }
+  auto memory = options.reservation
+      ? std::make_shared<QueryReadMemory>(*options.reservation) : nullptr;
+  FactReadMemoryScope output_memory(memory.get());
+  FactReadMemoryScope working_memory(memory.get());
   CoexistingPathResult result;
   if (options.max_hops == 0 || request.frontier.empty()) return result;
 
   // Keep labels grouped by vertex.  Entries are ids into result.labels, so
   // dominance never invalidates predecessor references.
   std::map<VertexKey, std::vector<uint64_t>> by_vertex;
+  std::shared_ptr<const void> frontier_owner;
+  FactReadMemoryScope initial_memory(memory.get());
   std::vector<uint64_t> frontier;
-  std::vector<bool> active;
+  std::vector<uint8_t> active;
+  const auto vertex_labels = [&](VertexRef vertex)
+      -> StatusOr<std::vector<uint64_t>*> {
+    const VertexKey key{vertex};
+    auto found = by_vertex.find(key);
+    if (found == by_vertex.end()) {
+      if (Status status = working_memory.Reserve(
+              sizeof(decltype(by_vertex)::value_type) + 4 * sizeof(void*));
+          !status.ok()) return status;
+      found = by_vertex.emplace(key, std::vector<uint64_t>{}).first;
+    }
+    return &found->second;
+  };
   for (const VertexRef& source : request.frontier) {
     const uint64_t id = result.labels.size();
     if (Status status = ChargeCoexistingLabel(options); !status.ok())
       return status;
+    auto existing = vertex_labels(source);
+    if (!existing.ok()) return existing.status();
+    if (Status status = ReserveFactAppend(&result.labels, &output_memory); !status.ok()) return status;
+    if (Status status = ReserveFactAppend(&active, &working_memory); !status.ok()) return status;
+    if (Status status = ReserveFactAppend(existing.ValueOrDie(), &working_memory); !status.ok()) return status;
+    if (Status status = ReserveFactAppend(&frontier, &initial_memory); !status.ok()) return status;
     result.labels.push_back(
         CoexistingLabel{source, *interval, 0,
                         std::numeric_limits<uint64_t>::max(), EdgeRef{}});
     active.push_back(true);
-    by_vertex[VertexKey{source}].push_back(id);
+    existing.ValueOrDie()->push_back(id);
     frontier.push_back(id);
   }
+  auto initial_owner = initial_memory.Retain(memory);
+  if (!initial_owner.ok()) return initial_owner.status();
+  frontier_owner = initial_owner.ConsumeValueOrDie();
 
   std::optional<uint32_t> target_depth;
   std::vector<uint64_t> target_labels;
   GraphFrontierOptions expansion_options = options;
   // ExpandTemporal charges raw traversals. Coexisting execution charges only
   // labels that survive interval dominance, as required by QueryReservation.
-  expansion_options.reservation = nullptr;
-  for (uint32_t depth = 1;
+  expansion_options.count_expansion_resources = false;
+  for (uint64_t depth = 1;
        depth <= options.max_hops && !frontier.empty(); ++depth) {
     if (target_depth.has_value() && depth > *target_depth) break;
+    FactReadMemoryScope next_memory(memory.get());
     std::vector<uint64_t> next;
     for (uint64_t prior_id : frontier) {
       if (prior_id >= active.size() || !active[prior_id]) continue;
@@ -760,9 +853,10 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
       // Copy the small label: accepted candidates append to result.labels and
       // may reallocate the backing vector while this expansion is in flight.
       const CoexistingLabel prior = result.labels[prior_id];
-      GraphExpansionRequest layer = request;
-      layer.frontier = {prior.vertex};
-      layer.interval = prior.common;
+      FactReadMemoryScope layer_memory(memory.get());
+      if (Status status = layer_memory.Reserve(sizeof(VertexRef)); !status.ok()) return status;
+      GraphExpansionRequest layer{{prior.vertex}, prior.common,
+                                   request.direction, request.edge_type};
       auto expanded = ExpandTemporal(snapshot, layer, expansion_options);
       if (!expanded.ok()) return expanded.status();
       for (const TemporalTraversal& traversal : expanded.ValueOrDie()) {
@@ -782,7 +876,9 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
           else continue;
         }
         const ValidTimeInterval common = traversal.effective;
-        auto& existing = by_vertex[VertexKey{destination}];
+        auto existing_labels = vertex_labels(destination);
+        if (!existing_labels.ok()) return existing_labels.status();
+        auto& existing = *existing_labels.ValueOrDie();
         const bool target_candidate = destination == target;
         if (!target_candidate) {
           bool dominated = false;
@@ -806,21 +902,30 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
         if (Status status = ChargeCoexistingLabel(options); !status.ok())
           return status;
         const uint64_t id = result.labels.size();
-        result.labels.push_back(CoexistingLabel{destination, common, depth,
+        if (Status status = ReserveFactAppend(&result.labels, &output_memory); !status.ok()) return status;
+        if (Status status = ReserveFactAppend(&active, &working_memory); !status.ok()) return status;
+        if (Status status = ReserveFactAppend(&existing, &working_memory); !status.ok()) return status;
+        result.labels.push_back(CoexistingLabel{destination, common, static_cast<uint32_t>(depth),
                                                 prior_id, traversal.edge});
         active.push_back(true);
         existing.push_back(id);
         if (destination == target) {
           if (!target_depth.has_value()) target_depth = depth;
           if (depth == *target_depth) {
+            if (Status status = ReserveFactAppend(&target_labels, &working_memory); !status.ok()) return status;
             target_labels.push_back(id);
           }
         }
-        if (!target_depth.has_value() || depth < *target_depth)
+        if (!target_depth.has_value() || depth < *target_depth) {
+          if (Status status = ReserveFactAppend(&next, &next_memory); !status.ok()) return status;
           next.push_back(id);
+        }
       }
     }
+    auto next_owner = next_memory.Retain(memory);
+    if (!next_owner.ok()) return next_owner.status();
     frontier = std::move(next);
+    frontier_owner = next_owner.ConsumeValueOrDie();
   }
 
   // Select winners globally. A candidate rejected by an earlier winner may
@@ -832,27 +937,54 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
       return result.labels[left].common.from.value < result.labels[right].common.from.value;
     return left < right;
   });
+  uint64_t longest_path = 0;
+  for (uint64_t id : target_labels)
+    longest_path = std::max<uint64_t>(longest_path, result.labels[id].depth);
+  if (Status status = working_memory.ReserveElements(longest_path, 2 * sizeof(EdgeRef));
+      !status.ok()) return status;
+  std::vector<EdgeRef> left_edges;
+  std::vector<EdgeRef> right_edges;
+  left_edges.reserve(longest_path);
+  right_edges.reserve(longest_path);
   auto better = [&](uint64_t left, uint64_t right) {
     const uint64_t left_length = IntervalLength(result.labels[left].common);
     const uint64_t right_length = IntervalLength(result.labels[right].common);
     if (left_length != right_length) return left_length > right_length;
     if (result.labels[left].depth != result.labels[right].depth)
       return result.labels[left].depth < result.labels[right].depth;
-    if (LabelPathLess(result.labels, left, right)) return true;
-    if (LabelPathLess(result.labels, right, left)) return false;
+    if (LabelPathLess(result.labels, left, right, &left_edges, &right_edges)) return true;
+    if (LabelPathLess(result.labels, right, left, &left_edges, &right_edges)) return false;
     return left < right;
   };
-  std::deque<uint64_t> pending(target_labels.begin(), target_labels.end());
-  std::set<uint64_t> rejected;
+  if (Status status = working_memory.ReserveElements(target_labels.size(), sizeof(uint64_t));
+      !status.ok()) return status;
+  std::vector<uint64_t> pending;
+  pending.reserve(target_labels.size());
+  pending.assign(target_labels.begin(), target_labels.end());
+  size_t pending_head = 0;
+  const auto enqueue = [&](uint64_t id) -> Status {
+    if (pending_head > pending.size() / 2) {
+      pending.erase(pending.begin(), pending.begin() + pending_head);
+      pending_head = 0;
+    }
+    if (Status status = ReserveFactAppend(&pending, &working_memory); !status.ok()) return status;
+    pending.push_back(id);
+    return Status::OK();
+  };
+  std::vector<uint64_t> rejected;
   std::vector<uint64_t> winners;
-  while (!pending.empty()) {
-    const uint64_t candidate = pending.front();
-    pending.pop_front();
+  std::vector<uint64_t> overlapping;
+  while (pending_head < pending.size()) {
+    if (options.check_abort) {
+      if (Status status = options.check_abort(); !status.ok()) return status;
+    }
+    const uint64_t candidate = pending[pending_head++];
     if (std::find(winners.begin(), winners.end(), candidate) != winners.end()) continue;
-    std::vector<uint64_t> overlapping;
+    overlapping.clear();
     for (uint64_t winner : winners) {
       if (IntervalOverlaps(result.labels[winner].common,
                            result.labels[candidate].common)) {
+        if (Status status = ReserveFactAppend(&overlapping, &working_memory); !status.ok()) return status;
         overlapping.push_back(winner);
       }
     }
@@ -864,17 +996,25 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
       }
     }
     if (!beats_all) {
-      rejected.insert(candidate);
+      const auto position = std::lower_bound(rejected.begin(), rejected.end(), candidate);
+      if (position == rejected.end() || *position != candidate) {
+        const size_t index = position - rejected.begin();
+        if (Status status = ReserveFactAppend(&rejected, &working_memory); !status.ok()) return status;
+        rejected.insert(rejected.begin() + index, candidate);
+      }
       continue;
     }
     for (uint64_t winner : overlapping) {
       winners.erase(std::remove(winners.begin(), winners.end(), winner), winners.end());
-      pending.push_back(winner);
+      if (Status status = enqueue(winner); !status.ok()) return status;
     }
+    if (Status status = ReserveFactAppend(&winners, &working_memory); !status.ok()) return status;
     winners.push_back(candidate);
     // Any rejected candidate may have been blocked only by a winner removed
     // above. Requeue all of them after every winner-set change.
-    for (uint64_t id : rejected) pending.push_back(id);
+    for (uint64_t id : rejected) {
+      if (Status status = enqueue(id); !status.ok()) return status;
+    }
     rejected.clear();
   }
   std::sort(winners.begin(), winners.end(), [&](uint64_t left, uint64_t right) {
@@ -882,7 +1022,18 @@ StatusOr<CoexistingPathResult> CoexistingShortestPath(
       return result.labels[left].common.from.value < result.labels[right].common.from.value;
     return left < right;
   });
-  for (uint64_t id : winners) result.paths.push_back(ReconstructPath(result.labels, id));
+  for (uint64_t id : winners) {
+    if (options.check_abort) {
+      if (Status status = options.check_abort(); !status.ok()) return status;
+    }
+    if (Status status = ReserveFactAppend(&result.paths, &output_memory); !status.ok()) return status;
+    auto path = ReconstructPath(result.labels, id, &output_memory);
+    if (!path.ok()) return path.status();
+    result.paths.push_back(path.ConsumeValueOrDie());
+  }
+  auto output_owner = output_memory.Retain(memory);
+  if (!output_owner.ok()) return output_owner.status();
+  result.memory = output_owner.ConsumeValueOrDie();
   return result;
 }
 

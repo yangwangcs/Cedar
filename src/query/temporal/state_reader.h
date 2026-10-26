@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cedar/fact/read_spec.h"
+#include "storage/facts/read_memory_scope.h"
 
 namespace cedar::internal {
 
@@ -29,9 +30,14 @@ class StateRowStream {
 
   CanonicalStateReadSpec spec_;
   CanonicalStateBatchVisitor visitor_;
+  FactReadMemoryScope history_memory_;
+  FactReadMemoryScope history_payload_;
+  FactReadMemoryScope output_memory_;
+  FactReadMemoryScope output_payload_;
   std::vector<FactEvent> current_events_;
   std::optional<FactRef> current_ref_;
   std::vector<CanonicalStateRow> output_;
+  uint64_t emitted_rows_ = 0;
   bool limit_reached_ = false;
   bool finished_ = false;
 };

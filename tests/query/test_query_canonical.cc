@@ -16,6 +16,7 @@
 #include "query/runtime/property_binding.h"
 #include "query/runtime/read_context.h"
 #include "query/runtime/temporal_source.h"
+#include "query/resource/query_read_memory.h"
 
 namespace cedar {
 namespace {
@@ -350,6 +351,38 @@ TEST_F(QueryCanonicalTest, VertexPointMaxIdDoesNotWrapEntityRange) {
   ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
   EXPECT_EQ(batch.ValueOrDie()->Get<VertexRef>(vertex, 0),
             (VertexRef{PartId{0}, VertexId{UINT64_MAX}}));
+}
+
+TEST_F(QueryCanonicalTest, MaxEntityMetadataPreservesTimeAndCommit) {
+  ASSERT_EQ(AssertVertex(UINT64_MAX, 10), CommitSeq{1});
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("max_metadata_v");
+  Slot<ValidTime> valid_from = Slot<ValidTime>::Named("valid_from");
+  Slot<CommitSeq> commit_seq = Slot<CommitSeq>::Named("commit_seq");
+  auto source = Query::VertexPoint(
+      VertexRef{PartId{0}, VertexId{UINT64_MAX}}, vertex, At{ValidTime{15}});
+  ASSERT_TRUE(source.ok());
+  auto with_time = source.ValueOrDie().ProjectMetadata(
+      vertex.id(), MetadataKind::kValidFrom, Project(valid_from));
+  ASSERT_TRUE(with_time.ok());
+  auto with_commit = with_time.ValueOrDie().ProjectMetadata(
+      vertex.id(), MetadataKind::kCommitSeq, Project(commit_seq));
+  ASSERT_TRUE(with_commit.ok());
+  auto query = with_commit.ValueOrDie().Select(
+      {Project(vertex), Project(valid_from), Project(commit_seq)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(
+      std::move(snapshot).ConsumeValueOrDie(), Bindings{}, QueryOptions{});
+  ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<ValidTime>(valid_from, 0), ValidTime{10});
+  EXPECT_EQ(batch.ValueOrDie()->Get<CommitSeq>(commit_seq, 0), CommitSeq{1});
 }
 
 TEST_F(QueryCanonicalTest, UnorderedLimitStopsCanonicalStateStream) {
@@ -750,6 +783,135 @@ TEST_F(QueryCanonicalTest, FiltersRangeProvenanceAfterStateReduction) {
             (std::vector<ExpectedState>{{10, 20, 7}, {30, 40, 7}}));
 }
 
+TEST_F(QueryCanonicalTest, TemporalChainCacheRetainsQueryBudgetAcrossHits) {
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+      EntityFact::Vertex({PartId{0}, VertexId{42}}), ValidTime{1}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  internal::QueryReadContext context{
+      snapshot.ValueOrDie().canonical_reader(), snapshot.ValueOrDie().commit_seq()};
+  context.chain_cache = std::make_shared<internal::TemporalChainCache>();
+  internal::QueryReservation tiny(1);
+  context.runtime_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+  auto rejected = internal::TemporalSource::ReadHistory(
+      context, FactFamily::kVertexState, PropertyId{}, std::nullopt);
+  EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+  EXPECT_TRUE(context.chain_cache->chains.empty());
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+
+  internal::QueryReservation budget(1 << 20);
+  context.runtime_memory = std::make_shared<internal::QueryReadMemory>(budget);
+  {
+    auto first = internal::TemporalSource::ReadHistory(
+        context, FactFamily::kVertexState, PropertyId{}, std::nullopt);
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    ASSERT_EQ(first.ValueOrDie().size(), 1U);
+  }
+  ASSERT_EQ(context.chain_cache->chains.size(), 1U);
+  const auto* owner = context.chain_cache->chains.begin()->second.get();
+  const auto retained = budget.used_bytes();
+  ASSERT_GT(retained, sizeof(internal::FactChainView));
+  const auto peak = budget.peak_bytes();
+  {
+    auto hit = internal::TemporalSource::ReadHistory(
+        context, FactFamily::kVertexState, PropertyId{}, std::nullopt);
+    ASSERT_TRUE(hit.ok()) << hit.status().ToString();
+    ASSERT_EQ(hit.ValueOrDie().size(), 1U);
+    EXPECT_EQ(hit.ValueOrDie().front().ref.entity_id(), 42U);
+  }
+  EXPECT_EQ(context.chain_cache->chains.begin()->second.get(), owner);
+  EXPECT_EQ(budget.used_bytes(), retained);
+  EXPECT_EQ(budget.peak_bytes(), peak);
+  context.chain_cache.reset();
+  EXPECT_EQ(budget.used_bytes(), 0U);
+}
+
+TEST_F(QueryCanonicalTest, TemporalOutputsReserveAndRetainCopiedValues) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{17}, 0, "budget_text", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 8192}).ok());
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Set(
+      PropertyFact::Vertex({PartId{0}, VertexId{42}}, PropertyId{17}),
+      ValidTime{1}, Value::String(std::string(4096, 'x'))).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  internal::QueryReadContext context{
+      snapshot.ValueOrDie().canonical_reader(), snapshot.ValueOrDie().commit_seq()};
+  context.chain_cache = std::make_shared<internal::TemporalChainCache>();
+  // Warm an unbudgeted input owner so only each output allocation is tested.
+  ASSERT_TRUE(internal::TemporalSource::ReadHistory(
+      context, FactFamily::kVertexProperty, PropertyId{17}, std::nullopt).ok());
+  auto verify = [&](auto read) {
+    internal::QueryReservation tiny(1);
+    context.runtime_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+    {
+      auto rejected = read();
+      EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+    }
+    EXPECT_EQ(tiny.used_bytes(), 0U);
+    internal::QueryReservation adequate(1 << 20);
+    context.runtime_memory = std::make_shared<internal::QueryReadMemory>(adequate);
+    {
+      auto rows = read();
+      ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+      EXPECT_EQ(rows.ValueOrDie().size(), 1U);
+      EXPECT_GE(adequate.used_bytes(), 4096U);
+    }
+    EXPECT_EQ(adequate.used_bytes(), 0U);
+  };
+  const ValidTimeInterval interval{ValidTime{1}, ValidTime{2}};
+  verify([&] { return internal::TemporalSource::ReadHistory(
+      context, FactFamily::kVertexProperty, PropertyId{17}, std::nullopt); });
+  verify([&] { return internal::TemporalSource::ReadEvents(
+      context, FactFamily::kVertexProperty, PropertyId{17}, interval); });
+  verify([&] { return internal::TemporalSource::ReadChanges(
+      context, FactFamily::kVertexProperty, PropertyId{17}, interval); });
+  verify([&] { return internal::TemporalSource::ReadAt(
+      context, FactFamily::kVertexProperty, PropertyId{17}, ValidTime{1}); });
+  verify([&] { return internal::TemporalSource::ReadThroughout(
+      context, FactFamily::kVertexProperty, PropertyId{17}, interval); });
+  context.max_rows = 1;
+  verify([&] { return internal::TemporalSource::ReadAt(
+      context, FactFamily::kVertexProperty, PropertyId{17}, ValidTime{1}); });
+}
+
+TEST_F(QueryCanonicalTest, PropertyBindingMissingRowsRespectOutputBudget) {
+  const PropertyDefinition definition{
+      PropertyId{17}, 1, "missing_budget", PropertyEntityKind::kVertex,
+      PhysicalType::kInt64, 4096};
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  internal::QueryReadContext context{
+      snapshot.ValueOrDie().canonical_reader(), snapshot.ValueOrDie().commit_seq()};
+  std::vector<internal::StateRow> entities;
+  for (uint64_t id = 1; id <= 1000; ++id) {
+    entities.push_back({EntityFact::Vertex({PartId{0}, VertexId{id}}).ref(),
+                        {ValidTime{0}, ValidTime{10}}, std::nullopt});
+  }
+  internal::QueryReservation small(4096);
+  context.runtime_memory = std::make_shared<internal::QueryReadMemory>(small);
+  {
+    auto rejected = internal::PropertyBinder::BindIntervals(context, entities, definition);
+    EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+  }
+  EXPECT_EQ(small.used_bytes(), 0U);
+  internal::QueryReservation adequate(1 << 20);
+  context.runtime_memory = std::make_shared<internal::QueryReadMemory>(adequate);
+  {
+    auto rows = internal::PropertyBinder::BindAt(context, entities, ValidTime{5}, definition);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ(rows.ValueOrDie().size(), 1000U);
+    EXPECT_GE(adequate.used_bytes(), 1000 * sizeof(internal::BoundPropertyRow));
+  }
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+}
+
 TEST_F(QueryCanonicalTest, ReadsCanonicalAndPropertiesAcrossHomePartitions) {
   ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
       PropertyId{17}, 0, "partition_score", PropertyEntityKind::kVertex,
@@ -949,6 +1111,64 @@ TEST_F(QueryCanonicalTest, ExecutesInt64ParameterPredicate) {
   ASSERT_TRUE(batch.ok()) << batch.status().ToString();
   ASSERT_TRUE(batch.ValueOrDie().has_value());
   EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+}
+
+TEST_F(QueryCanonicalTest, PredicateViewsSurviveNestedStringBinaryChecksAndRowCompaction) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{28}, 0, "view_text", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 8192}).ok());
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{29}, 0, "view_binary", PropertyEntityKind::kVertex,
+      PhysicalType::kBinary, 8192}).ok());
+  const std::string text = std::string(2048, 't') + std::string("\0tail", 5);
+  const Binary binary{std::string("\0payload\0", 9)};
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t id = 1; id <= 4; ++id) {
+    const VertexRef vertex{PartId{0}, VertexId{id}};
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(vertex), ValidTime{0}).ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Set(PropertyFact::Vertex(vertex, PropertyId{28}),
+        ValidTime{0}, Value::String(id % 2 == 0 ? text : "other")).ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Set(PropertyFact::Vertex(vertex, PropertyId{29}),
+        ValidTime{0}, Value::Binary(binary.value)).ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  OptionalSlot<std::string> name = OptionalSlot<std::string>::Named("text");
+  OptionalSlot<Binary> payload = OptionalSlot<Binary>::Named("payload");
+  Parameter<std::string> expected_text = Parameter<std::string>::Named("text");
+  Parameter<Binary> expected_binary = Parameter<Binary>::Named("payload");
+  auto source = Query::Vertices(vertex, At{ValidTime{0}});
+  ASSERT_TRUE(source.ok());
+  auto names = source.ValueOrDie().BindVertexProperty(vertex, PropertyId{28}, name);
+  ASSERT_TRUE(names.ok());
+  auto bound = names.ValueOrDie().BindVertexProperty(vertex, PropertyId{29}, payload);
+  ASSERT_TRUE(bound.ok());
+  auto filtered = bound.ValueOrDie().Where(
+      Equal(ValueOf(name), ValueOf(expected_text)) &&
+      (Equal(ValueOf(payload), ValueOf(expected_binary)) &&
+       Equal(ValueOf(payload), Literal<Binary>(binary))));
+  ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+  auto query = filtered.ValueOrDie().Select({Project(vertex), Project(name), Project(payload)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  Bindings bindings;
+  ASSERT_TRUE(bindings.Bind(expected_text.id(), QueryType::kString, Value::String(text)).ok());
+  ASSERT_TRUE(bindings.Bind(expected_binary.id(), QueryType::kBinary, Value::Binary(binary.value)).ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  auto cursor = prepared.ValueOrDie().Execute(snapshot.ConsumeValueOrDie(), bindings, QueryOptions{});
+  ASSERT_TRUE(cursor.ok());
+  auto batch = cursor.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 2U);
+  for (size_t row = 0; row < 2; ++row) {
+    EXPECT_EQ(batch.ValueOrDie()->Get<VertexRef>(vertex, row).vertex_id.value, 2 * (row + 1));
+    EXPECT_EQ(batch.ValueOrDie()->Get<std::string>(name, row), text);
+    EXPECT_EQ(batch.ValueOrDie()->Get<Binary>(payload, row), binary);
+  }
 }
 
 TEST_F(QueryCanonicalTest, ExecutesStringAndBoolParameterPredicates) {

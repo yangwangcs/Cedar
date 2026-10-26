@@ -52,21 +52,38 @@ struct JourneyTraversal {
   ValidDuration duration;
 };
 
+// Bases are destroyed in reverse order, so the value dies before its lease.
+struct JourneyMemoryOwner {
+  std::shared_ptr<const void> memory;
+};
+struct JourneyResult : JourneyMemoryOwner, JourneyValue {
+  JourneyResult() = default;
+  JourneyResult(const JourneyResult&) = delete;
+  JourneyResult& operator=(const JourneyResult&) = delete;
+  JourneyResult(JourneyResult&&) noexcept = default;
+  JourneyResult& operator=(JourneyResult&& other) noexcept {
+    JourneyResult previous(std::move(other));
+    memory.swap(previous.memory);
+    std::swap(static_cast<JourneyValue&>(*this), static_cast<JourneyValue&>(previous));
+    return *this;
+  }
+};
+
 StatusOr<ValidTime> AddDuration(ValidTime departure, ValidDuration duration);
 bool TraversalFits(const ValidTimeInterval& effective, ValidTime departure,
                    ValidDuration duration);
 
-StatusOr<JourneyValue> EarliestArrival(Snapshot& snapshot,
+StatusOr<JourneyResult> EarliestArrival(Snapshot& snapshot,
                                        const JourneyRequest& request,
                                        const JourneyOptions& options = {});
-StatusOr<JourneyValue> LatestDeparture(Snapshot& snapshot,
+StatusOr<JourneyResult> LatestDeparture(Snapshot& snapshot,
                                         const JourneyRequest& request,
                                         const JourneyOptions& options = {});
-StatusOr<JourneyValue> FastestDuration(Snapshot& snapshot,
+StatusOr<JourneyResult> FastestDuration(Snapshot& snapshot,
                                        const JourneyRequest& request,
                                        const JourneyOptions& options = {});
 
-StatusOr<JourneyValue> FindJourney(Snapshot& snapshot,
+StatusOr<JourneyResult> FindJourney(Snapshot& snapshot,
                                    const JourneyRequest& request,
                                    const JourneyOptions& options = {});
 

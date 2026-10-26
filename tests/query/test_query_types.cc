@@ -44,6 +44,31 @@ TEST(QueryTypesTest, RejectsBindingsWhoseTypesDiffer) {
                   .IsBindError());
 }
 
+TEST(QueryTypesTest, BorrowedLookupPreservesPayloadAndTypedErrors) {
+  Bindings bindings;
+  ASSERT_TRUE(bindings.Bind(ParameterId{1}, QueryType::kString,
+                            Value::String(std::string(4096, 's'))).ok());
+  ASSERT_TRUE(bindings.Bind(ParameterId{2}, QueryType::kBinary,
+                            Value::Binary(std::string("a\0b", 3))).ok());
+  auto first = bindings.LookupBorrowed(ParameterId{1}, QueryType::kString);
+  auto again = bindings.LookupBorrowed(ParameterId{1}, QueryType::kString);
+  ASSERT_TRUE(first.ok());
+  ASSERT_TRUE(again.ok());
+  EXPECT_EQ(first.ValueOrDie(), again.ValueOrDie());
+  const auto& text = std::get<std::string>(std::get<Value>(*first.ValueOrDie()).data());
+  auto copied = bindings.Lookup(ParameterId{1}, QueryType::kString);
+  ASSERT_TRUE(copied.ok());
+  const auto& copy = std::get<std::string>(std::get<Value>(copied.ValueOrDie()).data());
+  EXPECT_EQ(text, copy);
+  EXPECT_NE(text.data(), copy.data());
+  auto binary = bindings.LookupBorrowed(ParameterId{2}, QueryType::kBinary);
+  ASSERT_TRUE(binary.ok());
+  EXPECT_EQ(std::get<std::string>(std::get<Value>(*binary.ValueOrDie()).data()),
+            std::string("a\0b", 3));
+  EXPECT_TRUE(bindings.LookupBorrowed(ParameterId{1}, QueryType::kBinary).status().IsBindError());
+  EXPECT_TRUE(bindings.LookupBorrowed(ParameterId{3}, QueryType::kString).status().IsBindError());
+}
+
 static_assert(
     std::is_same_v<decltype(QueryOptions{}.mode), QueryExecutionMode>);
 

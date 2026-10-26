@@ -47,6 +47,7 @@ struct QueryReadContext {
   std::function<void()> on_limit_early_stop;
   std::function<void(uint64_t)> on_property_index_seek;
   std::optional<cedar::EntityRange> entity_range;
+  std::shared_ptr<FactReadMemory> runtime_memory;
 };
 
 }  // namespace cedar::internal

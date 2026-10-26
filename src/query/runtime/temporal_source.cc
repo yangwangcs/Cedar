@@ -42,7 +42,7 @@ StatusOr<T> ColumnValue(const FactColumnarBatch& batch, FactColumnId id,
 
 StatusOr<std::optional<Value>> DecodeProjectedValue(
     const FactColumnarBatch& batch, size_t row, PhysicalType type,
-    FactOperation operation) {
+    FactOperation operation, FactReadMemoryScope* workspace) {
   if (operation == FactOperation::kDelete || type == PhysicalType{})
     return std::optional<Value>{};
   switch (type) {
@@ -78,24 +78,31 @@ StatusOr<std::optional<Value>> DecodeProjectedValue(
     }
     case PhysicalType::kString:
     case PhysicalType::kBinary: {
+      const FactColumn* column = FindColumn(batch, FactColumnId::kBytesValue);
+      const auto* values = column ? std::get_if<std::vector<std::string>>(&column->values) : nullptr;
+      if (!values || row >= values->size()) {
+        return Status::Corruption("query temporal source", "missing projected string");
+      }
+      const Status reserved = workspace->Reserve((*values)[row].capacity() + 1);
+      if (!reserved.ok()) return reserved;
       auto value = ColumnValue<std::string>(batch, FactColumnId::kBytesValue, row);
       if (!value.ok()) return value.status();
       return std::optional<Value>{type == PhysicalType::kString
-                                      ? Value::String(value.ValueOrDie())
-                                      : Value::Binary(value.ValueOrDie())};
+                                      ? Value::String(value.ConsumeValueOrDie())
+                                      : Value::Binary(value.ConsumeValueOrDie())};
     }
   }
   return Status::Corruption("query temporal source", "unknown projected physical type");
 }
 
-StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
+StatusOr<std::shared_ptr<const FactChains>> ReadChains(const CanonicalFactReader& reader,
                                 CommitSeq snapshot_seq, FactFamily family,
                                 PropertyId property,
                                 const PartScope& part_scope,
                                 const std::shared_ptr<TemporalChainCache>& cache = nullptr,
                                 std::optional<CommitSeqRange> system_range = std::nullopt,
-                                std::optional<EntityRange> entity_range = std::nullopt) {
-  FactChains chains;
+                                std::optional<EntityRange> entity_range = std::nullopt,
+                                std::shared_ptr<FactReadMemory> runtime_memory = {}) {
   std::ostringstream cache_key;
   cache_key << static_cast<unsigned>(family) << ':' << property.value << ':'
             << static_cast<unsigned>(part_scope.kind);
@@ -115,7 +122,7 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
     std::lock_guard<std::mutex> lock(cache->mutex);
     const auto found = cache->chains.find(cache_key.str());
     if (found != cache->chains.end()) {
-      return *found->second;
+      return found->second;
     }
   }
   const std::vector<FactColumnId> projection = {
@@ -127,8 +134,8 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
       FactColumnId::kFloat32Value, FactColumnId::kFloat64Value,
       FactColumnId::kTimestamp64Value, FactColumnId::kBytesValue};
   FactChainCursor cursor(FactBatchOrder::kIdentityValidDescCommitDesc,
-                         snapshot_seq, system_range);
-  auto consume = [&cursor, family, property](const FactColumnarBatch& batch) {
+                         snapshot_seq, system_range, runtime_memory);
+  auto consume = [&cursor, family, property, &runtime_memory](const FactColumnarBatch& batch) {
         const size_t rows = batch.row_count();
         for (size_t row = 0; row < rows; ++row) {
           auto part = ColumnValue<uint32_t>(batch, FactColumnId::kPartId, row);
@@ -147,16 +154,17 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
           if (!physical.ok()) return physical.status();
           const auto family_value = family;
           const auto property_value = property;
+          FactReadMemoryScope conversion(runtime_memory.get());
           auto value = DecodeProjectedValue(
               batch, row, static_cast<PhysicalType>(physical.ValueOrDie()),
-              static_cast<FactOperation>(operation.ValueOrDie()));
+              static_cast<FactOperation>(operation.ValueOrDie()), &conversion);
           if (!value.ok()) return value.status();
           FactEvent event{FactRef{PartId{part.ValueOrDie()}, family_value,
                                   property_value, entity.ValueOrDie()},
                           ValidTime{valid_from.ValueOrDie()},
                           CommitSeq{commit_seq.ValueOrDie()},
                           static_cast<FactOperation>(operation.ValueOrDie()),
-                          schema_epoch.ValueOrDie(), value.ValueOrDie(),
+                          schema_epoch.ValueOrDie(), value.ConsumeValueOrDie(),
                           std::nullopt};
           Status consumed = cursor.Consume(event);
           if (!consumed.ok()) return consumed;
@@ -178,13 +186,18 @@ StatusOr<FactChains> ReadChains(const CanonicalFactReader& reader,
   if (!scanned.ok()) return scanned;
   const Status finished = cursor.Finish(snapshot_seq);
   if (!finished.ok()) return finished;
-  chains = cursor.chains();
+  // Charge the map node/key with the chain owner before inserting it. Sharing
+  // this immutable owner avoids deep copies on both insertion and lookup.
+  const std::string key = cache_key.str();
+  const uint64_t cache_bytes = cache ? sizeof(decltype(cache->chains)::value_type) +
+                                         4 * sizeof(void*) + key.capacity() + 1 : 0;
+  auto chains = cursor.TakeChains(cache_bytes);
+  if (!chains.ok()) return chains.status();
   if (cache != nullptr) {
-    auto reduced = std::make_shared<const std::vector<FactChainView>>(chains);
     std::lock_guard<std::mutex> lock(cache->mutex);
-    cache->chains.emplace(cache_key.str(), std::move(reduced));
+    cache->chains.emplace(key, chains.ValueOrDie());
   }
-  return chains;
+  return chains.ConsumeValueOrDie();
 }
 
 bool Contains(const ValidTimeInterval& interval, ValidTime time) {
@@ -192,36 +205,42 @@ bool Contains(const ValidTimeInterval& interval, ValidTime time) {
          (!interval.to.has_value() || time.value < interval.to->value);
 }
 
-StatusOr<std::vector<StateRow>> Materialize(
+StatusOr<BudgetedRows<StateRow>> Materialize(
     const CanonicalFactReader& reader, CommitSeq snapshot_seq,
     FactFamily family, PropertyId property,
     std::optional<ValidTimeInterval> bounds, const PartScope& part_scope,
     const std::shared_ptr<TemporalChainCache>& cache = nullptr,
     std::optional<CommitSeqRange> system_range = std::nullopt,
-    std::optional<cedar::EntityRange> entity_range = std::nullopt) {
+    std::optional<cedar::EntityRange> entity_range = std::nullopt,
+    std::shared_ptr<FactReadMemory> runtime_memory = {}) {
   if (bounds.has_value()) {
     const Status valid = bounds->Validate();
     if (!valid.ok()) return valid;
   }
   auto chains = ReadChains(reader, snapshot_seq, family, property, part_scope, cache,
-                           system_range, entity_range);
+                           system_range, entity_range, runtime_memory);
   if (!chains.ok()) return chains.status();
 
+  FactReadMemoryScope output(runtime_memory.get());
   std::vector<StateRow> rows;
-  for (const auto& view : chains.ValueOrDie()) {
+  for (const auto& view : *chains.ValueOrDie()) {
     for (const StateInterval& state : view.present) {
       std::optional<ValidTimeInterval> effective = state.interval;
       if (bounds.has_value()) effective = Clip(state.interval, *bounds);
       if (!effective.has_value()) continue;
+      Status status = ReserveFactAppend(&rows, &output);
+      if (!status.ok()) return status;
+      status = output.Reserve(FactValueHeapBytes(state.value));
+      if (!status.ok()) return status;
       rows.push_back({view.ref, *effective, state.value});
     }
   }
-  return rows;
+  return RetainRows(std::move(rows), &output, std::move(runtime_memory));
 }
 
 }  // namespace
 
-StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
+StatusOr<BudgetedRows<EventRow>> TemporalSource::ReadEvents(
     Snapshot& snapshot, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval, const PartScope& part_scope) {
   return ReadEvents(QueryReadContext{snapshot.canonical_reader(),
@@ -229,31 +248,37 @@ StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
                     family, property, interval);
 }
 
-StatusOr<std::vector<EventRow>> TemporalSource::ReadEvents(
+StatusOr<BudgetedRows<EventRow>> TemporalSource::ReadEvents(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   const Status valid = interval.Validate();
   if (!valid.ok()) return valid;
   auto chains = ReadChains(context.facts, context.snapshot_seq, family, property,
                            context.part_scope, context.chain_cache,
-                           context.system_time_range, context.entity_range);
+                           context.system_time_range, context.entity_range,
+                           context.runtime_memory);
   if (!chains.ok()) return chains.status();
 
+  FactReadMemoryScope output(context.runtime_memory.get());
   std::vector<EventRow> rows;
-  for (const auto& view : chains.ValueOrDie()) {
+  for (const auto& view : *chains.ValueOrDie()) {
     for (const CorrectedBoundary& boundary : view.boundaries) {
       if (!Contains(interval, boundary.valid_from)) continue;
       if (context.system_time_range.has_value() &&
           !context.system_time_range->Contains(boundary.commit_seq)) continue;
+      Status status = ReserveFactAppend(&rows, &output);
+      if (!status.ok()) return status;
+      status = output.Reserve(FactValueHeapBytes(boundary.value));
+      if (!status.ok()) return status;
       rows.push_back({view.ref, boundary.valid_from, boundary.commit_seq,
                       boundary.operation, boundary.value,
                       boundary.schema_epoch});
     }
   }
-  return rows;
+  return RetainRows(std::move(rows), &output, context.runtime_memory);
 }
 
-StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
+StatusOr<BudgetedRows<ChangeRow>> TemporalSource::ReadChanges(
     Snapshot& snapshot, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval, const PartScope& part_scope) {
   return ReadChanges(QueryReadContext{snapshot.canonical_reader(),
@@ -261,48 +286,56 @@ StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
                      family, property, interval);
 }
 
-StatusOr<std::vector<ChangeRow>> TemporalSource::ReadChanges(
+StatusOr<BudgetedRows<ChangeRow>> TemporalSource::ReadChanges(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   const Status valid = interval.Validate();
   if (!valid.ok()) return valid;
   auto chains = ReadChains(context.facts, context.snapshot_seq, family, property,
                            context.part_scope, context.chain_cache,
-                           context.system_time_range, context.entity_range);
+                           context.system_time_range, context.entity_range,
+                           context.runtime_memory);
   if (!chains.ok()) return chains.status();
 
+  FactReadMemoryScope output(context.runtime_memory.get());
   std::vector<ChangeRow> rows;
-  for (const auto& view : chains.ValueOrDie()) {
+  for (const auto& view : *chains.ValueOrDie()) {
     bool present = false;
-    std::optional<Value> value;
+    const std::optional<Value> empty;
+    const std::optional<Value>* value = &empty;
     for (const CorrectedBoundary& boundary : view.boundaries) {
       const bool after_present = boundary.operation == FactOperation::kPut;
-      const std::optional<Value> after = after_present ? boundary.value
-                                                       : std::nullopt;
+      const auto& after = after_present ? boundary.value : empty;
       const bool changed = present != after_present ||
-                           (present && value != after);
+                           (present && *value != after);
       if (changed && Contains(interval, boundary.valid_from) &&
           (!context.system_time_range.has_value() ||
            context.system_time_range->Contains(boundary.commit_seq))) {
+        Status status = ReserveFactAppend(&rows, &output);
+        if (!status.ok()) return status;
+        status = output.Reserve(FactValueHeapBytes(*value));
+        if (!status.ok()) return status;
+        status = output.Reserve(FactValueHeapBytes(after));
+        if (!status.ok()) return status;
         rows.push_back({view.ref, boundary.valid_from,
-                        present ? value : std::nullopt,
+                        present ? *value : std::nullopt,
                         after_present ? after : std::nullopt});
       }
       present = after_present;
-      value = after;
+      value = &after;
     }
   }
-  return rows;
+  return RetainRows(std::move(rows), &output, context.runtime_memory);
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadAt(
     Snapshot& snapshot, FactFamily family, PropertyId property,
     ValidTime valid_time, const PartScope& part_scope) {
   return ReadAt(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
                                  part_scope, {}, {}}, family, property, valid_time);
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadAt(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     ValidTime valid_time) {
   // A state-row cap is only safe for the planner-proven direct canonical
@@ -317,11 +350,15 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
     spec.snapshot_seq = context.snapshot_seq;
     spec.valid_time = valid_time;
     spec.max_rows = context.max_rows;
+    FactReadMemoryScope output(context.runtime_memory.get());
     std::vector<StateRow> bounded;
     const Status status = context.facts.ReadStateRows(
-        spec, [&bounded](const std::vector<CanonicalStateRow>& batch) {
-          bounded.reserve(bounded.size() + batch.size());
+        spec, [&bounded, &output](const std::vector<CanonicalStateRow>& batch) {
           for (const CanonicalStateRow& row : batch) {
+            Status status = ReserveFactAppend(&bounded, &output);
+            if (!status.ok()) return status;
+            status = output.Reserve(FactValueHeapBytes(row.value));
+            if (!status.ok()) return status;
             bounded.push_back({row.ref, row.effective, row.value});
           }
           return Status::OK();
@@ -332,25 +369,22 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadAt(
         bounded.size() >= *context.max_rows && *context.max_rows != 0) {
       context.on_limit_early_stop();
     }
-    return bounded;
+    return RetainRows(std::move(bounded), &output, context.runtime_memory);
   }
   auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
                           std::nullopt, context.part_scope, context.chain_cache,
-                          context.system_time_range, context.entity_range);
+                          context.system_time_range, context.entity_range,
+                          context.runtime_memory);
   if (!rows.ok()) return rows.status();
-  std::vector<StateRow> result;
-  for (StateRow& row : rows.ValueOrDie()) {
-    if (Contains(row.effective, valid_time)) result.push_back(std::move(row));
-  }
-  if (context.max_rows.has_value() &&
-      result.size() > *context.max_rows) {
-    result.erase(result.begin() + static_cast<size_t>(*context.max_rows),
-                 result.end());
-  }
-  return result;
+  uint64_t kept = 0;
+  rows.ValueOrDie().EraseIf([&](const StateRow& row) {
+    if (!Contains(row.effective, valid_time)) return true;
+    return context.max_rows.has_value() && kept++ >= *context.max_rows;
+  });
+  return rows.ConsumeValueOrDie();
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadHistory(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadHistory(
     Snapshot& snapshot, FactFamily family, PropertyId property,
     std::optional<ValidTimeInterval> interval, const PartScope& part_scope) {
   return ReadHistory(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
@@ -358,56 +392,57 @@ StatusOr<std::vector<StateRow>> TemporalSource::ReadHistory(
                      std::move(interval));
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadHistory(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadHistory(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     std::optional<ValidTimeInterval> interval) {
   return Materialize(context.facts, context.snapshot_seq, family, property,
                      std::move(interval), context.part_scope, context.chain_cache,
-                     context.system_time_range, context.entity_range);
+                     context.system_time_range, context.entity_range,
+                     context.runtime_memory);
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadOverlaps(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadOverlaps(
     Snapshot& snapshot, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval, const PartScope& part_scope) {
   return ReadOverlaps(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
                                        part_scope, {}, {}}, family, property, interval);
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadOverlaps(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadOverlaps(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   return Materialize(context.facts, context.snapshot_seq, family, property,
                      interval, context.part_scope, context.chain_cache,
-                     context.system_time_range, context.entity_range);
+                     context.system_time_range, context.entity_range,
+                     context.runtime_memory);
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadThroughout(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadThroughout(
     Snapshot& snapshot, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval, const PartScope& part_scope) {
   return ReadThroughout(QueryReadContext{snapshot.canonical_reader(), snapshot.commit_seq(),
                                          part_scope, {}, {}}, family, property, interval);
 }
 
-StatusOr<std::vector<StateRow>> TemporalSource::ReadThroughout(
+StatusOr<BudgetedRows<StateRow>> TemporalSource::ReadThroughout(
     const QueryReadContext& context, FactFamily family, PropertyId property,
     const ValidTimeInterval& interval) {
   const Status valid = interval.Validate();
   if (!valid.ok()) return valid;
   auto rows = Materialize(context.facts, context.snapshot_seq, family, property,
                           std::nullopt, context.part_scope, context.chain_cache,
-                          context.system_time_range, context.entity_range);
+                          context.system_time_range, context.entity_range,
+                          context.runtime_memory);
   if (!rows.ok()) return rows.status();
-  std::vector<StateRow> result;
-  for (const StateRow& row : rows.ValueOrDie()) {
+  rows.ValueOrDie().EraseIf([&](const StateRow& row) {
     const bool starts_before = row.effective.from.value <= interval.from.value;
     const bool ends_after = !row.effective.to.has_value() ||
                             (interval.to.has_value() &&
                              interval.to->value <= row.effective.to->value);
-    if (starts_before && ends_after) {
-      result.push_back({row.ref, interval, row.value});
-    }
-  }
-  return result;
+    return !starts_before || !ends_after;
+  });
+  for (auto& row : rows.ValueOrDie()) row.effective = interval;
+  return rows.ConsumeValueOrDie();
 }
 
 }  // namespace cedar::internal

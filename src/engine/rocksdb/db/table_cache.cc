@@ -9,6 +9,8 @@
 
 #include "db/table_cache.h"
 
+#include <cstring>
+
 #include "db/dbformat.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/snapshot_impl.h"
@@ -184,6 +186,12 @@ Status TableCache::FindTable(
     bool pin_table_handle) {
   assert(out_table_reader != nullptr && *out_table_reader == nullptr);
   assert(handle != nullptr && *handle == nullptr);
+  // Cedar readers have independent byte admission. File-metadata pins would
+  // retain idle readers indefinitely and defeat pressure-driven eviction.
+  if (std::strcmp(mutable_cf_options.table_factory->Name(),
+                  "CedarParquetFactTable") == 0) {
+    pin_table_handle = false;
+  }
   PERF_TIMER_GUARD_WITH_CLOCK(find_table_nanos, ioptions_.clock);
 
   // Fast path: if table reader is already pinned, return it directly without a
@@ -227,6 +235,17 @@ Status TableCache::FindTable(
                          &table_reader, mutable_cf_options, skip_filters, level,
                          prefetch_index_and_filter_in_cache,
                          max_file_size_for_l0_meta_pin, file_temperature);
+      if (s.IsMemoryLimit()) {
+        // Reader metadata has a byte budget independent of this count-based
+        // cache. Reclaim idle readers before one retry; referenced readers keep
+        // their handles and cannot be destroyed underneath an active read.
+        cache_.get()->EraseUnRefEntries();
+        s = GetTableReader(ro, file_options, internal_comparator, file_meta,
+                           false, file_read_hist, &table_reader,
+                           mutable_cf_options, skip_filters, level,
+                           prefetch_index_and_filter_in_cache,
+                           max_file_size_for_l0_meta_pin, file_temperature);
+      }
       if (!s.ok()) {
         assert(table_reader == nullptr);
         RecordTick(ioptions_.stats, NO_FILE_ERRORS);

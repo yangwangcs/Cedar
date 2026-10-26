@@ -330,7 +330,8 @@ Status ScanSingleCedarParquetTable(
   Status status = cfd->table_cache()->FindTable(
       read_options, cfd->table_cache()->file_options(), cfd->internal_comparator(),
       *only_file, &table_handle, super_version->mutable_cf_options, &table_reader,
-      /*no_io=*/false, cfd->internal_stats()->GetFileReadHist(only_level),
+      /*no_io=*/read_options.read_tier == kBlockCacheTier,
+      cfd->internal_stats()->GetFileReadHist(only_level),
       /*skip_filters=*/false, only_level,
       /*prefetch_index_and_filter_in_cache=*/true,
       /*max_file_size_for_l0_meta_pin=*/0, only_file->temperature);
@@ -425,7 +426,8 @@ Status ScanMultipleCedarParquetTables(
       Status status = cfd->table_cache()->FindTable(
           read_options, cfd->table_cache()->file_options(), cfd->internal_comparator(),
           *file, &handle, super_version->mutable_cf_options, &table_reader,
-          false, cfd->internal_stats()->GetFileReadHist(level), false, level, true, 0,
+          read_options.read_tier == kBlockCacheTier,
+          cfd->internal_stats()->GetFileReadHist(level), false, level, true, 0,
           file->temperature);
       if (!status.ok()) {
         for (auto& source : sources) {
@@ -637,13 +639,29 @@ Status MakeCedarParquetSortLowerBound(const Slice& user_key, std::string* sort_k
 }
 
 Status ScanCedarParquetFacts(
-    DB* db, ColumnFamilyHandle* column_family, const ReadOptions& read_options,
-    const cedar_parquet::CedarParquetScanSpec& spec,
+    DB* db, ColumnFamilyHandle* column_family, const ReadOptions& requested_options,
+    const cedar_parquet::CedarParquetScanSpec& requested_spec,
     const cedar_parquet::CedarParquetColumnarBatchVisitor& visitor) {
   if (db == nullptr || column_family == nullptr) {
     return Status::InvalidArgument("Cedar columnar scan requires database and column family");
   }
   if (!visitor) return Status::InvalidArgument("Cedar columnar scan requires visitor");
+
+  auto spec = requested_spec;
+  ReadOptions read_options = requested_options;
+  // Neither entry point may weaken a cache-only or no-fill request. Keep the
+  // scan's budget when callers supply it through the columnar specification.
+  if (spec.policy.options.read_tier == kBlockCacheTier) {
+    read_options.read_tier = kBlockCacheTier;
+  }
+  read_options.fill_cache = read_options.fill_cache && spec.policy.options.fill_cache;
+  if (read_options.cedar_query_memory) {
+    spec.policy.query_memory = read_options.cedar_query_memory;
+  } else {
+    read_options.cedar_query_memory = spec.policy.query_memory;
+  }
+  spec.policy.options = read_options;
+  spec.policy.admit = spec.policy.admit && read_options.fill_cache;
 
   bool request_encoded_values = false;
   std::vector<CedarParquetColumnVector> columns;

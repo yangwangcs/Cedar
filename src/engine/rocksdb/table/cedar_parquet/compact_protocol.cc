@@ -100,20 +100,32 @@ void CompactWriter::WriteStructFieldBegin(int16_t field_id) {
 
 void CompactWriter::WriteListEnd() {}
 
-CompactReader::CompactReader(const std::string& data, size_t max_bytes)
-    : data_(data), max_bytes_(max_bytes) {}
+CompactReader::CompactReader(const std::string& data, size_t max_bytes,
+                             CedarParquetMemoryLease* memory)
+    : data_(data), max_bytes_(max_bytes), memory_(memory) {}
+
+Status CompactReader::Reserve(uint64_t count, uint64_t element_bytes) {
+  if (element_bytes && count > UINT64_MAX / element_bytes)
+    return Status::MemoryLimit("Parquet metadata allocation overflow");
+  return memory_ ? memory_->Grow(count * element_bytes) : Status::OK();
+}
 
 void CompactReader::ReadStructBegin() {
-  field_id_stack_.push_back(last_field_id_);
+  if (depth_ == field_id_stack_.size()) {
+    invalid_depth_ = true;
+    return;
+  }
+  field_id_stack_[depth_++] = last_field_id_;
   last_field_id_ = 0;
 }
 
 void CompactReader::ReadStructEnd() {
-  last_field_id_ = field_id_stack_.back();
-  field_id_stack_.pop_back();
+  if (depth_ == 0) { invalid_depth_ = true; return; }
+  last_field_id_ = field_id_stack_[--depth_];
 }
 
 Status CompactReader::ReadByte(uint8_t* value) {
+  if (invalid_depth_) return Status::Corruption("compact nesting exceeds bound");
   if (position_ >= data_.size()) return Status::Corruption("truncated compact protocol");
   *value = static_cast<uint8_t>(data_[position_++]);
   return Status::OK();
@@ -192,6 +204,9 @@ Status CompactReader::ReadBinary(std::string* value) {
   if (size > max_bytes_ || size > data_.size() - position_) {
     return Status::Corruption("invalid compact binary size");
   }
+  // assign can grow an existing string geometrically on repeated fields.
+  status = Reserve(2, size + 16);
+  if (!status.ok()) return status;
   value->assign(data_.data() + position_, static_cast<size_t>(size));
   position_ += static_cast<size_t>(size);
   return Status::OK();

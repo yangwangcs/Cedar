@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "rocksdb/status.h"
+#include "table/cedar_parquet/cedar_parquet_read_budget.h"
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 
@@ -94,7 +95,10 @@ CedarParquetFooter MakeRequiredFactsFooter(
 Status AddCedarParquetRowGroup(CedarParquetFooter* footer,
                                CedarParquetFooter::RowGroup row_group);
 Status EncodeCompactFooter(const CedarParquetFooter& footer, std::string* encoded);
-Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* footer);
+Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* footer,
+                          CedarParquetMemoryLease* memory = nullptr);
+uint64_t FooterMemoryBytes(const CedarParquetFooter& footer);
+uint64_t MetadataStringBytes(const std::string& value);
 Status AppendParquetFooter(std::string* file, const CedarParquetFooter& footer);
 Status ParseParquetFooter(const std::string& file, CedarParquetFooter* footer,
                           size_t* footer_offset);
@@ -103,12 +107,14 @@ Status EncodeOffsetIndex(
     std::string* encoded);
 Status DecodeOffsetIndex(
     const std::string& encoded,
-    std::vector<CedarParquetFooter::ColumnChunk::PageLocation>* locations);
+    std::vector<CedarParquetFooter::ColumnChunk::PageLocation>* locations,
+    CedarParquetMemoryLease* memory = nullptr);
 Status EncodeColumnIndex(
     const std::vector<CedarParquetFooter::ColumnChunk::PageIndex>& pages,
     std::string* encoded);
 Status DecodeColumnIndex(
     const std::string& encoded,
-    std::vector<CedarParquetFooter::ColumnChunk::PageIndex>* pages);
+    std::vector<CedarParquetFooter::ColumnChunk::PageIndex>* pages,
+    CedarParquetMemoryLease* memory = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE::cedar_parquet

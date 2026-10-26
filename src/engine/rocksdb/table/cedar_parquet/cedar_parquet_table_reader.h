@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <optional>
@@ -26,6 +27,7 @@ class CedarParquetProjectedCursor;
 
 class CedarParquetTableReader final : public TableReader {
  public:
+  ~CedarParquetTableReader() override;
   static Status Open(const InternalKeyComparator& internal_comparator,
                      std::unique_ptr<RandomAccessFileReader>&& file,
                      uint64_t file_size, CedarParquetTableOptions options,
@@ -53,9 +55,7 @@ class CedarParquetTableReader final : public TableReader {
   std::shared_ptr<const TableProperties> GetTableProperties() const override {
     return table_properties_;
   }
-  size_t ApproximateMemoryUsage() const override {
-    return sizeof(*this) + footer_bytes_ + bloom_bytes_;
-  }
+  size_t ApproximateMemoryUsage() const override;
   Status VerifyChecksum(const ReadOptions& read_options, TableReaderCaller caller,
                         bool meta_blocks_only = false) override;
 
@@ -79,23 +79,41 @@ class CedarParquetTableReader final : public TableReader {
   friend class CedarParquetTableIterator;
   friend class CedarParquetProjectedCursor;
   struct DecodedRowGroup {
+    std::unique_ptr<CedarParquetMemoryLease> working_lease;
     std::vector<std::string> sort_keys;
     std::vector<std::string> internal_keys;
     std::vector<std::string> values;
   };
 
-  // Page-cache resident form of one canonical page. `internal_keys` is not
-  // cached: the internal key is byte-identical to
-  // DecodeCedarParquetSortKey(sort_key), DecodeCanonicalPage validates the
-  // stored column against that derivation before the page becomes resident, and
-  // consumers reconstruct it on demand. This removes one vector of per-row
-  // strings (about a third of the page charge) from every cached page.
+  struct DecodedColumnPage {
+    CedarParquetColumnVector column;
+    const std::vector<std::string>& strings() const {
+      return std::get<std::vector<std::string>>(column.values);
+    }
+    size_t rows() const {
+      return std::visit([](const auto& values) { return values.size(); }, column.values);
+    }
+  };
+  // Canonical readers borrow the same immutable payloads as projected readers.
   struct DecodedCanonicalPage {
-    std::vector<std::string> sort_keys;
-    std::vector<std::string> values;
+    std::shared_ptr<const DecodedColumnPage> sort_owner;
+    std::shared_ptr<const DecodedColumnPage> value_owner;
+    const std::vector<std::string>& sort_keys;
+    const std::vector<std::string>& values;
+    DecodedCanonicalPage(std::shared_ptr<const DecodedColumnPage> sort,
+                         std::shared_ptr<const DecodedColumnPage> value)
+        : sort_owner(std::move(sort)), value_owner(std::move(value)),
+          sort_keys(sort_owner->strings()), values(value_owner->strings()) {}
+  };
+  struct ProjectedPage {
+    std::unique_ptr<CedarParquetMemoryLease> working_lease;
+    std::array<std::shared_ptr<const DecodedColumnPage>, 25> columns;
+    std::vector<std::string> internal_keys;
+    uint64_t output_reservation = 0;
   };
   struct CachePage {
-    DecodedCanonicalPage page;
+    std::unique_ptr<CedarParquetMemoryLease> working_lease;
+    DecodedColumnPage page;
     size_t charge = 0;
     bool cached = false;
     std::atomic<uint32_t> pins{0};
@@ -103,6 +121,7 @@ class CedarParquetTableReader final : public TableReader {
     ~CachePage();
   };
   struct PageOwner {
+    std::shared_ptr<const void> query_pin;
     std::shared_ptr<Cache> cache;
     Cache::Handle* handle = nullptr;
     CachePage* entry = nullptr;
@@ -119,23 +138,38 @@ class CedarParquetTableReader final : public TableReader {
                           std::shared_ptr<TableProperties> table_properties,
                           size_t footer_bytes,
                           std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms,
-                          CedarParquetReadResources resources);
+                          CedarParquetReadResources resources,
+                          std::unique_ptr<CedarParquetMemoryLease> metadata_memory);
 
   Status DecodeRowGroup(size_t row_group_index, DecodedRowGroup* decoded) const;
-  Status DecodeCanonicalPage(size_t row_group_index, size_t page_index,
-                             DecodedCanonicalPage* decoded) const;
+  Status LoadColumnPage(size_t row_group_index, size_t column_index,
+      size_t page_index, const CedarParquetReadPolicy& policy,
+      std::shared_ptr<const DecodedColumnPage>* decoded,
+      const std::shared_ptr<const DecodedColumnPage>& sort = {},
+      bool* did_decode = nullptr, CedarParquetScanStats* stats = nullptr) const;
+  Status LoadProjectedPage(size_t row_group_index, size_t page_index,
+      const CedarParquetScanSpec& spec,
+      const std::vector<CedarParquetColumnVector>& columns,
+      bool encoded_values, ProjectedPage* page, CedarParquetScanStats* stats) const;
   Status LoadCanonicalPage(
       size_t row_group_index, size_t page_index,
+      const CedarParquetReadPolicy& policy,
       std::shared_ptr<const DecodedCanonicalPage>* decoded) const;
   Status DecodeColumnPage(size_t row_group_index, size_t column_index,
                           size_t page_index,
-                          std::vector<std::string>* decoded) const;
+                          std::vector<std::string>* decoded,
+                          CedarParquetMemoryLease* lease,
+                          CedarParquetScanStats* stats = nullptr) const;
   Status DecodePrimitiveColumnPage(
       size_t row_group_index, size_t column_index, size_t page_index,
-      std::vector<std::optional<std::string>>* decoded) const;
+      std::vector<std::optional<std::string>>* decoded,
+      CedarParquetMemoryLease* lease,
+      CedarParquetScanStats* stats = nullptr) const;
   Status FindRowGroup(const std::string& sort_key,
                       size_t* row_group_index) const;
 
+  // First member: metadata outlives every reader-owned payload on destruction.
+  std::unique_ptr<CedarParquetMemoryLease> metadata_memory_;
   const InternalKeyComparator* internal_comparator_;
   std::unique_ptr<RandomAccessFileReader> file_;
   uint64_t file_size_;
@@ -175,6 +209,7 @@ class CedarParquetProjectedCursor final {
   CedarParquetScanSpec spec_;
   bool request_encoded_values_ = false;
   std::vector<CedarParquetColumnVector> columns_;
+  std::unique_ptr<CedarParquetMemoryLease> batch_lease_;
   CedarParquetColumnarBatch batch_;
   size_t row_group_index_ = 0;
   size_t page_index_ = 0;

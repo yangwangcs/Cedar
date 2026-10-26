@@ -238,7 +238,9 @@ Status ParseDataPageEnvelope(const std::string& page,
                              CedarParquetCompressionCodec codec,
                              int32_t* num_values, std::string* body,
                              size_t* consumed,
-                             size_t max_uncompressed_body_bytes) {
+                             size_t max_uncompressed_body_bytes,
+                             size_t max_values = std::numeric_limits<size_t>::max(),
+                             const CedarParquetPageReservation& reserve = {}) {
   CompactReader reader(page);
   int32_t page_type = -1;
   int32_t uncompressed_size = -1;
@@ -290,6 +292,14 @@ Status ParseDataPageEnvelope(const std::string& page,
   if (crc32c::Value(stored_body, stored_size) !=
           static_cast<uint32_t>(stored_crc)) {
     return Status::Corruption("Parquet data-page CRC32C mismatch");
+  }
+  if (static_cast<size_t>(*num_values) > max_values) {
+    return Status::Corruption("Parquet page exceeds configured value count");
+  }
+  if (reserve) {
+    Status reservation = reserve(static_cast<size_t>(uncompressed_size),
+                                 static_cast<size_t>(*num_values));
+    if (!reservation.ok()) return reservation;
   }
   Status status = DecompressPageBody(stored_body, stored_size,
                                      static_cast<size_t>(uncompressed_size), codec,
@@ -511,7 +521,7 @@ Status DecodePlainPrimitiveDataPage(
     std::vector<std::optional<std::string>>* values, size_t* consumed,
     int32_t fixed_length, CedarParquetCompressionCodec codec,
     size_t max_uncompressed_body_bytes, size_t max_value_bytes,
-    size_t max_values) {
+    size_t max_values, const CedarParquetPageReservation& reserve) {
   if (!IsSupportedPhysicalType(physical_type)) {
     return Status::NotSupported("unsupported Parquet primitive physical type");
   }
@@ -519,7 +529,8 @@ Status DecodePlainPrimitiveDataPage(
   std::string decoded_body;
   size_t page_bytes = 0;
   Status status = ParseDataPageEnvelope(page, codec, &num_values, &decoded_body,
-                                        &page_bytes, max_uncompressed_body_bytes);
+                                        &page_bytes, max_uncompressed_body_bytes,
+                                        max_values, reserve);
   if (!status.ok()) return status;
   if (static_cast<size_t>(num_values) > max_values) {
     return Status::Corruption("Parquet page exceeds configured value count");

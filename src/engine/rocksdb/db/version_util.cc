@@ -6,6 +6,7 @@
 #include "db/version_util.h"
 
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <thread>
 #include <utility>
@@ -28,6 +29,12 @@ Status LoadTableHandlersHelper(
     size_t max_file_size_for_l0_meta_pin, const ReadOptions& read_options,
     std::atomic<bool>* stop) {
   assert(table_cache != nullptr);
+  // Eager version loading pins every reader for the version lifetime. Cedar's
+  // bounded metadata pool instead admits readers on demand through TableCache.
+  if (std::strcmp(mutable_cf_options.table_factory->Name(),
+                  "CedarParquetFactTable") == 0) {
+    return Status::OK();
+  }
 
   std::atomic<size_t> next_file_meta_idx(0);
   std::atomic<bool> has_error(false);

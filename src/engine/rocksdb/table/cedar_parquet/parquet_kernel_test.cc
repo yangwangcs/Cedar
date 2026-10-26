@@ -66,6 +66,96 @@ TEST(CedarParquetKernelTest, WritesAndReadsParquetMagicAndFooter) {
   EXPECT_EQ(decoded.schema.back().name, "edge_type");
 }
 
+TEST(CedarParquetKernelTest, MetadataParsersPrechargeAndReleaseScratch) {
+  auto footer = MakeRequiredFactsFooter(0, {});
+  AssertOk(AddCedarParquetRowGroup(&footer, MakeValidRowGroup(
+      CedarParquetCompressionCodec::kUncompressed)));
+  std::string encoded;
+  AssertOk(EncodeCompactFooter(footer, &encoded));
+  CedarParquetReadBudget tiny(128);
+  std::unique_ptr<CedarParquetMemoryLease> rejected;
+  AssertOk(tiny.Acquire(0, &rejected));
+  CedarParquetFooter decoded;
+  EXPECT_TRUE(DecodeCompactFooter(encoded, &decoded, rejected.get()).IsMemoryLimit());
+  EXPECT_TRUE(decoded.schema.empty());
+  EXPECT_EQ(tiny.current_bytes(), 0U);
+  CedarParquetReadBudget budget(1 << 20);
+  std::unique_ptr<CedarParquetMemoryLease> memory;
+  AssertOk(budget.Acquire(0, &memory));
+  AssertOk(DecodeCompactFooter(encoded, &decoded, memory.get()));
+  EXPECT_EQ(budget.current_bytes(), FooterMemoryBytes(decoded));
+  EXPECT_GT(budget.peak_bytes(), budget.current_bytes());
+  std::vector<CedarParquetFooter::ColumnChunk::PageIndex> pages = {
+      {std::string(100, 'a'), std::string(100, 'b'), false}, {"", "", true}};
+  AssertOk(EncodeColumnIndex(pages, &encoded));
+  std::vector<CedarParquetFooter::ColumnChunk::PageIndex> output;
+  const auto footer_bytes = budget.current_bytes();
+  AssertOk(DecodeColumnIndex(encoded, &output, memory.get()));
+  const uint64_t payload = output.capacity() * sizeof(output.front()) +
+      MetadataStringBytes(output.front().min_value) + MetadataStringBytes(output.front().max_value);
+  EXPECT_EQ(budget.current_bytes(), footer_bytes + payload);
+  EXPECT_GT(budget.peak_bytes(), budget.current_bytes());
+  output.clear();
+  output.shrink_to_fit();
+  decoded = {};
+  memory.reset();
+  EXPECT_EQ(budget.current_bytes(), 0U);
+}
+
+TEST(CedarParquetKernelTest, FooterCreatorAdmissionFailureRemainsMemoryLimit) {
+  auto footer = MakeRequiredFactsFooter(0, {});
+  AssertOk(AddCedarParquetRowGroup(&footer, MakeValidRowGroup(
+      CedarParquetCompressionCodec::kUncompressed)));
+  footer.created_by = std::string(128, 'c');
+  std::string encoded;
+  AssertOk(EncodeCompactFooter(footer, &encoded));
+  CedarParquetReadBudget measured(1 << 20);
+  std::unique_ptr<CedarParquetMemoryLease> first;
+  AssertOk(measured.Acquire(0, &first));
+  CedarParquetFooter decoded;
+  AssertOk(DecodeCompactFooter(encoded, &decoded, first.get()));
+  // created_by is the final binary field: refuse its allocation specifically.
+  CedarParquetReadBudget bounded(measured.peak_bytes() - 1);
+  std::unique_ptr<CedarParquetMemoryLease> memory;
+  AssertOk(bounded.Acquire(0, &memory));
+  CedarParquetFooter output;
+  const Status status = DecodeCompactFooter(encoded, &output, memory.get());
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_TRUE(output.schema.empty());
+  EXPECT_EQ(bounded.current_bytes(), 0U);
+}
+
+TEST(CedarParquetKernelTest, PrimitiveReservationPrecedesDecompressionAndOutput) {
+  constexpr int32_t byte_array_physical = 6;
+  std::string page;
+  AssertOk(EncodePlainPrimitiveDataPage({std::string(8192, 'x')},
+      byte_array_physical, false, &page, 0, CedarParquetCompressionCodec::kZstd));
+  std::vector<std::optional<std::string>> decoded{std::string("unchanged")};
+  size_t consumed = 777;
+  size_t calls = 0;
+  const auto reserve = [&](size_t raw_bytes, size_t rows) {
+    ++calls;
+    EXPECT_GE(raw_bytes, 8192U);
+    EXPECT_EQ(rows, 1U);
+    return Status::MemoryLimit("test reservation exhausted");
+  };
+  // An unsupported codec would fail during decompression, after reservation.
+  Status status = DecodePlainPrimitiveDataPage(page, byte_array_physical, false,
+      &decoded, &consumed, 0, static_cast<CedarParquetCompressionCodec>(99),
+      16384, 16384, 1, reserve);
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(calls, 1U);
+  ASSERT_EQ(decoded.size(), 1U);
+  EXPECT_EQ(decoded[0], std::optional<std::string>("unchanged"));
+  EXPECT_EQ(consumed, 777U);
+  calls = 0;
+  status = DecodePlainPrimitiveDataPage(page, byte_array_physical, false,
+      &decoded, &consumed, 0, CedarParquetCompressionCodec::kZstd,
+      16384, 16384, 0, reserve);
+  EXPECT_TRUE(status.IsCorruption());
+  EXPECT_EQ(calls, 0U);
+}
+
 TEST(CedarParquetKernelTest, EncodesAndDecodesPlainByteArrayPage) {
   const std::array<std::string, 3> values = {"alpha", std::string("b\0eta", 5), "gamma"};
   std::vector<Slice> slices;

@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -196,6 +197,10 @@ TEST_F(CedarParquetFactTableFactoryTest, WritesAndReopensParquetV2FactsTable) {
 }
 
 TEST_F(CedarParquetFactTableFactoryTest, RejectsLegacyBlockBasedFactsTable) {
+  const std::string legacy_key = "legacy-key";
+  const std::string legacy_value = "legacy-value";
+
+  // Create a facts SST with the default block-based table factory.
   Options options;
   options.create_if_missing = true;
   options.create_missing_column_families = true;
@@ -203,7 +208,7 @@ TEST_F(CedarParquetFactTableFactoryTest, RejectsLegacyBlockBasedFactsTable) {
   std::unique_ptr<DB> database;
   ASSERT_TRUE(DB::Open(options, path_, Descriptors(options.table_factory), &handles, &database)
                   .ok());
-  ASSERT_TRUE(database->Put(WriteOptions(), handles[1], "legacy-key", "legacy-value").ok());
+  ASSERT_TRUE(database->Put(WriteOptions(), handles[1], legacy_key, legacy_value).ok());
   FlushOptions flush_options;
   flush_options.wait = true;
   ASSERT_TRUE(database->Flush(flush_options, handles[1]).ok());
@@ -213,11 +218,47 @@ TEST_F(CedarParquetFactTableFactoryTest, RejectsLegacyBlockBasedFactsTable) {
   handles.clear();
   database.reset();
 
+  // The Cedar Parquet fact factory opens readers on demand, so DB::Open does not
+  // inspect the legacy SST and succeeds. The legacy block-based file is still
+  // rejected: the first read opens it through NewTableReader, whose magic check
+  // fails with "facts table is not Cedar Parquet v2".
   auto facts_factory = std::shared_ptr<TableFactory>(
       NewCedarParquetFactTableFactory(CedarParquetTableOptions()));
-  EXPECT_TRUE(DB::Open(options, path_, Descriptors(facts_factory), &handles,
-                       &database)
-                  .IsCorruption());
+  const Status open_status =
+      DB::Open(options, path_, Descriptors(facts_factory), &handles, &database);
+  ASSERT_TRUE(open_status.ok()) << open_status.ToString();
+
+  // Keep using EXPECT below so that the column family handles are always
+  // destroyed; leaking them trips ColumnFamilySet's last_ref assertion.
+  std::cout << "DB::Open status: " << open_status.ToString() << std::endl;
+  std::string value;
+  const Status get_status = database->Get(ReadOptions(), handles[1], legacy_key, &value);
+  std::cout << "first Get status: " << get_status.ToString() << std::endl;
+  EXPECT_TRUE(get_status.IsCorruption()) << get_status.ToString();
+  EXPECT_NE(get_status.ToString().find("facts table"), std::string::npos)
+      << get_status.ToString();
+  EXPECT_NE(get_status.ToString().find("Cedar Parquet"), std::string::npos)
+      << get_status.ToString();
+
+  std::unique_ptr<Iterator> iterator(database->NewIterator(ReadOptions(), handles[1]));
+  if (iterator != nullptr) {
+    iterator->SeekToFirst();
+    std::cout << "iterator status: " << iterator->status().ToString() << std::endl;
+    EXPECT_TRUE(iterator->status().IsCorruption()) << iterator->status().ToString();
+    EXPECT_NE(iterator->status().ToString().find("facts table"), std::string::npos)
+        << iterator->status().ToString();
+    iterator->Seek(legacy_key);
+    EXPECT_TRUE(iterator->status().IsCorruption()) << iterator->status().ToString();
+    iterator.reset();
+  } else {
+    ADD_FAILURE() << "NewIterator returned null";
+  }
+
+  for (ColumnFamilyHandle* handle : handles) {
+    EXPECT_TRUE(database->DestroyColumnFamilyHandle(handle).ok());
+  }
+  handles.clear();
+  database.reset();
 }
 
 }  // namespace

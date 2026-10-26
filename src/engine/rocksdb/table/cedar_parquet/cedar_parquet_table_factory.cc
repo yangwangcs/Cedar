@@ -28,7 +28,11 @@ const char* CompressionCodecName(CedarParquetCompressionCodec codec) {
 
 CedarParquetFactTableFactory::CedarParquetFactTableFactory(
     CedarParquetTableOptions options, CedarParquetReadResources resources)
-    : options_(std::move(options)), read_resources_(std::move(resources)) {}
+    : options_(std::move(options)), read_resources_(std::move(resources)) {
+  if (!read_resources_.metadata_budget)
+    read_resources_.metadata_budget = std::make_shared<CedarParquetReadBudget>(
+        64ULL << 20, CedarParquetReadBudgetKind::kMetadata);
+}
 
 Status CedarParquetFactTableFactory::NewTableReader(
     const ReadOptions& read_options, const TableReaderOptions& table_reader_options,

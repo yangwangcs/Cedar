@@ -6,14 +6,17 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <future>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #include "db/dbformat.h"
@@ -347,8 +350,29 @@ Status AppendProjectedValue(CedarParquetColumnVector* column,
   return Status::OK();
 }
 
+Status AppendProjectedRow(CedarParquetColumnVector* destination,
+                           const CedarParquetColumnVector& source, size_t row) {
+  if (destination->values.index() != source.values.index() || row >= source.present.size())
+    return Status::Corruption("Cedar Parquet typed page representation mismatch");
+  destination->present.push_back(source.present[row]);
+  std::visit([&](auto& values) {
+    using Vector = std::decay_t<decltype(values)>;
+    values.push_back(std::get<Vector>(source.values)[row]);
+  }, destination->values);
+  return Status::OK();
+}
+
+bool ProjectedNumericMatches(const CedarParquetColumnVector& column, size_t row,
+                             const std::optional<uint64_t>& minimum,
+                             const std::optional<uint64_t>& maximum) {
+  if (!column.present[row]) return false;
+  const auto value = std::get<std::vector<uint64_t>>(column.values)[row];
+  return (!minimum || value >= *minimum) && (!maximum || value <= *maximum);
+}
+
 struct CedarParquetRowGroupScanResult {
   Status status;
+  std::unique_ptr<CedarParquetMemoryLease> working_lease;
   std::vector<CedarParquetColumnarBatch> batches;
   CedarParquetScanStats stats;
 };
@@ -490,8 +514,8 @@ void CedarParquetProjectedCursor::Next() {
 }
 
 Status CedarParquetProjectedCursor::LoadNextPage() {
-  batch_.internal_keys.clear();
-  batch_.encoded_values.clear();
+  batch_ = {};
+  batch_lease_.reset();
   batch_.columns = columns_;
   for (auto& column : batch_.columns) {
     std::visit([](auto& values) { values.clear(); }, column.values);
@@ -537,61 +561,20 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
       return Status::OK();
     }
 
-    if (spec_.stats != nullptr) {
-      ++spec_.stats->pages_read;
-      for (const auto& column : row_group.columns) {
-        spec_.stats->bytes_read += static_cast<uint64_t>(
-            column.page_locations[page_index_].compressed_page_size);
-      }
-    }
-
-    std::vector<std::string> sort_keys;
-    std::vector<std::string> internal_keys;
-    Status status = reader_->DecodeColumnPage(row_group_index_, 0, page_index_,
-                                              &sort_keys);
+    CedarParquetTableReader::ProjectedPage page;
+    Status status = reader_->LoadProjectedPage(row_group_index_, page_index_, spec_,
+                                               batch_.columns, request_encoded_values_, &page,
+                                               spec_.stats);
     if (!status.ok()) return status;
-    status = reader_->DecodeColumnPage(row_group_index_, 1, page_index_,
-                                       &internal_keys);
+    const auto& sort_keys = page.columns[0]->strings();
+    const auto& internal_keys = page.internal_keys;
+    if (!batch_lease_) {
+      status = reader_->read_resources_.working_budget->Acquire(
+          page.output_reservation, &batch_lease_, spec_.policy.query_memory);
+    } else {
+      status = batch_lease_->Grow(page.output_reservation);
+    }
     if (!status.ok()) return status;
-    if (sort_keys.size() != internal_keys.size()) {
-      return Status::Corruption("Cedar projected cursor canonical page length mismatch");
-    }
-
-    std::vector<std::vector<std::optional<std::string>>> projected_pages;
-    projected_pages.reserve(batch_.columns.size());
-    for (const auto& column : batch_.columns) {
-      std::vector<std::optional<std::string>> values;
-      status = reader_->DecodePrimitiveColumnPage(
-          row_group_index_, static_cast<size_t>(column.id), page_index_, &values);
-      if (!status.ok()) return status;
-      if (values.size() != internal_keys.size()) {
-        return Status::Corruption("Cedar projected cursor column length mismatch");
-      }
-      projected_pages.push_back(std::move(values));
-    }
-    std::vector<std::optional<std::string>> valid_times;
-    std::vector<std::optional<std::string>> commit_sequences;
-    if (spec_.valid_from_min.has_value() || spec_.valid_from_max.has_value()) {
-      status = reader_->DecodePrimitiveColumnPage(row_group_index_, 7, page_index_,
-                                                  &valid_times);
-      if (!status.ok()) return status;
-    }
-    if (spec_.cedar_commit_seq_min.has_value() ||
-        spec_.cedar_commit_seq_max.has_value()) {
-      status = reader_->DecodePrimitiveColumnPage(row_group_index_, 8, page_index_,
-                                                  &commit_sequences);
-      if (!status.ok()) return status;
-    }
-    std::vector<std::string> encoded_values;
-    if (request_encoded_values_) {
-      status = reader_->DecodeColumnPage(row_group_index_, 2, page_index_,
-                                         &encoded_values);
-      if (!status.ok()) return status;
-      if (encoded_values.size() != internal_keys.size()) {
-        return Status::Corruption(
-            "Cedar projected cursor encoded-value page length mismatch");
-      }
-    }
     for (size_t row = 0; row < internal_keys.size(); ++row) {
       if (spec_.sort_key_lower.has_value() &&
           sort_keys[row] < *spec_.sort_key_lower) {
@@ -602,27 +585,21 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
         // Keep this row group live until the buffered in-range rows are consumed.
         break;
       }
-      if (!valid_times.empty() &&
-          (!valid_times[row].has_value() ||
-           (spec_.valid_from_min.has_value() &&
-            DecodeLittleEndian(*valid_times[row]) < *spec_.valid_from_min) ||
-           (spec_.valid_from_max.has_value() &&
-            DecodeLittleEndian(*valid_times[row]) > *spec_.valid_from_max))) {
+      if ((spec_.valid_from_min || spec_.valid_from_max) &&
+          !ProjectedNumericMatches(page.columns[7]->column, row,
+                                    spec_.valid_from_min, spec_.valid_from_max)) {
         continue;
       }
-      if (!commit_sequences.empty() &&
-          (!commit_sequences[row].has_value() ||
-           (spec_.cedar_commit_seq_min.has_value() &&
-            DecodeLittleEndian(*commit_sequences[row]) < *spec_.cedar_commit_seq_min) ||
-           (spec_.cedar_commit_seq_max.has_value() &&
-            DecodeLittleEndian(*commit_sequences[row]) > *spec_.cedar_commit_seq_max))) {
+      if ((spec_.cedar_commit_seq_min || spec_.cedar_commit_seq_max) &&
+          !ProjectedNumericMatches(page.columns[8]->column, row,
+                                    spec_.cedar_commit_seq_min, spec_.cedar_commit_seq_max)) {
         continue;
       }
       batch_.internal_keys.push_back(internal_keys[row]);
-      if (request_encoded_values_) batch_.encoded_values.push_back(encoded_values[row]);
+      if (request_encoded_values_) batch_.encoded_values.push_back(page.columns[2]->strings()[row]);
       for (size_t column = 0; column < batch_.columns.size(); ++column) {
-        status = AppendProjectedValue(&batch_.columns[column],
-                                      projected_pages[column][row]);
+        status = AppendProjectedRow(&batch_.columns[column],
+            page.columns[static_cast<size_t>(batch_.columns[column].id)]->column, row);
         if (!status.ok()) return status;
       }
     }
@@ -632,6 +609,7 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
       }
       return Status::OK();
     }
+    batch_lease_.reset();
     if (row_group_index_ >= reader_->footer_.row_groups.size()) return Status::OK();
     ++page_index_;
   }
@@ -640,8 +618,9 @@ Status CedarParquetProjectedCursor::LoadNextPage() {
 
 class CedarParquetTableIterator final : public InternalIterator {
  public:
-  explicit CedarParquetTableIterator(const CedarParquetTableReader* reader)
-      : reader_(reader) {}
+  CedarParquetTableIterator(const CedarParquetTableReader* reader,
+                            CedarParquetReadPolicy policy)
+      : reader_(reader), policy_(std::move(policy)) {}
 
   bool Valid() const override {
     return status_.ok() && row_group_index_ < reader_->footer_.row_groups.size() &&
@@ -788,7 +767,8 @@ class CedarParquetTableIterator final : public InternalIterator {
       return false;
     }
     if (row_group_index_ != row_group_index || page_index_ != page_index) {
-      status_ = reader_->LoadCanonicalPage(row_group_index, page_index, &decoded_);
+      status_ = reader_->LoadCanonicalPage(row_group_index, page_index, policy_,
+                                           &decoded_);
       if (!status_.ok()) {
         Invalidate();
         return false;
@@ -821,6 +801,7 @@ class CedarParquetTableIterator final : public InternalIterator {
   }
 
   const CedarParquetTableReader* reader_;
+  CedarParquetReadPolicy policy_;
   std::shared_ptr<const CedarParquetTableReader::DecodedCanonicalPage> decoded_;
   mutable std::shared_ptr<const CedarParquetTableReader::DecodedCanonicalPage>
       pinned_value_page_;
@@ -843,8 +824,10 @@ CedarParquetTableReader::CedarParquetTableReader(
     CedarParquetTableOptions options, CedarParquetFooter footer,
     std::shared_ptr<TableProperties> table_properties, size_t footer_bytes,
     std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms,
-    CedarParquetReadResources resources)
-    : internal_comparator_(&internal_comparator),
+    CedarParquetReadResources resources,
+    std::unique_ptr<CedarParquetMemoryLease> metadata_memory)
+    : metadata_memory_(std::move(metadata_memory)),
+      internal_comparator_(&internal_comparator),
       file_(std::move(file)),
       file_size_(file_size),
       options_(std::move(options)),
@@ -854,11 +837,55 @@ CedarParquetTableReader::CedarParquetTableReader(
       user_key_blooms_(std::move(blooms)), read_resources_(std::move(resources)) {
   if (!read_resources_.metrics)
     read_resources_.metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  if (!read_resources_.working_budget)
+    read_resources_.working_budget = std::make_shared<CedarParquetReadBudget>(
+        64ULL << 20, CedarParquetReadBudgetKind::kWorking);
   if (read_resources_.canonical_page_cache)
     page_cache_namespace_ = read_resources_.canonical_page_cache->NewId();
   for (const auto& bloom : user_key_blooms_) {
     if (bloom.has_value()) bloom_bytes_ += bloom->bitset_bytes();
   }
+  const uint64_t metadata_bytes = ApproximateMemoryUsage();
+  const uint64_t current = read_resources_.metrics->reader_metadata_bytes.fetch_add(
+      metadata_bytes, std::memory_order_relaxed) + metadata_bytes;
+  auto& peak = read_resources_.metrics->reader_metadata_peak_bytes;
+  uint64_t previous = peak.load(std::memory_order_relaxed);
+  while (previous < current && !peak.compare_exchange_weak(
+      previous, current, std::memory_order_relaxed)) {}
+}
+
+CedarParquetTableReader::~CedarParquetTableReader() {
+  read_resources_.metrics->reader_metadata_bytes.fetch_sub(ApproximateMemoryUsage(),
+                                                          std::memory_order_relaxed);
+}
+
+size_t CedarParquetTableReader::ApproximateMemoryUsage() const {
+  size_t bytes = sizeof(*this) + FooterMemoryBytes(footer_);
+  const auto vector_bytes = [&bytes](const auto& values) {
+    bytes += values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type);
+  };
+  vector_bytes(user_key_blooms_);
+  for (const auto& bloom : user_key_blooms_)
+    if (bloom) bytes += bloom->storage_capacity();
+  if (table_properties_) {
+    // TableProperties may be coallocated with a shared_ptr control block;
+    // its allocator-based estimator requires a standalone allocation.
+    const auto& properties = *table_properties_;
+    bytes += sizeof(properties);
+    for (const auto* value : {&properties.db_id, &properties.db_session_id,
+          &properties.db_host_id, &properties.column_family_name,
+          &properties.filter_policy_name, &properties.comparator_name,
+          &properties.merge_operator_name, &properties.prefix_extractor_name,
+          &properties.property_collectors_names, &properties.compression_name,
+          &properties.compression_options}) bytes += value->capacity();
+    for (const auto* values : {&properties.user_collected_properties,
+                               &properties.readable_properties})
+      for (const auto& [key, value] : *values)
+        bytes += sizeof(std::pair<const std::string, std::string>) + 4 * sizeof(void*) +
+            key.capacity() + value.capacity();
+  }
+  bytes += options_.comparator_name.capacity();
+  return bytes;
 }
 
 Status CedarParquetTableReader::Open(
@@ -869,10 +896,28 @@ Status CedarParquetTableReader::Open(
     CedarParquetReadResources resources) {
   Status status = options.Validate();
   if (!status.ok()) return status;
+  if (!resources.metadata_budget)
+    resources.metadata_budget = std::make_shared<CedarParquetReadBudget>(
+        64ULL << 20, CedarParquetReadBudgetKind::kMetadata);
+  std::unique_ptr<CedarParquetMemoryLease> metadata_memory, open_memory;
+  status = resources.metadata_budget->Acquire(
+      sizeof(CedarParquetTableReader) + 8192 + 2 * options.comparator_name.capacity(),
+      &metadata_memory);
+  if (!status.ok()) return status;
+  status = resources.metadata_budget->Acquire(0, &open_memory);
+  if (!status.ok()) return status;
+  const auto read_metadata = [&](uint64_t offset, size_t size,
+      std::string* bytes, std::unique_ptr<CedarParquetMemoryLease>* input_memory) -> Status {
+    // The input allocation can overlap an owned copy in Bloom decoding or I/O.
+    Status allocated = resources.metadata_budget->Acquire(2 * uint64_t{size} + 32, input_memory);
+    return allocated.ok() ? ReadExact(file.get(), offset, size, bytes) : allocated;
+  };
   if (file == nullptr || file_size < 12) return Status::Corruption("truncated Cedar Parquet file");
   if (internal_comparator.user_comparator()->Name() != options.comparator_name) {
     return Status::InvalidArgument("Cedar Parquet comparator does not match table");
   }
+  status = open_memory->Grow(64);
+  if (!status.ok()) return status;
   std::string header;
   status = ReadExact(file.get(), 0, 4, &header);
   if (!status.ok()) return status;
@@ -886,14 +931,17 @@ Status CedarParquetTableReader::Open(
     return Status::Corruption("Cedar Parquet footer exceeds configured bound");
   }
   if (footer_size > file_size - 12) return Status::Corruption("invalid Cedar Parquet footer size");
+  std::unique_ptr<CedarParquetMemoryLease> footer_input;
   std::string footer_bytes;
-  status = ReadExact(file.get(), file_size - 8 - footer_size, footer_size, &footer_bytes);
+  status = read_metadata(file_size - 8 - footer_size, footer_size, &footer_bytes, &footer_input);
   if (!status.ok()) return status;
   CedarParquetFooter footer;
-  status = DecodeCompactFooter(footer_bytes, &footer);
+  status = DecodeCompactFooter(footer_bytes, &footer, metadata_memory.get());
   if (!status.ok()) return status;
   status = ValidateCedarParquetFileIdentity(footer);
   if (!status.ok()) return status;
+  std::string().swap(footer_bytes);
+  footer_input.reset();
   // A facts table emitted by the table builder always has at least one row
   // group. Keep the empty-footer kernel fixture readable, but never let the
   // table reader dereference an absent row group while opening an SST.
@@ -901,9 +949,26 @@ Status CedarParquetTableReader::Open(
     return Status::Corruption("Cedar Parquet table has no row groups");
   }
   const uint64_t footer_offset = file_size - 8 - footer_size;
+  status = metadata_memory->Grow(footer.row_groups.size() *
+      sizeof(std::optional<CedarSplitBlockBloomFilter>));
+  if (!status.ok()) return status;
   std::vector<std::optional<CedarSplitBlockBloomFilter>> blooms(footer.row_groups.size());
   std::vector<CedarParquetFileRange> declared_ranges;
-  std::string previous_row_group_max;
+  const auto add_range = [&](CedarParquetFileRange range) -> Status {
+    if (declared_ranges.size() == declared_ranges.capacity()) {
+      const uint64_t previous = declared_ranges.capacity();
+      if (previous > declared_ranges.max_size() / 2)
+        return Status::MemoryLimit("Parquet metadata ranges overflow");
+      const uint64_t next = previous ? 2 * previous : 1;
+      Status reserved = open_memory->Grow(next * sizeof(CedarParquetFileRange));
+      if (!reserved.ok()) return reserved;
+      declared_ranges.reserve(next);
+      open_memory->Shrink(previous * sizeof(CedarParquetFileRange));
+    }
+    declared_ranges.push_back(range);
+    return Status::OK();
+  };
+  std::string_view previous_row_group_max;
   for (auto& row_group : footer.row_groups) {
     const auto& sort_column = row_group.columns.front();
     if (row_group.file_offset != sort_column.data_page_offset) {
@@ -920,7 +985,7 @@ Status CedarParquetTableReader::Open(
       return Status::Corruption("Cedar Parquet row groups are unordered");
     }
     previous_row_group_max = sort_column.max_value;
-    std::vector<CedarParquetFooter::ColumnChunk::PageLocation> expected_pages;
+    const auto& expected_pages = row_group.columns.front().page_locations;
     for (auto& column : row_group.columns) {
       if (column.offset_index_offset < 4 || column.offset_index_length <= 0 ||
           static_cast<uint64_t>(column.offset_index_length) > options.max_index_bytes ||
@@ -929,15 +994,17 @@ Status CedarParquetTableReader::Open(
               footer_offset - static_cast<uint64_t>(column.offset_index_offset)) {
         return Status::Corruption("invalid Cedar Parquet offset-index bounds");
       }
+      std::unique_ptr<CedarParquetMemoryLease> index_input;
       std::string index_bytes;
-      status = ReadExact(file.get(),
+      status = read_metadata(
                          static_cast<uint64_t>(column.offset_index_offset),
                          static_cast<size_t>(column.offset_index_length),
-                         &index_bytes);
+                         &index_bytes, &index_input);
       if (!status.ok()) return status;
-      declared_ranges.push_back({static_cast<uint64_t>(column.offset_index_offset),
-                                 static_cast<uint64_t>(column.offset_index_length)});
-      status = DecodeOffsetIndex(index_bytes, &column.page_locations);
+      status = add_range({static_cast<uint64_t>(column.offset_index_offset),
+                          static_cast<uint64_t>(column.offset_index_length)});
+      if (!status.ok()) return status;
+      status = DecodeOffsetIndex(index_bytes, &column.page_locations, metadata_memory.get());
       if (!status.ok()) return status;
       if (column.page_locations.front().offset != column.data_page_offset ||
           column.page_locations.front().first_row_index != 0) {
@@ -968,8 +1035,9 @@ Status CedarParquetTableReader::Open(
         total_page_bytes += static_cast<uint64_t>(page.compressed_page_size);
         previous_page_end = static_cast<uint64_t>(page.offset) +
                             static_cast<uint64_t>(page.compressed_page_size);
-        declared_ranges.push_back({static_cast<uint64_t>(page.offset),
-                                   static_cast<uint64_t>(page.compressed_page_size)});
+        status = add_range({static_cast<uint64_t>(page.offset),
+                            static_cast<uint64_t>(page.compressed_page_size)});
+        if (!status.ok()) return status;
       }
       if (total_page_bytes != static_cast<uint64_t>(column.total_compressed_size)) {
         return Status::Corruption("Cedar Parquet offset index size mismatch");
@@ -981,21 +1049,23 @@ Status CedarParquetTableReader::Open(
               footer_offset - static_cast<uint64_t>(column.column_index_offset)) {
         return Status::Corruption("invalid Cedar Parquet column-index bounds");
       }
+      std::unique_ptr<CedarParquetMemoryLease> column_index_input;
       std::string column_index_bytes;
-      status = ReadExact(file.get(),
+      status = read_metadata(
                          static_cast<uint64_t>(column.column_index_offset),
                          static_cast<size_t>(column.column_index_length),
-                         &column_index_bytes);
+                         &column_index_bytes, &column_index_input);
       if (!status.ok()) return status;
-      declared_ranges.push_back({static_cast<uint64_t>(column.column_index_offset),
-                                 static_cast<uint64_t>(column.column_index_length)});
-      status = DecodeColumnIndex(column_index_bytes, &column.page_indexes);
+      status = add_range({static_cast<uint64_t>(column.column_index_offset),
+                          static_cast<uint64_t>(column.column_index_length)});
+      if (!status.ok()) return status;
+      status = DecodeColumnIndex(column_index_bytes, &column.page_indexes, metadata_memory.get());
       if (!status.ok()) return status;
       if (column.page_indexes.size() != column.page_locations.size()) {
         return Status::Corruption("Cedar Parquet column index page count mismatch");
       }
       if (column.path == "sort_key") {
-        std::string previous_page_max;
+        std::string_view previous_page_max;
         for (const auto& page : column.page_indexes) {
           if (page.all_null ||
               page.min_value.size() != kCedarParquetV2SortKeyBytes ||
@@ -1011,9 +1081,7 @@ Status CedarParquetTableReader::Open(
           return Status::Corruption("Cedar sort-key page index disagrees with column bounds");
         }
       }
-      if (expected_pages.empty()) {
-        expected_pages = column.page_locations;
-      } else if (expected_pages.size() != column.page_locations.size()) {
+      if (expected_pages.size() != column.page_locations.size()) {
         return Status::Corruption("Cedar Parquet columns use different page boundaries");
       } else {
         for (size_t index = 0; index < expected_pages.size(); ++index) {
@@ -1036,15 +1104,19 @@ Status CedarParquetTableReader::Open(
               footer_offset - static_cast<uint64_t>(sort_column_for_bloom.bloom_filter_offset)) {
         return Status::Corruption("invalid Cedar Parquet Bloom bounds");
       }
+      std::unique_ptr<CedarParquetMemoryLease> bloom_input;
       std::string bloom_bytes;
-      status = ReadExact(file.get(),
+      status = read_metadata(
                          static_cast<uint64_t>(sort_column_for_bloom.bloom_filter_offset),
                          static_cast<size_t>(sort_column_for_bloom.bloom_filter_length),
-                         &bloom_bytes);
+                         &bloom_bytes, &bloom_input);
       if (!status.ok()) return status;
-      declared_ranges.push_back(
+      status = add_range(
           {static_cast<uint64_t>(sort_column_for_bloom.bloom_filter_offset),
            static_cast<uint64_t>(sort_column_for_bloom.bloom_filter_length)});
+      if (!status.ok()) return status;
+      status = metadata_memory->Grow(bloom_bytes.size() + 32);
+      if (!status.ok()) return status;
       CedarSplitBlockBloomFilter bloom;
       status = CedarSplitBlockBloomFilter::Decode(bloom_bytes, &bloom);
       if (!status.ok()) return status;
@@ -1085,8 +1157,8 @@ Status CedarParquetTableReader::Open(
   reader->reset(new CedarParquetTableReader(internal_comparator, std::move(file),
                                              file_size, std::move(options),
                                              std::move(footer), std::move(properties),
-                                             footer_bytes.size(), std::move(blooms),
-                                             std::move(resources)));
+                                             footer_size, std::move(blooms),
+                                             std::move(resources), std::move(metadata_memory)));
   return Status::OK();
 }
 
@@ -1101,6 +1173,20 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
   }
   std::array<std::vector<std::string>*, 3> columns = {
       &decoded->sort_keys, &decoded->internal_keys, &decoded->values};
+  const uint64_t base_bytes = sizeof(DecodedRowGroup) +
+      static_cast<uint64_t>(row_group.num_rows) * 3 * sizeof(std::string) + 256;
+  Status reservation = read_resources_.working_budget->Acquire(
+      base_bytes, &decoded->working_lease);
+  if (!reservation.ok()) return reservation;
+  const auto retained_bytes = [&]() {
+    uint64_t bytes = sizeof(DecodedRowGroup) + 256;
+    for (const auto* values : columns) {
+      bytes += std::max(values->capacity(), static_cast<size_t>(row_group.num_rows)) *
+          sizeof(std::string);
+      for (const auto& value : *values) bytes += value.capacity();
+    }
+    return bytes;
+  };
   for (size_t index = 0; index < columns.size(); ++index) {
     const auto& column = row_group.columns[index];
     columns[index]->clear();
@@ -1109,15 +1195,22 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
          ++page_index) {
       std::vector<std::string> page_values;
       Status status = DecodeColumnPage(row_group_index, index, page_index,
-                                       &page_values);
+                                       &page_values, decoded->working_lease.get());
       if (!status.ok()) return status;
       const auto& location = column.page_locations[page_index];
       if (location.first_row_index !=
           static_cast<int64_t>(columns[index]->size())) {
         return Status::Corruption("Cedar Parquet page row index is not contiguous");
       }
-      columns[index]->insert(columns[index]->end(), page_values.begin(),
-                             page_values.end());
+      columns[index]->insert(columns[index]->end(),
+                             std::make_move_iterator(page_values.begin()),
+                             std::make_move_iterator(page_values.end()));
+      std::vector<std::string>().swap(page_values);
+      // Keep reservations for the other canonical vectors, not page scratch.
+      const uint64_t retained = std::max(base_bytes, retained_bytes());
+      if (retained > decoded->working_lease->bytes())
+        return Status::MemoryLimit("Cedar checksum result exceeds reservation");
+      decoded->working_lease->Shrink(decoded->working_lease->bytes() - retained);
     }
     if (columns[index]->size() != static_cast<size_t>(row_group.num_rows)) {
       return Status::Corruption("invalid Cedar Parquet row-group column length");
@@ -1157,6 +1250,17 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
     return Status::Corruption("Cedar Parquet row-group bounds disagree with data");
   }
   for (size_t column_index = 3; column_index < row_group.columns.size(); ++column_index) {
+    std::unique_ptr<CedarParquetMemoryLease> materialized_lease;
+    uint64_t validation_bytes = 256;
+    for (size_t row = 0; row < decoded->values.size(); ++row) {
+      validation_bytes = std::max<uint64_t>(validation_bytes,
+          4ULL * (decoded->values[row].size() + decoded->internal_keys[row].size() + 256));
+    }
+    const uint64_t materialized_base = validation_bytes +
+        static_cast<uint64_t>(row_group.num_rows) * sizeof(std::optional<std::string>);
+    reservation = read_resources_.working_budget->Acquire(
+        materialized_base, &materialized_lease);
+    if (!reservation.ok()) return reservation;
     std::vector<std::optional<std::string>> materialized;
     const auto& column = row_group.columns[column_index];
     if (column.page_indexes.size() != column.page_locations.size()) {
@@ -1166,7 +1270,7 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
     for (size_t page_index = 0; page_index < column.page_locations.size(); ++page_index) {
       std::vector<std::optional<std::string>> page;
       Status status = DecodePrimitiveColumnPage(row_group_index, column_index,
-                                                page_index, &page);
+                                                page_index, &page, materialized_lease.get());
       if (!status.ok()) return status;
       bool all_null = true;
       std::string minimum;
@@ -1198,6 +1302,13 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
       }
       materialized.insert(materialized.end(), std::make_move_iterator(page.begin()),
                           std::make_move_iterator(page.end()));
+      std::vector<std::optional<std::string>>().swap(page);
+      uint64_t retained = validation_bytes +
+          materialized.capacity() * sizeof(std::optional<std::string>);
+      for (const auto& value : materialized) if (value) retained += value->capacity();
+      if (retained > materialized_lease->bytes())
+        return Status::MemoryLimit("Cedar checksum column exceeds reservation");
+      materialized_lease->Shrink(materialized_lease->bytes() - retained);
     }
     if (materialized.size() != static_cast<size_t>(row_group.num_rows)) {
       return Status::Corruption("materialized Cedar Parquet column length mismatch");
@@ -1217,7 +1328,8 @@ Status CedarParquetTableReader::DecodeRowGroup(size_t row_group_index,
 
 Status CedarParquetTableReader::DecodePrimitiveColumnPage(
     size_t row_group_index, size_t column_index, size_t page_index,
-    std::vector<std::optional<std::string>>* decoded) const {
+    std::vector<std::optional<std::string>>* decoded,
+    CedarParquetMemoryLease* lease, CedarParquetScanStats* stats) const {
   if (row_group_index >= footer_.row_groups.size()) {
     return Status::InvalidArgument("Cedar Parquet row group is out of range");
   }
@@ -1227,19 +1339,45 @@ Status CedarParquetTableReader::DecodePrimitiveColumnPage(
     return Status::InvalidArgument("Cedar Parquet page is out of range");
   }
   const auto& location = row_group.columns[column_index].page_locations[page_index];
+  if (lease) {
+    Status reservation = lease->Grow(
+        static_cast<uint64_t>(location.compressed_page_size) + 128);
+    if (!reservation.ok()) return reservation;
+  }
   std::string page;
+  if (stats) stats->bytes_read += static_cast<uint64_t>(location.compressed_page_size);
+  read_resources_.metrics->file_read_calls.fetch_add(1, std::memory_order_relaxed);
+  read_resources_.metrics->file_read_bytes.fetch_add(
+      static_cast<uint64_t>(location.compressed_page_size), std::memory_order_relaxed);
   Status status = ReadExact(file_.get(), static_cast<uint64_t>(location.offset),
                             static_cast<size_t>(location.compressed_page_size), &page);
   if (!status.ok()) return status;
   const CedarParquetSchemaElement& schema = footer_.schema[column_index + 1];
   size_t consumed = 0;
+  const auto decode_started = std::chrono::steady_clock::now();
   status = DecodePlainPrimitiveDataPage(
       page, schema.physical_type, schema.repetition_type == kParquetOptional,
       decoded, &consumed, schema.type_length,
       row_group.columns[column_index].compression_codec,
       static_cast<size_t>(options_.page_max_bytes),
       static_cast<size_t>(options_.max_row_bytes),
-      static_cast<size_t>(options_.page_max_rows));
+      static_cast<size_t>(options_.page_max_rows),
+      [lease](size_t raw_bytes, size_t rows) {
+        if (!lease) return Status::OK();
+        // Bound the simultaneously live raw body, decoded strings, nullable
+        // vector, required-column conversion, and key validation scratch.
+        // Envelope fields are validated nonnegative i32 values before here.
+        return lease->Grow(4ULL * raw_bytes +
+            static_cast<uint64_t>(rows) *
+                (sizeof(std::optional<std::string>) + sizeof(std::string) + 64) + 128);
+      });
+  const uint64_t decode_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - decode_started).count());
+  read_resources_.metrics->decode_nanoseconds.fetch_add(decode_ns, std::memory_order_relaxed);
+  auto& column_metrics = read_resources_.metrics->columns[column_index];
+  column_metrics.decode_attempts.fetch_add(1, std::memory_order_relaxed);
+  column_metrics.decode_nanoseconds.fetch_add(decode_ns, std::memory_order_relaxed);
   if (!status.ok()) return status;
   const auto& locations = row_group.columns[column_index].page_locations;
   const int64_t first_row = locations[page_index].first_row_index;
@@ -1255,10 +1393,11 @@ Status CedarParquetTableReader::DecodePrimitiveColumnPage(
 
 Status CedarParquetTableReader::DecodeColumnPage(
     size_t row_group_index, size_t column_index, size_t page_index,
-    std::vector<std::string>* decoded) const {
+    std::vector<std::string>* decoded, CedarParquetMemoryLease* lease,
+    CedarParquetScanStats* stats) const {
   std::vector<std::optional<std::string>> primitive_values;
   Status status = DecodePrimitiveColumnPage(row_group_index, column_index, page_index,
-                                            &primitive_values);
+                                            &primitive_values, lease, stats);
   if (!status.ok()) return status;
   decoded->clear();
   decoded->reserve(primitive_values.size());
@@ -1268,42 +1407,6 @@ Status CedarParquetTableReader::DecodeColumnPage(
     }
     decoded->push_back(std::move(*value));
   }
-  return Status::OK();
-}
-
-Status CedarParquetTableReader::DecodeCanonicalPage(
-    size_t row_group_index, size_t page_index,
-    DecodedCanonicalPage* decoded) const {
-  Status status = DecodeColumnPage(row_group_index, 0, page_index,
-                                   &decoded->sort_keys);
-  if (!status.ok()) return status;
-  // The stored internal-key column is derivable from the sort keys, so it is
-  // not kept resident. It is still decoded here (transiently) to validate every
-  // row: a page whose stored key disagrees with its sort key must fail closed
-  // exactly as before, and the ordering of the column is checked by the
-  // row-group verification path.
-  std::vector<std::string> stored_internal_keys;
-  status = DecodeColumnPage(row_group_index, 1, page_index,
-                            &stored_internal_keys);
-  if (!status.ok()) return status;
-  status = DecodeColumnPage(row_group_index, 2, page_index, &decoded->values);
-  if (!status.ok()) return status;
-  if (decoded->sort_keys.size() != stored_internal_keys.size() ||
-      stored_internal_keys.size() != decoded->values.size()) {
-    return Status::Corruption("Cedar Parquet canonical page column length mismatch");
-  }
-  status = ValidateCanonicalRowBytes(decoded->sort_keys, stored_internal_keys,
-                                     decoded->values, options_.max_row_bytes);
-  if (!status.ok()) return status;
-  for (size_t index = 0; index < stored_internal_keys.size(); ++index) {
-    std::string decoded_key;
-    status = DecodeCedarParquetSortKey(decoded->sort_keys[index], &decoded_key);
-    if (!status.ok()) return status;
-    if (decoded_key != stored_internal_keys[index]) {
-      return Status::Corruption("Cedar Parquet canonical page key mismatch");
-    }
-  }
-  ++page_decode_count_;
   return Status::OK();
 }
 
@@ -1331,14 +1434,44 @@ CedarParquetTableReader::PageOwner::~PageOwner() {
 
 Status CedarParquetTableReader::LoadCanonicalPage(
     size_t row_group_index, size_t page_index,
+    const CedarParquetReadPolicy& policy,
     std::shared_ptr<const DecodedCanonicalPage>* decoded) const {
+  if (!decoded) return Status::InvalidArgument("missing canonical destination");
+  std::shared_ptr<const DecodedColumnPage> sort, values;
+  bool sort_decoded = false, values_decoded = false;
+  Status status = LoadColumnPage(row_group_index, 0, page_index, policy, &sort,
+                                 {}, &sort_decoded);
+  if (!status.ok()) return status;
+  status = LoadColumnPage(row_group_index, 2, page_index, policy, &values,
+                          sort, &values_decoded);
+  if (!status.ok()) return status;
+  if (sort_decoded || values_decoded) {
+    ++page_decode_count_;
+    read_resources_.metrics->decodes.fetch_add(1, std::memory_order_relaxed);
+  }
+  *decoded = std::make_shared<DecodedCanonicalPage>(std::move(sort), std::move(values));
+  return Status::OK();
+}
+
+Status CedarParquetTableReader::LoadColumnPage(
+    size_t row_group_index, size_t column_index, size_t page_index,
+    const CedarParquetReadPolicy& policy,
+    std::shared_ptr<const DecodedColumnPage>* decoded,
+    const std::shared_ptr<const DecodedColumnPage>& sort,
+    bool* did_decode, CedarParquetScanStats* stats) const {
+  if (did_decode) *did_decode = false;
   if (decoded == nullptr) {
     return Status::InvalidArgument("missing Cedar Parquet page destination");
   }
   const auto& cache = read_resources_.canonical_page_cache;
   const auto& metrics = read_resources_.metrics;
-  std::string key;
+  if (column_index >= metrics->columns.size()) {
+    return Status::InvalidArgument("Cedar Parquet metric column is out of range");
+  }
+  auto& column_metrics = metrics->columns[column_index];
+  std::string key = "cedar.column.v1";
   for (uint64_t component : {page_cache_namespace_, static_cast<uint64_t>(row_group_index),
+                             static_cast<uint64_t>(column_index),
                              static_cast<uint64_t>(page_index)})
     for (unsigned shift = 0; shift < 64; shift += 8)
       key.push_back(static_cast<char>(component >> shift));
@@ -1347,48 +1480,214 @@ Status CedarParquetTableReader::LoadCanonicalPage(
   if (cache) {
     if (Cache::Handle* handle = cache->Lookup(key)) {
       auto* entry = static_cast<CachePage*>(cache->Value(handle));
+      std::shared_ptr<const void> query_pin;
+      if (policy.query_memory) {
+        Status pinned = policy.query_memory->Pin(entry, entry->charge, &query_pin);
+        if (!pinned.ok()) {
+          cache->Release(handle);
+          return pinned;
+        }
+      }
       auto owner = std::make_shared<PageOwner>(cache, handle, entry);
-      *decoded = std::shared_ptr<const DecodedCanonicalPage>(owner, &entry->page);
+      owner->query_pin = std::move(query_pin);
+      *decoded = std::shared_ptr<const DecodedColumnPage>(owner, &entry->page);
       metrics->hits.fetch_add(1, std::memory_order_relaxed);
+      column_metrics.hits.fetch_add(1, std::memory_order_relaxed);
       return Status::OK();
     }
   }
   metrics->misses.fetch_add(1, std::memory_order_relaxed);
+  column_metrics.misses.fetch_add(1, std::memory_order_relaxed);
+  if (policy.options.read_tier == kBlockCacheTier) {
+    return Status::Incomplete("Cedar Parquet canonical page is not cached");
+  }
+  std::unique_ptr<CedarParquetMemoryLease> lease;
+  Status status = read_resources_.working_budget->Acquire(
+      sizeof(CachePage) + sizeof(PageOwner) + key.capacity() + 128, &lease,
+      policy.query_memory);
+  if (!status.ok()) return status;
   auto loaded = std::make_unique<CachePage>();
+  loaded->working_lease = std::move(lease);
   // Metrics ownership and charge are assigned only after successful decode,
   // so a corrupt/partial page cannot decrement bytes it never acquired.
-  Status status = DecodeCanonicalPage(row_group_index, page_index, &loaded->page);
+  std::vector<std::optional<std::string>> primitive;
+  status = DecodePrimitiveColumnPage(row_group_index, column_index, page_index,
+                                     &primitive, loaded->working_lease.get(), stats);
   if (!status.ok()) return status;
-  metrics->decodes.fetch_add(1, std::memory_order_relaxed);
+  auto& column = loaded->page.column;
+  column.id = static_cast<CedarParquetColumnId>(column_index);
+  if (column_index == 0 || column_index == 2) {
+    column.values = std::vector<std::string>{};
+    auto& strings = std::get<std::vector<std::string>>(column.values);
+    strings.reserve(primitive.size());
+    for (auto& value : primitive) {
+      if (!value) return Status::Corruption("canonical Cedar Parquet column contains null");
+      strings.push_back(std::move(*value));
+    }
+    if (column_index == 0) {
+      std::vector<std::optional<std::string>>().swap(primitive);
+      size_t retained = sizeof(CachePage) + sizeof(PageOwner) + key.capacity() + 128;
+      retained += strings.capacity() * sizeof(std::string);
+      for (const auto& value : strings) retained += value.capacity();
+      if (retained > loaded->working_lease->bytes()) {
+        return Status::MemoryLimit("Cedar Parquet decoded page exceeds reservation");
+      }
+      // Sort decoding scratch is gone; only the retained keys overlap the
+      // independently reserved stored-key validation decode below.
+      loaded->working_lease->Shrink(loaded->working_lease->bytes() - retained);
+      std::vector<std::string> stored;
+      status = DecodeColumnPage(row_group_index, 1, page_index, &stored,
+                                 loaded->working_lease.get(), stats);
+      if (!status.ok()) return status;
+      if (stored.size() != strings.size())
+        return Status::Corruption("Cedar Parquet canonical page column length mismatch");
+      for (size_t row = 0; row < stored.size(); ++row) {
+        char internal[kCedarParquetV2UserKeyBytes + 8];
+        status = DecodeCedarParquetSortKey(strings[row], internal, sizeof(internal));
+        if (!status.ok()) return status;
+        if (Slice(stored[row]) != Slice(internal, sizeof(internal)))
+          return Status::Corruption("Cedar Parquet canonical page key mismatch");
+      }
+    } else {
+      auto sort_owner = sort;
+      if (!sort_owner) {
+        status = LoadColumnPage(row_group_index, 0, page_index, policy, &sort_owner,
+                                {}, nullptr, stats);
+        if (!status.ok()) return status;
+      }
+      const auto& keys = sort_owner->strings();
+      if (keys.size() != strings.size())
+        return Status::Corruption("Cedar Parquet canonical page column length mismatch");
+      for (size_t row = 0; row < keys.size(); ++row) {
+        // This is the same cross-column row bound as the canonical decoder;
+        // the stored internal-key column was already validated against sort.
+        const uint64_t fixed = keys[row].size() + kCedarParquetV2UserKeyBytes + 8 + 12;
+        if (fixed > options_.max_row_bytes ||
+            strings[row].size() > options_.max_row_bytes - fixed)
+          return Status::Corruption("Cedar Parquet row exceeds configured bound");
+      }
+    }
+  } else {
+    status = MakeColumnVector(column.id, &column);
+    if (!status.ok()) return status;
+    column.present.reserve(primitive.size());
+    std::visit([&primitive](auto& values) { values.reserve(primitive.size()); }, column.values);
+    for (const auto& value : primitive) {
+      status = AppendProjectedValue(&column, value);
+      if (!status.ok()) return status;
+    }
+  }
+  // Destroy all primitive input strings before releasing scratch accounting.
+  std::vector<std::optional<std::string>>().swap(primitive);
+  metrics->column_decodes.fetch_add(1, std::memory_order_relaxed);
+  column_metrics.decoded_pages.fetch_add(1, std::memory_order_relaxed);
+  if (did_decode) *did_decode = true;
   size_t bytes = sizeof(CachePage) + sizeof(PageOwner) + key.capacity();
-  const auto add_column_bytes = [&bytes](const std::vector<std::string>& column) {
-    bytes += column.capacity() * sizeof(std::string);
-    for (const std::string& value : column) bytes += value.capacity();
-  };
-  add_column_bytes(loaded->page.sort_keys);
-  add_column_bytes(loaded->page.values);
+  bytes += column.present.capacity();
+  std::visit([&bytes](const auto& values) {
+    bytes += values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type);
+    if constexpr (std::is_same_v<typename std::decay_t<decltype(values)>::value_type,
+                                 std::string>)
+      for (const auto& value : values) bytes += value.capacity();
+  }, column.values);
+  if (bytes > loaded->working_lease->bytes()) {
+    return Status::MemoryLimit("Cedar Parquet decoded page exceeds reservation");
+  }
+  // All decompression/validation scratch has been destroyed by this point.
+  loaded->working_lease->Shrink(loaded->working_lease->bytes() - bytes);
   metrics->decoded_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  column_metrics.decoded_bytes.fetch_add(bytes, std::memory_order_relaxed);
   loaded->charge = bytes;
   loaded->metrics = metrics;
-  if (cache && bytes <= cache->GetCapacity()) {
+  if (policy.admit && cache && bytes <= cache->GetCapacity()) {
     loaded->cached = true;
     metrics->resident_charge_bytes.fetch_add(bytes, std::memory_order_relaxed);
     Cache::Handle* handle = nullptr;
     status = cache->Insert(key, loaded.get(), &helper, bytes, &handle);
     if (status.ok()) {
+      column_metrics.admissions.fetch_add(1, std::memory_order_relaxed);
+      // The strict resident cache now owns the result's physical charge.
+      loaded->working_lease.reset();
       CachePage* entry = loaded.release();
+      std::shared_ptr<const void> query_pin;
+      if (policy.query_memory) {
+        Status pinned = policy.query_memory->Pin(entry, entry->charge, &query_pin);
+        if (!pinned.ok()) {
+          cache->Release(handle);
+          return pinned;
+        }
+      }
       auto owner = std::make_shared<PageOwner>(cache, handle, entry);
-      *decoded = std::shared_ptr<const DecodedCanonicalPage>(owner, &entry->page);
+      owner->query_pin = std::move(query_pin);
+      *decoded = std::shared_ptr<const DecodedColumnPage>(owner, &entry->page);
       return Status::OK();
     }
     loaded->cached = false;
     metrics->resident_charge_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     metrics->insert_failures.fetch_add(1, std::memory_order_relaxed);
   }
+  if (policy.admit) {
+    column_metrics.admission_rejections.fetch_add(1, std::memory_order_relaxed);
+  }
   metrics->uncached_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
   CachePage* entry = loaded.get();
   auto owner = std::make_shared<PageOwner>(std::move(loaded));
-  *decoded = std::shared_ptr<const DecodedCanonicalPage>(owner, &entry->page);
+  *decoded = std::shared_ptr<const DecodedColumnPage>(owner, &entry->page);
+  return Status::OK();
+}
+
+Status CedarParquetTableReader::LoadProjectedPage(
+    size_t row_group_index, size_t page_index, const CedarParquetScanSpec& spec,
+    const std::vector<CedarParquetColumnVector>& projection,
+    bool encoded_values, ProjectedPage* page, CedarParquetScanStats* stats) const {
+  const uint64_t bytes_before = stats ? stats->bytes_read : 0;
+  std::array<bool, 25> required{};
+  required[0] = true;
+  required[2] = encoded_values;
+  required[7] = spec.valid_from_min.has_value() || spec.valid_from_max.has_value();
+  required[8] = spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value();
+  for (const auto& column : projection) required[static_cast<size_t>(column.id)] = true;
+  for (size_t column = 0; column < required.size(); ++column) {
+    if (!required[column]) continue;
+    Status status = LoadColumnPage(row_group_index, column, page_index, spec.policy,
+                                   &page->columns[column], page->columns[0], nullptr, stats);
+    if (!status.ok()) return status;
+    if (column != 0 && page->columns[column]->rows() != page->columns[0]->rows())
+      return Status::Corruption("Cedar projected page column length mismatch");
+  }
+  if (stats && stats->bytes_read != bytes_before) ++stats->pages_read;
+  const auto& keys = page->columns[0]->strings();
+  const uint64_t key_bytes = sizeof(ProjectedPage) +
+      uint64_t(keys.size()) * (sizeof(std::string) + kCedarParquetV2UserKeyBytes + 8);
+  Status status = read_resources_.working_budget->Acquire(key_bytes + 128,
+                                                         &page->working_lease,
+                                                         spec.policy.query_memory);
+  if (!status.ok()) return status;
+  page->internal_keys.reserve(keys.size());
+  for (const auto& sort_key : keys) {
+    std::string internal_key;
+    status = DecodeCedarParquetSortKey(sort_key, &internal_key);
+    if (!status.ok()) return status;
+    page->internal_keys.push_back(std::move(internal_key));
+  }
+  // Output vectors grow geometrically and may keep earlier batches alive.
+  // Reserve a conservative duplicate before the scan/cursor copies any rows.
+  uint64_t output_bytes = key_bytes + sizeof(CedarParquetColumnarBatch) + 128;
+  for (size_t column = 2; column < required.size(); ++column) {
+    const bool output_column = column == 2 ? encoded_values :
+        std::any_of(projection.begin(), projection.end(), [column](const auto& item) {
+          return static_cast<size_t>(item.id) == column;
+        });
+    if (!output_column) continue;
+    output_bytes += sizeof(CedarParquetColumnVector) + page->columns[column]->column.present.capacity();
+    std::visit([&output_bytes](const auto& values) {
+      output_bytes += values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type);
+      if constexpr (std::is_same_v<typename std::decay_t<decltype(values)>::value_type,
+                                   std::string>)
+        for (const auto& value : values) output_bytes += value.capacity();
+    }, page->columns[column]->column.values);
+  }
+  page->output_reservation = 2 * output_bytes;
   return Status::OK();
 }
 
@@ -1528,7 +1827,7 @@ Status CedarParquetTableReader::ScanProjected(
     return false;
   };
   const auto scan_row_group = [&](size_t row_group_index) {
-    CedarParquetRowGroupScanResult result{Status::OK(), {}, {}};
+    CedarParquetRowGroupScanResult result;
     CedarParquetColumnarBatch batch;
     batch.columns = columns;
     const auto flush = [&]() {
@@ -1576,80 +1875,27 @@ Status CedarParquetTableReader::ScanProjected(
         break;
       }
 
-      ++result.stats.pages_read;
-      for (const auto& column : row_group.columns) {
-        if (page_index < column.page_locations.size()) {
-          result.stats.bytes_read += static_cast<uint64_t>(
-              column.page_locations[page_index].compressed_page_size);
-        }
-      }
-
-      std::vector<std::string> sort_keys;
-      std::vector<std::string> internal_keys;
-      Status status = DecodeColumnPage(row_group_index, 0, page_index, &sort_keys);
+      ProjectedPage page;
+      Status status = LoadProjectedPage(row_group_index, page_index, spec, columns,
+                                        request_encoded_values, &page, &result.stats);
       if (!status.ok()) {
         result.status = status;
         return result;
       }
-      status = DecodeColumnPage(row_group_index, 1, page_index, &internal_keys);
+      const auto& sort_keys = page.columns[0]->strings();
+      const auto& internal_keys = page.internal_keys;
+      if (!result.working_lease) {
+        status = read_resources_.working_budget->Acquire(
+            page.output_reservation, &result.working_lease, spec.policy.query_memory);
+      } else {
+        status = result.working_lease->Grow(page.output_reservation);
+      }
       if (!status.ok()) {
         result.status = status;
         return result;
       }
-      if (sort_keys.size() != internal_keys.size()) {
-        result.status = Status::Corruption(
-            "Cedar Parquet scan canonical page length mismatch");
-        return result;
-      }
 
-      std::vector<std::vector<std::optional<std::string>>> projected_pages;
-      projected_pages.reserve(columns.size());
-      for (const auto& column : columns) {
-        std::vector<std::optional<std::string>> values;
-        status = DecodePrimitiveColumnPage(
-            row_group_index, static_cast<size_t>(column.id), page_index, &values);
-        if (!status.ok()) {
-          result.status = status;
-          return result;
-        }
-        if (values.size() != internal_keys.size()) {
-          result.status = Status::Corruption(
-              "Cedar Parquet scan projected page length mismatch");
-          return result;
-        }
-        projected_pages.push_back(std::move(values));
-      }
-      std::vector<std::optional<std::string>> valid_times;
-      std::vector<std::optional<std::string>> commit_sequences;
-      if (spec.valid_from_min.has_value() || spec.valid_from_max.has_value()) {
-        status = DecodePrimitiveColumnPage(row_group_index, 7, page_index, &valid_times);
-        if (!status.ok()) {
-          result.status = status;
-          return result;
-        }
-      }
-      if (spec.cedar_commit_seq_min.has_value() || spec.cedar_commit_seq_max.has_value()) {
-        status = DecodePrimitiveColumnPage(row_group_index, 8, page_index,
-                                           &commit_sequences);
-        if (!status.ok()) {
-          result.status = status;
-          return result;
-        }
-      }
-      std::vector<std::string> encoded_values;
-      if (request_encoded_values) {
-        status = DecodeColumnPage(row_group_index, 2, page_index, &encoded_values);
-        if (!status.ok()) {
-          result.status = status;
-          return result;
-        }
-        if (encoded_values.size() != internal_keys.size()) {
-          result.status = Status::Corruption(
-              "Cedar Parquet scan encoded-value page length mismatch");
-          return result;
-        }
-      }
-
+      bool emitted_page_row = false;
       for (size_t row = 0; row < internal_keys.size(); ++row) {
         if (spec.sort_key_lower.has_value() && sort_keys[row] < *spec.sort_key_lower) {
           continue;
@@ -1659,20 +1905,14 @@ Status CedarParquetTableReader::ScanProjected(
           result.status = Status::OK();
           return result;
         }
-        if (!valid_times.empty() &&
-            (!valid_times[row].has_value() ||
-             (spec.valid_from_min.has_value() &&
-              DecodeLittleEndian(*valid_times[row]) < *spec.valid_from_min) ||
-             (spec.valid_from_max.has_value() &&
-              DecodeLittleEndian(*valid_times[row]) > *spec.valid_from_max))) {
+        if ((spec.valid_from_min || spec.valid_from_max) &&
+            !ProjectedNumericMatches(page.columns[7]->column, row,
+                                      spec.valid_from_min, spec.valid_from_max)) {
           continue;
         }
-        if (!commit_sequences.empty() &&
-            (!commit_sequences[row].has_value() ||
-             (spec.cedar_commit_seq_min.has_value() &&
-              DecodeLittleEndian(*commit_sequences[row]) < *spec.cedar_commit_seq_min) ||
-             (spec.cedar_commit_seq_max.has_value() &&
-              DecodeLittleEndian(*commit_sequences[row]) > *spec.cedar_commit_seq_max))) {
+        if ((spec.cedar_commit_seq_min || spec.cedar_commit_seq_max) &&
+            !ProjectedNumericMatches(page.columns[8]->column, row,
+                                      spec.cedar_commit_seq_min, spec.cedar_commit_seq_max)) {
           continue;
         }
         if (!claim_row()) {
@@ -1680,11 +1920,12 @@ Status CedarParquetTableReader::ScanProjected(
           result.status = Status::OK();
           return result;
         }
+        emitted_page_row = true;
         batch.internal_keys.push_back(internal_keys[row]);
-        if (request_encoded_values) batch.encoded_values.push_back(encoded_values[row]);
+        if (request_encoded_values) batch.encoded_values.push_back(page.columns[2]->strings()[row]);
         for (size_t column_index = 0; column_index < columns.size(); ++column_index) {
-          status = AppendProjectedValue(&batch.columns[column_index],
-                                        projected_pages[column_index][row]);
+          status = AppendProjectedRow(&batch.columns[column_index],
+              page.columns[static_cast<size_t>(columns[column_index].id)]->column, row);
           if (!status.ok()) {
             result.status = status;
             return result;
@@ -1694,6 +1935,7 @@ Status CedarParquetTableReader::ScanProjected(
           flush();
         }
       }
+      if (!emitted_page_row) result.working_lease->Shrink(page.output_reservation);
     }
     flush();
     return result;
@@ -1870,17 +2112,20 @@ Status CedarParquetTableReader::FindRowGroup(const std::string& sort_key,
 }
 
 InternalIterator* CedarParquetTableReader::NewIterator(
-    const ReadOptions&, const SliceTransform*, Arena* arena, bool,
-    TableReaderCaller, size_t, bool) {
-  if (arena == nullptr) return new CedarParquetTableIterator(this);
+    const ReadOptions& read_options, const SliceTransform*, Arena* arena, bool,
+    TableReaderCaller caller, size_t, bool) {
+  CedarParquetReadPolicy policy{read_options,
+      read_options.fill_cache && caller != TableReaderCaller::kCompaction &&
+      caller != TableReaderCaller::kCompactionRefill,
+      read_options.cedar_query_memory};
+  if (arena == nullptr) return new CedarParquetTableIterator(this, policy);
   void* memory = arena->AllocateAligned(sizeof(CedarParquetTableIterator));
-  return new (memory) CedarParquetTableIterator(this);
+  return new (memory) CedarParquetTableIterator(this, policy);
 }
 
 Status CedarParquetTableReader::Get(const ReadOptions& read_options, const Slice& key,
                                     GetContext* get_context,
                                     const SliceTransform*, bool) {
-  static_cast<void>(read_options);
   ParsedInternalKey target;
   Status status = ParseInternalKey(key, &target, false);
   if (!status.ok()) return status;
@@ -1906,7 +2151,10 @@ Status CedarParquetTableReader::Get(const ReadOptions& read_options, const Slice
     for (size_t page_index = static_cast<size_t>(page - sort_column.page_indexes.begin());
          page_index < sort_column.page_locations.size(); ++page_index) {
       std::shared_ptr<const DecodedCanonicalPage> decoded_page;
-      status = LoadCanonicalPage(row_group_index, page_index, &decoded_page);
+      status = LoadCanonicalPage(row_group_index, page_index,
+                                 {read_options, read_options.fill_cache,
+                                  read_options.cedar_query_memory},
+                                 &decoded_page);
       if (!status.ok()) return status;
       const auto& sort_keys = decoded_page->sort_keys;
       if (!sort_keys.empty() && sort_keys.back() < sort_key) continue;
@@ -1959,7 +2207,6 @@ Status CedarParquetTableReader::Get(const ReadOptions& read_options, const Slice
 void CedarParquetTableReader::MultiGet(
     const ReadOptions& read_options, const MultiGetContext::Range* mget_range,
     const SliceTransform* prefix_extractor, bool skip_filters) {
-  static_cast<void>(read_options);
   static_cast<void>(prefix_extractor);
   static_cast<void>(skip_filters);
   if (mget_range == nullptr) return;
@@ -1985,6 +2232,8 @@ void CedarParquetTableReader::MultiGet(
     cached.row_group_index = row_group_index;
     cached.page_index = page_index;
     Status status = LoadCanonicalPage(row_group_index, page_index,
+                                      {read_options, read_options.fill_cache,
+                                       read_options.cedar_query_memory},
                                       &cached.decoded);
     if (!status.ok()) {
       cache.pop_back();
@@ -2116,9 +2365,12 @@ uint64_t CedarParquetTableReader::ApproximateSize(const ReadOptions& read_option
   return end_offset > start_offset ? end_offset - start_offset : 0;
 }
 
-Status CedarParquetTableReader::VerifyChecksum(const ReadOptions&, TableReaderCaller,
+Status CedarParquetTableReader::VerifyChecksum(const ReadOptions& read_options, TableReaderCaller,
                                                 bool meta_blocks_only) {
   if (meta_blocks_only) return Status::OK();
+  if (read_options.read_tier == kBlockCacheTier && !footer_.row_groups.empty()) {
+    return Status::Incomplete("Cedar Parquet checksum requires file I/O");
+  }
   for (size_t index = 0; index < footer_.row_groups.size(); ++index) {
     DecodedRowGroup decoded;
     Status status = DecodeRowGroup(index, &decoded);

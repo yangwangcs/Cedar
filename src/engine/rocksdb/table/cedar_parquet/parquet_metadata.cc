@@ -20,6 +20,27 @@ bool IsSupportedCompressionCodec(CedarParquetCompressionCodec codec) {
 }
 constexpr char kParquetMagic[] = "PAR1";
 
+// Shrink parser scratch only after all parser locals have been destroyed.
+// The caller's lease then owns just the payload moved to its output.
+class DecodeReservation {
+ public:
+  explicit DecodeReservation(CedarParquetMemoryLease* memory)
+      : memory_(memory), before_(memory ? memory->bytes() : 0) {}
+  ~DecodeReservation() {
+    if (memory_) memory_->Shrink(memory_->bytes() - before_ - retained_);
+  }
+  Status Retain(uint64_t bytes) {
+    if (memory_ && bytes > memory_->bytes() - before_)
+      return Status::MemoryLimit("Parquet metadata exceeds parser reservation");
+    retained_ = bytes;
+    return Status::OK();
+  }
+ private:
+  CedarParquetMemoryLease* memory_;
+  uint64_t before_;
+  uint64_t retained_ = 0;
+};
+
 struct ColumnSpec {
   const char* name;
   int32_t physical_type;
@@ -494,6 +515,8 @@ Status ReadRowGroup(CompactReader* reader, CedarParquetFooter::RowGroup* row_gro
       if (element_type != kCompactStruct || count != kFactsColumns.size()) {
         return Status::NotSupported("unsupported row-group columns");
       }
+      status = reader->Reserve(count, 2 * sizeof(CedarParquetFooter::ColumnChunk));
+      if (!status.ok()) return status;
       row_group->columns.resize(count);
       for (auto& column : row_group->columns) {
         status = ReadColumnChunk(reader, &column);
@@ -577,9 +600,39 @@ Status EncodeCompactFooter(const CedarParquetFooter& footer, std::string* encode
   return Status::OK();
 }
 
-Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* footer) {
+uint64_t MetadataStringBytes(const std::string& value) {
+  const uintptr_t data = reinterpret_cast<uintptr_t>(value.data());
+  const uintptr_t object = reinterpret_cast<uintptr_t>(&value);
+  return data >= object && data - object < sizeof(value) ? 0 : value.capacity() + 1;
+}
+
+uint64_t FooterMemoryBytes(const CedarParquetFooter& footer) {
+  uint64_t bytes = footer.schema.capacity() * sizeof(CedarParquetSchemaElement) +
+      footer.row_groups.capacity() * sizeof(CedarParquetFooter::RowGroup) +
+      footer.key_value_metadata.capacity() * sizeof(CedarParquetKeyValueMetadata) +
+      MetadataStringBytes(footer.created_by);
+  for (const auto& schema : footer.schema) bytes += MetadataStringBytes(schema.name);
+  for (const auto& group : footer.row_groups) {
+    bytes += group.columns.capacity() * sizeof(CedarParquetFooter::ColumnChunk);
+    for (const auto& column : group.columns) {
+      bytes += MetadataStringBytes(column.path) + MetadataStringBytes(column.min_value) +
+          MetadataStringBytes(column.max_value) +
+          column.page_locations.capacity() * sizeof(CedarParquetFooter::ColumnChunk::PageLocation) +
+          column.page_indexes.capacity() * sizeof(CedarParquetFooter::ColumnChunk::PageIndex);
+      for (const auto& page : column.page_indexes)
+        bytes += MetadataStringBytes(page.min_value) + MetadataStringBytes(page.max_value);
+    }
+  }
+  for (const auto& entry : footer.key_value_metadata)
+    bytes += MetadataStringBytes(entry.key) + (entry.value ? MetadataStringBytes(*entry.value) : 0);
+  return bytes;
+}
+
+Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* footer,
+                          CedarParquetMemoryLease* memory) {
   if (encoded.empty()) return Status::Corruption("empty Parquet footer");
-  CompactReader reader(encoded);
+  DecodeReservation reservation(memory);
+  CompactReader reader(encoded, 64U << 20, memory);
   CedarParquetFooter decoded;
   bool has_version = false;
   bool has_schema = false;
@@ -607,6 +660,8 @@ Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* foote
         if (element_type != kCompactStruct || count != kFactsColumns.size() + 1) {
           return Status::NotSupported("unsupported Parquet schema");
         }
+        status = reader.Reserve(count, 2 * sizeof(CedarParquetSchemaElement));
+        if (!status.ok()) return status;
         decoded.schema.resize(count);
         for (auto& element : decoded.schema) {
           status = ReadSchemaElement(&reader, &element);
@@ -627,6 +682,8 @@ Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* foote
         status = reader.ReadListBegin(&count, &element_type);
         if (!status.ok()) return status;
         if (element_type != kCompactStruct) return Status::Corruption("invalid Parquet row group");
+        status = reader.Reserve(count, 2 * sizeof(CedarParquetFooter::RowGroup));
+        if (!status.ok()) return status;
         decoded.row_groups.resize(count);
         for (auto& row_group : decoded.row_groups) {
           status = ReadRowGroup(&reader, &row_group);
@@ -646,6 +703,8 @@ Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* foote
         if (element_type != kCompactStruct || count == 0 || count > 16) {
           return Status::Corruption("invalid footer key-value metadata");
         }
+        status = reader.Reserve(count, 2 * sizeof(CedarParquetKeyValueMetadata));
+        if (!status.ok()) return status;
         decoded.key_value_metadata.resize(count);
         for (auto& metadata : decoded.key_value_metadata) {
           status = ReadKeyValueMetadata(&reader, &metadata);
@@ -656,7 +715,8 @@ Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* foote
       case 6:
         if (type != kCompactBinary) return Status::Corruption("invalid footer creator");
         status = reader.ReadBinary(&decoded.created_by);
-        if (!status.ok() || decoded.created_by.empty() ||
+        if (!status.ok()) return status;
+        if (decoded.created_by.empty() ||
             decoded.created_by.size() > 128) {
           return Status::Corruption("invalid footer creator");
         }
@@ -681,6 +741,8 @@ Status DecodeCompactFooter(const std::string& encoded, CedarParquetFooter* foote
     }
   }
   Status status = ValidateRequiredFactsSchema(decoded);
+  if (!status.ok()) return status;
+  status = reservation.Retain(FooterMemoryBytes(decoded));
   if (!status.ok()) return status;
   *footer = std::move(decoded);
   return Status::OK();
@@ -755,8 +817,10 @@ Status EncodeOffsetIndex(
 
 Status DecodeOffsetIndex(
     const std::string& encoded,
-    std::vector<CedarParquetFooter::ColumnChunk::PageLocation>* locations) {
-  CompactReader reader(encoded);
+    std::vector<CedarParquetFooter::ColumnChunk::PageLocation>* locations,
+    CedarParquetMemoryLease* memory) {
+  DecodeReservation reservation(memory);
+  CompactReader reader(encoded, 64U << 20, memory);
   reader.ReadStructBegin();
   bool has_locations = false;
   std::vector<CedarParquetFooter::ColumnChunk::PageLocation> decoded;
@@ -769,6 +833,7 @@ Status DecodeOffsetIndex(
     if (field_id != 1 || type != kCompactList) {
       return Status::NotSupported("unsupported Parquet offset-index field");
     }
+    if (has_locations) return Status::Corruption("duplicate Parquet offset-index locations");
     uint32_t count = 0;
     uint8_t element_type = 0;
     status = reader.ReadListBegin(&count, &element_type);
@@ -776,6 +841,8 @@ Status DecodeOffsetIndex(
     if (count == 0 || element_type != kCompactStruct) {
       return Status::Corruption("invalid Parquet offset-index locations");
     }
+    status = reader.Reserve(count, sizeof(CedarParquetFooter::ColumnChunk::PageLocation));
+    if (!status.ok()) return status;
     decoded.reserve(count);
     int64_t previous_offset = -1;
     int64_t previous_first_row = -1;
@@ -834,6 +901,8 @@ Status DecodeOffsetIndex(
   if (!reader.empty() || !has_locations) {
     return Status::Corruption("invalid Parquet offset index");
   }
+  Status status = reservation.Retain(decoded.capacity() * sizeof(decoded.front()));
+  if (!status.ok()) return status;
   *locations = std::move(decoded);
   return Status::OK();
 }
@@ -874,8 +943,10 @@ Status EncodeColumnIndex(
 
 Status DecodeColumnIndex(
     const std::string& encoded,
-    std::vector<CedarParquetFooter::ColumnChunk::PageIndex>* pages) {
-  CompactReader reader(encoded);
+    std::vector<CedarParquetFooter::ColumnChunk::PageIndex>* pages,
+    CedarParquetMemoryLease* memory) {
+  DecodeReservation reservation(memory);
+  CompactReader reader(encoded, 64U << 20, memory);
   reader.ReadStructBegin();
   std::vector<bool> null_pages;
   std::vector<std::string> minimums;
@@ -894,6 +965,7 @@ Status DecodeColumnIndex(
       return Status::NotSupported("unsupported Parquet column-index field");
     }
     if (field_id == 4) {
+      if (has_boundary_order) return Status::Corruption("duplicate column-index order");
       if (type != kCompactI32) return Status::Corruption("invalid column-index order");
       int32_t boundary_order = 0;
       status = reader.ReadI32(&boundary_order);
@@ -905,6 +977,9 @@ Status DecodeColumnIndex(
       continue;
     }
     if (type != kCompactList) return Status::Corruption("invalid Parquet column-index list");
+    if ((field_id == 1 && has_null_pages) || (field_id == 2 && has_minimums) ||
+        (field_id == 3 && has_maximums))
+      return Status::Corruption("duplicate Parquet column-index list");
     uint32_t count = 0;
     uint8_t element_type = 0;
     status = reader.ReadListBegin(&count, &element_type);
@@ -914,6 +989,9 @@ Status DecodeColumnIndex(
     }
     if (field_id == 1) {
       if (element_type != kCompactTrue) return Status::Corruption("invalid column-index null pages");
+      // vector<bool> rounds storage to words; reserve an upper byte bound.
+      status = reader.Reserve(uint64_t{count} + 64, 1);
+      if (!status.ok()) return status;
       null_pages.reserve(count);
       for (uint32_t index = 0; index < count; ++index) {
         bool is_null = false;
@@ -927,6 +1005,8 @@ Status DecodeColumnIndex(
         return Status::Corruption("invalid column-index bound type");
       }
       std::vector<std::string>& values = field_id == 2 ? minimums : maximums;
+      status = reader.Reserve(count, sizeof(std::string));
+      if (!status.ok()) return status;
       values.reserve(count);
       for (uint32_t index = 0; index < count; ++index) {
         std::string value;
@@ -945,6 +1025,8 @@ Status DecodeColumnIndex(
     return Status::Corruption("incomplete Parquet column index");
   }
   std::vector<CedarParquetFooter::ColumnChunk::PageIndex> decoded;
+  Status status = reader.Reserve(minimums.size(), sizeof(CedarParquetFooter::ColumnChunk::PageIndex));
+  if (!status.ok()) return status;
   decoded.reserve(minimums.size());
   for (size_t index = 0; index < minimums.size(); ++index) {
     if (null_pages[index]) {
@@ -959,6 +1041,11 @@ Status DecodeColumnIndex(
     }
     decoded.push_back({std::move(minimums[index]), std::move(maximums[index]), false});
   }
+  uint64_t retained = decoded.capacity() * sizeof(decoded.front());
+  for (const auto& page : decoded)
+    retained += MetadataStringBytes(page.min_value) + MetadataStringBytes(page.max_value);
+  status = reservation.Retain(retained);
+  if (!status.ok()) return status;
   *pages = std::move(decoded);
   return Status::OK();
 }

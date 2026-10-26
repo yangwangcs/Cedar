@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "rocksdb/status.h"
+#include "table/cedar_parquet/cedar_parquet_read_resources.h"
 #include "table/cedar_parquet/parquet_metadata.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -197,6 +198,7 @@ struct CedarParquetScanStats {
 };
 
 struct CedarParquetScanSpec {
+  CedarParquetReadPolicy policy;
   std::optional<std::string> sort_key_lower;
   std::optional<std::string> sort_key_upper;
   std::optional<uint64_t> valid_from_min;

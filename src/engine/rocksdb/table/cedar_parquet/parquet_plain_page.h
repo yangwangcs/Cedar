@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <string>
@@ -15,6 +16,10 @@
 #include "table/cedar_parquet/parquet_metadata.h"
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
+
+// Called after validating the envelope, before allocating decompression/output
+// storage. The caller keeps the reservation alive for the returned values.
+using CedarParquetPageReservation = std::function<Status(size_t, size_t)>;
 
 struct CedarParquetDataPageSize {
   size_t compressed_size = 0;
@@ -57,6 +62,7 @@ Status DecodePlainPrimitiveDataPage(
     std::vector<std::optional<std::string>>* values, size_t* consumed,
     int32_t fixed_length, CedarParquetCompressionCodec codec,
     size_t max_uncompressed_body_bytes,
-    size_t max_value_bytes, size_t max_values);
+    size_t max_value_bytes, size_t max_values,
+    const CedarParquetPageReservation& reserve = {});
 
 }  // namespace ROCKSDB_NAMESPACE::cedar_parquet

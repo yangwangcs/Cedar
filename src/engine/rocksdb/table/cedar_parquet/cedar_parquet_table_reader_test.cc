@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <mutex>
 #include <unistd.h>
 #include <vector>
 #include <thread>
@@ -105,6 +106,34 @@ std::string TestPath() {
   return path;
 }
 
+struct FileReadTrace {
+  std::mutex mutex;
+  std::vector<std::pair<uint64_t, size_t>> requests;
+  void Reset() {
+    std::lock_guard<std::mutex> lock(mutex);
+    requests.clear();
+  }
+};
+
+class TracedRandomAccessFile final : public FSRandomAccessFileWrapper {
+ public:
+  TracedRandomAccessFile(std::unique_ptr<FSRandomAccessFile> file,
+                         std::shared_ptr<FileReadTrace> trace)
+      : FSRandomAccessFileWrapper(file.get()), file_(std::move(file)),
+        trace_(std::move(trace)) {}
+  IOStatus Read(uint64_t offset, size_t bytes, const IOOptions& options,
+                Slice* result, char* scratch, IODebugContext* debug) const override {
+    {
+      std::lock_guard<std::mutex> lock(trace_->mutex);
+      trace_->requests.emplace_back(offset, bytes);
+    }
+    return file_->Read(offset, bytes, options, result, scratch, debug);
+  }
+ private:
+  std::unique_ptr<FSRandomAccessFile> file_;
+  std::shared_ptr<FileReadTrace> trace_;
+};
+
 TableBuilderOptions BuilderOptions(const ImmutableOptions& immutable_options,
                                    const MutableCFOptions& mutable_options,
                                    const InternalKeyComparator& comparator) {
@@ -126,7 +155,8 @@ std::unique_ptr<CedarParquetTableReader> BuildAndOpen(
     const InternalKeyComparator& comparator, uint32_t row_group_max_rows = 2,
     uint32_t page_max_rows = 1, uint64_t row_group_max_bytes = 4096,
     CedarParquetReadResources resources = {NewLRUCache(1<<20),
-        std::make_shared<CanonicalPageCacheMetrics>()}) {
+        std::make_shared<CanonicalPageCacheMetrics>()},
+    std::shared_ptr<FileReadTrace> trace = {}) {
   std::unique_ptr<WritableFileWriter> writer;
   EXPECT_TRUE(WritableFileWriter::Create(Env::Default()->GetFileSystem(), TestPath(),
                                          FileOptions(), &writer, nullptr)
@@ -147,9 +177,17 @@ std::unique_ptr<CedarParquetTableReader> BuildAndOpen(
   uint64_t file_size = 0;
   EXPECT_TRUE(Env::Default()->GetFileSize(TestPath(), &file_size).ok());
   std::unique_ptr<RandomAccessFileReader> file;
-  EXPECT_TRUE(RandomAccessFileReader::Create(Env::Default()->GetFileSystem(), TestPath(),
-                                              FileOptions(), &file, nullptr)
-                  .ok());
+  if (trace) {
+    std::unique_ptr<FSRandomAccessFile> raw;
+    EXPECT_TRUE(Env::Default()->GetFileSystem()->NewRandomAccessFile(
+        TestPath(), FileOptions(), &raw, nullptr).ok());
+    std::unique_ptr<FSRandomAccessFile> traced =
+        std::make_unique<TracedRandomAccessFile>(std::move(raw), std::move(trace));
+    file = std::make_unique<RandomAccessFileReader>(std::move(traced), TestPath());
+  } else {
+    EXPECT_TRUE(RandomAccessFileReader::Create(Env::Default()->GetFileSystem(), TestPath(),
+                                                FileOptions(), &file, nullptr).ok());
+  }
   std::unique_ptr<CedarParquetTableReader> reader;
   Status open_status = CedarParquetTableReader::Open(comparator, std::move(file), file_size,
                                                       options, &reader, std::move(resources));
@@ -341,6 +379,98 @@ TEST(CedarParquetTableReaderTest,
   }
 }
 
+TEST(CedarParquetTableReaderTest, FileAndMetadataMetricsFollowOwnedResources) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto trace = std::make_shared<FileReadTrace>();
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096,
+      {NewLRUCache(1 << 20), metrics}, trace);
+  ASSERT_NE(reader, nullptr);
+  EXPECT_EQ(metrics->reader_metadata_bytes.load(), reader->ApproximateMemoryUsage());
+  EXPECT_GT(metrics->reader_metadata_bytes.load(), sizeof(CedarParquetTableReader));
+  const auto first_charge = reader->ApproximateMemoryUsage();
+  EXPECT_EQ(metrics->reader_metadata_peak_bytes.load(), first_charge);
+  auto second_reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096,
+      {NewLRUCache(1 << 20), metrics});
+  ASSERT_NE(second_reader, nullptr);
+  const auto combined = first_charge + second_reader->ApproximateMemoryUsage();
+  EXPECT_EQ(metrics->reader_metadata_bytes.load(), combined);
+  EXPECT_EQ(metrics->reader_metadata_peak_bytes.load(), combined);
+  second_reader.reset();
+  EXPECT_EQ(metrics->reader_metadata_bytes.load(), first_charge);
+  EXPECT_EQ(metrics->reader_metadata_peak_bytes.load(), combined);
+  trace->Reset();
+  const auto calls_before = metrics->file_read_calls.load();
+  const auto bytes_before = metrics->file_read_bytes.load();
+  CedarParquetScanSpec spec;
+  spec.policy.admit = true;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  ASSERT_TRUE(reader->ScanProjected(spec, [](const auto&) { return Status::OK(); }).ok());
+  uint64_t requested_bytes = 0;
+  for (const auto& request : trace->requests) requested_bytes += request.second;
+  EXPECT_EQ(metrics->file_read_bytes.load() - bytes_before, requested_bytes);
+  EXPECT_GT(metrics->file_read_calls.load(), calls_before);
+  const auto bytes_warm = metrics->file_read_bytes.load();
+  ASSERT_TRUE(reader->ScanProjected(spec, [](const auto&) { return Status::OK(); }).ok());
+  EXPECT_EQ(metrics->file_read_bytes.load(), bytes_warm);
+  reader.reset();
+  EXPECT_EQ(metrics->reader_metadata_bytes.load(), 0U);
+  EXPECT_EQ(metrics->reader_metadata_peak_bytes.load(), combined);
+}
+
+TEST(CedarParquetTableReaderTest, MetadataAdmissionOwnsOpenScratchAndReaderLifetime) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto measured = std::make_shared<CedarParquetReadBudget>(
+      1 << 20, CedarParquetReadBudgetKind::kMetadata);
+  auto working = std::make_shared<CedarParquetReadBudget>(1);
+  auto first = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096,
+      {{}, {}, working, measured});
+  ASSERT_NE(first, nullptr);
+  EXPECT_GT(measured->current_bytes(), first->ApproximateMemoryUsage());
+  EXPECT_GT(measured->peak_bytes(), measured->current_bytes());
+  EXPECT_EQ(working->current_bytes(), 0U);
+  const uint64_t peak = measured->peak_bytes();
+  first.reset();
+  EXPECT_EQ(measured->current_bytes(), 0U);
+  auto budget = std::make_shared<CedarParquetReadBudget>(
+      peak, CedarParquetReadBudgetKind::kMetadata);
+  const auto open = [&](std::unique_ptr<CedarParquetTableReader>* result) {
+    uint64_t size = 0;
+    Status status = Env::Default()->GetFileSize(TestPath(), &size);
+    if (!status.ok()) return status;
+    std::unique_ptr<RandomAccessFileReader> file;
+    status = RandomAccessFileReader::Create(Env::Default()->GetFileSystem(),
+        TestPath(), FileOptions(), &file, nullptr);
+    if (!status.ok()) return status;
+    CedarParquetTableOptions table_options;
+    return CedarParquetTableReader::Open(comparator, std::move(file), size,
+        table_options, result, {{}, {}, working, budget});
+  };
+  ASSERT_TRUE(open(&first).ok());
+  const auto retained = budget->current_bytes();
+  std::unique_ptr<CedarParquetTableReader> second;
+  EXPECT_TRUE(open(&second).IsMemoryLimit());
+  EXPECT_EQ(second, nullptr);
+  EXPECT_EQ(budget->current_bytes(), retained);
+  EXPECT_LE(budget->peak_bytes(), budget->limit_bytes());
+  EXPECT_GT(budget->rejections(), 0U);
+  first.reset();
+  EXPECT_EQ(budget->current_bytes(), 0U);
+  ASSERT_TRUE(open(&second).ok());
+  second.reset();
+  EXPECT_EQ(budget->current_bytes(), 0U);
+  EXPECT_EQ(working->current_bytes(), 0U);
+}
+
 TEST(CedarParquetTableReaderTest, GetsNewestVisibleVersionAcrossRowGroups) {
   Options options;
   ImmutableOptions immutable_options(options);
@@ -429,6 +559,308 @@ TEST(CedarParquetTableReaderTest,
   EXPECT_EQ(entities, std::vector<uint64_t>({2, 3}));
   EXPECT_EQ(families, std::vector<uint32_t>({1, 1}));
   EXPECT_EQ(reader->PageDecodeCountForTesting(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, RepeatedAdmittedColumnScanReusesDecodedPages) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4), InternalKeyFor(2, 3)},
+      {StateFactValue(), StateFactValue()}, immutable_options, mutable_options,
+      comparator, 2, 1, 4096, {cache, metrics});
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.policy.admit = true;
+  std::vector<uint64_t> entities;
+  const auto consume = [&](const CedarParquetColumnarBatch& batch) {
+    const auto& column = std::get<std::vector<uint64_t>>(batch.columns[0].values);
+    entities.insert(entities.end(), column.begin(), column.end());
+    return Status::OK();
+  };
+  ASSERT_TRUE(reader->ScanProjected(spec, consume).ok());
+  EXPECT_EQ(entities, std::vector<uint64_t>({1, 2}));
+  EXPECT_GT(cache->GetUsage(), 0U);
+  EXPECT_GT(metrics->resident_charge_bytes.load(), 0U);
+  const uint64_t hits = metrics->hits.load();
+  const uint64_t misses = metrics->misses.load();
+  const uint64_t decode_ns = metrics->decode_nanoseconds.load();
+  uint64_t admitted = 0;
+  for (const auto& column : metrics->columns) admitted += column.admissions.load();
+  EXPECT_GT(admitted, 0U);
+  spec.policy.options.read_tier = kBlockCacheTier;
+  entities.clear();
+  const Status warm = reader->ScanProjected(spec, consume);
+  EXPECT_TRUE(warm.ok()) << warm.ToString();
+  EXPECT_EQ(entities, std::vector<uint64_t>({1, 2}));
+  EXPECT_GT(metrics->hits.load(), hits);
+  EXPECT_EQ(metrics->misses.load(), misses);
+  EXPECT_EQ(metrics->decode_nanoseconds.load(), decode_ns);
+  uint64_t column_hits = 0;
+  for (const auto& column : metrics->columns) column_hits += column.hits.load();
+  EXPECT_EQ(column_hits, metrics->hits.load());
+  EXPECT_EQ(reader->PageDecodeCountForTesting(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, WarmProjectedCursorUsesAdmittedColumnPages) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4), InternalKeyFor(2, 3)},
+      {StateFactValue(), StateFactValue()}, immutable_options, mutable_options,
+      comparator, 2, 1, 4096, {cache, metrics});
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.policy.admit = true;
+  ASSERT_TRUE(reader->ScanProjected(spec, [](const CedarParquetColumnarBatch&) {
+    return Status::OK();
+  }).ok());
+  spec.policy.options.read_tier = kBlockCacheTier;
+  std::unique_ptr<CedarParquetProjectedCursor> cursor;
+  const Status status = reader->NewProjectedCursor(spec, &cursor);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+  size_t rows = 0;
+  while (cursor->Valid()) {
+    ++rows;
+    cursor->Next();
+  }
+  EXPECT_TRUE(cursor->status().ok()) << cursor->status().ToString();
+  EXPECT_EQ(rows, 2U);
+}
+
+TEST(CedarParquetTableReaderTest, CanonicalAndColumnScanSharePayloadOwners) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  const auto key = InternalKeyFor(1, 4);
+  auto reader = BuildAndOpen({key}, {StateFactValue()}, immutable_options,
+      mutable_options, comparator, 2, 1, 4096, {cache, metrics});
+  std::unique_ptr<InternalIterator> canonical(reader->NewIterator(ReadOptions(),
+      nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  canonical->SeekToFirst();
+  ASSERT_TRUE(canonical->Valid());
+  const auto resident = metrics->resident_charge_bytes.load();
+  const auto usage = cache->GetUsage();
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEncodedValue};
+  spec.policy.admit = true;
+  spec.policy.options.read_tier = kBlockCacheTier;
+  size_t rows = 0;
+  const auto status = reader->ScanProjected(spec, [&](const CedarParquetColumnarBatch& batch) {
+    rows += batch.row_count();
+    EXPECT_EQ(batch.encoded_values, std::vector<std::string>({StateFactValue()}));
+    return Status::OK();
+  });
+  EXPECT_TRUE(status.ok()) << status.ToString();
+  EXPECT_EQ(rows, 1U);
+  EXPECT_EQ(metrics->resident_charge_bytes.load(), resident);
+  EXPECT_EQ(cache->GetUsage(), usage);
+  EXPECT_EQ(canonical->value().ToString(), StateFactValue());
+}
+
+TEST(CedarParquetTableReaderTest, PredicateProjectionLoadsColumnOnce) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto reader = BuildAndOpen({InternalFactKeyFor(1, 10, 20, 4)},
+      {StateFactValue()}, immutable_options, mutable_options, comparator,
+      2, 1, 4096, {{}, metrics});
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kValidFrom,
+                     CedarParquetColumnId::kCedarCommitSeq};
+  spec.valid_from_min = 10;
+  spec.cedar_commit_seq_max = 20;
+  size_t rows = 0;
+  auto status = reader->ScanProjected(spec, [&](const CedarParquetColumnarBatch& batch) {
+    rows += batch.row_count();
+    EXPECT_EQ(std::get<std::vector<uint64_t>>(batch.columns[0].values),
+              std::vector<uint64_t>({10}));
+    EXPECT_EQ(std::get<std::vector<uint64_t>>(batch.columns[1].values),
+              std::vector<uint64_t>({20}));
+    return Status::OK();
+  });
+  EXPECT_TRUE(status.ok()) << status.ToString();
+  EXPECT_EQ(rows, 1U);
+  // Sort-key, valid-time and commit-sequence pages each load once even without
+  // admission; stored internal keys are temporary validation, not cached pages.
+  EXPECT_EQ(metrics->misses.load(), 3U);
+  uint64_t total_ns = 0;
+  for (size_t column = 0; column < metrics->columns.size(); ++column) {
+    const auto& counters = metrics->columns[column];
+    total_ns += counters.decode_nanoseconds.load();
+    const bool loaded = column == 0 || column == 7 || column == 8;
+    EXPECT_EQ(counters.misses.load(), loaded ? 1U : 0U);
+    EXPECT_EQ(counters.decoded_pages.load(), loaded ? 1U : 0U);
+    EXPECT_EQ(counters.decode_attempts.load(), loaded || column == 1 ? 1U : 0U);
+    EXPECT_EQ(counters.admissions.load(), 0U);
+    EXPECT_EQ(counters.admission_rejections.load(), 0U);
+    if (loaded) EXPECT_GT(counters.decoded_bytes.load(), 0U);
+  }
+  EXPECT_GT(total_ns, 0U);
+  EXPECT_EQ(metrics->decode_nanoseconds.load(), total_ns);
+  spec.valid_from_min = 11;
+  rows = 0;
+  EXPECT_TRUE(reader->ScanProjected(spec, [&](const CedarParquetColumnarBatch& batch) {
+    rows += batch.row_count();
+    return Status::OK();
+  }).ok());
+  EXPECT_EQ(rows, 0U);
+}
+
+TEST(CedarParquetTableReaderTest, FileBytesCountOnlyActualRequestedColumns) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto trace = std::make_shared<FileReadTrace>();
+  auto reader = BuildAndOpen({InternalFactKeyFor(1, 10, 20, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096, {cache, {}}, trace);
+  std::ifstream input(TestPath(), std::ios::binary);
+  const std::string file((std::istreambuf_iterator<char>(input)), {});
+  CedarParquetFooter footer;
+  size_t footer_offset = 0;
+  ASSERT_TRUE(ParseParquetFooter(file, &footer, &footer_offset).ok());
+  ASSERT_EQ(footer.row_groups.size(), 1U);
+  for (auto& column : footer.row_groups[0].columns) {
+    ASSERT_TRUE(DecodeOffsetIndex(file.substr(static_cast<size_t>(column.offset_index_offset),
+        static_cast<size_t>(column.offset_index_length)), &column.page_locations).ok());
+    ASSERT_EQ(column.page_locations.size(), 1U);
+  }
+  trace->Reset();
+  CedarParquetScanStats stats;
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEntityId, CedarParquetColumnId::kValidFrom};
+  spec.valid_from_min = 10;
+  spec.policy.admit = true;
+  spec.stats = &stats;
+  const auto consume = [](const CedarParquetColumnarBatch&) { return Status::OK(); };
+  ASSERT_TRUE(reader->ScanProjected(spec, consume).ok());
+  uint64_t bytes = 0;
+  ASSERT_EQ(trace->requests.size(), 4U);
+  for (const auto& request : trace->requests) bytes += request.second;
+  EXPECT_EQ(stats.bytes_read, bytes);
+  for (size_t column : {size_t{0}, size_t{1},
+                        static_cast<size_t>(CedarParquetColumnId::kEntityId), size_t{7}}) {
+    const auto& location = footer.row_groups[0].columns[column].page_locations[0];
+    EXPECT_EQ(std::count(trace->requests.begin(), trace->requests.end(),
+        std::make_pair(static_cast<uint64_t>(location.offset),
+                       static_cast<size_t>(location.compressed_page_size))), 1);
+  }
+  const auto& value_location = footer.row_groups[0].columns[2].page_locations[0];
+  for (const auto& request : trace->requests)
+    EXPECT_NE(request.first, static_cast<uint64_t>(value_location.offset));
+  trace->Reset();
+  stats = {};
+  ASSERT_TRUE(reader->ScanProjected(spec, consume).ok());
+  EXPECT_TRUE(trace->requests.empty());
+  EXPECT_EQ(stats.bytes_read, 0U);
+}
+
+TEST(CedarParquetTableReaderTest, PartialCacheOnlyProjectionNeverReadsMissingColumn) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto trace = std::make_shared<FileReadTrace>();
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096, {cache, {}}, trace);
+  std::unique_ptr<InternalIterator> canonical(reader->NewIterator(ReadOptions(),
+      nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  canonical->SeekToFirst();
+  ASSERT_TRUE(canonical->Valid());
+  trace->Reset();
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.policy.options.read_tier = kBlockCacheTier;
+  size_t rows = 0;
+  const auto status = reader->ScanProjected(spec, [&](const CedarParquetColumnarBatch& batch) {
+    rows += batch.row_count();
+    return Status::OK();
+  });
+  EXPECT_TRUE(status.IsIncomplete()) << status.ToString();
+  EXPECT_EQ(rows, 0U);
+  EXPECT_TRUE(trace->requests.empty());
+}
+
+TEST(CedarParquetTableReaderTest, WarmProjectedScanReportsNoFileBytes) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096, {cache, {}});
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.policy.admit = true;
+  const auto consume = [](const CedarParquetColumnarBatch&) { return Status::OK(); };
+  ASSERT_TRUE(reader->ScanProjected(spec, consume).ok());
+  CedarParquetScanStats stats;
+  spec.stats = &stats;
+  ASSERT_TRUE(reader->ScanProjected(spec, consume).ok());
+  EXPECT_EQ(stats.bytes_read, 0U);
+}
+
+TEST(CedarParquetTableReaderTest, ChecksumRejectsBeforeReadWhenBudgetIsFull) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto budget = std::make_shared<CedarParquetReadBudget>(1);
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096, {{}, {}, budget});
+  const auto status = reader->VerifyChecksum(ReadOptions(), TableReaderCaller::kUserIterator);
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(budget->current_bytes(), 0U);
+  EXPECT_GT(budget->rejections(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, EmptyProjectedCursorReleasesEachFilteredPage) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys, values;
+  for (uint64_t entity = 1; entity <= 32; ++entity) {
+    keys.push_back(InternalFactKeyFor(entity, entity % 2 ? 1 : 2,
+                                     entity % 2 ? 2 : 1, entity));
+    values.push_back(StateFactValue());
+  }
+  auto budget = std::make_shared<CedarParquetReadBudget>(16 << 10);
+  auto reader = BuildAndOpen(keys, values, immutable_options, mutable_options,
+      comparator, 32, 2, 64 << 10, {{}, {}, budget});
+  CedarParquetScanSpec spec;
+  spec.projection = {CedarParquetColumnId::kEntityId};
+  spec.valid_from_min = 2;
+  spec.cedar_commit_seq_min = 2;
+  std::unique_ptr<CedarParquetProjectedCursor> cursor;
+  const auto status = reader->NewProjectedCursor(spec, &cursor);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+  EXPECT_FALSE(cursor->Valid());
+  EXPECT_TRUE(cursor->status().ok()) << cursor->status().ToString();
+  EXPECT_EQ(budget->current_bytes(), 0U);
+  EXPECT_LE(budget->peak_bytes(), budget->limit_bytes());
+  cursor.reset();
+  size_t callbacks = 0;
+  const auto scanned = reader->ScanProjected(spec, [&](const auto&) {
+    ++callbacks;
+    return Status::OK();
+  });
+  EXPECT_TRUE(scanned.ok()) << scanned.ToString();
+  EXPECT_EQ(callbacks, 0U);
+  EXPECT_EQ(budget->current_bytes(), 0U);
 }
 
 TEST(CedarParquetTableReaderTest, ReportsMetadataPruningAndBytesRead) {
@@ -1064,6 +1496,230 @@ TEST(CedarParquetTableReaderTest, AlternatingTenPagesReusesSharedCache) {
   EXPECT_EQ(reader->PageDecodeCountForTesting(), 0U);
 }
 
+TEST(CedarParquetTableReaderTest, NoFillReadsWithoutAdmitting) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  const auto key = InternalKeyFor(1, 4);
+  auto reader = BuildAndOpen({key}, {StateFactValue()}, immutable_options,
+      mutable_options, comparator, 2, 1, 4096, {cache, metrics});
+  ReadOptions read;
+  read.fill_cache = false;
+  {
+    std::unique_ptr<InternalIterator> it(reader->NewIterator(
+        read, nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+    it->Seek(key);
+    ASSERT_TRUE(it->status().ok());
+    ASSERT_TRUE(it->Valid());
+    EXPECT_EQ(it->value().ToString(), StateFactValue());
+    EXPECT_EQ(metrics->resident_charge_bytes.load(), 0U);
+  }
+  EXPECT_EQ(cache->GetUsage(), 0U);
+  EXPECT_EQ(metrics->uncached_live_bytes.load(), 0U);
+  {
+    std::unique_ptr<InternalIterator> warm(reader->NewIterator(
+        ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+    warm->Seek(key);
+    ASSERT_TRUE(warm->Valid());
+  }
+  const auto decodes = metrics->decodes.load();
+  std::unique_ptr<InternalIterator> hit(reader->NewIterator(
+      read, nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  hit->Seek(key);
+  ASSERT_TRUE(hit->Valid());
+  EXPECT_EQ(metrics->decodes.load(), decodes);
+  EXPECT_GT(metrics->hits.load(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, CanonicalReadRejectsBeforeDecodeWhenBudgetIsFull) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto budget = std::make_shared<CedarParquetReadBudget>(1);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096,
+      {{}, metrics, budget});
+  std::unique_ptr<InternalIterator> it(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  it->SeekToFirst();
+  EXPECT_FALSE(it->Valid());
+  EXPECT_TRUE(it->status().IsMemoryLimit()) << it->status().ToString();
+  EXPECT_EQ(metrics->decodes.load(), 0U);
+  EXPECT_EQ(budget->current_bytes(), 0U);
+  EXPECT_GT(budget->rejections(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, CanonicalValidationReleasesPriorDecodeScratch) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  std::vector<std::string> keys, values;
+  for (uint64_t id = 1; id <= 1024; ++id) {
+    keys.push_back(InternalKeyFor(id, 1));
+    values.push_back(StateFactValue());
+  }
+  auto budget = std::make_shared<CedarParquetReadBudget>(512 << 10);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto reader = BuildAndOpen(keys, values, immutable_options, mutable_options,
+      comparator, 1024, 1024, 1 << 20, {{}, metrics, budget});
+  ASSERT_NE(reader, nullptr);
+  {
+    ReadOptions read;
+    read.fill_cache = false;
+    std::unique_ptr<InternalIterator> it(reader->NewIterator(
+        read, nullptr, nullptr, false, TableReaderCaller::kCompaction));
+    it->SeekToFirst();
+    size_t rows = 0;
+    for (; it->Valid(); it->Next()) {
+      ASSERT_LT(rows, keys.size());
+      EXPECT_EQ(it->key().ToString(), keys[rows]);
+      EXPECT_EQ(it->value().ToString(), values[rows]);
+      ++rows;
+    }
+    ASSERT_TRUE(it->status().ok()) << it->status().ToString();
+    EXPECT_EQ(rows, 1024U);
+    EXPECT_EQ(metrics->resident_charge_bytes.load(), 0U);
+    EXPECT_LE(budget->peak_bytes(), 512U << 10);
+  }
+  EXPECT_EQ(budget->current_bytes(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, UncachedCanonicalOwnerRetainsWorkingLease) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto budget = std::make_shared<CedarParquetReadBudget>(1 << 20);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto cache = NewLRUCache(1, 0, true);
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096,
+      {cache, metrics, budget});
+  std::unique_ptr<InternalIterator> it(reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  it->SeekToFirst();
+  ASSERT_TRUE(it->Valid()) << it->status().ToString();
+  EXPECT_GT(budget->current_bytes(), 0U);
+  EXPECT_GE(budget->peak_bytes(), budget->current_bytes());
+  EXPECT_EQ(cache->GetUsage(), 0U);
+  EXPECT_EQ(it->value().ToString(), StateFactValue());
+  it.reset();
+  EXPECT_EQ(budget->current_bytes(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, CacheOnlyColdPartialAndWarmIterators) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  const std::vector<std::string> keys{InternalKeyFor(1, 4), InternalKeyFor(2, 4)};
+  auto reader = BuildAndOpen(keys, {StateFactValue(), StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096, {cache, metrics});
+  ReadOptions read;
+  read.read_tier = kBlockCacheTier;
+  for (bool reverse : {false, true}) {
+    std::unique_ptr<InternalIterator> cold(reader->NewIterator(
+        read, nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+    if (reverse) cold->SeekToLast(); else cold->SeekToFirst();
+    EXPECT_FALSE(cold->Valid());
+    EXPECT_TRUE(cold->status().IsIncomplete());
+  }
+  EXPECT_EQ(metrics->decodes.load(), 0U);
+  {
+    std::unique_ptr<InternalIterator> warm(reader->NewIterator(
+        ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+    warm->Seek(keys.front());
+    ASSERT_TRUE(warm->Valid());
+  }
+  std::unique_ptr<InternalIterator> partial(reader->NewIterator(
+      read, nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+  partial->SeekToFirst();
+  ASSERT_TRUE(partial->Valid());
+  partial->Next();
+  EXPECT_FALSE(partial->Valid());
+  EXPECT_TRUE(partial->status().IsIncomplete());
+  EXPECT_EQ(metrics->decodes.load(), 1U);
+  {
+    std::unique_ptr<InternalIterator> warm(reader->NewIterator(
+        ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUserIterator));
+    warm->SeekToLast();
+    ASSERT_TRUE(warm->Valid());
+  }
+  partial->SeekToLast();
+  ASSERT_TRUE(partial->Valid());
+  partial->Prev();
+  ASSERT_TRUE(partial->Valid());
+  EXPECT_EQ(metrics->decodes.load(), 2U);
+}
+
+TEST(CedarParquetTableReaderTest, CompactionDoesNotAdmitCanonicalPages) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  auto reader = BuildAndOpen({InternalKeyFor(1, 4)}, {StateFactValue()},
+      immutable_options, mutable_options, comparator, 2, 1, 4096, {cache, metrics});
+  for (auto caller : {TableReaderCaller::kCompaction,
+                      TableReaderCaller::kCompactionRefill}) {
+    std::unique_ptr<InternalIterator> it(reader->NewIterator(
+        ReadOptions(), nullptr, nullptr, false, caller));
+    it->SeekToFirst();
+    ASSERT_TRUE(it->Valid()) << it->status().ToString();
+    EXPECT_EQ(it->value().ToString(), StateFactValue());
+  }
+  EXPECT_EQ(cache->GetUsage(), 0U);
+  EXPECT_EQ(metrics->resident_charge_bytes.load(), 0U);
+}
+
+TEST(CedarParquetTableReaderTest, GetRespectsCacheOnlyAndNoFill) {
+  Options options;
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_options(options);
+  InternalKeyComparator comparator(BytewiseComparator());
+  auto cache = NewLRUCache(1 << 20, 0, true);
+  auto metrics = std::make_shared<CanonicalPageCacheMetrics>();
+  const auto key = InternalKeyFor(1, 4);
+  const auto user_key = V2UserKey(1);
+  auto reader = BuildAndOpen({key}, {StateFactValue()}, immutable_options,
+      mutable_options, comparator, 2, 1, 4096, {cache, metrics});
+  const auto get = [&](ReadOptions read) {
+    PinnableSlice value;
+    GetContext context(options.comparator, nullptr, nullptr, nullptr,
+        GetContext::kNotFound, user_key, &value, nullptr, nullptr, nullptr,
+        true, nullptr, nullptr);
+    auto status = reader->Get(read, key, &context, nullptr);
+    if (status.ok()) {
+      EXPECT_EQ(context.State(), GetContext::kFound);
+      EXPECT_EQ(value.ToString(), StateFactValue());
+    }
+    return status;
+  };
+  ReadOptions read;
+  read.read_tier = kBlockCacheTier;
+  EXPECT_TRUE(get(read).IsIncomplete());
+  EXPECT_EQ(metrics->decodes.load(), 0U);
+  read.read_tier = kReadAllTier;
+  read.fill_cache = false;
+  EXPECT_TRUE(get(read).ok());
+  EXPECT_EQ(cache->GetUsage(), 0U);
+  read.fill_cache = true;
+  EXPECT_TRUE(get(read).ok());
+  const auto decodes = metrics->decodes.load();
+  read.read_tier = kBlockCacheTier;
+  EXPECT_TRUE(get(read).ok());
+  EXPECT_EQ(metrics->decodes.load(), decodes);
+}
+
 TEST(CedarParquetTableReaderTest, PinnedPageRemainsChargedUntilIteratorRelease) {
   Options options;
   ImmutableOptions immutable_options(options);
@@ -1182,7 +1838,8 @@ TEST(CedarParquetTableReaderTest, FullPinnedCacheInsertFailureKeepsReadCorrect) 
       ReadOptions(),nullptr,nullptr,false,TableReaderCaller::kUserIterator));
   b->Seek(keys[1]);ASSERT_TRUE(b->Valid());
   EXPECT_EQ(b->value().ToString(),StateFactValue());
-  EXPECT_EQ(metrics->insert_failures.load(),1U);
+  // Both the sort-key and encoded-value page fail strict admission.
+  EXPECT_EQ(metrics->insert_failures.load(),2U);
   EXPECT_GT(metrics->uncached_live_bytes.load(),0U);
   b.reset();EXPECT_EQ(metrics->uncached_live_bytes.load(),0U);
   a.reset();reader.reset();cache->EraseUnRefEntries();

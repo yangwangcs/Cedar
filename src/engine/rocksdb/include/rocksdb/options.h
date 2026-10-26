@@ -38,6 +38,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace cedar_parquet {
+class CedarParquetQueryMemory;
+}
+
 class Cache;
 class CompactionFilter;
 class CompactionFilterFactory;
@@ -2080,6 +2084,10 @@ struct ReadOptions {
   // This would help not to the change eviction order of existing items in the
   // block cache.
   bool fill_cache = true;
+
+  // Runtime-only Cedar page decode/pin budget, copied with this read request.
+  // Other table formats ignore it; it is never persisted in DB options.
+  std::shared_ptr<cedar_parquet::CedarParquetQueryMemory> cedar_query_memory;
 
   // DEPRECATED: This option might be removed in a future release.
   // There should be no noticeable performance difference whether this option

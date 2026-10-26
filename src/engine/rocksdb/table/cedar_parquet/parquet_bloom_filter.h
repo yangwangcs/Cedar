@@ -25,6 +25,7 @@ class CedarSplitBlockBloomFilter {
 
   bool MayContain(std::string_view value) const;
   uint32_t bitset_bytes() const { return bitset_bytes_; }
+  size_t storage_capacity() const { return bitset_.capacity(); }
 
  private:
   static constexpr uint32_t kBytesPerBlock = 32;

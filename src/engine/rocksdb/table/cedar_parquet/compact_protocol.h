@@ -4,11 +4,13 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 #include "rocksdb/status.h"
+#include "table/cedar_parquet/cedar_parquet_read_budget.h"
 
 namespace ROCKSDB_NAMESPACE::cedar_parquet {
 
@@ -42,7 +44,10 @@ class CompactWriter {
 
 class CompactReader {
  public:
-  explicit CompactReader(const std::string& data, size_t max_bytes = 64U << 20);
+  explicit CompactReader(const std::string& data, size_t max_bytes = 64U << 20,
+                         CedarParquetMemoryLease* memory = nullptr);
+
+  Status Reserve(uint64_t count, uint64_t element_bytes);
 
   Status ReadFieldBegin(int16_t* field_id, uint8_t* type);
   void ReadStructBegin();
@@ -64,7 +69,10 @@ class CompactReader {
   size_t position_ = 0;
   size_t max_bytes_;
   int16_t last_field_id_ = 0;
-  std::vector<int16_t> field_id_stack_;
+  std::array<int16_t, 64> field_id_stack_{};
+  size_t depth_ = 0;
+  bool invalid_depth_ = false;
+  CedarParquetMemoryLease* memory_;
 };
 
 constexpr uint8_t kCompactStop = 0;

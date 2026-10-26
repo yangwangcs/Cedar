@@ -114,6 +114,7 @@ struct BoundStatement {
   std::vector<std::string> deletions;
   FactDemandSet demand;
   uint64_t fingerprint = 0;
+  std::string semantic_key;
 };
 
 StatusOr<BoundStatement> Bind(const Statement& statement,

@@ -12,11 +12,11 @@
 
 namespace cedar::internal {
 
-using ProjectionReader =
-    std::function<StatusOr<std::vector<ProjectionChain>>(const CoverageSlice&)>;
+using ProjectionVisitor = std::function<Status(
+    const CoverageSlice&, QueryReservation&, const ProjectionChainVisitor&)>;
 using PropertyIndexReader =
-    std::function<StatusOr<PropertyIndexSegment>(PartId, PropertyId,
-                                                 uint32_t, ValidTimeInterval)>;
+    std::function<StatusOr<PropertyIndexReadResult>(const CoverageRequest&,
+                                                   QueryReservation&)>;
 using DeltaReader = std::function<StatusOr<QueryDeltaView>()>;
 
 struct PreparedPlanTemplate {
@@ -51,33 +51,22 @@ class ReadBindingCapsule {
                      std::shared_ptr<const QueryDeltaLease> delta_lease,
                      std::optional<ProjectionGeneration> generation,
                      std::shared_ptr<ProjectionReadStats> stats,
-                     ProjectionReader projection_reader,
                      PropertyIndexReader property_index_reader,
-                     DeltaReader delta_reader)
+                     DeltaReader delta_reader,
+                     ProjectionVisitor projection_visitor = {})
       : plan_(std::move(plan)), delta_view_(std::move(delta_view)),
         delta_lease_(std::move(delta_lease)), generation_(std::move(generation)),
-        stats_(std::move(stats)), projection_reader_(std::move(projection_reader)),
+        stats_(std::move(stats)),
         property_index_reader_(std::move(property_index_reader)),
-        delta_reader_(std::move(delta_reader)) {}
-
-  ReadBindingCapsule(PreparedPlanTemplate plan,
-                     std::shared_ptr<const QueryDeltaView> delta_view,
-                     std::shared_ptr<const QueryDeltaLease> delta_lease,
-                     std::optional<ProjectionGeneration> generation,
-                     std::shared_ptr<ProjectionReadStats> stats,
-                     ProjectionReader projection_reader,
-                     DeltaReader delta_reader)
-      : ReadBindingCapsule(std::move(plan), std::move(delta_view),
-                           std::move(delta_lease), std::move(generation),
-                           std::move(stats), std::move(projection_reader),
-                           PropertyIndexReader{}, std::move(delta_reader)) {}
+        delta_reader_(std::move(delta_reader)),
+        projection_visitor_(std::move(projection_visitor)) {}
 
   const PreparedPlanTemplate& plan_template() const { return plan_; }
   const std::shared_ptr<const QueryDeltaView>& delta_view() const { return delta_view_; }
   const std::shared_ptr<const QueryDeltaLease>& delta_lease() const { return delta_lease_; }
   const std::optional<ProjectionGeneration>& projection_generation() const { return generation_; }
   const std::shared_ptr<ProjectionReadStats>& projection_stats() const { return stats_; }
-  const ProjectionReader& projection_reader() const { return projection_reader_; }
+  const ProjectionVisitor& projection_visitor() const { return projection_visitor_; }
   const PropertyIndexReader& property_index_reader() const {
     return property_index_reader_;
   }
@@ -89,9 +78,9 @@ class ReadBindingCapsule {
   std::shared_ptr<const QueryDeltaLease> delta_lease_;
   std::optional<ProjectionGeneration> generation_;
   std::shared_ptr<ProjectionReadStats> stats_;
-  ProjectionReader projection_reader_;
   PropertyIndexReader property_index_reader_;
   DeltaReader delta_reader_;
+  ProjectionVisitor projection_visitor_;
 };
 
 }  // namespace cedar::internal

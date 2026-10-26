@@ -106,5 +106,37 @@ TEST(ReadCatalog, SeeksTypedPropertyRangeWithoutReturningNonMatches) {
   EXPECT_EQ(less.front().value, Value::Int64(-10));
 }
 
+TEST(ReadCatalog, CoverageCandidateViewsBorrowOnlyMatchingCatalogKey) {
+  ReadCatalogBuilder builder;
+  for (uint32_t part : {0U, 1U, 2U}) {
+    for (uint64_t entity : {0ULL, 10ULL}) {
+      CoverageRegion region;
+      region.kind = ProjectionKind::kState;
+      region.part_id = PartId{part};
+      region.schema_epoch = 1;
+      region.entity_min = entity;
+      region.entity_max_exclusive = entity + 10;
+      region.valid_time = {ValidTime{0}, ValidTime{100}};
+      ASSERT_TRUE(builder.AddCoverage(
+          {ProjectionKind::kState, PartId{part}, std::nullopt, 1}, region).ok());
+    }
+  }
+  auto catalog = std::move(builder).Finish();
+  ASSERT_TRUE(catalog.ok());
+  const ReadCatalogKey key{ProjectionKind::kState, PartId{1}, std::nullopt, 1};
+  const auto first = catalog.ValueOrDie()->FindCoverageCandidates(
+      key, 0, 20, {ValidTime{0}, ValidTime{100}});
+  ASSERT_EQ(first.size(), 2U);
+  EXPECT_EQ(first[0].second.entity_min, 0U);
+  EXPECT_EQ(first[1].second.entity_min, 10U);
+  for (const auto& candidate : first) EXPECT_EQ(candidate.first, key);
+  const auto again = catalog.ValueOrDie()->FindCoverageCandidates(
+      key, 0, 20, {ValidTime{0}, ValidTime{100}});
+  EXPECT_EQ(first.data(), again.data());
+  EXPECT_TRUE(catalog.ValueOrDie()->FindCoverageCandidates(
+      {ProjectionKind::kState, PartId{3}, std::nullopt, 1},
+      0, 20, {ValidTime{0}, ValidTime{100}}).empty());
+}
+
 }  // namespace
 }  // namespace cedar::internal

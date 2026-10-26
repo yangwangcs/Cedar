@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -63,7 +64,7 @@ class ReadCatalog final : public SchemaProvider {
   const CoverageRegion* FindCoverage(const ReadCatalogKey&, uint64_t entity_min,
                                      uint64_t entity_max_exclusive,
                                      const ValidTimeInterval&) const;
-  std::vector<const CoverageRegion*> FindCoverageCandidates(
+  std::span<const std::pair<ReadCatalogKey, CoverageRegion>> FindCoverageCandidates(
       const ReadCatalogKey&, uint64_t entity_min, uint64_t entity_max_exclusive,
       const ValidTimeInterval&) const;
   uint64_t total_segment_count() const { return total_segment_count_; }

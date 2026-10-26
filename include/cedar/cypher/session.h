@@ -46,6 +46,8 @@ class CypherSession {
   CypherSession(CypherSession&&) noexcept;
   CypherSession& operator=(CypherSession&&) noexcept;
 
+  // Concurrent preparation shares a synchronized, bounded plan cache.
+  // Moving or destroying the session requires callers to quiesce first.
   StatusOr<PreparedCypher> Prepare(const std::string& source);
   StatusOr<QueryCursor> Execute(const PreparedCypher& prepared,
                                 const CypherRequest& request = {});
@@ -63,7 +65,7 @@ class CypherSession {
                          const CypherRequest& request) const;
   StatusOr<Snapshot> SnapshotFor(const BoundStatement& statement,
                                  const CypherRequest& request) const;
-  void Touch(uint64_t fingerprint);
+  void Touch(const std::string& semantic_key);
   std::unique_ptr<State> state_;
 };
 

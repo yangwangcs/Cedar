@@ -2,12 +2,133 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <atomic>
+#include <barrier>
+#include <thread>
+#include <vector>
 
 #include "cedar/cypher/session.h"
 #include "cedar/database.h"
+#include "test_util/sync_point.h"
 
 namespace cedar::cypher {
 namespace {
+
+#ifndef NDEBUG
+TEST(CypherSessionTest, PreparedHashCollisionDoesNotReuseStatement) {
+  char path[] = "/tmp/cedar_cypher_collision_XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  auto transaction = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t id : {1, 2, 3}) {
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex({PartId{0}, VertexId{id}}), ValidTime{1}).ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  auto* sync = rocksdb::SyncPoint::GetInstance();
+  struct ResetCallbacks {
+    ~ResetCallbacks() {
+      auto* sync = rocksdb::SyncPoint::GetInstance();
+      sync->DisableProcessing();
+      sync->ClearCallBack("CypherSession::Prepare:Fingerprint");
+      sync->ClearCallBack("CypherSession::Prepare:Compile");
+    }
+  } reset;
+  size_t compilations = 0;
+  sync->SetCallBack("CypherSession::Prepare:Fingerprint", [](void* value) {
+    *static_cast<uint64_t*>(value) = 42;
+  });
+  sync->SetCallBack("CypherSession::Prepare:Compile", [&](void*) { ++compilations; });
+  sync->EnableProcessing();
+  {
+    CypherSession session(*database.ValueOrDie(), SchemaCatalog{});
+    const std::string prefix = "FOR VALID_TIME AS OF 1 MATCH (v) RETURN v LIMIT ";
+    auto one = session.Prepare(prefix + "1");
+    auto two = session.Prepare(prefix + "2");
+    ASSERT_TRUE(one.ok() && two.ok());
+    EXPECT_EQ(one.ValueOrDie().fingerprint(), 42U);
+    EXPECT_EQ(two.ValueOrDie().fingerprint(), 42U);
+    EXPECT_NE(one.ValueOrDie().bound_statement().semantic_key,
+              two.ValueOrDie().bound_statement().semantic_key);
+    EXPECT_EQ(compilations, 2U);
+    auto reused = session.Prepare(prefix + "2");
+    ASSERT_TRUE(reused.ok());
+    EXPECT_EQ(compilations, 2U);
+    auto check_rows = [&](const PreparedCypher& prepared, size_t expected) {
+      auto cursor = session.Execute(prepared);
+      ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+      size_t rows = 0;
+      for (;;) {
+        auto batch = cursor.ValueOrDie().Next();
+        ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+        if (!batch.ValueOrDie()) break;
+        rows += batch.ValueOrDie()->row_count();
+      }
+      EXPECT_EQ(rows, expected);
+    };
+    check_rows(one.ValueOrDie(), 1);
+    check_rows(two.ValueOrDie(), 2);
+    // All keys still collide diagnostically while exercising bounded eviction.
+    for (size_t i = 0; i < 65; ++i) {
+      auto prepared = session.Prepare("FOR VALID_TIME AS OF " +
+          std::to_string(i + 2) + " MATCH (v) RETURN v");
+      ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    }
+    EXPECT_EQ(compilations, 67U);
+    auto reloaded = session.Prepare(prefix + "1");
+    ASSERT_TRUE(reloaded.ok());
+    EXPECT_EQ(compilations, 68U);
+    check_rows(reloaded.ValueOrDie(), 1);
+    check_rows(two.ValueOrDie(), 2);
+  }
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
+}
+#endif
+
+TEST(CypherSessionTest, ConcurrentPreparePreservesCacheEntriesAcrossEviction) {
+  char path[] = "/tmp/cedar_cypher_session_concurrent_XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok()) << database.status().ToString();
+  {
+    CypherSession session(*database.ValueOrDie(), SchemaCatalog{});
+    std::vector<std::string> sources;
+    std::vector<uint64_t> fingerprints;
+    for (size_t i = 0; i < 96; ++i) {
+      sources.push_back("FOR VALID_TIME AS OF " + std::to_string(i + 1) +
+                        " MATCH (v) RETURN v");
+      auto prepared = session.Prepare(sources.back());
+      ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+      fingerprints.push_back(prepared.ValueOrDie().fingerprint());
+    }
+    constexpr size_t kWorkers = 8;
+    std::barrier start(static_cast<std::ptrdiff_t>(kWorkers));
+    std::atomic<size_t> mismatches{0};
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < kWorkers; ++worker) {
+      workers.emplace_back([&, worker] {
+        start.arrive_and_wait();
+        for (size_t iteration = 0; iteration < 512; ++iteration) {
+          // Shared hot keys exercise LRU touches amid distinct-key eviction.
+          const size_t index = iteration % 2 == 0
+                                   ? 0 : (iteration + worker * 13) % sources.size();
+          auto prepared = session.Prepare(sources[index]);
+          if (!prepared.ok() ||
+              prepared.ValueOrDie().fingerprint() != fingerprints[index]) {
+            mismatches.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      });
+    }
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(mismatches.load(), 0U);
+  }
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
+  std::filesystem::remove_all(path);
+}
 
 TEST(CypherSessionTest, ExecutesWithSessionOwnedSnapshotAndAccessProfile) {
   char path[] = "/tmp/cedar_cypher_session_XXXXXX";
@@ -211,6 +332,42 @@ TEST(CypherSessionTest, ReadsStagedEdgeIdentityThroughTransactionOverlay) {
   EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
   EXPECT_TRUE(transaction.ValueOrDie()->Rollback().ok());
   database.ValueOrDie()->Close().IgnoreError();
+  std::filesystem::remove_all(path);
+}
+
+TEST(CypherSessionTest, DistinctLimitsKeepTheirBoundValuesAndResults) {
+  char path[] = "/tmp/cedar_cypher_session_limits_XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  auto database = Database::Open(DatabaseOptions{.path = path});
+  ASSERT_TRUE(database.ok());
+  auto transaction = database.ValueOrDie()->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t id : {1ULL, 2ULL}) {
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{id}}), ValidTime{1}).ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  CypherSession session(*database.ValueOrDie(), SchemaCatalog{});
+  for (size_t limit : {1U, 2U, 1U}) {
+    SCOPED_TRACE(limit);
+    auto prepared = session.Prepare(
+        "FOR VALID_TIME AS OF 1 MATCH (v) RETURN v LIMIT " +
+        std::to_string(limit));
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    EXPECT_EQ(prepared.ValueOrDie().bound_statement().limit_count, limit);
+    auto cursor = session.Execute(prepared.ValueOrDie());
+    ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+    size_t rows = 0;
+    while (true) {
+      auto batch = cursor.ValueOrDie().Next();
+      ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+      if (!batch.ValueOrDie()) break;
+      rows += batch.ValueOrDie()->row_count();
+    }
+    EXPECT_EQ(rows, limit);
+    EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+  }
+  EXPECT_TRUE(database.ValueOrDie()->Close().ok());
   std::filesystem::remove_all(path);
 }
 

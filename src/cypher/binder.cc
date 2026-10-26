@@ -2,11 +2,11 @@
 
 #include <algorithm>
 #include <iterator>
-#include <sstream>
 #include <unordered_set>
 
 #include "cedar/cypher/fingerprint.h"
 #include "cedar/cypher/relationship_type.h"
+#include "cypher/semantic_key.h"
 #include "query/read/read_catalog.h"
 
 namespace cedar::cypher {
@@ -24,14 +24,6 @@ void RebuildReadCatalog(const std::vector<PropertyDefinition>& properties,
 
 Status BindError(const char* message) {
   return Status::BindError("cypher binder", message);
-}
-
-std::string ScopeFingerprint(const std::optional<TimeScope>& scope) {
-  if (!scope.has_value()) return "none";
-  std::ostringstream out;
-  if (scope->as_of.has_value()) return "asof:" + std::to_string(*scope->as_of);
-  out << scope->from << ':' << (scope->to.has_value() ? std::to_string(*scope->to) : "-");
-  return out.str();
 }
 
 }  // namespace
@@ -169,10 +161,6 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
   if (statement.head == StatementHead::kMatch && statement.kind == StatementKind::kWrite) {
     return Status::InvalidArgument("cypher binder", "MATCH writes are not supported");
   }
-  std::string canonical = "v2|graph=" + bound.graph + "|part=" + std::to_string(bound.part_id.value);
-  canonical += "|kind=" + std::to_string(static_cast<uint8_t>(statement.kind));
-  canonical += "|valid=" + ScopeFingerprint(bound.valid_time) + "|system=" + ScopeFingerprint(bound.system_time);
-  canonical += "|changes=" + std::to_string(bound.changes ? 1 : 0);
   std::unordered_set<std::string> variables;
   for (size_t index = 0; index < statement.patterns.size(); ++index) {
     const auto& pattern = statement.patterns[index];
@@ -185,6 +173,10 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
     }
     if (pattern.max_hops > options.max_hops || pattern.max_hops == 0) {
       return BindError("path hop bound exceeds configured limit");
+    }
+    if (pattern.min_hops != 1) {
+      return Status::NotSupported("cypher binder",
+                                  "minimum path hop count currently must be 1");
     }
     if (!pattern.source_label.empty() || !pattern.destination_label.empty()) {
       return Status::NotSupported("cypher binder", "labels require a Cedar label fact family");
@@ -216,16 +208,12 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
       const auto resolved = ResolveRelationshipType(pattern.relationship);
       if (!resolved.ok()) return resolved.status();
       relationship_type = resolved.ValueOrDie();
-      canonical += "|edge_type=" + std::to_string(*relationship_type);
     }
     bound.relationship_types.push_back(relationship_type);
     ++bound.demand.vertex_families;
     if (!pattern.edge.empty() || !pattern.relationship.empty() || pattern.max_hops != 1) {
       ++bound.demand.edge_families;
     }
-    canonical += "|path=" + pattern.source_label + ':' + pattern.relationship + ':' +
-                 std::to_string(pattern.min_hops) + ':' + std::to_string(pattern.max_hops) +
-                 ':' + std::to_string(pattern.trail ? 1 : 0);
   }
   for (const auto& predicate : statement.predicates) {
     if (variables.find(predicate.variable) == variables.end()) {
@@ -263,7 +251,6 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
     }
     bound.predicates.push_back(std::move(bound_predicate));
     bound.demand.properties.push_back(property.ValueOrDie().property_id);
-    canonical += "|where=" + predicate.variable + "." + predicate.property;
   }
   for (const auto& assignment : statement.assignments) {
     auto property = LookupRequired(catalog, assignment.property,
@@ -287,8 +274,6 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
                                      parameter->id};
     bound.assignments.push_back(std::move(bound_assignment));
     bound.demand.properties.push_back(property.ValueOrDie().property_id);
-    canonical += "|set=" + assignment.target + ":" +
-                 std::to_string(property.ValueOrDie().property_id.value);
   }
   for (const auto& parameter : statement.parameters) {
     if (std::none_of(bound.parameters.begin(), bound.parameters.end(),
@@ -298,12 +283,8 @@ StatusOr<BoundStatement> Bind(const Statement& statement,
   }
   std::sort(bound.demand.properties.begin(), bound.demand.properties.end(),
             [](PropertyId left, PropertyId right) { return left.value < right.value; });
-  for (PropertyId property : bound.demand.properties) canonical += "|prop=" + std::to_string(property.value);
-  for (const auto& projection : statement.projections) {
-    canonical += "|return=" + projection.expression + ":" + projection.function;
-  }
-  canonical += "|security=" + options.security_digest;
-  bound.fingerprint = StableFingerprint(canonical);
+  bound.semantic_key = PreparedSemanticKey(bound, catalog.Fingerprint(), options);
+  bound.fingerprint = StableFingerprint(bound.semantic_key);
   return bound;
 }
 

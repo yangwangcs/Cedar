@@ -1,75 +1,12 @@
 #include "query/execution_context.h"
 
 #include <memory>
-#include <list>
 #include <mutex>
-#include <sstream>
-#include <unordered_map>
 #include <utility>
 
 #include "kernel/database_impl.h"
 
 namespace cedar::internal {
-
-namespace {
-
-class BoundedPlanTemplateCache {
- public:
-  std::shared_ptr<const PhysicalPlan> Lookup(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = positions_.find(key);
-    if (found == positions_.end()) return nullptr;
-    entries_.splice(entries_.begin(), entries_, found->second);
-    return found->second->plan;
-  }
-
-  void Insert(std::string key, std::shared_ptr<const PhysicalPlan> plan) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = positions_.find(key);
-    if (found != positions_.end()) {
-      found->second->plan = std::move(plan);
-      entries_.splice(entries_.begin(), entries_, found->second);
-      return;
-    }
-    entries_.push_front(Entry{std::move(key), std::move(plan)});
-    positions_[entries_.front().key] = entries_.begin();
-    while (entries_.size() > kCapacity) {
-      positions_.erase(entries_.back().key);
-      entries_.pop_back();
-    }
-  }
-
- private:
-  struct Entry {
-    std::string key;
-    std::shared_ptr<const PhysicalPlan> plan;
-  };
-  static constexpr size_t kCapacity = 64;
-  std::mutex mutex_;
-  std::list<Entry> entries_;
-  std::unordered_map<std::string, std::list<Entry>::iterator> positions_;
-};
-
-BoundedPlanTemplateCache& PlanTemplateCache() {
-  static BoundedPlanTemplateCache cache;
-  return cache;
-}
-
-std::string PlanCacheKey(const LogicalPlanNode& root, const PlanningContext& context,
-                         const std::string& schema_fingerprint) {
-  std::ostringstream out;
-  out << QueryPlanner::ExplainLogical(root) << '|' << schema_fingerprint << '|'
-      << context.database_identity << '|' << context.snapshot_seq.value << '|'
-      << static_cast<unsigned>(context.part_scope.kind);
-  for (PartId part : context.part_scope.parts) out << ':' << part.value;
-  out << '|' << context.projections.generation_id << '|'
-      << context.projections.base_seq.value << '|' << context.statistics.candidate_rows
-      << ':' << context.statistics.pages << ':' << context.statistics.physical_bytes << ':'
-      << context.statistics.decoded_bytes << ':' << context.statistics.known;
-  return out.str();
-}
-
-}  // namespace
 
 StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     const std::shared_ptr<Database::Impl>& database,
@@ -150,16 +87,11 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
   if (!schema.ok()) return schema.status();
   auto static_preparation = QueryPlanner::PrepareStatic(*root, schema.ValueOrDie());
   if (!static_preparation.ok()) return static_preparation.status();
-  const std::string plan_cache_key = PlanCacheKey(*root, context, schema.ValueOrDie());
-  std::shared_ptr<const PhysicalPlan> physical_plan =
-      PlanTemplateCache().Lookup(plan_cache_key);
-  if (!physical_plan) {
-    auto physical = QueryPlanner::Bind(*root, context);
-    if (!physical.ok()) return physical.status();
-    physical_plan = std::make_shared<const PhysicalPlan>(
-        std::move(physical).ConsumeValueOrDie());
-    PlanTemplateCache().Insert(plan_cache_key, physical_plan);
-  }
+  // Bound coverage and routing depend on this query's temporal/options state.
+  auto physical = QueryPlanner::Bind(*root, context);
+  if (!physical.ok()) return physical.status();
+  auto physical_plan = std::make_shared<const PhysicalPlan>(
+      std::move(physical).ConsumeValueOrDie());
 
   QueryExecutionBinding binding;
   binding.physical = *physical_plan;
@@ -241,9 +173,10 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
   // detaches, and they deliberately do not retain the database itself.
   const auto pinned_generation = binding.projection_generation;
   const auto projection_stats = binding.projection_stats;
-  binding.projection_reader =
+  binding.projection_visitor =
       [projection_store, snapshot_seq, pinned_generation, projection_stats](
-          const CoverageSlice& slice) -> StatusOr<std::vector<ProjectionChain>> {
+          const CoverageSlice& slice, QueryReservation& reservation,
+          const ProjectionChainVisitor& visitor) -> Status {
     if (!projection_store || !pinned_generation ||
         !pinned_generation->exists()) {
       return Status::NotFound("query", "pinned projection generation is unavailable");
@@ -261,7 +194,10 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     request.expected_base_seq = slice.projection_base;
     request.database_identity = slice.database_identity;
     request.stats = projection_stats.get();
-    return projection_store->ReadChains(request, *pinned_generation);
+    request.admit_pages = slice.entity_max_exclusive > slice.entity_min &&
+        slice.entity_max_exclusive - slice.entity_min == 1;
+    return projection_store->VisitChains(request, *pinned_generation,
+                                         reservation, visitor);
   };
   binding.delta_reader = [query_delta, snapshot_seq]() -> StatusOr<QueryDeltaView> {
     if (!query_delta) {
@@ -272,20 +208,14 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
   const auto pinned_property_generation = binding.projection_generation;
   binding.property_index_reader =
       [projection_store, snapshot_seq, pinned_property_generation](
-          PartId part, PropertyId property, uint32_t schema_epoch,
-          ValidTimeInterval valid_time) -> StatusOr<PropertyIndexSegment> {
+          const CoverageRequest& coverage, QueryReservation& reservation)
+          -> StatusOr<PropertyIndexReadResult> {
     if (!projection_store || !pinned_property_generation ||
         !pinned_property_generation->exists()) {
       return Status::NotFound("query", "property index generation is unavailable");
     }
-    CoverageRequest request;
+    CoverageRequest request = coverage;
     request.kind = ProjectionKind::kPropertyIndex;
-    request.part_id = part;
-    request.property_id = property;
-    request.schema_epoch = schema_epoch;
-    request.entity_min = 0;
-    request.entity_max_exclusive = UINT64_MAX;
-    request.valid_time = valid_time;
     request.snapshot_seq = snapshot_seq;
     request.generation_id = pinned_property_generation->generation_id();
     request.expected_base_seq = pinned_property_generation->manifest()
@@ -295,8 +225,8 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
     request.database_identity = pinned_property_generation->manifest()
                                     ? pinned_property_generation->manifest()->database_identity
                                     : std::string{};
-    return projection_store->ReadPropertyIndex(request,
-                                               *pinned_property_generation);
+    return projection_store->ReadBudgetedPropertyIndex(
+        request, *pinned_property_generation, reservation);
   };
   // The capsule is the ownership boundary for all snapshot-specific state.
   // Keep the value-shaped fields above for explain/test compatibility, but
@@ -307,9 +237,9 @@ StatusOr<QueryExecutionBinding> QueryExecutionContextFactory::Bind(
   binding.read_binding = std::make_shared<const ReadBindingCapsule>(
       std::move(prepared), std::move(binding.delta_view),
       std::move(binding.delta_lease), std::move(binding.projection_generation),
-      std::move(binding.projection_stats), std::move(binding.projection_reader),
+      std::move(binding.projection_stats),
       std::move(binding.property_index_reader),
-      std::move(binding.delta_reader));
+      std::move(binding.delta_reader), std::move(binding.projection_visitor));
   return binding;
 }
 

@@ -182,10 +182,9 @@ const CoverageRegion* ReadCatalog::FindCoverage(
   return nullptr;
 }
 
-std::vector<const CoverageRegion*> ReadCatalog::FindCoverageCandidates(
+std::span<const std::pair<ReadCatalogKey, CoverageRegion>> ReadCatalog::FindCoverageCandidates(
     const ReadCatalogKey& key, uint64_t entity_min,
     uint64_t entity_max_exclusive, const ValidTimeInterval& interval) const {
-  std::vector<const CoverageRegion*> result;
   const auto first = std::lower_bound(
       coverage_.begin(), coverage_.end(), key,
       [](const auto& entry, const ReadCatalogKey& target) {
@@ -202,11 +201,9 @@ std::vector<const CoverageRegion*> ReadCatalog::FindCoverageCandidates(
   (void)entity_min;
   (void)entity_max_exclusive;
   (void)interval;
-  for (auto current = first; current != coverage_.end() && current->first == key;
-       ++current) {
-    result.push_back(&current->second);
-  }
-  return result;
+  auto last = first;
+  while (last != coverage_.end() && last->first == key) ++last;
+  return {first, last};
 }
 
 Status ReadCatalogBuilder::AddSchema(PropertyDefinition definition) {

@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <list>
+#include <mutex>
 #include <unordered_map>
 #include "cedar/cypher/parser.h"
 #include "cedar/cypher/write.h"
+#include "test_util/sync_point.h"
 
 namespace cedar::cypher {
 
@@ -17,9 +19,10 @@ class CypherSession::State {
   Database* database;
   SchemaCatalog catalog;
   BinderOptions defaults;
-  std::unordered_map<uint64_t, PreparedCypher> cache;
-  std::list<uint64_t> lru;
-  std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_positions;
+  std::mutex cache_mutex;
+  std::unordered_map<std::string, PreparedCypher> cache;
+  std::list<std::string> lru;
+  std::unordered_map<std::string, std::list<std::string>::iterator> lru_positions;
   static constexpr size_t kMaxPrepared = 64;
 };
 
@@ -32,16 +35,16 @@ CypherSession::~CypherSession() = default;
 CypherSession::CypherSession(CypherSession&&) noexcept = default;
 CypherSession& CypherSession::operator=(CypherSession&&) noexcept = default;
 
-void CypherSession::Touch(uint64_t fingerprint) {
-  const auto position = state_->lru_positions.find(fingerprint);
+void CypherSession::Touch(const std::string& semantic_key) {
+  const auto position = state_->lru_positions.find(semantic_key);
   if (position != state_->lru_positions.end()) {
     state_->lru.erase(position->second);
     state_->lru_positions.erase(position);
   }
-  state_->lru.push_front(fingerprint);
-  state_->lru_positions[fingerprint] = state_->lru.begin();
+  state_->lru.push_front(semantic_key);
+  state_->lru_positions[semantic_key] = state_->lru.begin();
   while (state_->lru.size() > State::kMaxPrepared) {
-    const uint64_t evicted = state_->lru.back();
+    const std::string evicted = state_->lru.back();
     state_->cache.erase(evicted);
     state_->lru_positions.erase(evicted);
     state_->lru.pop_back();
@@ -54,22 +57,33 @@ StatusOr<PreparedCypher> CypherSession::Prepare(const std::string& source) {
   }
   const auto parsed = Parse(source);
   if (!parsed.ok()) return parsed.status();
-  const auto bound = Bind(parsed.ValueOrDie(), state_->catalog, state_->defaults);
+  auto bound = Bind(parsed.ValueOrDie(), state_->catalog, state_->defaults);
   if (!bound.ok()) return bound.status();
-  auto found = state_->cache.find(bound.ValueOrDie().fingerprint);
-  if (found != state_->cache.end()) {
-    Touch(found->first);
-    return found->second;
+  TEST_SYNC_POINT_CALLBACK("CypherSession::Prepare:Fingerprint",
+                           &bound.ValueOrDie().fingerprint);
+  {
+    std::lock_guard<std::mutex> lock(state_->cache_mutex);
+    auto found = state_->cache.find(bound.ValueOrDie().semantic_key);
+    if (found != state_->cache.end()) {
+      Touch(found->first);
+      return found->second;
+    }
   }
+  TEST_SYNC_POINT("CypherSession::Prepare:Compile");
   const auto query = Compile(bound.ValueOrDie());
   if (!query.ok()) return query.status();
   auto prepared = state_->database->PrepareQuery(query.ValueOrDie());
   if (!prepared.ok()) return prepared.status();
   PreparedCypher result(std::move(prepared).ConsumeValueOrDie(),
                         bound.ValueOrDie());
-  state_->cache.emplace(result.fingerprint(), result);
-  Touch(result.fingerprint());
-  return result;
+  {
+    std::lock_guard<std::mutex> lock(state_->cache_mutex);
+    // Another worker may have prepared this key while compilation ran unlocked.
+    auto [entry, inserted] =
+        state_->cache.emplace(bound.ValueOrDie().semantic_key, result);
+    Touch(entry->first);
+    return entry->second;
+  }
 }
 
 Status CypherSession::ValidateRequest(const BoundStatement& statement,

@@ -32,6 +32,95 @@ TEST(CypherBinderTest, BindsScopePartAndDemandWithoutParameterValues) {
             Bind(parsed.ValueOrDie(), Catalog(), options).ValueOrDie().fingerprint);
 }
 
+TEST(CypherBinderTest, RejectsUnsupportedMinimumHopCount) {
+  for (const auto* query : {
+           "MATCH (a)-[e*2..2]->(b) RETURN b",
+           "MATCH (a)-[e*0..2]->(b) RETURN b"}) {
+    const auto parsed = Parse(query);
+    ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();
+    const auto bound = Bind(parsed.ValueOrDie(), Catalog());
+    ASSERT_FALSE(bound.ok());
+    EXPECT_TRUE(bound.status().IsNotSupportedError()) << bound.status().ToString();
+  }
+  for (const auto* query : {
+           "MATCH (a)-[e*1..1]->(b) RETURN b",
+           "MATCH (a)-[e*1..2]->(b) RETURN b"}) {
+    const auto parsed = Parse(query);
+    ASSERT_TRUE(parsed.ok());
+    EXPECT_TRUE(Bind(parsed.ValueOrDie(), Catalog()).ok());
+  }
+}
+
+TEST(CypherBinderTest, FingerprintDistinguishesExecutionSemantics) {
+  const std::vector<std::pair<std::string, std::string>> pairs{
+      {"MATCH (v) RETURN v LIMIT 1", "MATCH (v) RETURN v LIMIT 2"},
+      {"MATCH (v) WHERE v.name = 'CN' RETURN v",
+       "MATCH (v) WHERE v.name = 'US' RETURN v"},
+      {"MATCH (v) WHERE v.name = 'CN' RETURN v",
+       "MATCH (v) WHERE v.name > 'CN' RETURN v"},
+      {"MATCH (v) WHERE v.name = $a RETURN v",
+       "MATCH (v) WHERE v.name = $b RETURN v"},
+      {"MATCH (v {part_id: 0, id: 1}) RETURN v",
+       "MATCH (v {part_id: 0, id: 2}) RETURN v"},
+      {"CREATE (a), (b) DELETE a", "CREATE (a), (b) DELETE b"},
+      {"MATCH (a)-[e*1..1]->(b) RETURN b",
+       "MATCH (a)-[e*1..2]->(b) RETURN b"},
+      {"MATCH (a)-[e]->(b) RETURN a", "MATCH (a)-[e]->(b) RETURN b"},
+      {"MATCH (a)-[e]->(b) RETURN e",
+       "MATCH (a)-[e]->(b) RETURN valid_from(e)"},
+      {"FOR VALID_TIME BETWEEN 10 AND 20 MATCH (v) RETURN v",
+       "FOR VALID_TIME BETWEEN 10 AND 30 MATCH (v) RETURN v"},
+      {"FOR SYSTEM_TIME AS OF 7 MATCH (v) RETURN v",
+       "FOR SYSTEM_TIME AS OF 8 MATCH (v) RETURN v"},
+      {"MATCH (v {part_id: 0, id: 1}) RETURN v",
+       "MATCH (v {part_id: 1, id: 1}) RETURN v"},
+  };
+  for (const auto& [first, second] : pairs) {
+    SCOPED_TRACE(first + " vs " + second);
+    const auto first_ast = Parse(first);
+    const auto second_ast = Parse(second);
+    ASSERT_TRUE(first_ast.ok()) << first_ast.status().ToString();
+    ASSERT_TRUE(second_ast.ok()) << second_ast.status().ToString();
+    const auto left = Bind(first_ast.ValueOrDie(), Catalog());
+    const auto right = Bind(second_ast.ValueOrDie(), Catalog());
+    ASSERT_TRUE(left.ok()) << left.status().ToString();
+    ASSERT_TRUE(right.ok()) << right.status().ToString();
+    EXPECT_NE(left.ValueOrDie().semantic_key, right.ValueOrDie().semantic_key);
+    EXPECT_NE(left.ValueOrDie().fingerprint, right.ValueOrDie().fingerprint);
+  }
+}
+
+TEST(CypherBinderTest, SemanticIdentityFramesBinaryLiteralsAndSchema) {
+  auto parsed = Parse("MATCH (v) WHERE v.name = 'x' RETURN v");
+  ASSERT_TRUE(parsed.ok());
+  auto first_ast = parsed.ValueOrDie();
+  first_ast.predicates.front().literal = std::string("x\0|where=", 9);
+  auto second_ast = first_ast;
+  second_ast.predicates.front().literal = "x";
+  const auto first = Bind(first_ast, Catalog());
+  const auto second = Bind(second_ast, Catalog());
+  ASSERT_TRUE(first.ok());
+  ASSERT_TRUE(second.ok());
+  EXPECT_NE(first.ValueOrDie().semantic_key, second.ValueOrDie().semantic_key);
+
+  SchemaCatalog newer;
+  ASSERT_TRUE(newer.Add(PropertyDefinition{PropertyId{7}, 2, "name",
+      PropertyEntityKind::kVertex, PhysicalType::kString, 64}).ok());
+  const auto changed_schema = Bind(first_ast, newer);
+  ASSERT_TRUE(changed_schema.ok());
+  EXPECT_NE(first.ValueOrDie().semantic_key,
+            changed_schema.ValueOrDie().semantic_key);
+
+  const auto whitespace = Parse("  MATCH (v) WHERE v.name = 'x' RETURN v  ");
+  ASSERT_TRUE(whitespace.ok());
+  const auto equivalent = Bind(whitespace.ValueOrDie(), Catalog());
+  const auto original = Bind(parsed.ValueOrDie(), Catalog());
+  ASSERT_TRUE(equivalent.ok());
+  ASSERT_TRUE(original.ok());
+  EXPECT_EQ(equivalent.ValueOrDie().semantic_key,
+            original.ValueOrDie().semantic_key);
+}
+
 TEST(CypherBinderTest, ResolvesPropertyNamesAndStableParameterIds) {
   const auto parsed = Parse("USE g CREATE (a) SET a.name = $name");
   ASSERT_TRUE(parsed.ok()) << parsed.status().ToString();

@@ -171,7 +171,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         execution_plan.bound_delta_lease = capsule.delta_lease();
         execution_plan.projection_generation = capsule.projection_generation();
         execution_plan.projection_stats = capsule.projection_stats();
-        execution_plan.projection_reader = capsule.projection_reader();
+        execution_plan.projection_visitor = capsule.projection_visitor();
         execution_plan.property_index_reader = capsule.property_index_reader();
         execution_plan.delta_reader = capsule.delta_reader();
       } else {
@@ -182,7 +182,7 @@ StatusOr<QueryCursor> PreparedQuery::Execute(
         execution_plan.bound_delta_lease = bound.delta_lease;
         execution_plan.projection_generation = bound.projection_generation;
         execution_plan.projection_stats = bound.projection_stats;
-        execution_plan.projection_reader = bound.projection_reader;
+        execution_plan.projection_visitor = bound.projection_visitor;
         execution_plan.property_index_reader = bound.property_index_reader;
         execution_plan.delta_reader = bound.delta_reader;
       }

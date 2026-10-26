@@ -7,10 +7,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "cedar/database.h"
 #include "cedar/query/query.h"
+#include "cedar/transaction.h"
 
 namespace cedar {
 namespace {
@@ -35,6 +37,122 @@ class QueryLifecycleTest : public ::testing::Test {
   std::string path_;
   std::unique_ptr<Database> database_;
 };
+
+TEST_F(QueryLifecycleTest, BindingDoesNotReuseAnotherValidTime) {
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t id : {1ULL, 2ULL}) {
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex(VertexRef{PartId{0}, VertexId{id}}),
+        ValidTime{1}).ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  const auto vertex = Slot<VertexRef>::WithId(SlotId{42}, "v");
+  for (uint64_t time : {10ULL, 20ULL, 10ULL, 30ULL}) {
+    SCOPED_TRACE(time);
+    auto source = Query::Vertices(vertex, At{ValidTime{time}});
+    ASSERT_TRUE(source.ok());
+    auto query = source.ValueOrDie().Select({Project(vertex)});
+    ASSERT_TRUE(query.ok());
+    auto prepared = database_->PrepareQuery(query.ValueOrDie());
+    ASSERT_TRUE(prepared.ok());
+    auto snapshot = database_->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    ASSERT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{1});
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), {}, {});
+    ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+    size_t rows = 0;
+    while (true) {
+      auto batch = cursor.ValueOrDie().Next();
+      ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+      if (!batch.ValueOrDie()) break;
+      rows += batch.ValueOrDie()->row_count();
+    }
+    EXPECT_EQ(rows, 2U);
+    EXPECT_TRUE(cursor.ValueOrDie().terminal_info().complete);
+    ASSERT_TRUE(cursor.ValueOrDie().Close().ok());
+  }
+}
+
+TEST_F(QueryLifecycleTest, BindingUsesCurrentExecutionMode) {
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+      EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{1}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  const auto vertex = Slot<VertexRef>::Named("v");
+  auto source = Query::Vertices(vertex, At{ValidTime{1}});
+  ASSERT_TRUE(source.ok());
+  auto query = source.ValueOrDie().Select({Project(vertex)});
+  ASSERT_TRUE(query.ok());
+  auto prepared = database_->PrepareQuery(query.ValueOrDie());
+  ASSERT_TRUE(prepared.ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  for (auto mode : {QueryExecutionMode::kInteractive,
+                    QueryExecutionMode::kAnalytical,
+                    QueryExecutionMode::kInteractive}) {
+    auto explanation = prepared.ValueOrDie().ExplainPhysical(
+        snapshot.ValueOrDie(), QueryOptions{.mode = mode});
+    ASSERT_TRUE(explanation.ok()) << explanation.status().ToString();
+    const char* expected = mode == QueryExecutionMode::kAnalytical
+                               ? "lane=analytical" : "lane=interactive";
+    EXPECT_NE(explanation.ValueOrDie().find(expected), std::string::npos)
+        << explanation.ValueOrDie();
+  }
+}
+
+TEST_F(QueryLifecycleTest, BindingAcrossDatabasesWithoutProjectionUsesCurrentContext) {
+  auto other_opened = Database::Open(DatabaseOptions{.path = path_ + "/other"});
+  ASSERT_TRUE(other_opened.ok()) << other_opened.status().ToString();
+  auto other = other_opened.ConsumeValueOrDie();
+  const VertexRef first{PartId{0}, VertexId{1}};
+  const VertexRef second{PartId{7}, VertexId{2}};
+  for (const auto& [database, vertex, birth] : {
+           std::tuple{database_.get(), first, uint64_t{1}},
+           std::tuple{other.get(), second, uint64_t{15}}}) {
+    auto transaction = database->BeginTransaction();
+    ASSERT_TRUE(transaction.ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex(vertex), ValidTime{birth}).ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  }
+  const auto output = Slot<VertexRef>::WithId(SlotId{42}, "v");
+  for (const uint64_t time : {20ULL, 10ULL, 20ULL}) {
+    SCOPED_TRACE(time);
+    auto source = Query::Vertices(output, At{ValidTime{time}});
+    ASSERT_TRUE(source.ok());
+    auto query = source.ValueOrDie().Select({Project(output)});
+    ASSERT_TRUE(query.ok());
+    for (Database* database : {database_.get(), other.get(), database_.get()}) {
+      const bool is_first = database == database_.get();
+      SCOPED_TRACE(is_first ? "first database" : "second database");
+      auto prepared = database->PrepareQuery(query.ValueOrDie());
+      ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+      auto snapshot = database->BeginSnapshot();
+      ASSERT_TRUE(snapshot.ok());
+      ASSERT_EQ(snapshot.ValueOrDie().commit_seq(), CommitSeq{1});
+      auto cursor = prepared.ValueOrDie().Execute(
+          snapshot.ConsumeValueOrDie(), {}, {});
+      ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+      std::vector<VertexRef> rows;
+      for (;;) {
+        auto batch = cursor.ValueOrDie().Next();
+        ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+        if (!batch.ValueOrDie()) break;
+        for (size_t row = 0; row < batch.ValueOrDie()->row_count(); ++row)
+          rows.push_back(batch.ValueOrDie()->Get<VertexRef>(output, row));
+      }
+      if (is_first) EXPECT_EQ(rows, (std::vector<VertexRef>{first}));
+      else if (time == 10) EXPECT_TRUE(rows.empty());
+      else EXPECT_EQ(rows, (std::vector<VertexRef>{second}));
+      EXPECT_TRUE(cursor.ValueOrDie().terminal_info().complete);
+      ASSERT_TRUE(cursor.ValueOrDie().Close().ok());
+    }
+  }
+  ASSERT_TRUE(other->Close().ok());
+}
 
 TEST_F(QueryLifecycleTest, CleanEndIsIdempotentAndComplete) {
   Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");

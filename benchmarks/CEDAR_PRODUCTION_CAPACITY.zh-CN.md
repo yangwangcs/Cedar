@@ -19,6 +19,33 @@
 
 预算内部保持现有比例：facts WriteBufferManager 额度 25%，meta/default 共用额度 5%，共享 block cache 上限 55%。EURDATA 入口的查询 memory、projection cache、query delta 各为 256 MiB。
 
+2026-10-24 归属说明：上述是配置额度，不是三份独立物理占用。
+非 developer profile 的 WBM 使用 shared cache reservation；reservation 对应的
+实际 memtable 不能与该 charge 再重复相加。共享 cache 同时容纳 block 和 Cedar
+解码列页；pin 是 resident 的子集。read-working、独立 projection cache、查询
+输出及其他开销需分别观察，重叠的查询/DB reservation 不代表两份分配。
+本页 2026-10-13 的镜像与容量观测是历史结果，DockerData 重建后不再代表当前
+容器状态；新分层缓存尚未完成生产压力验收，不据此修改本页生产容量数值。
+参见[列式缓存与部署验证](../docs/columnar-cache-and-deployment.md)。
+
+2026-10-25 补充（**不改本页任何数值**）：reader metadata 的自动上限改为
+`max(4096, min(1 GiB, storage_memory_budget / 16))`，并计入 Open 容量预检；
+这只是归属与预检解释的变化，本页容量数字与比例保持原样。生产形状测量（T4）显示
+55 GiB 预算下 36 个 512 MiB L0 的 metadata peak 约占 1 GiB 的 61.5%，1 GiB 的
+break-even 约为每文件 5.37M facts；但该数据来自 synthetic/lab fixture（synthetic
+48.107 B/fact vs 仓库生产 fixture 162.56 B/fact），**尚未在生产容器内存压力下验收**。
+容量规划仍须按实际数据密度、L0 数量与压力测试复核，不能把本页额度当作已验收峰值。
+
+2026-10-26 补充（**仍然不改本页任何数值**）：本阶段完成的是 C3 三档
+read-shape **性能矩阵**（small/medium/large 各 40/40，128 MiB / swap0 / 2 CPU
+专用容器，全部 `cold_unverified`）与 bind/overlay 上的 C4 机制验证，不是容量
+验收；它不产生新的容量结论，因此本页 memtable、cache、比例与镜像数值保持
+2026-10-13 原样。归属提醒：C3 的“文件请求/列解码归零”只在工作集可驻留缓存时
+出现（small 档与 medium/large 的 point），扫描无一致收益，不能据此调整
+`block_cache_bytes`、reader metadata 或其他容量额度；生产 profile 的混合负载与
+真实冷读仍未验证。证据见
+`_gates/final-acceptance-20261026/{03-c3,04-c4-mounts,05-ntfs}/` 与同目录 REPORT。
+
 ## RocksDB 列族
 
 | 项目 | facts | meta | default |

@@ -16,7 +16,10 @@ Cedar Kernel bitemporal graph database.
    measured write, read, and sustained mixed-workload results.
 5. Read the [follow-up release notes](release-notes.md) for the F11-F20 changes
    and the F14 retention milestone, including the v2-only meta sequence
-   contract, the reopen-validation default switch, and the rollback options.
+   contract, the full-history reopen-validation default, and the explicit
+   bounded-validation option.
+6. Read the [columnar cache deployment notes](columnar-cache-and-deployment.md)
+   for cache ownership, reproducible validation, and current evidence limits.
 
 ## Public Storage Model
 
@@ -137,7 +140,10 @@ which keeps every `sequence/*` record and the historical contiguous
 - **Read/repair semantics:** `ReadSequence` and `ReadSequenceRange` report
   `SnapshotExpired` for history below the durable boundary instead of silently
   shortening the range; a missing record at or above it is `Corruption`. The
-  transaction-ID allocator cold path starts its rebuild at the watermark.
+  same expiry applies to transaction resolution and idempotent commit retries.
+  Concurrent resolution uses a single RocksDB snapshot, so it can still return
+  the historical result when its snapshot predates the prune.
+  The transaction-ID allocator cold path starts its rebuild at the watermark.
   `BeginSnapshot`/`GetPointAtAt` already reject `as_of` below
   `oldest_readable`.
 - **Compatibility:** the extra meta key is invisible to binaries that predate

@@ -176,3 +176,94 @@ benchmarks/run_cedar_query_campaign.sh \
 Compare future results only when the Cedar revision, compiler, host,
 filesystem, workload, transaction size, duration, writer count, group-commit
 limits, and reopen setting are documented together.
+
+## Column Page Cache Metrics
+
+`GetCommitPipelineMetrics()` separates these layers:
+
+| Fields | Meaning |
+| --- | --- |
+| `column_page_cache_hits`, `column_page_cache_misses`, `column_page_cache_decodes` | Physical immutable column-page lookups and successful decodes |
+| `column_page_resident_charge_bytes` | Payload capacity charged to the shared strict cache |
+| `column_page_pinned_charge_bytes` | Resident charge currently pinned; a subset of resident bytes |
+| `column_page_uncached_live_bytes` | Live transient column pages, charged to the read working pool |
+| `storage_file_read_calls`, `storage_file_read_bytes` | Data-page requests issued to the filesystem, including checksum and canonical-key validation pages |
+| `storage_read_working_bytes`, `storage_read_working_peak_bytes`, `storage_read_working_rejections` | Current, peak and rejected DB read reservations |
+| `parquet_reader_metadata_bytes`, `parquet_reader_metadata_peak_bytes` | Current and peak reader-owned footer, indexes, Bloom storage and table-property capacity estimates |
+| `projection_page_cache_hits`, `projection_page_cache_misses`, `projection_page_cache_resident_bytes` | Independent derived-page cache lookups and resident usage |
+
+Filesystem request bytes are not device I/O. Buffered requests can be satisfied
+by the Linux page cache. Opening readers also reads metadata, which is outside
+the data-page request counters. Recovery validation can warm both layers before
+a workload starts; use counter deltas after recovery for workload comparisons.
+
+The legacy `canonical_page_decodes` counter counts canonical path cold loads.
+It is not the total of all column decodes. Legacy hits, misses, decoded bytes,
+resident, pin and insertion failures now count physical column pages: a
+canonical sort/value pair can produce two rejected insertions. Do not add the
+legacy gauges to the corresponding column gauges, or add pins to residency.
+The DB read pool and a query's logical pin allowance also describe different
+constraints on memory; a query pin does not allocate a second payload.
+
+`projection_cache_bytes=0` disables derived-page residency. Point-entity query
+reads admit validated pages; range reads look up existing pages without
+admission. Cache entries contain unfiltered immutable pages. Their keys include
+database/segment identity, generation, base sequence, schema, page and payload
+checksum. Resident entries do not keep retired generation files alive; active
+read handles retain generation and query leases until consumption completes.
+
+The persisted-dataset runner and matrix are documented in
+`columnar-cache-and-deployment.md`. Their Debug smoke verifies correctness and
+counter collection; it does not establish a cold-read or production latency
+improvement. Preserve the raw CSV and per-run sidecars when comparing builds.
+
+`CanonicalFactReader::ReadExact` now accepts an optional
+`std::shared_ptr<FactReadMemory>` request argument. Calls retain the default,
+but custom reader subclasses must update their override signature. Ordinary
+state/event/exact requests and columnar reads propagate the query resource to
+storage page reservations. Reader-open metadata remains reader-owned rather
+than part of the data-page request accounting.
+
+Exact reads return a movable `FactEventBatch`; use `.events` for rows and retain
+the batch while using its buffer. Clearing `.events` retains its capacity and
+reservation until the batch is destroyed or replaced. Point `FactEvent` results
+carry their result reservation as well. Budgeted exact reads inspect value sizes
+at the pinned snapshot before `MultiGet` copies encoded strings; this adds a
+sizing pass and should be included in read-cost comparisons. Ordinary scan
+decoding, event buffers, state history and correction workspace reserve query
+memory before owning allocations. Runtime reservation owners are not persisted.
+The exact-read array charge includes RocksDB's temporary pinned-value slots,
+KeyContext and sorted-pointer heap arrays, plus per-batch LookupKey and
+GetContext heap workspaces. Geometric array growth includes overlapping old
+and new buffers. These charges apply before the corresponding read allocations;
+insufficient allowance returns ResourceExhausted and rolls back reservations.
+Transaction-overlay merged rows, sorting workspace and callback copies are
+query-budgeted. Columnar overlay output consumes event batches directly. Event
+limits apply after merging; state limits apply after correction-history reduction.
+Other engine-internal allocations, including iterator and file-selection
+structures, still require an allocation audit; these counters do not establish
+a hard bound on all process memory.
+
+`parquet_reader_metadata_bytes` reports the estimated dynamic storage owned by
+currently open Parquet readers. `parquet_reader_metadata_peak_bytes` retains
+the maximum combined reader charge for that database resource lifetime,
+including after readers close. It excludes decoded pages charged to the shared
+cache and is an estimate of owned capacity, not allocator RSS or a reservation.
+# Column-page decode timing
+
+The dedicated columnar cache benchmark reports `decode_us` as the measured
+interval's primitive page decode time, accumulated in nanoseconds and converted
+to microseconds once for CSV output. The timer starts after file I/O and ends
+when primitive decompression/decoding returns. It includes decoder budget
+callbacks and failed decode attempts; it excludes typed-column conversion,
+canonical validation, cache lookup, and file reads. It is elapsed time summed
+across workers, so it is neither CPU time nor end-to-end latency.
+
+Internal runtime counters additionally separate all 25 physical columns:
+lookup hits/misses, admissions, admission rejections, completed typed-page
+decodes and retained allocation charges, primitive decode attempts and time.
+Temporary internal-key validation contributes primitive attempts/time but no
+cache lookup or retained typed-page charge. Admission rejection means admission
+was requested but disabled, oversized, or rejected by the cache; lookup-only
+bypasses are not counted as rejected admissions. A cache-hit query pin denial
+returns a resource error before recording a successful hit.

@@ -17,6 +17,8 @@ namespace cedar::internal {
 struct ResolvedStorageProfile {
   uint64_t memory_budget_bytes = 0;
   uint64_t block_cache_bytes = 0;
+  uint64_t storage_read_working_bytes = 0;
+  uint64_t storage_reader_metadata_bytes = 0;
   uint64_t facts_write_buffer_bytes = 0;
   uint64_t meta_write_buffer_bytes = 0;
   uint64_t default_write_buffer_bytes = 0;

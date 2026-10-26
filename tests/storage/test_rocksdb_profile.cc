@@ -19,6 +19,134 @@
 namespace cedar::internal {
 namespace {
 
+TEST(RocksDbProfileTest, UsesBufferedIoForSystemPageCache) {
+  FactStoreOptions store;
+  const auto options = MakeRocksDbOptions(store, true);
+  EXPECT_FALSE(options.use_direct_reads);
+  EXPECT_FALSE(options.use_direct_io_for_flush_and_compaction);
+}
+
+TEST(RocksDbProfileTest, ResolvesStorageReadWorkingBudget) {
+  FactStoreOptions small;
+  small.storage_profile = StorageProfile::kKernelTest;
+  const auto automatic = ResolveStorageProfile(small);
+  ASSERT_TRUE(automatic.ok()) << automatic.status().ToString();
+  EXPECT_EQ(automatic.ValueOrDie().storage_read_working_bytes, 64ULL << 10);
+  EXPECT_EQ(automatic.ValueOrDie().storage_reader_metadata_bytes, 64ULL << 10);
+  small.storage_read_working_bytes = 12345;
+  small.storage_reader_metadata_bytes = 23456;
+  const auto explicit_budget = ResolveStorageProfile(small);
+  ASSERT_TRUE(explicit_budget.ok());
+  EXPECT_EQ(explicit_budget.ValueOrDie().storage_read_working_bytes, 12345U);
+  EXPECT_EQ(explicit_budget.ValueOrDie().storage_reader_metadata_bytes, 23456U);
+  FactStoreOptions large;
+  large.write_buffer_bytes = 1ULL << 30;
+  large.block_cache_bytes = 1ULL << 30;
+  const auto capped = ResolveStorageProfile(large);
+  ASSERT_TRUE(capped.ok());
+  EXPECT_EQ(capped.ValueOrDie().storage_read_working_bytes, 64ULL << 20);
+  // Automatic reader metadata follows budget/16 up to 1 GiB: a 2 GiB budget
+  // reserves 128 MiB while the working pool keeps its 64 MiB cap.
+  EXPECT_EQ(capped.ValueOrDie().storage_reader_metadata_bytes, 128ULL << 20);
+}
+
+TEST(RocksDbProfileTest, ResolvesAutomaticReaderMetadataAcrossBudgets) {
+  constexpr uint64_t kKiB = 1ULL << 10;
+  constexpr uint64_t kMiB = 1ULL << 20;
+  constexpr uint64_t kGiB = 1ULL << 30;
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(pages, 0);
+  ASSERT_GT(page_size, 0);
+  const uint64_t host_memory =
+      static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+  ASSERT_GT(host_memory, 2ULL << 30);
+
+  const auto expect_metadata = [](uint64_t budget, uint64_t expected) {
+    FactStoreOptions options;
+    options.storage_profile = StorageProfile::kProductionAppend;
+    options.production.memory_budget_bytes = budget;
+    const auto resolved = ResolveStorageProfile(options);
+    ASSERT_TRUE(resolved.ok())
+        << "budget=" << budget << " " << resolved.status().ToString();
+    EXPECT_EQ(resolved.ValueOrDie().storage_reader_metadata_bytes, expected)
+        << "budget=" << budget;
+    EXPECT_EQ(resolved.ValueOrDie().storage_read_working_bytes, 64 * kMiB)
+        << "budget=" << budget;
+  };
+
+  struct MetadataCase {
+    uint64_t budget;
+    uint64_t metadata;
+  };
+  const MetadataCase cases[] = {
+      {8 * kGiB, 512 * kMiB},
+      {16 * kGiB, 1 * kGiB},
+      // Above the 16 GiB crossing the automatic value stays capped at 1 GiB.
+      {32 * kGiB, 1 * kGiB},
+  };
+  size_t checked = 0;
+  for (const auto& test_case : cases) {
+    if (test_case.budget > host_memory / 2) continue;
+    expect_metadata(test_case.budget, test_case.metadata);
+    ++checked;
+  }
+  // The gate container (~110 GiB) runs all three budgets. Smaller hosts skip
+  // the 32 GiB case because the profile rejects budgets above 50% of memory.
+  if (host_memory >= 66 * kGiB) {
+    EXPECT_EQ(checked, 3U);
+  } else {
+    EXPECT_GE(checked, 1U);
+  }
+
+  // The documented production default is 50% of host memory (~55 GiB in the
+  // gate container). It must resolve to the 1 GiB cap, not budget/16.
+  const uint64_t production_shape = host_memory / 2;
+  expect_metadata(production_shape,
+                  production_shape >= 16 * kGiB ? 1 * kGiB
+                                                : production_shape / 16);
+
+  // The 1 MiB kernel-test profile is below the cap and keeps 64 KiB.
+  FactStoreOptions kernel;
+  kernel.storage_profile = StorageProfile::kKernelTest;
+  const auto resolved_kernel = ResolveStorageProfile(kernel);
+  ASSERT_TRUE(resolved_kernel.ok()) << resolved_kernel.status().ToString();
+  EXPECT_EQ(resolved_kernel.ValueOrDie().memory_budget_bytes, 1 * kMiB);
+  EXPECT_EQ(resolved_kernel.ValueOrDie().storage_reader_metadata_bytes,
+            64 * kKiB);
+  EXPECT_EQ(resolved_kernel.ValueOrDie().storage_read_working_bytes, 64 * kKiB);
+}
+
+TEST(RocksDbProfileTest, ExplicitReaderMetadataOverridesTheAutomaticCap) {
+  constexpr uint64_t kGiB = 1ULL << 30;
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(pages, 0);
+  ASSERT_GT(page_size, 0);
+  const uint64_t host_memory =
+      static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+
+  FactStoreOptions options;
+  options.storage_profile = StorageProfile::kProductionAppend;
+  options.production.memory_budget_bytes =
+      std::min<uint64_t>(16 * kGiB, host_memory / 2);
+  ASSERT_GE(options.production.memory_budget_bytes, 1 * kGiB);
+  // Explicit nonzero values win even above the automatic 1 GiB cap.
+  options.storage_reader_metadata_bytes = 2 * kGiB;
+  options.storage_read_working_bytes = 12345;
+  const auto resolved = ResolveStorageProfile(options);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  EXPECT_EQ(resolved.ValueOrDie().storage_reader_metadata_bytes, 2 * kGiB);
+  EXPECT_EQ(resolved.ValueOrDie().storage_read_working_bytes, 12345U);
+}
+
+TEST(RocksDbProfileTest, RejectsOverflowingDeveloperStorageBudget) {
+  FactStoreOptions options;
+  options.write_buffer_bytes = UINT64_MAX;
+  options.block_cache_bytes = 1;
+  EXPECT_TRUE(ResolveStorageProfile(options).status().IsInvalidArgument());
+}
+
 class MetaCompressionTest : public testing::TestWithParam<StorageProfile> {
  protected:
   void SetUp() override {

@@ -102,7 +102,26 @@ std::shared_ptr<rocksdb::TableFactory> MakeTableFactory(
 StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
     const FactStoreOptions& options) {
   ResolvedStorageProfile result;
+  const auto resolve_read_budget = [&] {
+    // Reader metadata is pinned for every active L0 reader during recovery and
+    // scans, so its automatic cap follows 1/16 of the storage budget up to
+    // 1 GiB instead of the page-decode working cap. A production budget of
+    // 55 GiB therefore reserves 1 GiB, while budgets below 16 GiB keep the
+    // linear 1/16 share (the 1 MiB kernel-test profile still resolves to
+    // 64 KiB). An explicit nonzero option always wins.
+    result.storage_reader_metadata_bytes = options.storage_reader_metadata_bytes != 0
+        ? options.storage_reader_metadata_bytes
+        : std::max<uint64_t>(4096, std::min<uint64_t>(kGiB,
+                                                     result.memory_budget_bytes / 16));
+    result.storage_read_working_bytes = options.storage_read_working_bytes != 0
+        ? options.storage_read_working_bytes
+        : std::max<uint64_t>(4096, std::min<uint64_t>(64 * kMiB,
+                                                     result.memory_budget_bytes / 16));
+  };
   if (options.storage_profile == StorageProfile::kDeveloper) {
+    if (options.block_cache_bytes > UINT64_MAX - options.write_buffer_bytes) {
+      return Status::InvalidArgument("storage profile", "memory budget overflows uint64");
+    }
     result.memory_budget_bytes = options.write_buffer_bytes + options.block_cache_bytes;
     result.block_cache_bytes = options.block_cache_bytes;
     result.facts_write_buffer_bytes = options.write_buffer_bytes;
@@ -119,6 +138,7 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
     result.normal_flush_credits = 1;
     result.emergency_flush_credits = 1;
     result.compaction_credits = 1;
+    resolve_read_budget();
     return result;
   }
   if (options.production.max_commit_batch_count == 0 ||
@@ -175,6 +195,7 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
     result.max_background_jobs = 2;
     result.max_subcompactions = 1;
     result.max_total_wal_size = 256ULL * 1024ULL;
+    resolve_read_budget();
     return result;
   }
   uint64_t budget = options.production.memory_budget_bytes;
@@ -316,6 +337,7 @@ StatusOr<ResolvedStorageProfile> ResolveStorageProfile(
                                             result.meta_write_buffer_bytes));
   result.compaction_rate_limit_bytes_per_sec =
       options.production.compaction_rate_limit_bytes_per_sec;
+  resolve_read_budget();
   return result;
 }
 

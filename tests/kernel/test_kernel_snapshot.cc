@@ -759,6 +759,12 @@ TEST_F(KernelSnapshotTest, CloseRacingFastPathLeavesNoLivePins) {
       EXPECT_TRUE(closed.IsSnapshotPinned()) << closed.ToString();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    // A failed close reopens admission, so continuous readers can keep a pin
+    // alive across every retry. Quiesce them before requiring close to succeed,
+    // and join before any fatal assertion so failures cannot terminate the test.
+    stop.store(true, std::memory_order_relaxed);
+    for (std::thread& reader : readers) reader.join();
+    if (!closed.ok()) closed = database->Close();
     ASSERT_TRUE(closed.ok()) << closed.ToString();
     // A successful close implies zero live pins: the store is gone, so a new
     // read is rejected instead of returning stale data.
@@ -766,8 +772,6 @@ TEST_F(KernelSnapshotTest, CloseRacingFastPathLeavesNoLivePins) {
         database->GetPointAt(property.ref(), ValidTime{15});
     ASSERT_FALSE(after_close.ok());
     EXPECT_TRUE(after_close.status().IsInvalidArgument());
-    stop.store(true, std::memory_order_relaxed);
-    for (std::thread& reader : readers) reader.join();
     EXPECT_EQ(unexpected.load(), 0U);
     EXPECT_GT(succeeded.load(), 0U);
     EXPECT_GT(succeeded.load() + rejected.load(), 0U);

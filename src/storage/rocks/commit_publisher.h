@@ -23,6 +23,25 @@ struct CandidateCommit {
   std::vector<std::string> fact_keys;
 };
 
+// The canonical fact set includes identity facts synthesized by the writer.
+// Visit without retaining another copy of the transaction's value payloads.
+template <typename Visitor>
+Status VisitCommitFacts(const StoreCommitBatch& batch, Visitor visitor) {
+  for (const auto& mutation : batch.mutations) {
+    const Status status = visitor(mutation, nullptr);
+    if (!status.ok()) return status;
+  }
+  for (const auto& identity : batch.edge_identities) {
+    const PendingFactMutation mutation{
+        FactRef(identity.home_part_id, FactFamily::kEdgeIdentity,
+                PropertyId{}, identity.edge_id.value),
+        ValidTime{0}, FactOperation::kPut, 0, std::nullopt};
+    const Status status = visitor(mutation, &identity);
+    if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
 // Appends one candidate transaction to `write_batch`. The committed sequence
 // record is always encoded with the only supported format (meta sequence v2,
 // `kSequenceV2`); the transaction-outcome record, facts and routing metadata are

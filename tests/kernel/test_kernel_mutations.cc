@@ -48,6 +48,31 @@ class KernelMutationTest : public ::testing::Test {
   std::unique_ptr<Database> database_;
 };
 
+TEST_F(KernelMutationTest, SameEdgeIdInDifferentHomePartsIsIndependent) {
+  auto transaction = Begin();
+  for (uint32_t part : {1U, 2U}) {
+    for (uint64_t id : {11ULL, 12ULL}) {
+      ASSERT_TRUE(transaction->Assert(
+          EntityFact::Vertex(VertexRef{PartId{part}, VertexId{id}}),
+          ValidTime{10}).ok());
+    }
+    const EdgeIdentity identity{EdgeRef{PartId{part}, EdgeId{7}},
+        VertexRef{PartId{part}, VertexId{11}},
+        VertexRef{PartId{part}, VertexId{12}}, 1};
+    const auto status = transaction->Assert(identity, ValidTime{10});
+    ASSERT_TRUE(status.ok()) << status.ToString();
+  }
+  ASSERT_TRUE(transaction->Commit().ok());
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  for (uint32_t part : {1U, 2U}) {
+    const auto exists = snapshot.ValueOrDie().Exists(
+        EntityFact::Edge(EdgeRef{PartId{part}, EdgeId{7}}), ValidTime{10});
+    ASSERT_TRUE(exists.ok());
+    EXPECT_TRUE(exists.ValueOrDie());
+  }
+}
+
 TEST_F(KernelMutationTest, StagesEntityStateWithoutPropertySchemaOrValue) {
   std::unique_ptr<Transaction> transaction = Begin();
   ASSERT_TRUE(transaction->Assert(EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}), ValidTime{10}).ok());

@@ -1193,11 +1193,9 @@ TEST_F(FactStoreMetadataTest,
       << status.ToString();
 }
 
-// F18: the production default is now the bounded recent window. An old fact
-// that the window skips no longer fails Open; damage to it is observed when the
-// fact is read instead. The explicit deep option remains the documented
-// rollback to the previous full-history reopen validation.
-TEST_F(FactStoreMetadataTest, DefaultReopenValidationUsesBoundedWindow) {
+// The default reopen policy cross-checks every retained fact. The bounded
+// recent window remains available as an explicit performance policy.
+TEST_F(FactStoreMetadataTest, DefaultReopenValidationUsesFullHistory) {
   constexpr uint64_t kTransactions = 5;
   for (uint64_t index = 1; index <= kTransactions; ++index) {
     ASSERT_TRUE(store_
@@ -1211,30 +1209,26 @@ TEST_F(FactStoreMetadataTest, DefaultReopenValidationUsesBoundedWindow) {
   ASSERT_FALSE(old_fact.empty());
   DeleteFactRecord(path_, old_fact);
 
-  // Only K is overridden to keep the test cheap (production K=4096); the
-  // cross-check policy is the default one.
   FactStoreOptions defaults{path_};
   defaults.recovery_validation_recent_sequences = 2;
   store_ = std::make_unique<FactStore>(defaults);
-  ASSERT_TRUE(store_->Open().ok())
-      << "default reopen validation must not check facts outside the recent "
-         "window";
+  const Status default_status = store_->Open();
+  EXPECT_TRUE(default_status.IsCorruption()) << default_status.ToString();
+  EXPECT_NE(default_status.ToString().find("missing fact"), std::string::npos)
+      << default_status.ToString();
+
+  FactStoreOptions bounded{path_};
+  bounded.deep_recovery_validation = false;
+  bounded.recovery_validation_recent_sequences = 2;
+  store_ = std::make_unique<FactStore>(bounded);
+  ASSERT_TRUE(store_->Open().ok());
   const auto read = store_->ReadCurrent(
       EntityFact::Vertex(VertexRef{PartId{0}, VertexId{1}}).ref(),
       ValidTime{11});
   ASSERT_TRUE(read.ok()) << read.status().ToString();
   EXPECT_FALSE(read.ValueOrDie().has_value())
-      << "the deleted fact is detected on read, not at reopen";
+      << "the explicitly bounded policy may skip facts outside its window";
   ASSERT_TRUE(store_->Close().ok());
-
-  // Documented rollback: deep=true restores the previous full-history policy.
-  FactStoreOptions deep{path_};
-  deep.deep_recovery_validation = true;
-  store_ = std::make_unique<FactStore>(deep);
-  const Status status = store_->Open();
-  EXPECT_TRUE(status.IsCorruption()) << status.ToString();
-  EXPECT_NE(status.ToString().find("missing fact"), std::string::npos)
-      << status.ToString();
 }
 
 TEST_F(FactStoreMetadataTest,
@@ -1259,7 +1253,7 @@ TEST_F(FactStoreMetadataTest,
   ASSERT_TRUE(store_->Open().ok());
   ASSERT_TRUE(store_->Close().ok());
 
-  // Explicit opt-in: the default is now the bounded policy (F18).
+  // Full validation rejects the missing retained fact.
   FactStoreOptions deep_options{path_};
   deep_options.deep_recovery_validation = true;
   store_ = std::make_unique<FactStore>(deep_options);
@@ -1395,6 +1389,21 @@ TEST_F(FactStoreMetadataTest, ReopenValidationCountersResetBetweenOpens) {
 // scan latched Corruption after visiting the first fact. Database::Open then
 // silently skipped its adjacency rebuild. ScanFamily must read committed facts
 // of both requested families across flushed SSTs.
+TEST_F(FactStoreMetadataTest, ReopenReadBudgetExhaustionIsNotMissingFactCorruption) {
+  const StoreCommitBatch batch{
+      TxnId{1}, 10,
+      {{EntityFact::Vertex({PartId{0}, VertexId{7}}).ref(), ValidTime{10},
+        FactOperation::kPut, 0, std::nullopt}}, {}};
+  ASSERT_TRUE(store_->Commit(batch).ok());
+  ASSERT_TRUE(store_->Close().ok());
+  FactStoreOptions tiny_options{path_};
+  tiny_options.storage_read_working_bytes = 1;
+  FactStore tiny(tiny_options);
+  const Status rejected = tiny.Open();
+  EXPECT_TRUE(rejected.IsResourceExhausted()) << rejected.ToString();
+  EXPECT_TRUE(store_->Open().ok());
+}
+
 TEST_F(FactStoreMetadataTest, ScanFamilyReadsFlushedFactsAfterCleanReopen) {
   const EdgeIdentity identity{EdgeId{17}, VertexId{7}, VertexId{11}, 3};
   const StoreCommitBatch batch{

@@ -1086,7 +1086,9 @@ TEST(KernelAdmissionControlTest, BoundsMailboxAdmissionWithoutBlockingCallers) {
           .reserved_interactive_workers = 1,
           .query_memory_bytes = 32ULL * 1024ULL * 1024ULL,
           .projection_cache_bytes = 32ULL * 1024ULL * 1024ULL,
-          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL}});
+          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL},
+      .storage_read_working_bytes = 32ULL << 20,
+      .storage_reader_metadata_bytes = 16ULL << 20});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto first = database->BeginTransaction();
@@ -3048,7 +3050,9 @@ TEST(KernelGroupCommitTest, UsesOnlyCedarWriteSeam) {
           .reserved_interactive_workers = 1,
           .query_memory_bytes = 32ULL * 1024ULL * 1024ULL,
           .projection_cache_bytes = 32ULL * 1024ULL * 1024ULL,
-          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL}});
+          .query_delta_bytes = 32ULL * 1024ULL * 1024ULL},
+      .storage_read_working_bytes = 32ULL << 20,
+      .storage_reader_metadata_bytes = 16ULL << 20});
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
   auto database = std::move(opened).ConsumeValueOrDie();
   auto transaction = database->BeginTransaction();

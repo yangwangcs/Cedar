@@ -74,32 +74,28 @@ Status AppendCandidateToWriteBatch(const CandidateCommit& candidate,
       return Status::InvalidArgument("commit publisher", "duplicate fact key");
     }
   }
-  for (size_t index = 0; index < candidate.batch->mutations.size(); ++index) {
-    const PendingFactMutation& mutation = candidate.batch->mutations[index];
+  size_t index = 0;
+  const Status facts_written = VisitCommitFacts(*candidate.batch,
+      [&](const PendingFactMutation& mutation, const EdgeIdentity* identity) {
     const FactEvent event{mutation.ref, mutation.valid_from, candidate.commit_seq,
-                          mutation.operation, mutation.schema_epoch, mutation.value};
+                          mutation.operation, mutation.schema_epoch, mutation.value,
+                          identity ? std::optional<EdgeIdentity>{*identity}
+                                   : std::nullopt};
     const auto encoded_value = EncodeFactValue(event);
     if (!encoded_value.ok()) return encoded_value.status();
-    write_batch->Put(facts_cf, candidate.fact_keys[index],
-                     encoded_value.ValueOrDie());
-  }
-  for (const EdgeIdentity& identity : candidate.batch->edge_identities) {
-    const FactRef identity_ref(identity.home_part_id, FactFamily::kEdgeIdentity,
-                               PropertyId{}, identity.edge_id.value);
-    const std::string identity_key =
-        EncodeFactKey(identity_ref, ValidTime{0}, candidate.commit_seq);
-    if (identity_key.empty()) {
-      return Status::InvalidArgument("commit publisher", "invalid edge identity fact key");
+    if (identity == nullptr) {
+      write_batch->Put(facts_cf, candidate.fact_keys[index++],
+                       encoded_value.ValueOrDie());
+    } else {
+      const std::string key = EncodeFactKey(
+          mutation.ref, mutation.valid_from, candidate.commit_seq);
+      sequence_fact_keys.push_back(key);
+      write_batch->Put(facts_cf, key, encoded_value.ValueOrDie());
     }
-    sequence_fact_keys.push_back(identity_key);
-    const FactEvent identity_event{
-        identity_ref, ValidTime{0}, candidate.commit_seq, FactOperation::kPut,
-        0, std::nullopt, identity};
-    const auto encoded_identity_fact = EncodeFactValue(identity_event);
-    if (!encoded_identity_fact.ok()) return encoded_identity_fact.status();
-    write_batch->Put(facts_cf, identity_key,
-                     encoded_identity_fact.ValueOrDie());
-
+    return Status::OK();
+  });
+  if (!facts_written.ok()) return facts_written;
+  for (const EdgeIdentity& identity : candidate.batch->edge_identities) {
     const auto key = EncodeEdgeIdentityMetaKey(identity.edge_ref());
     const auto value = EncodeEdgeIdentity(identity);
     if (!key.ok()) return key.status();

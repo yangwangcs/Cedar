@@ -25,6 +25,7 @@
 #include "kernel/temporal_validation.h"
 #include "kernel/transaction_mutation.h"
 #include "query/temporal/state_reader.h"
+#include "storage/facts/read_memory_scope.h"
 
 namespace cedar {
 
@@ -165,16 +166,33 @@ class TransactionOverlayReader final : public CanonicalFactReader {
     const CommitSeq durable_seq =
         snapshot_seq.value > base_.commit_seq().value ? base_.commit_seq()
                                                        : snapshot_seq;
+    internal::FactReadMemoryScope result_memory(spec.read_memory.get());
     auto current = base_.canonical_reader().ReadStateAt(spec, time, durable_seq);
     if (!current.ok() || !include_staged_) return current;
-    std::optional<FactEvent> winner = current.ValueOrDie();
-    for (const FactEvent& event : StagedEvents(spec)) {
-      if (event.valid_from.value > time.value) continue;
-      if (!winner.has_value() || event.valid_from.value > winner->valid_from.value ||
-          (event.valid_from == winner->valid_from && event.commit_seq.value >= winner->commit_seq.value)) {
-        winner = event;
+    std::optional<FactEvent> winner = std::move(current).ConsumeValueOrDie();
+    std::optional<FactEvent> staged_winner;
+    const std::optional<Value>* payload = nullptr;
+    const Status selected = VisitStaged(spec, [&](const FactEvent& event, const std::optional<Value>& value) {
+      if (event.valid_from.value > time.value) return Status::OK();
+      const auto& candidate = staged_winner ? staged_winner : winner;
+      if (!candidate || event.valid_from.value > candidate->valid_from.value ||
+          (event.valid_from == candidate->valid_from && event.commit_seq.value >= candidate->commit_seq.value)) {
+        staged_winner = event;
+        payload = value ? &value : nullptr;
       }
-    }
+      return Status::OK();
+    });
+    if (!selected.ok()) return selected;
+    if (!staged_winner) return winner;
+    Status reserved = result_memory.Reserve(sizeof(FactEvent));
+    if (!reserved.ok()) return reserved;
+    reserved = result_memory.Reserve(payload ? internal::FactValueHeapBytes(*payload) : 0);
+    if (!reserved.ok()) return reserved;
+    if (payload) staged_winner->value = *payload;
+    auto owner = result_memory.Retain(spec.read_memory);
+    if (!owner.ok()) return owner.status();
+    staged_winner->read_memory_owner = std::move(owner).ConsumeValueOrDie();
+    winner = std::move(staged_winner);
     return winner;
   }
 
@@ -184,7 +202,9 @@ class TransactionOverlayReader final : public CanonicalFactReader {
     if (!include_staged_) return base_.canonical_reader().ReadStateRows(spec, visitor);
     if (spec.max_rows.has_value() && *spec.max_rows == 0) return Status::OK();
     internal::StateRowStream stream(spec, visitor);
-    Status status = ReadEvents(spec.facts, [&stream](const FactEventBatch& batch) {
+    FactReadSpec events = spec.facts;
+    events.max_rows.reset();
+    Status status = ReadEvents(events, [&stream](const FactEventBatch& batch) {
       return stream.Consume(batch);
     });
     if (status.IsQueryCancelled() && stream.limit_reached()) return Status::OK();
@@ -195,16 +215,35 @@ class TransactionOverlayReader final : public CanonicalFactReader {
   Status ReadEvents(const FactReadSpec& spec,
                     const CanonicalFactBatchVisitor& visitor) const override {
     if (!visitor) return Status::InvalidArgument("transaction overlay", "missing visitor");
+    const Status valid = spec.Validate();
+    if (!valid.ok()) return valid;
+    if (spec.max_rows && *spec.max_rows == 0) return Status::OK();
+    if (!include_staged_) return base_.canonical_reader().ReadEvents(spec, visitor);
+    internal::FactReadMemoryScope event_memory(spec.read_memory.get());
     std::vector<FactEvent> events;
-    Status status = base_.canonical_reader().ReadEvents(spec, [&events](const FactEventBatch& batch) {
-      events.insert(events.end(), batch.events.begin(), batch.events.end());
+    auto append = [&](const FactEvent& event, const std::optional<Value>& value) {
+      Status status = internal::ReserveFactAppend(&events, &event_memory);
+      if (!status.ok()) return status;
+      status = event_memory.Reserve(internal::FactValueHeapBytes(value));
+      if (!status.ok()) return status;
+      events.push_back(FactEvent{event.ref, event.valid_from, event.commit_seq,
+          event.operation, event.schema_epoch, value, event.edge_identity});
+      return Status::OK();
+    };
+    Status status = base_.canonical_reader().ReadEvents(spec, [&](const FactEventBatch& batch) {
+      for (const auto& event : batch.events) {
+        const Status copied = append(event, event.value);
+        if (!copied.ok()) return copied;
+      }
       return Status::OK();
     });
     if (!status.ok()) return status;
-    if (include_staged_) {
-      auto staged = StagedEvents(spec);
-      events.insert(events.end(), staged.begin(), staged.end());
-    }
+    status = VisitStaged(spec, append);
+    if (!status.ok()) return status;
+    // stable_sort may allocate a second row buffer while the input stays live.
+    internal::FactReadMemoryScope sort_memory(spec.read_memory.get());
+    status = sort_memory.ReserveElements(events.size(), sizeof(FactEvent));
+    if (!status.ok()) return status;
     std::stable_sort(events.begin(), events.end(), [](const FactEvent& left, const FactEvent& right) {
       if (left.ref != right.ref) {
         return std::tuple{left.ref.part_id().value,
@@ -217,9 +256,19 @@ class TransactionOverlayReader final : public CanonicalFactReader {
       if (left.valid_from != right.valid_from) return left.valid_from.value < right.valid_from.value;
       return left.commit_seq.value < right.commit_seq.value;
     });
+    sort_memory.Reset();
+    const size_t output_size = spec.max_rows
+        ? std::min<uint64_t>(events.size(), *spec.max_rows) : events.size();
     size_t offset = 0;
-    while (offset < events.size()) {
-      const size_t count = std::min<size_t>(spec.batch_row_limit, events.size() - offset);
+    while (offset < output_size) {
+      const size_t count = std::min<size_t>(spec.batch_row_limit, output_size - offset);
+      internal::FactReadMemoryScope batch_memory(spec.read_memory.get());
+      status = batch_memory.ReserveElements(count, sizeof(FactEvent));
+      if (!status.ok()) return status;
+      for (size_t i = offset; i < offset + count; ++i) {
+        status = batch_memory.Reserve(internal::FactValueHeapBytes(events[i].value));
+        if (!status.ok()) return status;
+      }
       FactEventBatch batch{std::vector<FactEvent>(events.begin() + offset, events.begin() + offset + count)};
       status = visitor(batch);
       if (!status.ok()) return status;
@@ -231,36 +280,61 @@ class TransactionOverlayReader final : public CanonicalFactReader {
   Status ReadColumnar(const FactReadSpec& spec,
                       const CanonicalColumnarBatchVisitor& visitor) const override {
     if (spec.projection.empty()) return Status::InvalidArgument("transaction overlay", "missing projection");
-    std::vector<FactEvent> events;
-    Status status = ReadEvents(spec, [&events](const FactEventBatch& batch) {
-      events.insert(events.end(), batch.events.begin(), batch.events.end()); return Status::OK();
+    if (!visitor) return Status::InvalidArgument("transaction overlay", "missing visitor");
+    return ReadEvents(spec, [&](const FactEventBatch& events) {
+      internal::FactReadMemoryScope column_memory(spec.read_memory.get());
+      Status status = column_memory.ReserveElements(spec.projection.size(), sizeof(FactColumn));
+      if (!status.ok()) return status;
+      FactColumnarBatch batch;
+      batch.columns.reserve(spec.projection.size());
+      for (FactColumnId id : spec.projection) {
+        FactColumn column;
+        status = MakeOverlayColumn(id, &column);
+        if (!status.ok()) return status;
+        status = std::visit([&](auto& values) {
+          using Element = typename std::decay_t<decltype(values)>::value_type;
+          Status reserved = column_memory.ReserveElements(
+              events.events.size(), sizeof(Element) + sizeof(uint8_t));
+          if (!reserved.ok()) return reserved;
+          values.reserve(events.events.size());
+          return Status::OK();
+        }, column.values);
+        if (!status.ok()) return status;
+        column.present.reserve(events.events.size());
+        batch.columns.push_back(std::move(column));
+      }
+      for (const auto& event : events.events) {
+        for (auto& column : batch.columns) {
+          if (column.id == FactColumnId::kBytesValue) {
+            // The optional argument and value_or copy overlap during append.
+            status = column_memory.ReserveElements(internal::FactValueHeapBytes(event.value), 2);
+            if (!status.ok()) return status;
+          }
+          status = AppendOverlayEvent(&column, event);
+          if (!status.ok()) return status;
+        }
+      }
+      return visitor(batch);
     });
-    if (!status.ok()) return status;
-    FactColumnarBatch batch;
-    for (FactColumnId id : spec.projection) {
-      FactColumn column; status = MakeOverlayColumn(id, &column); if (!status.ok()) return status;
-      batch.columns.push_back(std::move(column));
-    }
-    for (const FactEvent& event : events) {
-      for (FactColumn& column : batch.columns) { status = AppendOverlayEvent(&column, event); if (!status.ok()) return status; }
-      if (batch.row_count() >= spec.batch_row_limit) { status = visitor(batch); if (!status.ok()) return status; batch = {}; for (FactColumnId id : spec.projection) { FactColumn column; status = MakeOverlayColumn(id, &column); if (!status.ok()) return status; batch.columns.push_back(std::move(column)); } }
-    }
-    if (batch.row_count() != 0) return visitor(batch);
-    return Status::OK();
   }
 
-  StatusOr<std::vector<FactEvent>> ReadExact(const std::vector<std::string>& keys) const override {
-    return base_.canonical_reader().ReadExact(keys);
+  StatusOr<FactEventBatch> ReadExact(
+      const std::vector<std::string>& keys,
+      std::shared_ptr<FactReadMemory> read_memory = {}) const override {
+    return base_.canonical_reader().ReadExact(keys, std::move(read_memory));
   }
 
  private:
-  std::vector<FactEvent> StagedEvents(const FactReadSpec& spec) const {
-    std::vector<FactEvent> events;
-    if (!include_staged_) return events;
+  template <typename Visitor>
+  Status VisitStaged(const FactReadSpec& spec, const Visitor& visitor) const {
+    if (!include_staged_) return Status::OK();
     for (const PendingFactMutation& mutation : mutations_) {
       FactEvent event{mutation.ref, mutation.valid_from, overlay_seq_, mutation.operation,
-                      mutation.schema_epoch, mutation.value, std::nullopt};
-      if (MatchesOverlaySpec(spec, event)) events.push_back(std::move(event));
+                      mutation.schema_epoch, std::nullopt, std::nullopt};
+      if (MatchesOverlaySpec(spec, event)) {
+        const Status status = visitor(event, mutation.value);
+        if (!status.ok()) return status;
+      }
     }
     if (spec.family == FactFamily::kEdgeIdentity) {
       for (const EdgeIdentity& identity : identities_) {
@@ -268,10 +342,13 @@ class TransactionOverlayReader final : public CanonicalFactReader {
                                 PropertyId{}, identity.edge_id.value},
                         ValidTime{0}, overlay_seq_, FactOperation::kPut,
                         0, std::nullopt, identity};
-        if (MatchesOverlaySpec(spec, event)) events.push_back(std::move(event));
+        if (MatchesOverlaySpec(spec, event)) {
+          const Status status = visitor(event, event.value);
+          if (!status.ok()) return status;
+        }
       }
     }
-    return events;
+    return Status::OK();
   }
 
   Snapshot base_;
@@ -485,7 +562,7 @@ class Transaction::State {
     const auto existing = std::find_if(
         edge_identities.begin(), edge_identities.end(),
         [&identity](const EdgeIdentity& candidate) {
-          return candidate.edge_id == identity.edge_id;
+          return candidate.edge_ref() == identity.edge_ref();
         });
     if (existing != edge_identities.end() && *existing != identity) {
       return Status::IdentityConflict("transaction", "edge ID has a different identity");

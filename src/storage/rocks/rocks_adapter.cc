@@ -38,6 +38,8 @@
 #include <rocksdb/write_batch.h>
 
 #include "db/cedar_columnar_scan.h"
+#include "table/get_context.h"
+#include "table/multiget_context.h"
 #include "cedar/core/crc32c.h"
 #include "cedar/fact/fact_codec.h"
 #include "cedar/fact/meta_codec.h"
@@ -47,6 +49,7 @@
 #include "storage/facts/fact_identity_history.h"
 #include "storage/facts/group_commit_planner.h"
 #include "storage/facts/prepared_commit_codec.h"
+#include "storage/facts/read_memory_scope.h"
 #include "storage/facts/recent_fact_write_index.h"
 #include "storage/rocks/rocksdb_config.h"
 #include "storage/facts/vacuum.h"
@@ -54,6 +57,24 @@
 
 namespace cedar {
 namespace {
+class RocksQueryReadMemory final : public rocksdb::cedar_parquet::CedarParquetQueryMemory {
+ public:
+  explicit RocksQueryReadMemory(std::shared_ptr<FactReadMemory> memory)
+      : memory_(std::move(memory)) {}
+  rocksdb::Status Reserve(uint64_t bytes) override {
+    const auto status = memory_->Reserve(bytes);
+    return status.ok() ? rocksdb::Status::OK() : rocksdb::Status::MemoryLimit(status.ToString());
+  }
+  void Release(uint64_t bytes) override { memory_->Release(bytes); }
+  rocksdb::Status Pin(const void* owner, uint64_t bytes,
+                      std::shared_ptr<const void>* lease) override {
+    *lease = memory_->Pin(owner, bytes);
+    return *lease ? rocksdb::Status::OK() :
+        rocksdb::Status::MemoryLimit("column page pin exceeds query budget");
+  }
+ private:
+  std::shared_ptr<FactReadMemory> memory_;
+};
 
 // One durable lease extension every 65,536 transaction IDs keeps the
 // publisher-mutex fsync off the critical path for ~65k transaction starts.
@@ -107,6 +128,7 @@ Status FromRocksDb(const rocksdb::Status& status, const char* context) {
   if (status.IsCorruption()) return Status::Corruption(context, message);
   if (status.IsInvalidArgument()) return Status::InvalidArgument(context, message);
   if (status.IsNotSupported()) return Status::NotSupported(context, message);
+  if (status.IsMemoryLimit()) return Status::ResourceExhausted(context, message);
   return Status::IOError(context, message);
 }
 
@@ -519,6 +541,8 @@ class FactStoreImpl {
   std::unique_ptr<internal::RecentFactWriteIndex> recent_fact_write_index;
   std::unique_ptr<internal::FactIdentityHistory> identity_history;
   std::shared_ptr<rocksdb::cedar_parquet::CanonicalPageCacheMetrics> canonical_page_metrics;
+  std::shared_ptr<rocksdb::cedar_parquet::CedarParquetReadBudget> storage_read_budget;
+  std::shared_ptr<rocksdb::cedar_parquet::CedarParquetReadBudget> storage_metadata_budget;
   std::function<void()> validation_scan_observer_for_testing;
   // S1: reports the source of every committed sequence record consumed by
   // reopen validation. See FactStoreOptions for the contract.
@@ -526,9 +550,9 @@ class FactStoreImpl {
   // Reopen outcome validation batch size (production 1024). Tests override it
   // to exercise MultiGet batch boundaries with a handful of transactions.
   size_t sequence_validation_outcome_batch_size = 1024;
-  // Reopen fact cross-check policy; see FactStoreOptions. F18 flips the
-  // production default to the bounded recent window (K=4096).
-  bool deep_recovery_validation = false;
+  // Reopen fact cross-check policy; see FactStoreOptions. Full retained-history
+  // validation is the default; bounded validation is an explicit option.
+  bool deep_recovery_validation = true;
   uint64_t recovery_validation_recent_sequences = 4096;
   // Reports one completed reopen validation pass; see FactStoreOptions.
   std::function<void(const ReopenValidationPhaseCounters&)>
@@ -1401,6 +1425,8 @@ void FactStoreImpl::ReleaseRetainedStateForClose() {
   identity_history.reset();
   statistics.reset();
   canonical_page_metrics.reset();
+  storage_read_budget.reset();
+  storage_metadata_budget.reset();
   {
     std::lock_guard<std::mutex> lock(retired_schemas_mutex);
     // Releasing the catalog is safe for both callers: FinishClose drained every
@@ -1580,12 +1606,11 @@ Status ResumeVacuum(FactStoreImpl* store, const FactStoreOptions& options,
 // watermark that excuses exactly the records that may be missing. Reopen
 // validation starts at the watermark; it never sees a gap it cannot explain.
 //
-// Idempotent and resumable: every call re-scans from the sequence prefix and
-// deletes whatever is still below the boundary, so a crash-interrupted prune is
-// finished by the next Vacuum or by an open with the option enabled. `boundary`
-// is the Vacuum target (= the durable oldest-readable boundary), so this never
-// deletes a record a live snapshot can read: a snapshot below the boundary is
-// already rejected by BeginSnapshot.
+// Idempotent and resumable: a crash-interrupted prune starts over on its next
+// invocation, while one invocation advances a single iterator monotonically
+// across delete batches. `boundary` is the Vacuum target (= the durable
+// oldest-readable boundary), so this never deletes a record a live snapshot can
+// read: a snapshot below the boundary is already rejected by BeginSnapshot.
 // Never invoked unless FactStoreOptions::prune_sequence_records_on_vacuum is
 // set, so the default meta layout and reopen contract are unchanged.
 Status PruneSequenceRecords(FactStoreImpl* store,
@@ -1619,10 +1644,11 @@ Status PruneSequenceRecords(FactStoreImpl* store,
           ? kMaxKeysPerBatch
           : std::min(kMaxKeysPerBatch,
                      options.sequence_prune_batch_size_for_testing);
-  while (true) {
-    std::unique_ptr<rocksdb::Iterator> iterator(
-        store->db->NewIterator(rocksdb::ReadOptions(), store->meta_cf));
-    iterator->Seek(kSequenceMetaPrefix);
+  std::unique_ptr<rocksdb::Iterator> iterator(
+      store->db->NewIterator(rocksdb::ReadOptions(), store->meta_cf));
+  iterator->Seek(kSequenceMetaPrefix);
+  while (iterator->Valid() &&
+         StartsWith(iterator->key(), kSequenceMetaPrefix)) {
     rocksdb::WriteBatch deletes;
     size_t batch_keys = 0;
     for (; iterator->Valid() &&
@@ -1650,6 +1676,10 @@ Status PruneSequenceRecords(FactStoreImpl* store,
     const Status after_batch = RunVacuumFaultInjector(
         options, VacuumFaultPoint::kAfterSequencePruneBatch);
     if (!after_batch.ok()) return after_batch;
+  }
+  if (!iterator->status().ok()) {
+    return FromRocksDb(iterator->status(),
+                       "iterate sequence records for retention pruning");
   }
   return RunVacuumFaultInjector(
       options, VacuumFaultPoint::kBeforeSequencePruneCompletion);
@@ -1734,41 +1764,29 @@ StatusOr<std::vector<CurrentFactInterval>> CurrentFactIntervals(
 }
 
 void PublishValidationCache(FactStoreImpl* store,
-                            const std::vector<PendingFactMutation>& mutations,
-                            CommitSeq commit_seq) {
-  if (store->version_validation_cache == nullptr) return;
-  for (const PendingFactMutation& mutation : mutations) {
-    store->version_validation_cache->Publish(mutation, commit_seq);
-  }
-}
-
-void PublishValidationCache(FactStoreImpl* store,
                             const StoreCommitBatch& batch,
                             CommitSeq commit_seq) {
-  PublishValidationCache(store, batch.mutations, commit_seq);
+  if (store->version_validation_cache == nullptr) return;
+  internal::VisitCommitFacts(batch,
+      [&](const PendingFactMutation& mutation, const EdgeIdentity*) {
+    store->version_validation_cache->Publish(mutation, commit_seq);
+    return Status::OK();
+  }).IgnoreError();
 }
 
 void PublishRecentFactWriteIndex(FactStoreImpl* store,
-                                 const std::vector<PendingFactMutation>& mutations,
+                                 const StoreCommitBatch& batch,
                                  CommitSeq commit_seq) {
-  if (store->recent_fact_write_index == nullptr &&
-      store->identity_history == nullptr) {
-    return;
-  }
-  for (const PendingFactMutation& mutation : mutations) {
+  internal::VisitCommitFacts(batch,
+      [&](const PendingFactMutation& mutation, const EdgeIdentity*) {
     if (store->recent_fact_write_index != nullptr) {
       store->recent_fact_write_index->Publish(mutation.ref, commit_seq);
     }
     if (store->identity_history != nullptr) {
       store->identity_history->Publish(mutation.ref);
     }
-  }
-}
-
-void PublishRecentFactWriteIndex(FactStoreImpl* store,
-                                 const StoreCommitBatch& batch,
-                                 CommitSeq commit_seq) {
-  PublishRecentFactWriteIndex(store, batch.mutations, commit_seq);
+    return Status::OK();
+  }).IgnoreError();
 }
 
 StatusOr<TemporalNeighborhood> ReadTemporalNeighborhoodWithIterator(
@@ -2238,6 +2256,9 @@ Status ValidateSequenceRecordContent(FactStoreImpl* store, CommitSeq commit_seq,
         rocksdb::ReadOptions(), store->facts_cf,
         rocksdb::Slice(fact_key.data(), fact_key.size()), &encoded_fact);
     if (!got_fact.ok()) {
+      if (!got_fact.IsNotFound()) {
+        return FromRocksDb(got_fact, "validate sequence fact");
+      }
       return Status::Corruption("fact store",
                                 "sequence record is missing fact");
     }
@@ -2330,9 +2351,8 @@ Status ValidateCommittedSequences(FactStoreImpl* store, CommitSeq visible_seq,
   std::string expected_key;
   expected_key.reserve(kSequenceMetaKeyBytes);
   const size_t kOutcomeBatch = store->sequence_validation_outcome_batch_size;
-  // The recent-fact cross-check window: facts at or above this floor are read
-  // and decoded; older facts are covered by the Vacuum ordering invariant and
-  // are detected on read. deep_recovery_validation disables the bound.
+  // Explicit bounded policy: facts at or above this floor are read and decoded;
+  // the default full-history policy checks every retained sequence.
   const uint64_t recent_sequences =
       std::max<uint64_t>(1, store->recovery_validation_recent_sequences);
   const uint64_t recent_floor =
@@ -2569,25 +2589,26 @@ Status StoreCommitBatch::Validate() const {
                                      "duplicate strict read dependency");
     }
   }
-  std::unordered_set<uint64_t> edge_ids;
-  edge_ids.reserve(edge_identities.size());
+  using EdgeKey = std::pair<uint32_t, uint64_t>;
+  std::set<EdgeKey> edge_ids;
   for (const EdgeIdentity& identity : edge_identities) {
     const Status valid = identity.Validate();
     if (!valid.ok()) return valid;
-    if (!edge_ids.emplace(identity.edge_id.value).second) {
+    if (!edge_ids.emplace(identity.edge_ref().home_part_id.value,
+                          identity.edge_id.value).second) {
       return Status::InvalidArgument("commit batch", "duplicate edge identity");
     }
   }
   if (!edge_ids.empty()) {
-    std::unordered_set<uint64_t> edge_state_assertions;
-    edge_state_assertions.reserve(edge_ids.size());
+    std::set<EdgeKey> edge_state_assertions;
     for (const PendingFactMutation& mutation : mutations) {
       if (mutation.ref.family() == FactFamily::kEdgeState &&
           mutation.operation == FactOperation::kPut) {
-        edge_state_assertions.insert(mutation.ref.entity_id());
+        edge_state_assertions.emplace(mutation.ref.part_id().value,
+                                       mutation.ref.entity_id());
       }
     }
-    for (uint64_t edge_id : edge_ids) {
+    for (const EdgeKey& edge_id : edge_ids) {
       if (!edge_state_assertions.contains(edge_id)) {
         return Status::InvalidArgument("commit batch",
                                        "edge identity lacks state assertion");
@@ -2698,6 +2719,12 @@ Status FactStore::Open() {
   rocksdb::Options options = internal::MakeRocksDbOptions(
       options_, is_new_database, resolved_ptr, &shared_cache);
   auto page_metrics = std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
+  auto read_budget = std::make_shared<rocksdb::cedar_parquet::CedarParquetReadBudget>(
+      resolved_profile.ValueOrDie().storage_read_working_bytes,
+      rocksdb::cedar_parquet::CedarParquetReadBudgetKind::kWorking);
+  auto metadata_budget = std::make_shared<rocksdb::cedar_parquet::CedarParquetReadBudget>(
+      resolved_profile.ValueOrDie().storage_reader_metadata_bytes,
+      rocksdb::cedar_parquet::CedarParquetReadBudgetKind::kMetadata);
 
   std::vector<std::string> existing_column_families;
   if (!is_new_database) {
@@ -2719,7 +2746,7 @@ Status FactStore::Open() {
 
   std::vector<rocksdb::ColumnFamilyDescriptor> descriptors =
       internal::MakeRocksDbColumnFamilyDescriptors(options_, options, resolved_ptr,
-          {shared_cache, page_metrics});
+          {shared_cache, page_metrics, read_budget, metadata_budget});
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   std::unique_ptr<rocksdb::DB> db;
   const rocksdb::Status opened =
@@ -2745,6 +2772,8 @@ Status FactStore::Open() {
     store->maintenance_compaction_credits = resolved_ptr->compaction_credits;
   }
   store->canonical_page_metrics = std::move(page_metrics);
+  store->storage_read_budget = std::move(read_budget);
+  store->storage_metadata_budget = std::move(metadata_budget);
   store->db = std::move(db);
   store->default_cf = handles[0];
   store->facts_cf = handles[1];
@@ -3007,7 +3036,14 @@ Status FactStore::Open() {
       ++identity_records;
     }
     if (!iterator->status().ok()) {
-      return FromRocksDb(iterator->status(), "scan fact identities");
+      const std::string context = "scan fact identities; working=" +
+          std::to_string(store->storage_read_budget->current_bytes()) + "/" +
+          std::to_string(store->storage_read_budget->limit_bytes()) +
+          " rejected=" + std::to_string(store->storage_read_budget->rejections()) +
+          "; metadata=" + std::to_string(store->storage_metadata_budget->current_bytes()) +
+          "/" + std::to_string(store->storage_metadata_budget->limit_bytes()) +
+          " rejected=" + std::to_string(store->storage_metadata_budget->rejections());
+      return FromRocksDb(iterator->status(), context.c_str());
     }
   }
   // S3: a skipped rebuild reports records == 0; the elapsed time still covers
@@ -3652,13 +3688,20 @@ StatusOr<StoreSnapshot> FactStore::BeginSnapshotAtCached(
 
 StatusOr<std::optional<FactEvent>> FactStore::Read(
     const StoreSnapshot& snapshot, const FactRef& ref,
-    ValidTime valid_time) const {
+    ValidTime valid_time, std::shared_ptr<FactReadMemory> read_memory) const {
   if (snapshot.epoch_ == nullptr || snapshot.owner_ != this) {
     return Status::InvalidArgument("fact read", "snapshot belongs to another store");
   }
   const std::shared_ptr<FactStoreImpl>& store = snapshot.store_;
   const Status valid = ref.Validate();
   if (!valid.ok()) return valid;
+  internal::FactReadMemoryScope temporary_memory(read_memory.get());
+  internal::FactReadMemoryScope result_memory(read_memory.get());
+  Status reserved = temporary_memory.Reserve(
+      2 * kEncodedFactKeyBytes + 1 + sizeof(RocksQueryReadMemory) + 64);
+  if (!reserved.ok()) return reserved;
+  reserved = result_memory.Reserve(sizeof(FactEvent));
+  if (!reserved.ok()) return reserved;
   const std::string seek = EncodeFactKey(
       ref, valid_time, CommitSeq{std::numeric_limits<uint64_t>::max()});
   if (seek.empty()) return Status::InvalidArgument("fact read", "invalid fact key");
@@ -3666,6 +3709,8 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
   const rocksdb::Slice prefix(seek.data(), kFactIdentityPrefixBytes);
   CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
+  if (read_memory)
+    options.cedar_query_memory = std::make_shared<RocksQueryReadMemory>(read_memory);
   options.snapshot = snapshot.epoch_->lease->get();
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->facts_cf));
@@ -3678,6 +3723,11 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
     if (decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value) {
       continue;
     }
+    if (iterator->value().size() > kMaxFactValuePayloadBytes + 64) {
+      return Status::Corruption("fact read", "oversized fact value");
+    }
+    reserved = result_memory.Reserve(iterator->value().size() + 1);
+    if (!reserved.ok()) return reserved;
     auto decoded_value = DecodeFactValue(
         decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
         decoded_key.ValueOrDie().commit_seq, iterator->value().ToStringView());
@@ -3685,6 +3735,9 @@ StatusOr<std::optional<FactEvent>> FactStore::Read(
     if (decoded_value.ValueOrDie().operation == FactOperation::kDelete) {
       return std::optional<FactEvent>{};
     }
+    auto owner = result_memory.Retain(read_memory);
+    if (!owner.ok()) return owner.status();
+    decoded_value.ValueOrDie().read_memory_owner = std::move(owner).ConsumeValueOrDie();
     return std::optional<FactEvent>{decoded_value.ConsumeValueOrDie()};
   }
   if (!iterator->status().ok()) return FromRocksDb(iterator->status(), "iterate fact read");
@@ -3787,7 +3840,8 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
 }
 
 Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
-                             const FactVisitor& visitor) const {
+                             const FactVisitor& visitor,
+                             std::shared_ptr<FactReadMemory> read_memory) const {
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -3797,22 +3851,28 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
       return Status::InvalidArgument("fact scan", "snapshot belongs to another store");
   }
   if (!visitor) return Status::InvalidArgument("fact scan", "missing visitor");
+  internal::FactReadMemoryScope temporary_memory(read_memory.get());
+  const Status reserved = temporary_memory.Reserve(
+      2 * kEncodedFactKeyBytes + 1 + sizeof(RocksQueryReadMemory) + 64);
+  if (!reserved.ok()) return reserved;
   CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
+  if (read_memory)
+    options.cedar_query_memory = std::make_shared<RocksQueryReadMemory>(read_memory);
   options.snapshot = snapshot.epoch_->lease->get();
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->facts_cf));
-  // Fact keys are ordered by version|part|family|..., so one prefix seek per
+  // Fact keys are ordered by version|part|family|..., so one seek per
   // (version, part) reads only the requested family instead of decoding every
-  // fact in the CF. The prefixes go through the transient 0x04 seek encoding:
-  // a synthetic short user key would be mistaken for a canonical fact key by
-  // the Cedar Parquet comparator as soon as the facts CF holds flushed SSTs.
+  // fact in the CF. Pad each prefix to a canonical fact-key length with zeroes:
+  // this is the bytewise lower bound for that range and stays in the fact-key
+  // namespace while RocksDB locates files and the Parquet reader seeks rows.
   const auto seek_prefix = [&iterator](std::string_view prefix) -> Status {
-    const std::string encoded =
-        rocksdb::cedar_parquet::EncodeCedarParquetPrefixSeekKey(prefix);
-    if (encoded.empty()) {
+    if (prefix.empty() || prefix.size() > kEncodedFactKeyBytes) {
       return Status::Corruption("fact scan", "invalid family scan prefix");
     }
+    std::string encoded(prefix);
+    encoded.resize(kEncodedFactKeyBytes, '\0');
     iterator->Seek(rocksdb::Slice(encoded));
     return iterator->status().ok()
                ? Status::OK()
@@ -3856,6 +3916,13 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
       if (!decoded_key.ok()) return decoded_key.status();
       if (decoded_key.ValueOrDie().commit_seq.value <=
           snapshot.commit_seq().value) {
+        internal::FactReadMemoryScope decoded_memory(read_memory.get());
+        if (iterator->value().size() > kMaxFactValuePayloadBytes + 64) {
+          return Status::Corruption("fact scan", "oversized fact value");
+        }
+        const Status charged = decoded_memory.Reserve(
+            sizeof(FactEvent) + iterator->value().size() + 1);
+        if (!charged.ok()) return charged;
         auto decoded_value = DecodeFactValue(
             decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
             decoded_key.ValueOrDie().commit_seq,
@@ -3872,14 +3939,13 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
       return FromRocksDb(iterator->status(), "iterate family scan");
     }
 
-    // Skip the rest of this (version, part) and move to the next partition;
-    // when this was the last partition, advance to the next key version.
+    // Skip the rest of this partition. Fact key version 2 is the only supported
+    // format, so the maximum partition is the end of its key space; a synthetic
+    // version-3 seek would be rejected by the Parquet sort-key codec.
     std::string next_prefix;
     if (part != std::numeric_limits<uint32_t>::max()) {
       next_prefix.push_back(static_cast<char>(key_version));
       append_part(&next_prefix, part + 1);
-    } else if (key_version != std::numeric_limits<uint8_t>::max()) {
-      next_prefix.push_back(static_cast<char>(key_version + 1));
     } else {
       break;
     }
@@ -3893,7 +3959,8 @@ Status FactStore::ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
 
 Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                        const FactScanBounds& bounds,
-                       const FactVisitor& visitor) const {
+                       const FactVisitor& visitor,
+                       std::shared_ptr<FactReadMemory> read_memory) const {
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -3919,19 +3986,25 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
   }
   const std::optional<uint64_t> seek_entity =
       prefix.entity_id().has_value() ? prefix.entity_id() : bounds.entity_id_min;
+  internal::FactReadMemoryScope temporary_memory(read_memory.get());
+  const Status reserved = temporary_memory.Reserve(
+      2 * kEncodedFactKeyBytes + 1 + sizeof(RocksQueryReadMemory) + 64);
+  if (!reserved.ok()) return reserved;
   const std::string match_prefix = EncodeFactIdentityPrefix(
       prefix.part_id(), prefix.family(), prefix.property_id(), prefix.entity_id());
   const std::string seek_key = EncodeFactIdentityPrefix(
       prefix.part_id(), prefix.family(), prefix.property_id(), seek_entity);
   CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
+  if (read_memory)
+    options.cedar_query_memory = std::make_shared<RocksQueryReadMemory>(read_memory);
   options.snapshot = snapshot.epoch_->lease->get();
   std::unique_ptr<rocksdb::Iterator> iterator(
       store->db->NewIterator(options, store->facts_cf));
   for (iterator->Seek(seek_key);
        iterator->Valid() && StartsWith(iterator->key(), match_prefix);
        iterator->Next()) {
-    const auto decoded_key = DecodeFactKey(iterator->key().ToString());
+    const auto decoded_key = DecodeFactKey(iterator->key().ToStringView());
     if (!decoded_key.ok()) return decoded_key.status();
     if (bounds.entity_id_min.has_value() &&
         decoded_key.ValueOrDie().ref.entity_id() < *bounds.entity_id_min) {
@@ -3944,9 +4017,16 @@ Status FactStore::Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
     if (decoded_key.ValueOrDie().commit_seq.value > snapshot.commit_seq().value) {
       continue;
     }
+    internal::FactReadMemoryScope decoded_memory(read_memory.get());
+    if (iterator->value().size() > kMaxFactValuePayloadBytes + 64) {
+      return Status::Corruption("fact scan", "oversized fact value");
+    }
+    const Status charged = decoded_memory.Reserve(
+        sizeof(FactEvent) + iterator->value().size() + 1);
+    if (!charged.ok()) return charged;
     auto decoded_value = DecodeFactValue(
         decoded_key.ValueOrDie().ref, decoded_key.ValueOrDie().valid_from,
-        decoded_key.ValueOrDie().commit_seq, iterator->value().ToString());
+        decoded_key.ValueOrDie().commit_seq, iterator->value().ToStringView());
     if (!decoded_value.ok()) return decoded_value.status();
     const Status visited = visitor(decoded_value.ConsumeValueOrDie());
     if (!visited.ok()) return visited;
@@ -3990,6 +4070,10 @@ Status FactStore::ScanColumnar(const StoreSnapshot& snapshot,
   }
 
   rocksdb::cedar_parquet::CedarParquetScanSpec rocks_spec;
+  rocks_spec.policy.admit = options.admit_cache;
+  rocks_spec.policy.options.fill_cache = options.admit_cache;
+  if (options.read_memory)
+    rocks_spec.policy.query_memory = std::make_shared<RocksQueryReadMemory>(options.read_memory);
   rocks_spec.batch_row_limit = options.batch_row_limit;
   rocksdb::cedar_parquet::CedarParquetScanStats scan_stats;
   rocks_spec.stats = &scan_stats;
@@ -4320,7 +4404,9 @@ StatusOr<std::vector<FactEvent>> FactStore::ReadCanonicalEvents(
               }
               return left < right;
             });
-  return ReadExactFacts(snapshot, fact_keys);
+  auto events = ReadExactFacts(snapshot, fact_keys);
+  if (!events.ok()) return events.status();
+  return std::move(events).ConsumeValueOrDie().events;
 }
 
 StatusOr<FactEvent> FactStore::ReadExactFact(
@@ -4351,9 +4437,10 @@ StatusOr<FactEvent> FactStore::ReadExactFact(
                          key.ValueOrDie().commit_seq, encoded);
 }
 
-StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
+StatusOr<FactEventBatch> FactStore::ReadExactFacts(
     const StoreSnapshot& snapshot,
-    const std::vector<std::string>& encoded_fact_keys) const {
+    const std::vector<std::string>& encoded_fact_keys,
+    std::shared_ptr<FactReadMemory> read_memory) const {
   std::shared_ptr<FactStoreImpl> store;
   {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -4363,7 +4450,37 @@ StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
       return Status::InvalidArgument("scan facts", "snapshot belongs to another store");
     }
   }
-  if (encoded_fact_keys.empty()) return std::vector<FactEvent>{};
+  if (encoded_fact_keys.empty()) return FactEventBatch{};
+  internal::FactReadMemoryScope temporary_memory(read_memory.get());
+  internal::FactReadMemoryScope result_memory(read_memory.get());
+  Status reserved = temporary_memory.ReserveElements(
+      encoded_fact_keys.size(), sizeof(DecodedFactKey) + sizeof(rocksdb::Slice) +
+                                    sizeof(rocksdb::ColumnFamilyHandle*) +
+                                    sizeof(std::string) + sizeof(rocksdb::Status) +
+                                    sizeof(rocksdb::PinnableSlice));
+  if (!reserved.ok()) return reserved;
+  reserved = temporary_memory.Reserve(sizeof(RocksQueryReadMemory) + 64);
+  if (!reserved.ok()) return reserved;
+  reserved = result_memory.ReserveElements(encoded_fact_keys.size(), sizeof(FactEvent));
+  if (!reserved.ok()) return reserved;
+  const uint64_t batch_keys = std::min<uint64_t>(
+      encoded_fact_keys.size(), rocksdb::MultiGetContext::MAX_BATCH_SIZE);
+  if (encoded_fact_keys.size() > rocksdb::MultiGetContext::MAX_BATCH_SIZE) {
+    const uint64_t heap_keys = encoded_fact_keys.size() -
+        rocksdb::MultiGetContext::MAX_BATCH_SIZE;
+    // autovector grows KeyContext geometrically while its old buffer is live;
+    // the pointer array is resized once. All keys use the same facts CF.
+    reserved = temporary_memory.ReserveElements(heap_keys,
+        3 * sizeof(rocksdb::KeyContext) + sizeof(rocksdb::KeyContext*));
+    if (!reserved.ok()) return reserved;
+  }
+  if (batch_keys > 16) {
+    reserved = temporary_memory.ReserveElements(batch_keys, sizeof(rocksdb::LookupKey));
+    if (!reserved.ok()) return reserved;
+    reserved = temporary_memory.ReserveElements(batch_keys - 16,
+        3 * sizeof(rocksdb::GetContext));
+    if (!reserved.ok()) return reserved;
+  }
   std::vector<DecodedFactKey> decoded_keys;
   decoded_keys.reserve(encoded_fact_keys.size());
   std::vector<rocksdb::Slice> keys;
@@ -4381,13 +4498,40 @@ StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
   std::vector<std::string> values;
   CanonicalReadPerfTracker physical_read(&store->canonical_read_physical_bytes);
   rocksdb::ReadOptions options;
+  if (read_memory)
+    options.cedar_query_memory = std::make_shared<RocksQueryReadMemory>(read_memory);
   options.snapshot = snapshot.epoch_->lease->get();
+  if (read_memory) {
+    // MultiGet owns encoded strings even for memtable hits. Inspect borrowed
+    // values at the same immutable snapshot before allowing those copies.
+    std::unique_ptr<rocksdb::Iterator> probe(
+        store->db->NewIterator(options, store->facts_cf));
+    for (const rocksdb::Slice& key : keys) {
+      probe->Seek(key);
+      if (!probe->Valid()) {
+        if (!probe->status().ok()) return FromRocksDb(probe->status(), "size exact fact");
+        return Status::Corruption("scan facts", "sequence references missing fact");
+      }
+      if (probe->key() != key) {
+        return Status::Corruption("scan facts", "sequence references missing fact");
+      }
+      const uint64_t encoded_bytes = probe->value().size();
+      if (encoded_bytes > kMaxFactValuePayloadBytes + 64) {
+        return Status::Corruption("scan facts", "oversized fact value");
+      }
+      reserved = temporary_memory.ReserveElements(encoded_bytes + 1, 2);
+      if (!reserved.ok()) return reserved;
+      reserved = result_memory.Reserve(encoded_bytes + 1);
+      if (!reserved.ok()) return reserved;
+    }
+  }
   const std::vector<rocksdb::Status> statuses =
       store->db->MultiGet(options, families, keys, &values);
   store->multi_get_operations.fetch_add(encoded_fact_keys.size(),
                                         std::memory_order_relaxed);
   store->multi_get_batches.fetch_add(1, std::memory_order_relaxed);
-  std::vector<FactEvent> events;
+  FactEventBatch output;
+  std::vector<FactEvent>& events = output.events;
   events.reserve(encoded_fact_keys.size());
   for (size_t i = 0; i < statuses.size(); ++i) {
     if (!statuses[i].ok()) {
@@ -4396,13 +4540,15 @@ StatusOr<std::vector<FactEvent>> FactStore::ReadExactFacts(
       }
       return FromRocksDb(statuses[i], "read exact facts");
     }
-    const auto event = DecodeFactValue(decoded_keys[i].ref,
-                                       decoded_keys[i].valid_from,
-                                       decoded_keys[i].commit_seq, values[i]);
+    auto event = DecodeFactValue(decoded_keys[i].ref, decoded_keys[i].valid_from,
+                                 decoded_keys[i].commit_seq, values[i]);
     if (!event.ok()) return event.status();
-    events.push_back(event.ValueOrDie());
+    events.push_back(std::move(event).ConsumeValueOrDie());
   }
-  return events;
+  auto owner = result_memory.Retain(read_memory);
+  if (!owner.ok()) return owner.status();
+  output.read_memory_owner = std::move(owner).ConsumeValueOrDie();
+  return output;
 }
 
 StatusOr<StoreCommitResult> FactStore::Commit(const StoreCommitBatch& batch) {
@@ -4934,14 +5080,23 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
   if (got_outcome.ok()) {
     const auto outcome = DecodeTransactionOutcome(encoded_outcome);
     if (!outcome.ok()) return outcome.status();
+    if (outcome.ValueOrDie().commit_seq.value <
+        store->sequence_retention_watermark.load(std::memory_order_acquire)) {
+      return Status::SnapshotExpired(
+          "commit",
+          "sequence record was pruned below the sequence retention watermark");
+    }
     const auto sequence_key = EncodeSequenceMetaKey(outcome.ValueOrDie().commit_seq);
     if (!sequence_key.ok()) return sequence_key.status();
     std::string encoded_sequence;
     const rocksdb::Status got_sequence = store->db->Get(
         rocksdb::ReadOptions(), store->meta_cf, sequence_key.ValueOrDie(),
         &encoded_sequence);
-    if (!got_sequence.ok()) {
+    if (got_sequence.IsNotFound()) {
       return Status::Corruption("commit", "outcome is missing sequence record");
+    }
+    if (!got_sequence.ok()) {
+      return FromRocksDb(got_sequence, "read committed sequence record");
     }
     const auto sequence = DecodeSequenceRecord(
         encoded_sequence, outcome.ValueOrDie().commit_seq);
@@ -4952,20 +5107,21 @@ StatusOr<StoreCommitResult> FactStore::CommitDirect(
             batch.mutations.size() + batch.edge_identities.size()) {
       return Status::Conflict("commit", "transaction ID belongs to a different batch");
     }
-    std::set<uint64_t> committed_edge_ids;
+    std::set<std::pair<uint32_t, uint64_t>> committed_edge_ids;
     for (const std::string& fact_key : sequence.ValueOrDie().fact_keys) {
       const auto decoded_key = DecodeFactKey(fact_key);
       if (!decoded_key.ok()) return decoded_key.status();
-      if (decoded_key.ValueOrDie().ref.family() == FactFamily::kEdgeState ||
-          decoded_key.ValueOrDie().ref.family() == FactFamily::kEdgeProperty) {
-        committed_edge_ids.emplace(decoded_key.ValueOrDie().ref.entity_id());
+      if (decoded_key.ValueOrDie().ref.family() == FactFamily::kEdgeIdentity) {
+        committed_edge_ids.emplace(decoded_key.ValueOrDie().ref.part_id().value,
+                                    decoded_key.ValueOrDie().ref.entity_id());
       }
     }
     if (committed_edge_ids.size() != batch.edge_identities.size()) {
       return Status::Conflict("commit", "transaction ID belongs to a different batch");
     }
     for (const EdgeIdentity& identity : batch.edge_identities) {
-      if (!committed_edge_ids.contains(identity.edge_id.value)) {
+      if (!committed_edge_ids.contains(
+              {identity.edge_ref().home_part_id.value, identity.edge_id.value})) {
         return Status::Conflict("commit", "transaction ID belongs to a different batch");
       }
       const auto committed_identity =
@@ -6181,25 +6337,61 @@ StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(
   }
   const auto transaction_key = EncodeTransactionMetaKey(txn_id);
   if (!transaction_key.ok()) return transaction_key.status();
+  const rocksdb::Snapshot* raw_snapshot = nullptr;
+  CommitSeq published_visible;
+  {
+    std::lock_guard<std::mutex> lock(store->publisher_mutex);
+    raw_snapshot = store->db->GetSnapshot();
+    published_visible = store->visible_seq;
+  }
+  if (raw_snapshot == nullptr) {
+    return Status::IOError("transaction", "RocksDB refused read snapshot");
+  }
+  SnapshotLease snapshot_lease(store.get(), raw_snapshot);
+  rocksdb::ReadOptions read_options;
+  read_options.snapshot = snapshot_lease.get();
+
   std::string encoded_outcome;
   const rocksdb::Status got_outcome = store->db->Get(
-      rocksdb::ReadOptions(), store->meta_cf, transaction_key.ValueOrDie(),
-      &encoded_outcome);
+      read_options, store->meta_cf, transaction_key.ValueOrDie(), &encoded_outcome);
   if (got_outcome.IsNotFound()) return std::optional<StoreCommitResult>{};
   if (!got_outcome.ok()) return FromRocksDb(got_outcome, "read transaction outcome");
   const auto outcome = DecodeTransactionOutcome(encoded_outcome);
   if (!outcome.ok()) return outcome.status();
-  {
-    std::lock_guard<std::mutex> lock(store->publisher_mutex);
-    if (outcome.ValueOrDie().commit_seq.value > store->visible_seq.value) {
-      return std::optional<StoreCommitResult>{};
-    }
+
+  std::string encoded_visible;
+  const rocksdb::Status got_visible = store->db->Get(
+      read_options, store->meta_cf, EncodeVisibleWatermarkKey(),
+      &encoded_visible);
+  if (got_visible.IsNotFound()) {
+    return Status::Corruption("transaction", "visible watermark is missing");
   }
-  // A committed transaction whose sequence history was pruned is below the
-  // durable retention boundary. Report the retention outcome explicitly instead
-  // of the generic "outcome is missing sequence record" corruption below.
-  if (outcome.ValueOrDie().commit_seq.value <
-      store->sequence_retention_watermark.load(std::memory_order_acquire)) {
+  if (!got_visible.ok()) {
+    return FromRocksDb(got_visible, "read visible sequence watermark");
+  }
+  const auto visible = DecodeWatermark(encoded_visible);
+  if (!visible.ok()) return visible.status();
+  if (outcome.ValueOrDie().commit_seq.value > visible.ValueOrDie().value ||
+      outcome.ValueOrDie().commit_seq.value > published_visible.value) {
+    return std::optional<StoreCommitResult>{};
+  }
+
+  uint64_t retention_watermark = 0;
+  std::string encoded_retention;
+  const rocksdb::Status got_retention = store->db->Get(
+      read_options, store->meta_cf, EncodeSequenceRetentionWatermarkKey(),
+      &encoded_retention);
+  if (got_retention.ok()) {
+    const auto decoded_retention = DecodeWatermark(encoded_retention);
+    if (!decoded_retention.ok()) return decoded_retention.status();
+    retention_watermark = decoded_retention.ValueOrDie().value;
+  } else if (!got_retention.IsNotFound()) {
+    return FromRocksDb(got_retention, "read sequence retention watermark");
+  }
+  // Both the outcome and this boundary come from the same RocksDB snapshot as
+  // the sequence record below, so concurrent pruning has a single observable
+  // result: the historical result or SnapshotExpired, never a false corruption.
+  if (outcome.ValueOrDie().commit_seq.value < retention_watermark) {
     return Status::SnapshotExpired(
         "transaction",
         "sequence record was pruned below the sequence retention watermark");
@@ -6208,10 +6400,13 @@ StatusOr<std::optional<StoreCommitResult>> FactStore::ResolveTransaction(
   if (!sequence_key.ok()) return sequence_key.status();
   std::string encoded_sequence;
   const rocksdb::Status got_sequence = store->db->Get(
-      rocksdb::ReadOptions(), store->meta_cf, sequence_key.ValueOrDie(),
+      read_options, store->meta_cf, sequence_key.ValueOrDie(),
       &encoded_sequence);
-  if (!got_sequence.ok()) {
+  if (got_sequence.IsNotFound()) {
     return Status::Corruption("transaction", "outcome is missing sequence record");
+  }
+  if (!got_sequence.ok()) {
+    return FromRocksDb(got_sequence, "read transaction sequence record");
   }
   const auto sequence = DecodeSequenceRecord(
       encoded_sequence, outcome.ValueOrDie().commit_seq);
@@ -6672,6 +6867,17 @@ StatusOr<ValidationCacheMetrics> FactStore::SampleValidationCacheMetrics() const
   RunNonEpochOpObserverForTesting();
   ValidationCacheMetrics metrics;
   if (store->canonical_page_metrics) {
+    const auto& pages = *store->canonical_page_metrics;
+    metrics.column_page_cache_hits = pages.hits.load(std::memory_order_relaxed);
+    metrics.column_page_cache_misses = pages.misses.load(std::memory_order_relaxed);
+    metrics.column_page_cache_decodes = pages.column_decodes.load(std::memory_order_relaxed);
+    metrics.column_page_resident_charge_bytes = pages.resident_charge_bytes.load(std::memory_order_relaxed);
+    metrics.column_page_pinned_charge_bytes = pages.pinned_charge_bytes.load(std::memory_order_relaxed);
+    metrics.column_page_uncached_live_bytes = pages.uncached_live_bytes.load(std::memory_order_relaxed);
+    metrics.storage_file_read_calls = pages.file_read_calls.load(std::memory_order_relaxed);
+    metrics.storage_file_read_bytes = pages.file_read_bytes.load(std::memory_order_relaxed);
+    metrics.parquet_reader_metadata_bytes = pages.reader_metadata_bytes.load(std::memory_order_relaxed);
+    metrics.parquet_reader_metadata_peak_bytes = pages.reader_metadata_peak_bytes.load(std::memory_order_relaxed);
     metrics.canonical_page_hits = store->canonical_page_metrics->hits.load(std::memory_order_relaxed);
     metrics.canonical_page_misses = store->canonical_page_metrics->misses.load(std::memory_order_relaxed);
     metrics.canonical_page_decodes = store->canonical_page_metrics->decodes.load(std::memory_order_relaxed);
@@ -6682,6 +6888,17 @@ StatusOr<ValidationCacheMetrics> FactStore::SampleValidationCacheMetrics() const
     metrics.canonical_page_insert_failures = store->canonical_page_metrics->insert_failures.load(std::memory_order_relaxed);
   }
   metrics.canonical_validation_scans = store->canonical_validation_scans.load(std::memory_order_relaxed);
+  if (store->storage_read_budget) {
+    metrics.storage_read_working_bytes = store->storage_read_budget->current_bytes();
+    metrics.storage_read_working_peak_bytes = store->storage_read_budget->peak_bytes();
+    metrics.storage_read_working_rejections = store->storage_read_budget->rejections();
+  }
+  if (store->storage_metadata_budget) {
+    metrics.storage_reader_metadata_reserved_bytes = store->storage_metadata_budget->current_bytes();
+    metrics.storage_reader_metadata_peak_bytes = store->storage_metadata_budget->peak_bytes();
+    metrics.storage_reader_metadata_rejections = store->storage_metadata_budget->rejections();
+    metrics.storage_reader_metadata_limit_bytes = store->storage_metadata_budget->limit_bytes();
+  }
   metrics.canonical_validation_boundaries = store->canonical_validation_boundaries.load(std::memory_order_relaxed);
   if (store->identity_history != nullptr) {
     metrics.identity_history_resident_bytes =

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -6,6 +7,7 @@
 
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_store.h"
+#include "query/runtime/relational.h"
 
 namespace cedar::internal {
 namespace {
@@ -57,7 +59,8 @@ class ProjectionStoreTest : public ::testing::Test {
     b.manifest.regions.push_back(std::move(r));
     return b;
   }
-  ProjectionBuild BuildPropertyIndex(uint64_t generation) {
+  ProjectionBuild BuildPropertyIndex(uint64_t generation, uint64_t count = 1,
+                                      size_t value_bytes = 2) {
     ProjectionBuild b;
     b.manifest.database_identity = "test-db";
     b.manifest.generation_id = generation;
@@ -68,7 +71,7 @@ class ProjectionStoreTest : public ::testing::Test {
     r.property_id = PropertyId{7};
     r.schema_epoch = 1;
     r.entity_min = 1;
-    r.entity_max_exclusive = 100;
+    r.entity_max_exclusive = std::max<uint64_t>(100, 42 + count);
     r.valid_time = {ValidTime{0}, std::nullopt};
     r.built_through = CommitSeq{generation};
     SegmentDescriptor d;
@@ -81,7 +84,7 @@ class ProjectionStoreTest : public ::testing::Test {
     d.header.property_id = PropertyId{7};
     d.header.schema_epoch = 1;
     d.header.entity_min = 1;
-    d.header.entity_max_exclusive = 100;
+    d.header.entity_max_exclusive = r.entity_max_exclusive;
     d.header.valid_from_min = ValidTime{0};
     PropertyIndexSegment index;
     index.generation_id = generation;
@@ -90,9 +93,11 @@ class ProjectionStoreTest : public ::testing::Test {
     index.property = PropertyId{7};
     index.part_id = PartId{1};
     index.schema_epoch = 1;
-    index.postings.push_back({VertexRef{PartId{1}, VertexId{42}},
-                              ValidTimeInterval{ValidTime{0}, std::nullopt},
-                              CommitSeq{generation}, Value::String("CN")});
+    for (uint64_t row = 0; row < count; ++row) {
+      index.postings.push_back({VertexRef{PartId{1}, VertexId{42 + row}},
+          ValidTimeInterval{ValidTime{0}, std::nullopt}, CommitSeq{generation},
+          Value::String(value_bytes == 2 ? "CN" : std::string(value_bytes, 'x'))});
+    }
     auto encoded = EncodePropertyIndexSegment(index);
     if (!encoded.ok()) return {};
     d.file_bytes = encoded.ValueOrDie().size();
@@ -161,6 +166,96 @@ TEST_F(ProjectionStoreTest, PublishesAndReadsPropertyIndexGeneration) {
   auto reopened_index = reopened.ValueOrDie()->ReadPropertyIndex(request, *pin);
   ASSERT_TRUE(reopened_index.ok());
   EXPECT_EQ(reopened_index.ValueOrDie().postings.front().vertex.vertex_id.value, 42U);
+}
+
+TEST_F(ProjectionStoreTest, PropertyIndexBudgetFailureDoesNotPoisonGeneration) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  ASSERT_TRUE(opened.ValueOrDie()->Build(BuildPropertyIndex(10, 512, 256)).ok());
+  CoverageRequest request;
+  request.kind = ProjectionKind::kPropertyIndex;
+  request.part_id = PartId{1};
+  request.property_id = PropertyId{7};
+  request.schema_epoch = 1;
+  request.entity_min = 1;
+  request.entity_max_exclusive = 554;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.database_identity = "test-db";
+  auto generation = opened.ValueOrDie()->Acquire(request);
+  ASSERT_TRUE(generation.has_value());
+  QueryReservation small(256 << 10);
+  auto rejected = opened.ValueOrDie()->ReadBudgetedPropertyIndex(request, *generation, small);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+  EXPECT_EQ(small.used(ResourceDimension::kMemory), 0U);
+  QueryReservation reservation(8 << 20);
+  auto read = opened.ValueOrDie()->ReadBudgetedPropertyIndex(request, *generation, reservation);
+  ASSERT_TRUE(read.ok()) << read.status().ToString();
+  ASSERT_EQ(read.ValueOrDie().segment.postings.size(), 512U);
+  EXPECT_EQ(read.ValueOrDie().segment.postings.back().vertex.vertex_id.value, 553U);
+  EXPECT_EQ(read.ValueOrDie().segment.postings.back().value, Value::String(std::string(256, 'x')));
+  EXPECT_GT(reservation.used(ResourceDimension::kMemory), 0U);
+  read = Status::NotFound("test", "released property index");
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+}
+
+TEST_F(ProjectionStoreTest, PropertyIndexReadSelectsEntityRegionAndBindingIdentity) {
+  auto build = BuildPropertyIndex(10);
+  auto second = BuildPropertyIndex(10);
+  auto decoded = DecodePropertyIndexSegment(second.segments.front().bytes);
+  ASSERT_TRUE(decoded.ok());
+  decoded.ValueOrDie().postings.front().vertex.vertex_id = VertexId{142};
+  decoded.ValueOrDie().pages.clear();
+  auto encoded = EncodePropertyIndexSegment(decoded.ValueOrDie());
+  ASSERT_TRUE(encoded.ok());
+  auto& region = second.manifest.regions.front();
+  region.entity_min = 100;
+  region.entity_max_exclusive = 200;
+  auto& descriptor = second.segments.front().descriptor;
+  descriptor.segment_id = "property-index-second";
+  descriptor.filename = "property-index-second.cpi";
+  descriptor.header.entity_min = 100;
+  descriptor.header.entity_max_exclusive = 200;
+  descriptor.file_bytes = encoded.ValueOrDie().size();
+  descriptor.checksum = crc32c::Value(encoded.ValueOrDie().data(), encoded.ValueOrDie().size());
+  second.segments.front().bytes = encoded.ValueOrDie();
+  region.segments = {descriptor};
+  build.segments.push_back(std::move(second.segments.front()));
+  build.manifest.regions.push_back(std::move(region));
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  const auto status = opened.ValueOrDie()->Build(build);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+  CoverageRequest request;
+  request.kind = ProjectionKind::kPropertyIndex;
+  request.part_id = PartId{1};
+  request.property_id = PropertyId{7};
+  request.schema_epoch = 1;
+  request.entity_min = 100;
+  request.entity_max_exclusive = 200;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  request.generation_id = 10;
+  request.expected_base_seq = CommitSeq{10};
+  request.database_identity = "test-db";
+  auto generation = opened.ValueOrDie()->Acquire(request);
+  ASSERT_TRUE(generation.has_value());
+  auto index = opened.ValueOrDie()->ReadPropertyIndex(request, *generation);
+  ASSERT_TRUE(index.ok()) << index.status().ToString();
+  ASSERT_EQ(index.ValueOrDie().postings.size(), 1U);
+  EXPECT_EQ(index.ValueOrDie().postings.front().vertex.vertex_id.value, 142U);
+  request.entity_min = 1;
+  request.entity_max_exclusive = 100;
+  index = opened.ValueOrDie()->ReadPropertyIndex(request, *generation);
+  ASSERT_TRUE(index.ok());
+  EXPECT_EQ(index.ValueOrDie().postings.front().vertex.vertex_id.value, 42U);
+  request.expected_base_seq = CommitSeq{9};
+  EXPECT_TRUE(opened.ValueOrDie()->ReadPropertyIndex(request, *generation).status().IsConflict());
+  request.expected_base_seq = CommitSeq{10};
+  request.database_identity = "different-db";
+  EXPECT_TRUE(opened.ValueOrDie()->ReadPropertyIndex(request, *generation).status().IsIdentityConflict());
 }
 
 TEST_F(ProjectionStoreTest, ReadsPublishedChainsForRuntimeProjectionSlice) {
@@ -240,6 +335,89 @@ TEST_F(ProjectionStoreTest, OldReaderPinsRetiredGeneration) {
   EXPECT_TRUE(pin->exists());
   pin.reset(); store.CollectRetired();
   EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
+}
+
+TEST_F(ProjectionStoreTest, HotPageCacheRespectsGenerationAndConfiguredCapacity) {
+  ProjectionStoreOptions options{path_, "test-db", {}};
+  options.projection_cache_bytes = 16384;
+  auto opened = QueryProjectionStore::Open(options);
+  ASSERT_TRUE(opened.ok());
+  auto& store = *opened.ValueOrDie();
+  ASSERT_TRUE(store.Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1}; request.schema_epoch = 1;
+  request.entity_min = 1; request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{20};
+  request.admit_pages = true;
+  ProjectionReadStats stats;
+  request.stats = &stats;
+  auto pin = store.Acquire(request);
+  ASSERT_TRUE(pin);
+  QueryReservation query(65536);
+  const auto visit = [&](const ProjectionChain& chain) {
+    EXPECT_EQ(chain.header.generation_id, request.generation_id.value_or(10));
+    EXPECT_EQ(chain.intervals.size(), 1U);
+    return Status::OK();
+  };
+  ASSERT_TRUE(store.VisitChains(request, *pin, query, visit).ok());
+  EXPECT_GT(stats.physical_bytes, 0U);
+  EXPECT_GT(store.SamplePageCacheMetrics().resident_bytes, 0U);
+  stats = {};
+  ASSERT_TRUE(store.VisitChains(request, *pin, query, visit).ok());
+  EXPECT_EQ(stats.physical_bytes, 0U);
+  EXPECT_EQ(stats.decoded_bytes, 0U);
+  EXPECT_GT(store.SamplePageCacheMetrics().hits, 0U);
+  EXPECT_EQ(query.used_bytes(), 0U);
+  ASSERT_TRUE(store.Build(Build(20, "seg-b")).ok());
+  auto next = store.Acquire(request);
+  ASSERT_TRUE(next);
+  stats = {};
+  request.generation_id = 20;
+  ASSERT_TRUE(store.VisitChains(request, *next, query, visit).ok());
+  EXPECT_GT(stats.physical_bytes, 0U);
+  EXPECT_LE(store.SamplePageCacheMetrics().resident_bytes, 16384U);
+  pin.reset();
+  store.CollectRetired();
+  EXPECT_FALSE(std::filesystem::exists(path_ + "/seg-a.csegment"));
+}
+
+TEST_F(ProjectionStoreTest, VisitorRetainsGenerationAndDoesNotQuarantineResourceFailures) {
+  auto opened = QueryProjectionStore::Open({path_, "test-db", {}});
+  ASSERT_TRUE(opened.ok());
+  auto& store = *opened.ValueOrDie();
+  ASSERT_TRUE(store.Build(Build(10)).ok());
+  CoverageRequest request;
+  request.part_id = PartId{1}; request.schema_epoch = 1;
+  request.entity_min = 1; request.entity_max_exclusive = 2;
+  request.valid_time = {ValidTime{0}, std::nullopt};
+  request.snapshot_seq = CommitSeq{10};
+  auto pin = store.Acquire(request);
+  ASSERT_TRUE(pin.has_value());
+  QueryReservation small(100);
+  auto status = store.VisitChains(request, *pin, small,
+      [](const ProjectionChain&) { return Status::OK(); });
+  EXPECT_TRUE(status.IsResourceExhausted()) << status.ToString();
+  EXPECT_EQ(small.used_bytes(), 0U);
+  EXPECT_EQ(store.pending_rebuild_requests(), 0U);
+  EXPECT_TRUE(store.projections_enabled());
+  QueryReservation adequate(65536);
+  status = store.VisitChains(request, *pin, adequate,
+      [](const ProjectionChain&) { return Status::IOError("test", "visitor failure"); });
+  EXPECT_TRUE(status.IsIOError());
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+  EXPECT_EQ(store.pending_rebuild_requests(), 0U);
+  ASSERT_TRUE(store.Build(Build(20, "seg-b")).ok());
+  size_t visited = 0;
+  status = store.VisitChains(request, *pin, adequate,
+      [&](const ProjectionChain& chain) {
+        EXPECT_EQ(chain.header.generation_id, 10U);
+        ++visited;
+        return Status::OK();
+      });
+  EXPECT_TRUE(status.ok()) << status.ToString();
+  EXPECT_EQ(visited, 1U);
+  EXPECT_EQ(adequate.used_bytes(), 0U);
 }
 
 TEST_F(ProjectionStoreTest, DebugBoundsPreserveRolloverCoverageAndCleanup) {

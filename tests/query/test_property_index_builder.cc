@@ -31,9 +31,10 @@ class Reader final : public CanonicalFactReader {
   Status ReadColumnar(const FactReadSpec&, const CanonicalColumnarBatchVisitor&) const override {
     return Status::NotSupported("test", "unused");
   }
-  StatusOr<std::vector<FactEvent>> ReadExact(
-      const std::vector<std::string>&) const override {
-    return std::vector<FactEvent>{};
+  StatusOr<FactEventBatch> ReadExact(
+      const std::vector<std::string>&,
+      std::shared_ptr<FactReadMemory> = {}) const override {
+    return FactEventBatch{};
   }
 };
 

@@ -1,6 +1,7 @@
 #ifndef CEDAR_QUERY_PROJECTION_FORMAT_H_
 #define CEDAR_QUERY_PROJECTION_FORMAT_H_
 #include <optional>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,9 @@ struct ProjectionChain {
   bool operator==(const ProjectionChain&) const = default;
 };
 
+// Includes owned container capacities and string storage, but no shared data.
+size_t ProjectionChainMemoryBytes(const ProjectionChain& chain);
+
 // Directory metadata can be decoded without touching any page payload. The
 // returned chain contains header and page_directory only.
 StatusOr<ProjectionChain> DecodeProjectionDirectory(const std::string& bytes,
@@ -74,7 +78,8 @@ StatusOr<ProjectionChain> DecodeProjectionDirectory(const std::string& bytes,
 StatusOr<ProjectionChain> ReadProjectionPagePayload(
     const ProjectionHeader&, CompressionCodec,
     const ProjectionPageDirectoryEntry&, const std::string& payload,
-    size_t allocation_limit = 64ULL * 1024ULL * 1024ULL);
+    size_t allocation_limit = 64ULL * 1024ULL * 1024ULL,
+    const std::function<bool(size_t)>& reserve = {});
 StatusOr<std::string> EncodeProjectionPage(const ProjectionChain&,
                                            CompressionCodec);
 StatusOr<ProjectionChain> DecodeProjectionPage(const std::string&,

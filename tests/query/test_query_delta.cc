@@ -220,9 +220,9 @@ TEST(FactStoreBatchReadTest, ReadsContiguousSequencesAndExactFactsInOrder) {
     const auto facts = store.ReadExactFacts(snapshot.ValueOrDie(),
                                             sequences.ValueOrDie()[1].fact_keys);
     ASSERT_TRUE(facts.ok()) << facts.status().ToString();
-    ASSERT_EQ(facts.ValueOrDie().size(),
+    ASSERT_EQ(facts.ValueOrDie().events.size(),
               sequences.ValueOrDie()[1].fact_keys.size());
-    EXPECT_EQ(facts.ValueOrDie()[0].ref, edge);
+    EXPECT_EQ(facts.ValueOrDie().events[0].ref, edge);
   }
   ASSERT_TRUE(store.Close().ok());
   std::filesystem::remove_all(path);

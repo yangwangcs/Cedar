@@ -5,6 +5,7 @@
 #include <type_traits>
 
 #include "cedar/core/crc32c.h"
+#include "query/resource/query_read_memory.h"
 
 namespace cedar::internal {
 namespace {
@@ -61,12 +62,40 @@ void PutBytes(std::string* out, const std::string& value) {
   Put32(out, static_cast<uint32_t>(value.size()));
   out->append(value);
 }
-bool GetBytes(const std::string& in, size_t* p, std::string* value) {
+Status ReadValue(const std::string& in, size_t* p, size_t payload_end,
+                 Value* value, FactReadMemoryScope* output,
+                 FactReadMemory* memory) {
   uint32_t size = 0;
-  if (!Get32(in, p, &size) || size > in.size() - *p) return false;
-  value->assign(in.data() + *p, size);
+  if (!Get32(in, p, &size) || *p > payload_end || size > payload_end - *p)
+    return Status::Corruption("property index", "truncated value");
+  FactReadMemoryScope scratch(memory);
+  const uint64_t capacity = std::max<uint64_t>(16, uint64_t{size} + 1);
+  if (Status status = scratch.Reserve(capacity); !status.ok()) return status;
+  if (Status status = output->Reserve(capacity); !status.ok()) return status;
+  std::string encoded(in.data() + *p, size);
+  auto decoded = Value::Decode(encoded);
+  if (!decoded) return Status::Corruption("property index", "invalid value");
+  const auto* text = std::get_if<std::string>(&decoded->data());
+  const uint64_t retained = text ? text->capacity() + 1 : 0;
+  if (retained > capacity) {
+    return Status::ResourceExhausted("property index", "decoded value exceeds reserved capacity");
+  }
+  output->Release(capacity - retained);
+  *value = std::move(*decoded);
   *p += size;
-  return true;
+  return Status::OK();
+}
+
+uint64_t ValueHeapBytes(const Value& value) {
+  const auto* text = std::get_if<std::string>(&value.data());
+  return text ? text->capacity() + 1 : 0;
+}
+
+Status ReserveEncodingScratch(const Value& value, FactReadMemoryScope* scratch) {
+  const uint64_t bytes = ValueHeapBytes(value);
+  if (bytes > UINT64_MAX / 8 - 128)
+    return Status::ResourceExhausted("property index", "encoding scratch overflow");
+  return scratch->Reserve(8 * (bytes + 128));
 }
 
 uint64_t BloomBit(const PropertyIndexPosting& posting) {
@@ -91,9 +120,20 @@ std::string EncodePostingForCrc(const PropertyIndexPosting& posting) {
   return out;
 }
 
-Status BuildPageDirectory(PropertyIndexSegment* segment) {
+Status BuildPageDirectory(PropertyIndexSegment* segment,
+                          FactReadMemoryScope* output = nullptr,
+                          FactReadMemory* scratch_memory = nullptr) {
   segment->pages.clear();
-  for (uint32_t first = 0; first < segment->postings.size();
+  if (segment->postings.size() > UINT32_MAX)
+    return Status::ResourceExhausted("property index", "posting count exceeds directory range");
+  const uint64_t page_count = (segment->postings.size() + kPropertyIndexPageRows - 1) /
+                              kPropertyIndexPageRows;
+  if (output && page_count > segment->pages.capacity()) {
+    if (Status status = output->ReserveElements(page_count,
+            sizeof(PropertyIndexSegment::PageDirectoryEntry)); !status.ok()) return status;
+  }
+  segment->pages.reserve(page_count);
+  for (uint64_t first = 0; first < segment->postings.size();
        first += kPropertyIndexPageRows) {
     const uint32_t count = std::min<uint32_t>(
         kPropertyIndexPageRows,
@@ -101,12 +141,18 @@ Status BuildPageDirectory(PropertyIndexSegment* segment) {
     PropertyIndexSegment::PageDirectoryEntry page;
     page.first_posting = first;
     page.row_count = count;
+    if (output) {
+      if (Status status = output->Reserve(ValueHeapBytes(segment->postings[first].value));
+          !status.ok()) return status;
+      if (Status status = output->Reserve(ValueHeapBytes(segment->postings[first + count - 1].value));
+          !status.ok()) return status;
+    }
     page.min_value = segment->postings[first].value;
     page.max_value = segment->postings[first + count - 1].value;
     page.entity_min = UINT64_MAX;
     page.entity_max_exclusive = 0;
     page.valid_from_min = segment->postings[first].effective.from;
-    std::string payload;
+    uint32_t payload_crc = 0;
     for (uint32_t i = 0; i < count; ++i) {
       const auto& posting = segment->postings[first + i];
       page.entity_min = std::min(page.entity_min, posting.vertex.vertex_id.value);
@@ -123,10 +169,13 @@ Status BuildPageDirectory(PropertyIndexSegment* segment) {
            posting.effective.to->value > page.valid_to_max->value)) {
         page.valid_to_max = posting.effective.to;
       }
+      FactReadMemoryScope scratch(scratch_memory);
+      if (Status status = ReserveEncodingScratch(posting.value, &scratch); !status.ok()) return status;
       page.bloom_mask |= BloomBit(posting);
-      payload.append(EncodePostingForCrc(posting));
+      const std::string encoded = EncodePostingForCrc(posting);
+      payload_crc = crc32c::Extend(payload_crc, encoded.data(), encoded.size());
     }
-    page.payload_crc32c = crc32c::Value(payload.data(), payload.size());
+    page.payload_crc32c = payload_crc;
     segment->pages.push_back(std::move(page));
   }
   return Status::OK();
@@ -148,14 +197,18 @@ void EncodePageDirectoryEntry(std::string* out,
 }
 
 StatusOr<PropertyIndexSegment::PageDirectoryEntry> DecodePageDirectoryEntry(
-    const std::string& in, size_t* p, size_t payload_end) {
+    const std::string& in, size_t* p, size_t payload_end,
+    FactReadMemoryScope* output, FactReadMemory* memory) {
   PropertyIndexSegment::PageDirectoryEntry page;
   uint32_t has_to = 0;
   uint64_t to = 0;
-  std::string encoded_min, encoded_max;
-  if (!Get32(in, p, &page.first_posting) || !Get32(in, p, &page.row_count) ||
-      !GetBytes(in, p, &encoded_min) || !GetBytes(in, p, &encoded_max) ||
-      !Get64(in, p, &page.entity_min) ||
+  if (!Get32(in, p, &page.first_posting) || !Get32(in, p, &page.row_count))
+    return Status::Corruption("property index", "truncated page directory");
+  if (Status status = ReadValue(in, p, payload_end, &page.min_value, output, memory);
+      !status.ok()) return status;
+  if (Status status = ReadValue(in, p, payload_end, &page.max_value, output, memory);
+      !status.ok()) return status;
+  if (!Get64(in, p, &page.entity_min) ||
       !Get64(in, p, &page.entity_max_exclusive) ||
       !Get64(in, p, &page.valid_from_min.value) || *p >= payload_end) {
     return Status::Corruption("property index", "truncated page directory");
@@ -165,27 +218,22 @@ StatusOr<PropertyIndexSegment::PageDirectoryEntry> DecodePageDirectoryEntry(
       !Get32(in, p, &page.payload_crc32c) || has_to > 1) {
     return Status::Corruption("property index", "invalid page directory");
   }
-  const auto min_value = Value::Decode(encoded_min);
-  const auto max_value = Value::Decode(encoded_max);
-  if (!min_value || !max_value) {
-    return Status::Corruption("property index", "invalid page value bounds");
-  }
-  page.min_value = *min_value;
-  page.max_value = *max_value;
   if (has_to) page.valid_to_max = ValidTime{to};
   return page;
 }
 
 }  // namespace
 
-Status BuildPropertyIndexPages(PropertyIndexSegment* segment) {
+Status BuildPropertyIndexPages(PropertyIndexSegment* segment,
+    FactReadMemoryScope* output, FactReadMemory* scratch_memory) {
   if (segment == nullptr) {
     return Status::InvalidArgument("property index", "missing segment");
   }
-  return BuildPageDirectory(segment);
+  return BuildPageDirectory(segment, output, scratch_memory);
 }
 
-Status ValidatePropertyIndexSegment(const PropertyIndexSegment& segment) {
+Status ValidatePropertyIndexSegment(const PropertyIndexSegment& segment,
+                                   FactReadMemory* scratch_memory) {
   if (segment.generation_id == 0 || segment.base_seq.value > segment.built_through.value ||
       !segment.property.valid() || segment.schema_epoch == 0) {
     return Status::InvalidArgument("property index", "invalid segment identity");
@@ -228,11 +276,15 @@ Status ValidatePropertyIndexSegment(const PropertyIndexSegment& segment) {
       if (page.min_value != first.value || page.max_value != last.value) {
         return Status::InvalidArgument("property index", "page bounds differ from postings");
       }
-      std::string payload;
+      uint32_t payload_crc = 0;
       for (uint32_t i = 0; i < page.row_count; ++i) {
-        payload.append(EncodePostingForCrc(segment.postings[page.first_posting + i]));
+        const auto& posting = segment.postings[page.first_posting + i];
+        FactReadMemoryScope scratch(scratch_memory);
+        if (Status status = ReserveEncodingScratch(posting.value, &scratch); !status.ok()) return status;
+        const std::string encoded = EncodePostingForCrc(posting);
+        payload_crc = crc32c::Extend(payload_crc, encoded.data(), encoded.size());
       }
-      if (page.payload_crc32c != crc32c::Value(payload.data(), payload.size())) {
+      if (page.payload_crc32c != payload_crc) {
         return Status::Corruption("property index", "page payload checksum mismatch");
       }
       expected_first += page.row_count;
@@ -274,11 +326,20 @@ StatusOr<std::string> EncodePropertyIndexSegment(
 
 StatusOr<PropertyIndexSegment> DecodePropertyIndexSegment(
     const std::string& bytes, size_t allocation_limit) {
+  QueryReservation reservation(allocation_limit);
+  auto memory = std::make_shared<QueryReadMemory>(reservation);
+  FactReadMemoryScope input(memory.get());
+  if (Status status = input.Reserve(bytes.capacity() + 1); !status.ok()) return status;
+  auto decoded = DecodeBudgetedPropertyIndexSegment(bytes, memory);
+  if (!decoded.ok()) return decoded.status();
+  return std::move(decoded.ValueOrDie().segment);
+}
+
+StatusOr<PropertyIndexReadResult> DecodeBudgetedPropertyIndexSegment(
+    const std::string& bytes, std::shared_ptr<FactReadMemory> memory) {
+  if (!memory) return Status::InvalidArgument("property index", "missing read memory");
   if (bytes.size() < 4 + 8 * 3 + 4 * 4 + 4 || bytes.compare(0, 4, "CPI1") != 0) {
     return Status::Corruption("property index", "invalid segment header");
-  }
-  if (bytes.size() > allocation_limit) {
-    return Status::ResourceExhausted("property index", "segment exceeds allocation limit");
   }
   const size_t payload_end = bytes.size() - 4;
   size_t crc_at = payload_end;
@@ -286,18 +347,22 @@ StatusOr<PropertyIndexSegment> DecodePropertyIndexSegment(
   if (!Get32(bytes, &crc_at, &expected) || expected != crc32c::Value(bytes.data(), payload_end)) {
     return Status::Corruption("property index", "segment checksum mismatch");
   }
-  PropertyIndexSegment segment;
+  FactReadMemoryScope output(memory.get());
+  PropertyIndexReadResult result;
+  auto& segment = result.segment;
   size_t p = 4;
   uint32_t property = 0, part = 0, epoch = 0, count = 0;
   if (!Get64(bytes, &p, &segment.generation_id) || !Get64(bytes, &p, &segment.base_seq.value) ||
       !Get64(bytes, &p, &segment.built_through.value) || !Get32(bytes, &p, &property) ||
       !Get32(bytes, &p, &part) || !Get32(bytes, &p, &epoch) || !Get32(bytes, &p, &count) ||
-      count > 1'000'000) {
+      count > 1'000'000 || property > UINT16_MAX) {
     return Status::Corruption("property index", "truncated segment metadata");
   }
   segment.property = PropertyId{static_cast<uint16_t>(property)};
   segment.part_id = PartId{part};
   segment.schema_epoch = epoch;
+  if (Status status = output.ReserveElements(count, sizeof(PropertyIndexPosting));
+      !status.ok()) return status;
   segment.postings.reserve(count);
   for (uint32_t i = 0; i < count; ++i) {
     PropertyIndexPosting posting{VertexRef{}, {}, CommitSeq{}, Value::Int64(0)};
@@ -309,14 +374,11 @@ StatusOr<PropertyIndexSegment> DecodePropertyIndexSegment(
     if (has_to > 1 || !Get64(bytes, &p, &to) || !Get64(bytes, &p, &commit)) {
       return Status::Corruption("property index", "invalid posting interval");
     }
-    std::string encoded;
-    if (!GetBytes(bytes, &p, &encoded)) return Status::Corruption("property index", "truncated value");
-    const auto value = Value::Decode(encoded);
-    if (!value.has_value()) return Status::Corruption("property index", "invalid posting value");
+    if (Status status = ReadValue(bytes, &p, payload_end, &posting.value, &output, memory.get());
+        !status.ok()) return status;
     posting.vertex = VertexRef{segment.part_id, VertexId{vertex}};
     posting.effective = {ValidTime{from}, has_to ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt};
     posting.commit_seq = CommitSeq{commit};
-    posting.value = *value;
     segment.postings.push_back(std::move(posting));
   }
   // CPI1 files produced before page directories ended after the posting list.
@@ -327,24 +389,44 @@ StatusOr<PropertyIndexSegment> DecodePropertyIndexSegment(
     if (!Get32(bytes, &p, &page_count) || page_count > 1'000'000) {
       return Status::Corruption("property index", "invalid page directory count");
     }
+    if (Status status = output.ReserveElements(page_count,
+            sizeof(PropertyIndexSegment::PageDirectoryEntry)); !status.ok()) return status;
     segment.pages.reserve(page_count);
     for (uint32_t i = 0; i < page_count; ++i) {
-      auto page = DecodePageDirectoryEntry(bytes, &p, payload_end);
+      auto page = DecodePageDirectoryEntry(bytes, &p, payload_end, &output, memory.get());
       if (!page.ok()) return page.status();
       segment.pages.push_back(std::move(page).ConsumeValueOrDie());
     }
   }
   if (p != payload_end) return Status::Corruption("property index", "trailing segment payload");
-  const Status valid = ValidatePropertyIndexSegment(segment);
+  const Status valid = ValidatePropertyIndexSegment(segment, memory.get());
   if (!valid.ok()) return valid;
-  return segment;
+  auto owner = output.Retain(memory);
+  if (!owner.ok()) return owner.status();
+  result.memory = owner.ConsumeValueOrDie();
+  return result;
 }
 
 std::vector<PropertyIndexPosting> SeekPropertyIndexRange(
     const PropertyIndexSegment& segment, PropertyIndexOperator op,
     const Value& lower, const std::optional<Value>& upper) {
+  std::vector<PropertyIndexPosting> result;
+  VisitPropertyIndexRange(segment, op, lower,
+      [&](const PropertyIndexPosting& posting) {
+        result.push_back(posting);
+        return Status::OK();
+      }, upper).IgnoreError();
+  return result;
+}
+
+Status VisitPropertyIndexRange(
+    const PropertyIndexSegment& segment, PropertyIndexOperator op,
+    const Value& lower,
+    const std::function<Status(const PropertyIndexPosting&)>& visitor,
+    const std::optional<Value>& upper) {
+  if (!visitor) return Status::InvalidArgument("property index", "missing visitor");
   const auto& postings = segment.postings;
-  if (postings.empty()) return {};
+  if (postings.empty()) return Status::OK();
   const bool starts_at_lower = op == PropertyIndexOperator::kEqual ||
                                op == PropertyIndexOperator::kGreater ||
                                op == PropertyIndexOperator::kGreaterEqual;
@@ -364,7 +446,6 @@ std::vector<PropertyIndexPosting> SeekPropertyIndexRange(
           return CompareValues(posting.value, value) < 0;
         }) - postings.begin());
   }
-  std::vector<PropertyIndexPosting> result;
   for (size_t index = first_index; index < postings.size(); ++index) {
     const auto& posting = postings[index];
     const int cmp = CompareValues(posting.value, lower);
@@ -376,9 +457,11 @@ std::vector<PropertyIndexPosting> SeekPropertyIndexRange(
       break;
     }
     if (upper.has_value() && CompareValues(posting.value, *upper) > 0) break;
-    if (Matches(op, cmp)) result.push_back(posting);
+    if (Matches(op, cmp)) {
+      if (Status status = visitor(posting); !status.ok()) return status;
+    }
   }
-  return result;
+  return Status::OK();
 }
 
 }  // namespace cedar::internal

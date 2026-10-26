@@ -17,6 +17,7 @@
 #include <utility>
 #include <thread>
 #include <vector>
+#include <span>
 
 #include "storage/facts/fact_store.h"
 #include "query/temporal/corrected_chain.h"
@@ -77,6 +78,8 @@ struct QueryDeltaView {
   CommitSeq first_missing;
 
   std::vector<FactEvent> EventsFor(const FactRef& ref) const;
+  // Borrowed until this view is changed or destroyed.
+  std::span<const FactEvent> EventRangeFor(const FactRef& ref) const;
   std::vector<EdgeIdentity> EdgeIdentitiesThrough(CommitSeq snapshot) const;
 };
 

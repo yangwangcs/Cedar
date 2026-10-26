@@ -54,11 +54,12 @@ bool GetBlob(const std::string& in, size_t* at, std::string* blob) {
   *blob = in.substr(*at, n); *at += n; return true;
 }
 bool GetBlobBudget(const std::string& in, size_t* at, std::string* blob,
-                   size_t limit, size_t* used) {
+                   size_t limit, size_t* used,
+                   const std::function<bool(size_t)>& reserve = {}) {
   uint32_t n = 0;
   if (!G32(in, at, &n) || *at > in.size() || n > in.size() - *at) return false;
   size_t remaining = limit - std::min(limit, *used);
-  if (n > remaining) return false;
+  if (n > remaining || (reserve && !reserve(n))) return false;
   *used += n;
   *blob = in.substr(*at, n); *at += n; return true;
 }
@@ -77,6 +78,7 @@ bool DecodeSignedDelta(uint64_t encoded, uint64_t previous, uint64_t* current) {
 }
 bool DecodeRle(const std::string& in, size_t expected, std::vector<uint32_t>* values) {
   size_t at = 0; values->clear();
+  values->reserve(expected);
   while (values->size() < expected) { uint32_t value = 0, run = 0; if (!G32(in, &at, &value) || !G32(in, &at, &run) || run == 0 || run > expected - values->size()) return false; values->insert(values->end(), run, value); }
   return at == in.size();
 }
@@ -95,7 +97,8 @@ void EncodePayload(std::string* s, const std::vector<ProjectionInterval>& is,
   PutBlob(s, presence); PutBlob(s, operations); PutBlob(s, ie); PutBlob(s, it); PutBlob(s, ito); PutBlob(s, EncodeRle(ii)); PutBlob(s, be); PutBlob(s, bt); PutBlob(s, EncodeRle(bi));
 }
 Status DecodePayload(const std::string& s, size_t row_limit, size_t* allocation_used,
-                     ProjectionChain* c) {
+                     ProjectionChain* c,
+                     const std::function<bool(size_t)>& reserve = {}) {
   size_t p = 0; uint32_t magic = 0, ni = 0, nb = 0, nd = 0;
   if (row_limit < sizeof(ProjectionInterval) || row_limit < sizeof(ProjectionBoundary))
     return Status::ResourceExhausted("projection", "row output budget exhausted");
@@ -106,29 +109,44 @@ Status DecodePayload(const std::string& s, size_t row_limit, size_t* allocation_
       nd > row_limit / sizeof(Value))
     return Status::ResourceExhausted("projection", "decoded rows exceed budget");
   size_t reserve_cost = size_t(nd) * (sizeof(Value) + sizeof(size_t));
-  if (reserve_cost > row_limit - std::min(row_limit, *allocation_used)) return Status::ResourceExhausted("projection", "dictionary capacity exceeds budget");
+  if (reserve_cost > row_limit - std::min(row_limit, *allocation_used) ||
+      (reserve && !reserve(reserve_cost))) return Status::ResourceExhausted("projection", "dictionary capacity exceeds budget");
   *allocation_used += reserve_cost;
   std::vector<Value> dictionary; std::vector<size_t> dictionary_sizes; dictionary.reserve(nd); dictionary_sizes.reserve(nd);
   for (uint32_t n = 0; n < nd; ++n) {
-    std::string encoded; if (!GetBlob(s, &p, &encoded)) return Status::Corruption("projection", "invalid value dictionary");
-    size_t value_cost = sizeof(Value) + encoded.size();
-    if (value_cost > row_limit - std::min(row_limit, *allocation_used)) return Status::ResourceExhausted("projection", "dictionary exceeds budget");
+    std::string encoded;
+    if (!GetBlobBudget(s, &p, &encoded, row_limit, allocation_used, reserve))
+      return Status::ResourceExhausted("projection", "encoded dictionary exceeds budget");
+    // Decode and ownership transfer can overlap two string copies.
+    if (encoded.size() > (std::numeric_limits<size_t>::max() - sizeof(Value)) / 2)
+      return Status::ResourceExhausted("projection", "dictionary cost overflow");
+    size_t value_cost = sizeof(Value) + 2 * encoded.size();
+    if (value_cost > row_limit - std::min(row_limit, *allocation_used) ||
+        (reserve && !reserve(value_cost))) return Status::ResourceExhausted("projection", "dictionary exceeds budget");
     auto value = Value::Decode(encoded); if (!value) return Status::Corruption("projection", "invalid dictionary value"); dictionary.push_back(*value); dictionary_sizes.push_back(encoded.size()); *allocation_used += value_cost;
   }
   std::string presence, operations, ie, it, ito, irle, be, bt, brle;
-  if (!GetBlobBudget(s, &p, &presence, row_limit, allocation_used) || !GetBlobBudget(s, &p, &operations, row_limit, allocation_used) || !GetBlobBudget(s, &p, &ie, row_limit, allocation_used) || !GetBlobBudget(s, &p, &it, row_limit, allocation_used) || !GetBlobBudget(s, &p, &ito, row_limit, allocation_used) || !GetBlobBudget(s, &p, &irle, row_limit, allocation_used) || !GetBlobBudget(s, &p, &be, row_limit, allocation_used) || !GetBlobBudget(s, &p, &bt, row_limit, allocation_used) || !GetBlobBudget(s, &p, &brle, row_limit, allocation_used) || presence.size() != (ni + 7) / 8 || operations.size() != (nb + 7) / 8) return Status::ResourceExhausted("projection", "column streams exceed budget");
+  if (!GetBlobBudget(s, &p, &presence, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &operations, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &ie, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &it, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &ito, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &irle, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &be, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &bt, row_limit, allocation_used, reserve) || !GetBlobBudget(s, &p, &brle, row_limit, allocation_used, reserve) || presence.size() != (ni + 7) / 8 || operations.size() != (nb + 7) / 8) return Status::ResourceExhausted("projection", "column streams exceed budget");
   if ((ni % 8 != 0 && (uint8_t(presence.back()) & ~uint8_t((1u << (ni % 8)) - 1))) ||
       (nb % 8 != 0 && (uint8_t(operations.back()) & ~uint8_t((1u << (nb % 8)) - 1))))
     return Status::Corruption("projection", "non-zero bitset padding");
+  const uint64_t row_capacity = uint64_t(ni) * (sizeof(ProjectionInterval) + sizeof(uint32_t)) +
+                                uint64_t(nb) * (sizeof(ProjectionBoundary) + sizeof(uint32_t));
+  if (row_capacity > row_limit - std::min(row_limit, *allocation_used) ||
+      (reserve && !reserve(static_cast<size_t>(row_capacity))))
+    return Status::ResourceExhausted("projection", "row capacities exceed budget");
+  *allocation_used += static_cast<size_t>(row_capacity);
+  c->intervals.reserve(c->intervals.size() + ni);
+  c->boundaries.reserve(c->boundaries.size() + nb);
   std::vector<uint32_t> ii, bi; if (!DecodeRle(irle, ni, &ii) || !DecodeRle(brle, nb, &bi)) return Status::Corruption("projection", "invalid value run");
   if (ie.size() != ni * 8 || it.size() != ni * 8 || ito.size() != ni * 8 || be.size() != nb * 8 || bt.size() != nb * 8) return Status::Corruption("projection", "invalid delta column");
   size_t ie_at = 0, it_at = 0, ito_at = 0, be_at = 0, bt_at = 0; uint64_t prev = 0, prev_entity = 0;
   for (uint32_t n = 0; n < ni; ++n) {
-    uint64_t entity_delta = 0, time_delta = 0, to = 0, entity = 0; if (!G64(ie, &ie_at, &entity_delta) || !G64(it, &it_at, &time_delta) || !G64(ito, &ito_at, &to) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || ii[n] >= dictionary.size()) return Status::Corruption("projection", "invalid interval delta"); size_t value_size = dictionary_sizes[ii[n]]; if (value_size > std::numeric_limits<size_t>::max() - sizeof(ProjectionInterval)) return Status::ResourceExhausted("projection", "interval cost overflow"); size_t row_cost = sizeof(ProjectionInterval) + value_size; size_t remaining_budget = row_limit - std::min(row_limit, *allocation_used); if (row_cost > remaining_budget) return Status::ResourceExhausted("projection", "interval rows exceed budget"); *allocation_used += row_cost; if (entity != prev_entity) prev = 0; if (time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid interval time delta"); prev_entity = entity; prev += time_delta; bool has = (uint8_t(presence[n / 8]) & (1u << (n % 8))) != 0; if (has && to < prev) return Status::Corruption("projection", "invalid interval range"); c->intervals.push_back({{ValidTime{prev}, has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt}, dictionary[ii[n]], prev_entity});
+    uint64_t entity_delta = 0, time_delta = 0, to = 0, entity = 0; if (!G64(ie, &ie_at, &entity_delta) || !G64(it, &it_at, &time_delta) || !G64(ito, &ito_at, &to) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || ii[n] >= dictionary.size()) return Status::Corruption("projection", "invalid interval delta"); size_t value_size = dictionary_sizes[ii[n]]; if (value_size > std::numeric_limits<size_t>::max() - sizeof(ProjectionInterval)) return Status::ResourceExhausted("projection", "interval cost overflow"); size_t row_cost = sizeof(ProjectionInterval) + value_size; size_t remaining_budget = row_limit - std::min(row_limit, *allocation_used); if (row_cost > remaining_budget || (reserve && !reserve(row_cost))) return Status::ResourceExhausted("projection", "interval rows exceed budget"); *allocation_used += row_cost; if (entity != prev_entity) prev = 0; if (time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid interval time delta"); prev_entity = entity; prev += time_delta; bool has = (uint8_t(presence[n / 8]) & (1u << (n % 8))) != 0; if (has && to < prev) return Status::Corruption("projection", "invalid interval range"); c->intervals.push_back({{ValidTime{prev}, has ? std::optional<ValidTime>(ValidTime{to}) : std::nullopt}, dictionary[ii[n]], prev_entity});
   }
   prev = prev_entity = 0;
   for (uint32_t n = 0; n < nb; ++n) {
-    uint64_t entity_delta = 0, time_delta = 0, entity = 0; if (!G64(be, &be_at, &entity_delta) || !G64(bt, &bt_at, &time_delta) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || bi[n] >= dictionary.size()) return Status::Corruption("projection", "invalid boundary delta"); size_t value_size = dictionary_sizes[bi[n]]; if (value_size > std::numeric_limits<size_t>::max() - sizeof(ProjectionBoundary)) return Status::ResourceExhausted("projection", "boundary cost overflow"); size_t row_cost = sizeof(ProjectionBoundary) + value_size; size_t remaining_budget = row_limit - std::min(row_limit, *allocation_used); if (row_cost > remaining_budget) return Status::ResourceExhausted("projection", "boundary rows exceed budget"); *allocation_used += row_cost; if (entity != prev_entity) prev = 0; if (time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid boundary time delta"); prev_entity = entity; prev += time_delta; auto op = (uint8_t(operations[n / 8]) & (1u << (n % 8))) ? FactOperation::kPut : FactOperation::kDelete; c->boundaries.push_back({ValidTime{prev}, op, dictionary[bi[n]], prev_entity});
+    uint64_t entity_delta = 0, time_delta = 0, entity = 0; if (!G64(be, &be_at, &entity_delta) || !G64(bt, &bt_at, &time_delta) || !DecodeSignedDelta(entity_delta, prev_entity, &entity) || bi[n] >= dictionary.size()) return Status::Corruption("projection", "invalid boundary delta"); size_t value_size = dictionary_sizes[bi[n]]; if (value_size > std::numeric_limits<size_t>::max() - sizeof(ProjectionBoundary)) return Status::ResourceExhausted("projection", "boundary cost overflow"); size_t row_cost = sizeof(ProjectionBoundary) + value_size; size_t remaining_budget = row_limit - std::min(row_limit, *allocation_used); if (row_cost > remaining_budget || (reserve && !reserve(row_cost))) return Status::ResourceExhausted("projection", "boundary rows exceed budget"); *allocation_used += row_cost; if (entity != prev_entity) prev = 0; if (time_delta > UINT64_MAX - prev) return Status::Corruption("projection", "invalid boundary time delta"); prev_entity = entity; prev += time_delta; auto op = (uint8_t(operations[n / 8]) & (1u << (n % 8))) ? FactOperation::kPut : FactOperation::kDelete; c->boundaries.push_back({ValidTime{prev}, op, dictionary[bi[n]], prev_entity});
   }
   return p == s.size() ? Status::OK() : Status::Corruption("projection", "trailing payload");
 }
@@ -149,6 +167,20 @@ Status ValidDirectory(const std::vector<ProjectionPageDirectoryEntry>& d, size_t
   return end == size - 4 ? Status::OK() : Status::Corruption("projection", "page payload gap");
 }
 }  // namespace
+
+size_t ProjectionChainMemoryBytes(const ProjectionChain& chain) {
+  size_t bytes = sizeof(ProjectionChain) +
+      chain.page_directory.capacity() * sizeof(ProjectionPageDirectoryEntry) +
+      chain.intervals.capacity() * sizeof(ProjectionInterval) +
+      chain.boundaries.capacity() * sizeof(ProjectionBoundary);
+  const auto add_value = [&bytes](const Value& value) {
+    if (const auto* text = std::get_if<std::string>(&value.data()))
+      bytes += text->capacity();
+  };
+  for (const auto& row : chain.intervals) add_value(row.value);
+  for (const auto& row : chain.boundaries) add_value(row.value);
+  return bytes;
+}
 
 StatusOr<std::string> EncodeProjectionPage(const ProjectionChain& c, CompressionCodec codec) {
   if (uint8_t(c.header.kind) < 1 || uint8_t(c.header.kind) > 5) return Status::InvalidArgument("projection", "invalid projection kind");
@@ -330,11 +362,18 @@ StatusOr<ProjectionChain> DecodeProjectionDirectory(const std::string& b,
 StatusOr<ProjectionChain> ReadProjectionPagePayload(
     const ProjectionHeader& header, CompressionCodec codec,
     const ProjectionPageDirectoryEntry& directory, const std::string& payload,
-    size_t allocation_limit) {
+    size_t allocation_limit, const std::function<bool(size_t)>& reserve) {
   if (payload.size() != directory.compressed_bytes ||
       crc32c::Value(payload.data(), payload.size()) != directory.payload_crc32c) {
     return Status::Corruption("projection", "page payload CRC32C mismatch");
   }
+  const uint64_t fixed_bytes = uint64_t(payload.capacity()) +
+      directory.uncompressed_bytes + sizeof(ProjectionChain) +
+      sizeof(ProjectionPageDirectoryEntry);
+  if (fixed_bytes > allocation_limit)
+    return Status::ResourceExhausted("projection", "page scratch exceeds budget");
+  if (reserve && !reserve(static_cast<size_t>(fixed_bytes) - payload.capacity()))
+    return Status::ResourceExhausted("projection", "page scratch reservation failed");
   auto raw = DecompressProjectionPayload(
       codec, payload, std::min<size_t>(directory.uncompressed_bytes,
                                        allocation_limit));
@@ -345,9 +384,9 @@ StatusOr<ProjectionChain> ReadProjectionPagePayload(
   ProjectionChain result;
   result.header = header;
   result.page_directory.push_back(directory);
-  size_t allocation_used = 0;
+  size_t allocation_used = static_cast<size_t>(fixed_bytes);
   auto decoded = DecodePayload(raw.ValueOrDie(), allocation_limit, &allocation_used,
-                               &result);
+                               &result, reserve);
   if (!decoded.ok()) return decoded;
   if (result.intervals.size() + result.boundaries.size() != directory.row_count) {
     return Status::Corruption("projection", "directory row count mismatch");

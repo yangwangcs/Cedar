@@ -2,6 +2,7 @@
 #define CEDAR_QUERY_PROJECTION_PROPERTY_INDEX_H_
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "cedar/core/status.h"
 #include "cedar/query/types.h"
 #include "query/read/read_catalog.h"
+#include "storage/facts/read_memory_scope.h"
 
 namespace cedar::internal {
 
@@ -44,9 +46,25 @@ struct PropertyIndexSegment {
   std::vector<PageDirectoryEntry> pages;
 };
 
+struct PropertyIndexReadResult {
+  PropertyIndexReadResult() = default;
+  PropertyIndexReadResult(const PropertyIndexReadResult&) = delete;
+  PropertyIndexReadResult& operator=(const PropertyIndexReadResult&) = delete;
+  PropertyIndexReadResult(PropertyIndexReadResult&&) noexcept = default;
+  PropertyIndexReadResult& operator=(PropertyIndexReadResult&& other) noexcept {
+    PropertyIndexReadResult previous(std::move(other));
+    memory.swap(previous.memory);
+    std::swap(segment, previous.segment);
+    return *this;
+  }
+  std::shared_ptr<const void> memory;
+  PropertyIndexSegment segment;
+};
+
 // Rebuilds deterministic page bounds after a segment is assembled from one
 // or more immutable files. This does not mutate canonical facts.
-Status BuildPropertyIndexPages(PropertyIndexSegment* segment);
+Status BuildPropertyIndexPages(PropertyIndexSegment* segment,
+    FactReadMemoryScope* output = nullptr, FactReadMemory* scratch_memory = nullptr);
 
 // Returns only postings in the typed predicate range. Postings must be sorted
 // by the schema value order; the seek uses a logarithmic lower bound and then
@@ -55,12 +73,21 @@ std::vector<PropertyIndexPosting> SeekPropertyIndexRange(
     const PropertyIndexSegment& segment, PropertyIndexOperator op,
     const Value& lower, const std::optional<Value>& upper = std::nullopt);
 
-Status ValidatePropertyIndexSegment(const PropertyIndexSegment& segment);
+Status VisitPropertyIndexRange(
+    const PropertyIndexSegment& segment, PropertyIndexOperator op,
+    const Value& lower,
+    const std::function<Status(const PropertyIndexPosting&)>& visitor,
+    const std::optional<Value>& upper = std::nullopt);
+
+Status ValidatePropertyIndexSegment(const PropertyIndexSegment& segment,
+                                   FactReadMemory* scratch_memory = nullptr);
 StatusOr<std::string> EncodePropertyIndexSegment(
     const PropertyIndexSegment& segment);
 StatusOr<PropertyIndexSegment> DecodePropertyIndexSegment(
     const std::string& bytes,
     size_t allocation_limit = 64ULL * 1024ULL * 1024ULL);
+StatusOr<PropertyIndexReadResult> DecodeBudgetedPropertyIndexSegment(
+    const std::string& bytes, std::shared_ptr<FactReadMemory> memory);
 
 }  // namespace cedar::internal
 

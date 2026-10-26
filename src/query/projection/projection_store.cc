@@ -1,19 +1,24 @@
 #include "query/projection/projection_store.h"
+#include "query/runtime/relational.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <set>
 #include <type_traits>
 
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_page_reader.h"
+#include "query/projection/projection_page_cache.h"
 #include "query/read/read_catalog.h"
+#include "query/resource/query_read_memory.h"
 
 namespace cedar::internal {
 namespace {
@@ -105,6 +110,7 @@ bool ParseCurrent(const std::string& in, uint64_t* generation) {
 }  // namespace
 
 struct ProjectionGeneration::State {
+  std::shared_ptr<ProjectionPageCache> page_cache;
   ProjectionManifest manifest;
   std::shared_ptr<const ReadCatalog> read_catalog;
   std::string directory;
@@ -134,7 +140,8 @@ StatusOr<std::shared_ptr<const ReadCatalog>> BuildReadCatalog(
 
 StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGeneration(
     const std::shared_ptr<ProjectionGeneration::State>& state,
-    const CoverageRequest& request) {
+    const CoverageRequest& request, QueryReservation* reservation,
+    const ProjectionChainVisitor& visitor) {
   if (!state || !state->present.load()) {
     return Status::NotFound("projection store", "projection generation is no longer available");
   }
@@ -152,6 +159,7 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
     return Status::NotFound("projection store", "coverage is unavailable");
   }
   std::vector<ProjectionChain> result;
+  bool visited_page = false;
   bool matched_region = false;
   bool coverage_hole = false;
   const ReadCatalogKey catalog_key{request.kind, request.part_id,
@@ -161,12 +169,12 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
                                     catalog_key, request.entity_min,
                                     request.entity_max_exclusive,
                                     request.valid_time)
-                              : std::vector<const CoverageRegion*>{};
+                              : std::span<const std::pair<ReadCatalogKey, CoverageRegion>>{};
   if (candidates.empty() && request.stats && state->read_catalog) {
     request.stats->pages_skipped += state->read_catalog->total_segment_count();
   }
-  for (const CoverageRegion* region_ptr : candidates) {
-    const auto& region = *region_ptr;
+  for (const auto& candidate : candidates) {
+    const auto& region = candidate.second;
     if (region.entity_min > request.entity_min ||
         region.entity_max_exclusive < request.entity_max_exclusive ||
         region.valid_time.from.value > request.valid_time.from.value ||
@@ -184,14 +192,34 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
       }
       const std::string filename = (fs::path(state->directory) / segment.filename).string();
       ProjectionPageReader page_reader;
-      auto directory = page_reader.ReadDirectory(filename);
+      struct DirectoryReservation {
+        QueryReservation* query;
+        uint64_t bytes = 0;
+        bool Reserve(size_t count) {
+          if (query && !query->ReserveMemory(count).ok()) return false;
+          bytes += count;
+          return true;
+        }
+        ~DirectoryReservation() { if (query) query->ReleaseMemory(bytes); }
+      } directory_reservation{reservation};
+      const auto reserve_directory = [&](size_t bytes) {
+        return directory_reservation.Reserve(bytes);
+      };
+      const size_t available = reservation
+          ? reservation->limit_bytes() - std::min(reservation->limit_bytes(), reservation->used_bytes())
+          : 64ULL << 20;
+      auto directory = page_reader.ReadDirectory(filename, available, reserve_directory);
+      if (!directory.ok() && directory.status().IsResourceExhausted())
+        return directory.status();
       if (!directory.ok() || directory.ValueOrDie().header != segment.header) {
         state->unavailable_segments.insert(segment.filename);
         state->corrupt_segments.insert(segment.filename);
         coverage_hole = true;
         continue;
       }
-      auto selection = page_reader.Select(directory.ValueOrDie(), request);
+      auto selection = page_reader.Select(directory.ValueOrDie(), request, reserve_directory);
+      if (!selection.ok() && selection.status().IsResourceExhausted())
+        return selection.status();
       if (!selection.ok()) {
         state->unavailable_segments.insert(segment.filename);
         state->corrupt_segments.insert(segment.filename);
@@ -199,6 +227,56 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
         continue;
       }
       if (request.stats) request.stats->pages_skipped += selection.ValueOrDie().pages_skipped;
+      if (reservation && visitor) {
+        const std::string* namespace_components[] = {
+            &state->manifest.database_identity, &state->directory,
+            &segment.segment_id, &segment.filename};
+        constexpr char kNamespace[] = "cedar.projection.v1";
+        uint64_t namespace_bytes = sizeof(kNamespace) - 1 + 2 * sizeof(uint64_t);
+        for (const auto* component : namespace_components) {
+          if (namespace_bytes > UINT64_MAX - sizeof(uint64_t) ||
+              component->size() > UINT64_MAX - namespace_bytes - sizeof(uint64_t))
+            return Status::ResourceExhausted("projection store", "cache namespace overflow");
+          namespace_bytes += sizeof(uint64_t) + component->size();
+        }
+        if (namespace_bytes > SIZE_MAX - 256 ||
+            !directory_reservation.Reserve(namespace_bytes + 256))
+          return Status::ResourceExhausted("projection store", "cache namespace exceeds budget");
+        ProjectionPageReadCache cache;
+        cache.pages = state->page_cache;
+        cache.generation = std::make_shared<ProjectionGeneration>(
+            ProjectionGeneration(state, true));
+        cache.admit = request.admit_pages;
+        cache.stats = request.stats;
+        cache.namespace_key.reserve(namespace_bytes);
+        cache.namespace_key = kNamespace;
+        for (const auto* component : namespace_components) {
+          const uint64_t length = component->size();
+          for (unsigned shift = 0; shift < 64; shift += 8)
+            cache.namespace_key.push_back(static_cast<char>(length >> shift));
+          cache.namespace_key.append(*component);
+        }
+        for (uint64_t field : {segment.file_bytes, uint64_t(segment.checksum)})
+          for (unsigned shift = 0; shift < 64; shift += 8)
+            cache.namespace_key.push_back(static_cast<char>(field >> shift));
+        Status visitor_status;
+        Status visited = page_reader.VisitSelected(
+            filename, directory.ValueOrDie(), selection.ValueOrDie(), *reservation,
+            [&](const ProjectionChain& chain) {
+              visited_page = true;
+              visitor_status = visitor(chain);
+              return visitor_status;
+            }, &cache);
+        if (!visitor_status.ok()) return visitor_status;
+        if (!visited.ok()) {
+          if (!visited.IsCorruption() && !visited.IsIOError() && !visited.IsNotFound())
+            return visited;
+          state->unavailable_segments.insert(segment.filename);
+          state->corrupt_segments.insert(segment.filename);
+          coverage_hole = true;
+        }
+        continue;
+      }
       auto decoded_pages = page_reader.ReadSelected(filename, directory.ValueOrDie(),
                                                      selection.ValueOrDie());
       if (!decoded_pages.ok()) {
@@ -235,7 +313,7 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChainsForGenera
     state->coverage_hole = coverage_hole;
     return Status::NotFound("projection store", "coverage has an unavailable region");
   }
-  if (result.empty()) return Status::NotFound("projection store", "coverage is unavailable");
+  if (result.empty() && !visited_page) return Status::NotFound("projection store", "coverage is unavailable");
   return result;
 }
 
@@ -251,7 +329,12 @@ uint64_t ProjectionGeneration::generation_id() const { return state_ ? state_->m
 const ProjectionManifest* ProjectionGeneration::manifest() const { return state_ ? &state_->manifest : nullptr; }
 
 QueryProjectionStore::QueryProjectionStore(ProjectionStoreOptions options)
-    : options_(std::move(options)), projections_path_(options_.path), manifests_path_(fs::path(options_.path) / "manifests") {}
+    : options_(std::move(options)),
+      page_cache_(std::make_shared<ProjectionPageCache>(options_.projection_cache_bytes)),
+      projections_path_(options_.path), manifests_path_(fs::path(options_.path) / "manifests") {}
+ProjectionPageCacheMetrics QueryProjectionStore::SamplePageCacheMetrics() const {
+  return {page_cache_->hits(), page_cache_->misses(), page_cache_->resident_bytes()};
+}
 QueryProjectionStore::~QueryProjectionStore() {
   std::lock_guard<std::mutex> lock(mutex_);
   closed_ = true;
@@ -358,6 +441,7 @@ Status QueryProjectionStore::LoadCurrent() {
     if (header.generation_id != generation || header.base_seq != manifest.ValueOrDie().base_seq || header.kind != r.kind || header.part_id != r.part_id || header.schema_epoch != r.schema_epoch || r.entity_min > header.entity_min || r.entity_max_exclusive < header.entity_max_exclusive || r.valid_time.from.value > header.valid_from_min.value || (r.valid_time.to && (!header.valid_to_max || r.valid_time.to->value < header.valid_to_max->value)) || (r.property_id.has_value() != (header.property_id.value != 0)) || (r.property_id && r.property_id->value != header.property_id.value)) return Status::Corruption("projection store", "referenced segment metadata mismatch");
   }
   auto state = std::make_shared<ProjectionGeneration::State>();
+  state->page_cache = page_cache_;
   state->manifest = manifest.ConsumeValueOrDie();
   state->directory = projections_path_;
   auto catalog = BuildReadCatalog(state->manifest);
@@ -525,6 +609,7 @@ Status QueryProjectionStore::Build(const ProjectionBuild& build) {
   s=PublishCurrent(build.manifest.generation_id); if (!s.ok()) return s;
   if (current_) { current_->retired = true; retired_.push_back(current_); }
   auto state=std::make_shared<ProjectionGeneration::State>();
+  state->page_cache = page_cache_;
   state->manifest=build.manifest;
   state->directory=projections_path_;
   auto catalog = BuildReadCatalog(state->manifest);
@@ -650,11 +735,31 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
 
 StatusOr<PropertyIndexSegment> QueryProjectionStore::ReadPropertyIndex(
     const CoverageRequest& request, const ProjectionGeneration& generation) const {
+  QueryReservation reservation(64ULL << 20);
+  auto result = ReadBudgetedPropertyIndex(request, generation, reservation);
+  if (!result.ok()) return result.status();
+  return std::move(result.ValueOrDie().segment);
+}
+
+StatusOr<PropertyIndexReadResult> QueryProjectionStore::ReadBudgetedPropertyIndex(
+    const CoverageRequest& request, const ProjectionGeneration& generation,
+    QueryReservation& reservation) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (closed_) return Status::NotFound("projection store", "store is closed");
   if (!generation.state_ || !request.property_id.has_value() ||
       request.kind != ProjectionKind::kPropertyIndex) {
     return Status::InvalidArgument("projection store", "invalid property index request");
   }
+  if (generation.state_ != current_ &&
+      std::find(retired_.begin(), retired_.end(), generation.state_) == retired_.end())
+    return Status::NotFound("projection store", "property index generation belongs to another store");
   const auto& state = generation.state_;
+  if ((!request.database_identity.empty() &&
+       request.database_identity != state->manifest.database_identity) ||
+      state->manifest.database_identity != options_.database_identity)
+    return Status::IdentityConflict("projection store", "property index identity changed");
+  if (request.expected_base_seq && *request.expected_base_seq != state->manifest.base_seq)
+    return Status::Conflict("projection store", "property index base changed");
   if (!state->present.load() || request.generation_id.has_value() &&
       *request.generation_id != state->manifest.generation_id ||
       request.snapshot_seq.value < state->manifest.base_seq.value) {
@@ -664,10 +769,18 @@ StatusOr<PropertyIndexSegment> QueryProjectionStore::ReadPropertyIndex(
     if (region.kind != ProjectionKind::kPropertyIndex ||
         region.part_id != request.part_id || region.property_id != request.property_id ||
         region.schema_epoch != request.schema_epoch || region.segments.empty() ||
-        region.built_through.value < request.snapshot_seq.value) {
+        region.built_through.value < request.snapshot_seq.value ||
+        region.entity_min > request.entity_min ||
+        region.entity_max_exclusive < request.entity_max_exclusive ||
+        region.valid_time.from.value > request.valid_time.from.value ||
+        (region.valid_time.to && (!request.valid_time.to ||
+                                 region.valid_time.to->value < request.valid_time.to->value))) {
       continue;
     }
-    PropertyIndexSegment merged;
+    auto memory = std::make_shared<QueryReadMemory>(reservation);
+    FactReadMemoryScope output(memory.get());
+    PropertyIndexReadResult result;
+    auto& merged = result.segment;
     merged.generation_id = state->manifest.generation_id;
     merged.base_seq = state->manifest.base_seq;
     merged.property = *request.property_id;
@@ -678,26 +791,46 @@ StatusOr<PropertyIndexSegment> QueryProjectionStore::ReadPropertyIndex(
           state->corrupt_segments.count(descriptor.filename) != 0) {
         return Status::NotFound("projection store", "property index segment unavailable");
       }
-      auto bytes = ReadFile(fs::path(state->directory) / descriptor.filename);
-      if (!bytes.ok()) return bytes.status();
-      auto decoded = DecodePropertyIndexSegment(bytes.ValueOrDie());
+      FactReadMemoryScope input_memory(memory.get());
+      if (Status status = input_memory.Reserve(
+              8192 + 4 * (state->directory.size() + descriptor.filename.size() + 128));
+          !status.ok()) return status;
+      std::ifstream input(fs::path(state->directory) / descriptor.filename,
+                           std::ios::binary | std::ios::ate);
+      if (!input) return Status::NotFound("projection store", "property index file not found");
+      const auto length = input.tellg();
+      if (length < 0 || static_cast<uint64_t>(length) > SIZE_MAX - 1 ||
+          static_cast<uint64_t>(length) > std::numeric_limits<std::streamsize>::max())
+        return Status::ResourceExhausted("projection store", "property index file size overflow");
+      if (Status status = input_memory.Reserve(static_cast<uint64_t>(length) + 1);
+          !status.ok()) return status;
+      std::string bytes(static_cast<size_t>(length), '\0');
+      input.seekg(0);
+      if (!input.read(bytes.data(), static_cast<std::streamsize>(length)))
+        return Status::IOError("projection store", "cannot read property index file");
+      auto decoded = DecodeBudgetedPropertyIndexSegment(bytes, memory);
       if (!decoded.ok()) {
-        state->corrupt_segments.insert(descriptor.filename);
+        if (decoded.status().IsCorruption()) state->corrupt_segments.insert(descriptor.filename);
         return decoded.status();
       }
-      if (decoded.ValueOrDie().generation_id != state->manifest.generation_id ||
-          decoded.ValueOrDie().property != *request.property_id ||
-          decoded.ValueOrDie().part_id != request.part_id ||
-          decoded.ValueOrDie().schema_epoch != request.schema_epoch ||
-          decoded.ValueOrDie().built_through.value < request.snapshot_seq.value) {
+      auto& segment = decoded.ValueOrDie().segment;
+      if (segment.generation_id != state->manifest.generation_id ||
+          segment.base_seq != state->manifest.base_seq ||
+          segment.property != *request.property_id ||
+          segment.part_id != request.part_id ||
+          segment.schema_epoch != request.schema_epoch ||
+          segment.built_through.value < request.snapshot_seq.value) {
         return Status::NotFound("projection store", "property index coverage is stale");
       }
-      if (merged.built_through.value < decoded.ValueOrDie().built_through.value) {
-        merged.built_through = decoded.ValueOrDie().built_through;
+      if (merged.built_through.value < segment.built_through.value) {
+        merged.built_through = segment.built_through;
       }
-      merged.postings.insert(merged.postings.end(),
-                             decoded.ValueOrDie().postings.begin(),
-                             decoded.ValueOrDie().postings.end());
+      for (auto& posting : segment.postings) {
+        if (Status status = ReserveFactAppend(&merged.postings, &output); !status.ok()) return status;
+        const auto* text = std::get_if<std::string>(&posting.value.data());
+        if (Status status = output.Reserve(text ? text->capacity() + 1 : 0); !status.ok()) return status;
+        merged.postings.push_back(std::move(posting));
+      }
     }
     std::sort(merged.postings.begin(), merged.postings.end(),
               [](const PropertyIndexPosting& left, const PropertyIndexPosting& right) {
@@ -717,9 +850,12 @@ StatusOr<PropertyIndexSegment> QueryProjectionStore::ReadPropertyIndex(
                   return left.vertex.part_id.value < right.vertex.part_id.value;
                 return left.vertex.vertex_id.value < right.vertex.vertex_id.value;
               });
-    const Status pages = BuildPropertyIndexPages(&merged);
+    const Status pages = BuildPropertyIndexPages(&merged, &output, memory.get());
     if (!pages.ok()) return pages;
-    return merged;
+    auto owner = output.Retain(memory);
+    if (!owner.ok()) return owner.status();
+    result.memory = owner.ConsumeValueOrDie();
+    return result;
   }
   return Status::NotFound("projection store", "property index coverage is missing");
 }
@@ -744,5 +880,28 @@ StatusOr<std::vector<ProjectionChain>> QueryProjectionStore::ReadChains(
     rebuild_requests_.push_back("generation=" + std::to_string(generation.state_->manifest.generation_id));
   }
   return chains;
+}
+Status QueryProjectionStore::VisitChains(
+    const CoverageRequest& request, const ProjectionGeneration& generation,
+    QueryReservation& reservation, const ProjectionChainVisitor& visitor) const {
+  if (!visitor) return Status::InvalidArgument("projection store", "missing visitor");
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (closed_ || !generation.state_) {
+    return Status::NotFound("projection store", "projection generation is no longer available");
+  }
+  auto chains = ReadChainsForGeneration(generation.state_, request, &reservation, visitor);
+  if (generation.state_->coverage_hole && current_ == generation.state_) {
+    // Existing leases keep this immutable generation alive, but it must no
+    // longer be eligible for new readers after a hole is detected.
+    generation.state_->retired = true;
+    retired_.push_back(generation.state_);
+    current_.reset();
+    enabled_ = false;
+  }
+  if (generation.state_->coverage_hole && !generation.state_->rebuild_enqueued) {
+    generation.state_->rebuild_enqueued = true;
+    rebuild_requests_.push_back("generation=" + std::to_string(generation.state_->manifest.generation_id));
+  }
+  return chains.ok() ? Status::OK() : chains.status();
 }
 }  // namespace cedar::internal

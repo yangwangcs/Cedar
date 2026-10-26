@@ -89,7 +89,11 @@ uint64_t QueryDeltaCommit::EstimatedBytes() const {
 }
 
 std::vector<FactEvent> QueryDeltaView::EventsFor(const FactRef& ref) const {
-  std::vector<FactEvent> result;
+  const auto events = EventRangeFor(ref);
+  return {events.begin(), events.end()};
+}
+
+std::span<const FactEvent> QueryDeltaView::EventRangeFor(const FactRef& ref) const {
   const auto begin = std::lower_bound(facts.begin(), facts.end(), ref,
       [](const FactEvent& event, const FactRef& key) {
         if (event.ref.part_id().value != key.part_id().value)
@@ -100,9 +104,9 @@ std::vector<FactEvent> QueryDeltaView::EventsFor(const FactRef& ref) const {
           return event.ref.property_id().value < key.property_id().value;
         return event.ref.entity_id() < key.entity_id();
       });
-  for (auto current = begin; current != facts.end() && current->ref == ref; ++current)
-    result.push_back(*current);
-  return result;
+  auto end = begin;
+  while (end != facts.end() && end->ref == ref) ++end;
+  return std::span<const FactEvent>(begin, end);
 }
 
 std::vector<EdgeIdentity> QueryDeltaView::EdgeIdentitiesThrough(
@@ -420,7 +424,7 @@ Status QueryDelta::RepairThrough(const FactStore& store,
       return events.status();
     }
     QueryDeltaCommit descriptor(sequence.commit_seq);
-    descriptor.facts = events.ConsumeValueOrDie();
+    descriptor.facts = std::move(events).ConsumeValueOrDie().events;
     for (const FactEvent& event : descriptor.facts) {
       if (event.edge_identity.has_value()) descriptor.edge_identities.push_back(*event.edge_identity);
     }

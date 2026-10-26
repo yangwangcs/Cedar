@@ -16,6 +16,14 @@
 namespace cedar::internal {
 
 struct ProjectionReadStats;
+class QueryReservation;
+class ProjectionPageCache;
+struct ProjectionPageCacheMetrics {
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t resident_bytes = 0;
+};
+using ProjectionChainVisitor = std::function<Status(const ProjectionChain&)>;
 
 struct CoverageRequest {
   ProjectionKind kind = ProjectionKind::kState;
@@ -30,6 +38,7 @@ struct CoverageRequest {
   std::optional<CommitSeq> expected_base_seq;
   std::string database_identity;
   ProjectionReadStats* stats = nullptr;
+  bool admit_pages = false;
 };
 
 // Per-slice decoder evidence. The pointer is caller-owned and is only touched
@@ -72,6 +81,7 @@ struct ProjectionStoreOptions {
   // Optional debug-profile bounds. Zero keeps the production behavior.
   uint64_t page_bytes = 0;
   uint32_t commits_per_generation = 0;
+  uint64_t projection_cache_bytes = 0;
 };
 
 class ProjectionGeneration {
@@ -122,23 +132,33 @@ class QueryProjectionStore {
   bool projections_enabled() const;
   std::optional<uint64_t> current_generation_id() const;
   std::optional<CommitSeq> current_base_seq() const;
+  ProjectionPageCacheMetrics SamplePageCacheMetrics() const;
   std::optional<ProjectionManifest> current_manifest() const;
   StatusOr<std::vector<ProjectionChain>> ReadChains(
       const CoverageRequest& request) const;
   StatusOr<std::vector<ProjectionChain>> ReadChains(
       const CoverageRequest& request, const ProjectionGeneration& generation) const;
+  Status VisitChains(const CoverageRequest& request,
+                     const ProjectionGeneration& generation,
+                     QueryReservation& reservation,
+                     const ProjectionChainVisitor& visitor) const;
   StatusOr<PropertyIndexSegment> ReadPropertyIndex(
       const CoverageRequest& request,
       const ProjectionGeneration& generation) const;
+  StatusOr<PropertyIndexReadResult> ReadBudgetedPropertyIndex(
+      const CoverageRequest& request, const ProjectionGeneration& generation,
+      QueryReservation& reservation) const;
 
  private:
   explicit QueryProjectionStore(ProjectionStoreOptions options);
   static StatusOr<std::vector<ProjectionChain>> ReadChainsForGeneration(
       const std::shared_ptr<ProjectionGeneration::State>& state,
-      const CoverageRequest& request);
+      const CoverageRequest& request, QueryReservation* reservation = nullptr,
+      const ProjectionChainVisitor& visitor = {});
   Status LoadCurrent();
   Status PublishCurrent(uint64_t generation);
   ProjectionStoreOptions options_;
+  std::shared_ptr<ProjectionPageCache> page_cache_;
   std::string projections_path_;
   std::string manifests_path_;
   mutable std::mutex mutex_;

@@ -5,6 +5,7 @@
 #include "cedar/core/crc32c.h"
 #include "query/projection/projection_format.h"
 #include "query/projection/property_index.h"
+#include "query/resource/query_read_memory.h"
 
 namespace cedar::internal {
 namespace {
@@ -169,6 +170,69 @@ TEST(ProjectionFormatTest, PropertyIndexSeekUsesTypedNumericOrdering) {
       segment, PropertyIndexOperator::kLess, Value::Int64(0));
   ASSERT_EQ(less.size(), 1U);
   EXPECT_EQ(less.front().value, Value::Int64(-10));
+}
+
+TEST(ProjectionFormatTest, PropertyIndexVisitorBorrowsPostingsAndPropagatesFailure) {
+  PropertyIndexSegment segment;
+  for (uint64_t index = 0; index < 600; ++index) {
+    segment.postings.push_back({VertexRef{PartId{0}, VertexId{index + 1}},
+        {ValidTime{0}, std::nullopt}, CommitSeq{1}, Value::Int64(index)});
+  }
+  ASSERT_TRUE(BuildPropertyIndexPages(&segment).ok());
+  size_t visited = 0;
+  Status status = VisitPropertyIndexRange(segment, PropertyIndexOperator::kGreaterEqual,
+      Value::Int64(513), [&](const PropertyIndexPosting& posting) {
+        EXPECT_EQ(&posting, &segment.postings[513 + visited]);
+        ++visited;
+        return Status::OK();
+      }, Value::Int64(515));
+  ASSERT_TRUE(status.ok()) << status.ToString();
+  EXPECT_EQ(visited, 3U);
+  visited = 0;
+  status = VisitPropertyIndexRange(segment, PropertyIndexOperator::kGreaterEqual,
+      Value::Int64(513), [&](const PropertyIndexPosting&) {
+        ++visited;
+        return Status::ResourceExhausted("test", "visitor refused candidate");
+      });
+  EXPECT_TRUE(status.IsResourceExhausted()) << status.ToString();
+  EXPECT_EQ(visited, 1U);
+  EXPECT_TRUE(VisitPropertyIndexRange(segment, PropertyIndexOperator::kEqual,
+      Value::Int64(513), {}).IsInvalidArgument());
+}
+
+TEST(ProjectionFormatTest, PropertyIndexDecodeBudgetsPayloadAndRetainsOutput) {
+  PropertyIndexSegment segment;
+  segment.generation_id = 1;
+  segment.base_seq = CommitSeq{1};
+  segment.built_through = CommitSeq{1};
+  segment.property = PropertyId{7};
+  segment.schema_epoch = 1;
+  for (uint64_t index = 0; index < 512; ++index) {
+    segment.postings.push_back({VertexRef{PartId{0}, VertexId{index + 1}},
+        {ValidTime{0}, std::nullopt}, CommitSeq{1}, Value::String(std::string(256, 'x'))});
+  }
+  const auto encoded = EncodePropertyIndexSegment(segment);
+  ASSERT_TRUE(encoded.ok());
+  QueryReservation tiny(32 << 10);
+  auto rejected = DecodeBudgetedPropertyIndexSegment(encoded.ValueOrDie(),
+      std::make_shared<QueryReadMemory>(tiny));
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+  EXPECT_EQ(tiny.used(ResourceDimension::kMemory), 0U);
+  QueryReservation reservation(8 << 20);
+  auto decoded = DecodeBudgetedPropertyIndexSegment(encoded.ValueOrDie(),
+      std::make_shared<QueryReadMemory>(reservation));
+  ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+  ASSERT_EQ(decoded.ValueOrDie().segment.postings.size(), 512U);
+  EXPECT_EQ(decoded.ValueOrDie().segment.postings.back().value, Value::String(std::string(256, 'x')));
+  const uint64_t bytes = reservation.used(ResourceDimension::kMemory);
+  EXPECT_GT(bytes, 512 * sizeof(PropertyIndexPosting));
+  PropertyIndexReadResult moved = std::move(decoded).ConsumeValueOrDie();
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), bytes);
+  moved = PropertyIndexReadResult{};
+  EXPECT_EQ(reservation.used(ResourceDimension::kMemory), 0U);
+  EXPECT_TRUE(DecodePropertyIndexSegment(encoded.ValueOrDie(), 32 << 10)
+                  .status().IsResourceExhausted());
 }
 
 TEST(ProjectionFormatTest, PropertyIndexSeekHonorsAllTypedBounds) {

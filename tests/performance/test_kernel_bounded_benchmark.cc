@@ -15,6 +15,8 @@
 #include "benchmarks/cedar_kernel_bench_workload.h"
 #include "benchmarks/cedar_kernel_bench_options.h"
 #include "cedar/database.h"
+#include "storage/facts/fact_store.h"
+#include "storage/rocks/rocksdb_config.h"
 
 namespace cedar::benchmark {
 namespace {
@@ -70,6 +72,8 @@ TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {
   options.storage_profile = StorageProfile::kProductionAppend;
   options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
   options.production.kernel_mode = true;
+  options.storage_read_working_bytes = 32ULL << 20;
+  options.storage_reader_metadata_bytes = 16ULL << 20;
   options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
   options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
   options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;
@@ -137,6 +141,48 @@ TEST(KernelBoundedBenchmarkTest, ConcurrentWritersExerciseNPlusOne) {
   std::filesystem::remove_all(path);
 }
 
+// Locks the kernel-test budget envelope against drift. Database::Open's own
+// preflight (src/kernel/database.cc) sums the same components but leaves the
+// default write buffer out; this assertion is the stricter contract and does
+// not change that preflight. The 1 MiB profile has no slack once the default
+// write buffer is counted, so any growth in a component must fail here.
+TEST(KernelBoundedBenchmarkTest,
+     KernelTestProfileFitsOneMiBEnvelopeIncludingDefaultWriteBuffer) {
+  constexpr uint64_t kKiB = 1024;
+  constexpr uint64_t kMiB = 1024 * kKiB;
+  FactStoreOptions store;
+  store.storage_profile = StorageProfile::kKernelTest;
+  // Same explicit pools as KernelTestProfileCompletesNativeFlushesAndReopens.
+  store.storage_read_working_bytes = 512 * kKiB;
+  store.storage_reader_metadata_bytes = 160 * kKiB;
+  const auto resolved = cedar::internal::ResolveStorageProfile(store);
+  ASSERT_TRUE(resolved.ok()) << resolved.status().ToString();
+  const auto& profile = resolved.ValueOrDie();
+  ASSERT_EQ(profile.memory_budget_bytes, 1 * kMiB);
+
+  const uint64_t query_memory_bytes = 16 * kKiB;
+  const uint64_t projection_cache_bytes = 16 * kKiB;
+  const uint64_t query_delta_bytes = 16 * kKiB;
+  EXPECT_EQ(profile.block_cache_bytes, 256 * kKiB);
+  EXPECT_EQ(profile.facts_write_buffer_bytes, 32 * kKiB);
+  EXPECT_EQ(profile.meta_write_buffer_bytes, 8 * kKiB);
+  EXPECT_EQ(profile.default_write_buffer_bytes, 8 * kKiB);
+  EXPECT_EQ(profile.storage_read_working_bytes, 512 * kKiB);
+  EXPECT_EQ(profile.storage_reader_metadata_bytes, 160 * kKiB);
+
+  const uint64_t envelope_kib =
+      (profile.block_cache_bytes + profile.facts_write_buffer_bytes +
+       profile.meta_write_buffer_bytes + profile.storage_read_working_bytes +
+       profile.storage_reader_metadata_bytes + query_memory_bytes +
+       projection_cache_bytes + query_delta_bytes +
+       profile.default_write_buffer_bytes) /
+      kKiB;
+  EXPECT_EQ(envelope_kib, 1024U);
+  EXPECT_LE(envelope_kib * kKiB, profile.memory_budget_bytes);
+  // The Open preflight omits the default write buffer: 1016 KiB of 1024 KiB.
+  EXPECT_EQ(envelope_kib - profile.default_write_buffer_bytes / kKiB, 1016U);
+}
+
 TEST(KernelBoundedBenchmarkTest,
      KernelTestProfileCompletesNativeFlushesAndReopens) {
   char pattern[] = "/tmp/cedar_kernel_test_maintenance_XXXXXX";
@@ -145,14 +191,31 @@ TEST(KernelBoundedBenchmarkTest,
   DatabaseOptions options;
   options.path = path;
   options.storage_profile = StorageProfile::kKernelTest;
-  options.query_runtime.query_memory_bytes = 128ULL * 1024ULL;
-  options.query_runtime.projection_cache_bytes = 128ULL * 1024ULL;
-  options.query_runtime.query_delta_bytes = 128ULL * 1024ULL;
+  options.storage_read_working_bytes = 512ULL << 10;
+  // Recovery merges several L0 readers at once. Keep the 512 KiB read
+  // workspace and fit their metadata plus query pools in the same 1 MiB cap.
+  options.storage_reader_metadata_bytes = 160ULL << 10;
+  options.query_runtime.query_memory_bytes = 16ULL << 10;
+  options.query_runtime.projection_cache_bytes = 16ULL << 10;
+  options.query_runtime.query_delta_bytes = 16ULL << 10;
   options.group_commit_max_batch_size = 64;
   options.group_commit_window_us = 200;
-  options.runtime_pressure_override_for_testing = [](PressureSample* sample) {
+  std::mutex pressure_mutex;
+  PressureSample peak_pressure;
+  options.runtime_pressure_override_for_testing = [&](PressureSample* sample) {
     sample->free_disk_bytes = UINT64_MAX;
     sample->free_disk_percent = 100;
+    std::lock_guard<std::mutex> lock(pressure_mutex);
+    for (auto field : {&PressureSample::write_stopped,
+                       &PressureSample::background_error,
+                       &PressureSample::l0_files,
+                       &PressureSample::immutable_memtable_count,
+                       &PressureSample::immutable_memtable_percent,
+                       &PressureSample::columnar_backlog_buffers,
+                       &PressureSample::pending_compaction_bytes,
+                       &PressureSample::retained_wal_bytes}) {
+      peak_pressure.*field = std::max(peak_pressure.*field, sample->*field);
+    }
   };
   auto opened = Database::Open(options);
   ASSERT_TRUE(opened.ok()) << opened.status().ToString();
@@ -183,7 +246,20 @@ TEST(KernelBoundedBenchmarkTest,
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   const BoundedWriterResult writer_result = writers.get();
-  ASSERT_TRUE(writer_result.status.ok()) << writer_result.status.ToString();
+  PressureSample observed_pressure;
+  {
+    std::lock_guard<std::mutex> lock(pressure_mutex);
+    observed_pressure = peak_pressure;
+  }
+  ASSERT_TRUE(writer_result.status.ok()) << writer_result.status.ToString()
+      << " write_stopped=" << observed_pressure.write_stopped
+      << " background_error=" << observed_pressure.background_error
+      << " l0=" << observed_pressure.l0_files
+      << " immutable_count=" << observed_pressure.immutable_memtable_count
+      << " immutable_percent=" << observed_pressure.immutable_memtable_percent
+      << " columnar_backlog=" << observed_pressure.columnar_backlog_buffers
+      << " compaction_bytes=" << observed_pressure.pending_compaction_bytes
+      << " wal_bytes=" << observed_pressure.retained_wal_bytes;
   EXPECT_EQ(writer_result.committed, 2048U);
   EXPECT_EQ(writer_result.failures, 0U);
   EXPECT_FALSE(saw_orphaned_high_pressure_debt)
@@ -239,9 +315,10 @@ TEST(KernelBoundedBenchmarkTest,
   DatabaseOptions options;
   options.path = path;
   options.storage_profile = StorageProfile::kKernelTest;
-  options.query_runtime.query_memory_bytes = 128ULL * 1024ULL;
-  options.query_runtime.projection_cache_bytes = 128ULL * 1024ULL;
-  options.query_runtime.query_delta_bytes = 128ULL * 1024ULL;
+  options.storage_read_working_bytes = 320ULL << 10;
+  options.query_runtime.query_memory_bytes = 96ULL << 10;
+  options.query_runtime.projection_cache_bytes = 96ULL << 10;
+  options.query_runtime.query_delta_bytes = 96ULL << 10;
   options.group_commit_max_batch_size = 64;
   options.group_commit_window_us = 200;
   options.runtime_pressure_override_for_testing = [](PressureSample* sample) {

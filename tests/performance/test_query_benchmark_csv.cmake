@@ -92,7 +92,9 @@ foreach(PROJECTION_STATE IN ITEMS base short-delta long-delta partial-coverage)
 endforeach()
 
 set(ACTIVE_DB "/tmp/cedar-query-bench-${TOKEN}-active")
-execute_process(COMMAND "${CEDAR_BENCHMARK}" "--path=${ACTIVE_DB}" "--operation=expand-out" "--projection-work=active" "--duration-seconds=1" OUTPUT_VARIABLE ACTIVE_OUT ERROR_VARIABLE ACTIVE_ERR RESULT_VARIABLE ACTIVE_RC)
+# Seed enough facts before timing so fixed statistics-file overhead does not
+# make the space gate depend on how many writes fit into a one-second run.
+execute_process(COMMAND "${CEDAR_BENCHMARK}" "--path=${ACTIVE_DB}" "--operation=expand-out" "--degree=1000" "--projection-work=active" "--duration-seconds=1" OUTPUT_VARIABLE ACTIVE_OUT ERROR_VARIABLE ACTIVE_ERR RESULT_VARIABLE ACTIVE_RC)
 if(NOT ACTIVE_RC EQUAL 0)
   message(FATAL_ERROR "active projection benchmark failed: ${ACTIVE_ERR}\n${ACTIVE_OUT}")
 endif()

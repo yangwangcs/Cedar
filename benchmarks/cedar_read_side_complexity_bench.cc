@@ -324,8 +324,8 @@ int main(int argc, char** argv) {
         -> cedar::StatusOr<std::pair<uint64_t, uint64_t>> {
       auto values = snapshot.ValueOrDie().canonical_reader().ReadExact(exact_keys);
       if (!values.ok()) return values.status();
-      return std::pair<uint64_t, uint64_t>{values.ValueOrDie().size(),
-                                           values.ValueOrDie().size() * 32};
+      return std::pair<uint64_t, uint64_t>{values.ValueOrDie().events.size(),
+                                           values.ValueOrDie().events.size() * 32};
     });
     PrintRow("exact_multiget_property_bindings_" + std::to_string(binding_count),
              exact_result, "canonical", rss);

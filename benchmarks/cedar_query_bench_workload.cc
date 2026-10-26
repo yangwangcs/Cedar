@@ -836,12 +836,24 @@ StatusOr<QueryBenchmarkResult> RunQueryBenchmark(
   DatabaseOptions db_options;
   db_options.path = options.path;
   db_options.storage_profile = StorageProfile::kProductionAppend;
-  db_options.production.memory_budget_bytes = 1ULL << 30;
+  // 11 GiB / 10 = 1.1 GiB (rounded down to whole bytes).
+  constexpr uint64_t kMemoryBudgetBytes = (11ULL << 30) / 10;
+  db_options.production.memory_budget_bytes = kMemoryBudgetBytes;
   db_options.production.kernel_mode = true;
-  // Reserve enough of the fixed production budget for the benchmark's
-  // 32-reader query matrix without allowing the default block cache to crowd
-  // out Cedar's explicit query pool.
-  db_options.production.block_cache_bytes = 128ULL << 20;
+  // Reserve enough of the production budget for the benchmark's 32-reader
+  // query matrix, storage working pool and projection resources.
+  // Database::Open's preflight charges the 25%/5% production write buffers, the
+  // block cache, the read working pool, the automatic reader-metadata pool
+  // (budget/16) and the three query pools. With a fixed 1 GiB budget that sum
+  // was 1,110,651,699 B > 1,073,741,824 B, so this fixture uses 1.1 GiB:
+  // 295,279,001 (facts) + 59,055,800 (meta) + 100,663,296 (block cache) +
+  // 16,777,216 (working) + 73,819,750 (metadata) + 536,870,912 (query) +
+  // 33,554,432 (projection) + 33,554,432 (delta) = 1,149,574,839 B (97.33%).
+  // The 32-reader 512 MiB query pool, 96 MiB block cache and 16 MiB working
+  // pool are unchanged; only the production-derived write buffers (25%/5%) and
+  // the automatic metadata share (budget/16) grow with the budget.
+  db_options.production.block_cache_bytes = 96ULL << 20;
+  db_options.storage_read_working_bytes = 16ULL << 20;
   db_options.wal_sync_mode = options.filesystem_wal_flush
                                  ? WalSyncMode::kFilesystemFlush
                                  : WalSyncMode::kFullDeviceFlush;

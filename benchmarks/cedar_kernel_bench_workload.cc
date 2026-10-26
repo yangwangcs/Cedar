@@ -36,6 +36,8 @@ DatabaseOptions MakeBenchmarkDatabaseOptions(const KernelBenchmarkOptions& optio
   database_options.storage_profile = StorageProfile::kProductionAppend;
   database_options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
   database_options.production.kernel_mode = true;
+  database_options.storage_read_working_bytes = 32ULL << 20;
+  database_options.storage_reader_metadata_bytes = 16ULL << 20;
   database_options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
   database_options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
   database_options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;

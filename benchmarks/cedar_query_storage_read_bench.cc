@@ -13,6 +13,7 @@
 
 #include "cedar/cypher/session.h"
 #include "cedar/database.h"
+#include "columnar_cache_dataset.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -36,28 +37,20 @@ uint64_t Percentile(std::vector<uint64_t> values, size_t percentile) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  uint64_t seconds = 1;
-  uint32_t entities = 1000;
-  uint32_t sessions = 1;
-  bool exact_part = false;
-  uint32_t part_id = 0;
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--seconds" && i + 1 < argc) seconds = std::stoull(argv[++i]);
-    else if (arg == "--entities" && i + 1 < argc) entities = std::stoul(argv[++i]);
-    else if (arg == "--sessions" && i + 1 < argc) sessions = std::stoul(argv[++i]);
-    else if (arg == "--part-scope" && i + 1 < argc) {
-      const std::string scope = argv[++i];
-      if (scope == "exact") exact_part = true;
-      else if (scope == "all" || scope == "wildcard") exact_part = false;
-      else return 2;
-    }
-    else if (arg == "--part-id" && i + 1 < argc) part_id = std::stoul(argv[++i]);
-    else if (i == 1) seconds = std::stoull(arg);
-    else if (i == 2) entities = std::stoul(arg);
-    else return 2;
+  cedar::benchmarks::CacheBenchOptions config;
+  std::string error;
+  if (!cedar::benchmarks::ParseCacheBenchOptions(
+          std::vector<std::string>(argv + 1, argv + argc), &config, &error) ||
+      !cedar::benchmarks::ValidateCacheBenchPath(config, &error)) {
+    std::cerr << error << '\n';
+    return 2;
   }
-  if (seconds == 0 || entities == 0 || sessions == 0 || sessions > 64) return 2;
+  if (!config.db_path.empty()) return cedar::benchmarks::RunColumnarCacheDataset(config);
+  const auto seconds = config.seconds;
+  const auto entities = config.entities;
+  const auto sessions = config.sessions;
+  const auto exact_part = config.exact_part;
+  const auto part_id = config.part_id;
 
   char path[] = "/tmp/cedar_query_storage_read_XXXXXX";
   if (::mkdtemp(path) == nullptr) return 1;

@@ -1826,6 +1826,8 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
     storage_options.path = options.path;
     storage_options.write_buffer_bytes = options.write_buffer_bytes;
     storage_options.block_cache_bytes = options.block_cache_bytes;
+    storage_options.storage_read_working_bytes = options.storage_read_working_bytes;
+    storage_options.storage_reader_metadata_bytes = options.storage_reader_metadata_bytes;
     storage_options.group_commit_max_batch_size = options.group_commit_max_batch_size;
     storage_options.group_commit_max_batch_bytes = options.group_commit_max_batch_bytes;
     storage_options.storage_profile = options.storage_profile;
@@ -1843,6 +1845,8 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
     if (!add(profile.facts_write_buffer_bytes, profile.meta_write_buffer_bytes,
              &allocations) ||
         !add(allocations, profile.block_cache_bytes, &allocations) ||
+        !add(allocations, profile.storage_read_working_bytes, &allocations) ||
+        !add(allocations, profile.storage_reader_metadata_bytes, &allocations) ||
         !add(allocations, options.query_runtime.query_memory_bytes, &allocations) ||
         !add(allocations, options.query_runtime.projection_cache_bytes, &allocations) ||
         !add(allocations, options.query_runtime.query_delta_bytes, &allocations) ||
@@ -1941,6 +1945,7 @@ StatusOr<std::unique_ptr<Database>> Database::Open(DatabaseOptions options) {
   internal::ProjectionStoreOptions projection_options;
   projection_options.path = database_path + "/projections";
   projection_options.database_identity = database_path;
+  projection_options.projection_cache_bytes = options.query_runtime.projection_cache_bytes;
   projection_options.visible_seq = recovered_visible;
   projection_options.oldest_readable_seq = recovered_oldest;
   projection_options.crash_fault_injector =
@@ -2714,7 +2719,30 @@ CommitPipelineMetrics Database::GetCommitPipelineMetrics() const {
       impl_->async_executor.ReservedRequests();
   metrics.async_mailbox_bytes_reserved = impl_->async_executor.ReservedBytes();
   const auto cache_metrics = impl_->store.SampleValidationCacheMetrics();
+  if (impl_->projection_store) {
+    const auto pages = impl_->projection_store->SamplePageCacheMetrics();
+    metrics.projection_page_cache_hits = pages.hits;
+    metrics.projection_page_cache_misses = pages.misses;
+    metrics.projection_page_cache_resident_bytes = pages.resident_bytes;
+  }
   if (cache_metrics.ok()) {
+    metrics.column_page_cache_hits = cache_metrics.ValueOrDie().column_page_cache_hits;
+    metrics.column_page_cache_misses = cache_metrics.ValueOrDie().column_page_cache_misses;
+    metrics.column_page_cache_decodes = cache_metrics.ValueOrDie().column_page_cache_decodes;
+    metrics.column_page_resident_charge_bytes = cache_metrics.ValueOrDie().column_page_resident_charge_bytes;
+    metrics.column_page_pinned_charge_bytes = cache_metrics.ValueOrDie().column_page_pinned_charge_bytes;
+    metrics.column_page_uncached_live_bytes = cache_metrics.ValueOrDie().column_page_uncached_live_bytes;
+    metrics.storage_file_read_calls = cache_metrics.ValueOrDie().storage_file_read_calls;
+    metrics.storage_file_read_bytes = cache_metrics.ValueOrDie().storage_file_read_bytes;
+    metrics.storage_read_working_bytes = cache_metrics.ValueOrDie().storage_read_working_bytes;
+    metrics.storage_read_working_peak_bytes = cache_metrics.ValueOrDie().storage_read_working_peak_bytes;
+    metrics.storage_read_working_rejections = cache_metrics.ValueOrDie().storage_read_working_rejections;
+    metrics.parquet_reader_metadata_bytes = cache_metrics.ValueOrDie().parquet_reader_metadata_bytes;
+    metrics.parquet_reader_metadata_peak_bytes = cache_metrics.ValueOrDie().parquet_reader_metadata_peak_bytes;
+    metrics.storage_reader_metadata_reserved_bytes = cache_metrics.ValueOrDie().storage_reader_metadata_reserved_bytes;
+    metrics.storage_reader_metadata_peak_bytes = cache_metrics.ValueOrDie().storage_reader_metadata_peak_bytes;
+    metrics.storage_reader_metadata_rejections = cache_metrics.ValueOrDie().storage_reader_metadata_rejections;
+    metrics.storage_reader_metadata_limit_bytes = cache_metrics.ValueOrDie().storage_reader_metadata_limit_bytes;
     metrics.canonical_page_hits = cache_metrics.ValueOrDie().canonical_page_hits;
     metrics.canonical_page_misses = cache_metrics.ValueOrDie().canonical_page_misses;
     metrics.canonical_page_decodes = cache_metrics.ValueOrDie().canonical_page_decodes;

@@ -31,8 +31,9 @@ class CanonicalFactReader {
   virtual Status ReadColumnar(
       const FactReadSpec& spec,
       const CanonicalColumnarBatchVisitor& visitor) const = 0;
-  virtual StatusOr<std::vector<FactEvent>> ReadExact(
-      const std::vector<std::string>& encoded_keys) const = 0;
+  virtual StatusOr<FactEventBatch> ReadExact(
+      const std::vector<std::string>& encoded_keys,
+      std::shared_ptr<FactReadMemory> read_memory = {}) const = 0;
 };
 
 }  // namespace cedar

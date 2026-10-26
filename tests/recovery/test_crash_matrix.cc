@@ -443,6 +443,8 @@ TEST_F(RecoveryCrashMatrixTest,
     options.storage_profile = StorageProfile::kProductionAppend;
     options.production.memory_budget_bytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
     options.production.kernel_mode = true;
+    options.storage_read_working_bytes = 32ULL << 20;
+    options.storage_reader_metadata_bytes = 16ULL << 20;
     options.query_runtime.query_memory_bytes = 32ULL * 1024ULL * 1024ULL;
     options.query_runtime.projection_cache_bytes = 32ULL * 1024ULL * 1024ULL;
     options.query_runtime.query_delta_bytes = 32ULL * 1024ULL * 1024ULL;

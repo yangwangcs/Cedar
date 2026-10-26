@@ -105,6 +105,10 @@ class Bindings {
   // uses this accessor to preserve the public Bindings contract at runtime.
   StatusOr<BoundValue> Lookup(ParameterId parameter, QueryType type) const;
 
+  // The borrowed value remains valid until Bind or destruction of this object.
+  StatusOr<const BoundValue*> LookupBorrowed(ParameterId parameter,
+                                            QueryType type) const;
+
  private:
   struct Binding {
     ParameterId parameter;

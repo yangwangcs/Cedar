@@ -46,6 +46,43 @@ TEST(FactModelTest, SeparatesEntityStateFromProperties) {
   EXPECT_EQ(property.ref().part_id(), PartId{3});
 }
 
+TEST(FactModelTest, ReleasesReadReservationAfterDestroyingOwnedPayload) {
+  bool released = false;
+  {
+    FactEvent event{EntityFact::Vertex({PartId{0}, VertexId{1}}).ref(),
+                    ValidTime{1}, CommitSeq{1}};
+    event.value = Value::String(std::string(4096, 'x'));
+    event.read_memory_owner = std::shared_ptr<const void>(
+        new int(1), [&](const void* token) {
+          // The owner is the final field, so value is still a live optional
+          // here. Its payload must already be cleared before releasing budget.
+          EXPECT_FALSE(event.value.has_value());
+          released = true;
+          delete static_cast<const int*>(token);
+        });
+  }
+  EXPECT_TRUE(released);
+}
+
+TEST(FactModelTest, MovesPayloadAndReservationWithoutCopyingStringStorage) {
+  FactEvent event{EntityFact::Vertex({PartId{0}, VertexId{1}}).ref(),
+                  ValidTime{1}, CommitSeq{1}};
+  event.value = Value::String(std::string(4096, 'x'));
+  auto owner = std::make_shared<int>(1);
+  event.read_memory_owner = owner;
+  const auto* bytes = std::get<std::string>(event.value->data()).data();
+  FactEvent moved(std::move(event));
+  EXPECT_EQ(std::get<std::string>(moved.value->data()).data(), bytes);
+  EXPECT_FALSE(event.read_memory_owner);
+  EXPECT_EQ(moved.read_memory_owner, owner);
+  FactEvent assigned{EntityFact::Vertex({PartId{0}, VertexId{2}}).ref(),
+                     ValidTime{1}, CommitSeq{1}};
+  assigned = std::move(moved);
+  EXPECT_EQ(std::get<std::string>(assigned.value->data()).data(), bytes);
+  EXPECT_FALSE(moved.read_memory_owner);
+  EXPECT_EQ(assigned.read_memory_owner, owner);
+}
+
 TEST(FactModelTest, ValidatesDistinctEdgeIdentity) {
   const EdgeIdentity identity{EdgeRef{PartId{7}, EdgeId{17}},
                               VertexRef{PartId{7}, VertexId{7}},

@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "cedar/core/status.h"
@@ -19,7 +21,30 @@
 
 namespace cedar {
 
+class FactReadMemory {
+ public:
+  virtual ~FactReadMemory() = default;
+  virtual Status Reserve(uint64_t bytes) = 0;
+  virtual void Release(uint64_t bytes) = 0;
+  virtual std::shared_ptr<const void> Pin(const void* owner, uint64_t bytes) = 0;
+};
+
 struct FactEventBatch {
+  FactEventBatch() = default;
+  explicit FactEventBatch(std::vector<FactEvent> rows) : events(std::move(rows)) {}
+  FactEventBatch(const FactEventBatch&) = delete;
+  FactEventBatch& operator=(const FactEventBatch&) = delete;
+  FactEventBatch(FactEventBatch&&) noexcept = default;
+  FactEventBatch& operator=(FactEventBatch&& other) noexcept {
+    if (this != &other) {
+      events = std::move(other.events);
+      read_memory_owner = std::move(other.read_memory_owner);
+    }
+    return *this;
+  }
+
+  // Declared first so the row buffer is destroyed before its reservation.
+  std::shared_ptr<const void> read_memory_owner;
   std::vector<FactEvent> events;
 };
 
@@ -118,6 +143,7 @@ struct FactReadSpec {
   // Total output cap. Unlike batch_row_limit this is not a callback batch
   // size and remains unset unless a planner proves LIMIT pushdown safe.
   std::optional<uint64_t> max_rows;
+  std::shared_ptr<FactReadMemory> read_memory;
 
   Status Validate() const {
     Status status = part_scope.Validate();

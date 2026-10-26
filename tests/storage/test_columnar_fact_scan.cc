@@ -12,7 +12,10 @@
 #include "cedar/database.h"
 #include "cedar/fact/fact_codec.h"
 #include "db/cedar_columnar_scan.h"
+#include "table/multiget_context.h"
 #include "storage/rocks/rocksdb_config.h"
+#include "query/resource/query_read_memory.h"
+#include "query/runtime/query_runtime.h"
 
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
@@ -121,6 +124,822 @@ TEST_F(ColumnarFactScanTest, EventAndStateScansUseThePinnedSnapshot) {
                   })
                   .ok());
   EXPECT_TRUE(state.empty());
+}
+
+TEST_F(ColumnarFactScanTest, PublicReadMetricsReportActualFileAndWorkingBytes) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  FlushFactsAndReopen();
+  const auto before = database_->GetCommitPipelineMetrics();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactScanSpec spec{PartId{7}, FactFamily::kVertexState, PropertyId{}, ValidTime{20}, 1};
+  size_t rows = 0;
+  ASSERT_TRUE(snapshot.ValueOrDie().EventScan(spec, [&](const FactEventBatch& batch) {
+    rows += batch.events.size();
+    return Status::OK();
+  }).ok());
+  EXPECT_EQ(rows, 1U);
+  const auto after = database_->GetCommitPipelineMetrics();
+  EXPECT_GE(after.storage_file_read_calls, before.storage_file_read_calls);
+  EXPECT_GT(after.storage_file_read_bytes, 0U);
+  EXPECT_GT(after.column_page_cache_decodes, 0U);
+  EXPECT_GT(after.parquet_reader_metadata_bytes, 0U);
+  EXPECT_GE(after.parquet_reader_metadata_peak_bytes, after.parquet_reader_metadata_bytes);
+  EXPECT_GE(after.storage_reader_metadata_reserved_bytes, after.parquet_reader_metadata_bytes);
+  EXPECT_GE(after.storage_reader_metadata_peak_bytes, after.storage_reader_metadata_reserved_bytes);
+  EXPECT_LE(after.storage_reader_metadata_peak_bytes, after.storage_reader_metadata_limit_bytes);
+  EXPECT_GT(after.storage_read_working_peak_bytes, 0U);
+  EXPECT_EQ(after.storage_read_working_bytes, 0U);
+  EXPECT_LE(after.column_page_pinned_charge_bytes, after.column_page_resident_charge_bytes);
+}
+
+TEST_F(ColumnarFactScanTest, CanonicalColumnarQueryBudgetRejectsAndReleases) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  FlushFactsAndReopen();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.family = FactFamily::kVertexState;
+  spec.projection = {FactColumnId::kEntityId};
+  internal::QueryReservation tiny(1);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+  const auto before = database_->GetCommitPipelineMetrics();
+  size_t calls = 0;
+  const auto rejected = snapshot.ValueOrDie().canonical_reader().ReadColumnar(
+      spec, [&](const FactColumnarBatch&) { ++calls; return Status::OK(); });
+  EXPECT_TRUE(rejected.IsResourceExhausted()) << rejected.ToString();
+  EXPECT_EQ(calls, 0U);
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+  const auto after = database_->GetCommitPipelineMetrics();
+  EXPECT_EQ(after.storage_read_working_bytes, 0U);
+  EXPECT_EQ(after.storage_file_read_bytes, before.storage_file_read_bytes);
+  internal::QueryReservation adequate(1 << 20);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(adequate);
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadColumnar(
+      spec, [&](const FactColumnarBatch& batch) {
+        EXPECT_EQ(batch.row_count(), 1U);
+        ++calls;
+        return Status::Conflict("test", "cancel callback");
+      }).IsConflict());
+  EXPECT_EQ(calls, 1U);
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+  EXPECT_EQ(database_->GetCommitPipelineMetrics().storage_read_working_bytes, 0U);
+}
+
+TEST_F(ColumnarFactScanTest, CanonicalPointAndEventReadsEnforceQueryBudget) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  FlushFactsAndReopen();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.entity_range.min = 9;
+  spec.entity_range.max_exclusive = 10;
+  internal::QueryReservation tiny(1);
+  internal::BudgetedCanonicalReader reader(snapshot.ValueOrDie().canonical_reader(), &tiny);
+  const auto before = database_->GetCommitPipelineMetrics();
+  const auto point = reader.ReadStateAt(spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+  EXPECT_FALSE(point.ok());
+  if (!point.ok()) EXPECT_TRUE(point.status().IsResourceExhausted()) << point.status().ToString();
+  size_t calls = 0;
+  const auto visitor = [&](const FactEventBatch&) { ++calls; return Status::OK(); };
+  const auto events = reader.ReadEvents(spec, visitor);
+  EXPECT_TRUE(events.IsResourceExhausted()) << events.ToString();
+  const std::vector<std::string> keys{
+      EncodeFactKey(FactRef{PartId{7}, FactFamily::kVertexState, PropertyId{}, 9},
+                    ValidTime{10}, snapshot.ValueOrDie().commit_seq())};
+  const auto exact = reader.ReadExact(keys);
+  EXPECT_FALSE(exact.ok());
+  if (!exact.ok()) EXPECT_TRUE(exact.status().IsResourceExhausted()) << exact.status().ToString();
+  spec.part_scope = PartScope::All();
+  const auto all_events = reader.ReadEvents(spec, visitor);
+  EXPECT_TRUE(all_events.IsResourceExhausted()) << all_events.ToString();
+  CanonicalStateReadSpec state;
+  state.facts = spec;
+  state.valid_time = ValidTime{20};
+  state.snapshot_seq = snapshot.ValueOrDie().commit_seq();
+  const auto states = reader.ReadStateRows(state, [&](const auto&) {
+    ++calls;
+    return Status::OK();
+  });
+  EXPECT_TRUE(states.IsResourceExhausted()) << states.ToString();
+  EXPECT_EQ(calls, 0U);
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+  const auto after = database_->GetCommitPipelineMetrics();
+  EXPECT_EQ(after.storage_file_read_bytes, before.storage_file_read_bytes);
+  EXPECT_EQ(after.storage_read_working_bytes, 0U);
+
+  internal::QueryReservation adequate(1 << 20);
+  internal::BudgetedCanonicalReader allowed(snapshot.ValueOrDie().canonical_reader(), &adequate);
+  spec.part_scope = PartScope::Exact(PartId{7});
+  {
+    const auto found = allowed.ReadStateAt(spec, ValidTime{20}, state.snapshot_seq);
+    ASSERT_TRUE(found.ok()) << found.status().ToString();
+    ASSERT_TRUE(found.ValueOrDie().has_value());
+    EXPECT_EQ(found.ValueOrDie()->ref.entity_id(), 9U);
+    const auto exact_found = allowed.ReadExact(keys);
+    ASSERT_TRUE(exact_found.ok()) << exact_found.status().ToString();
+    ASSERT_EQ(exact_found.ValueOrDie().events.size(), 1U);
+    EXPECT_EQ(exact_found.ValueOrDie().events[0].ref.entity_id(), 9U);
+    EXPECT_GT(adequate.used_bytes(), 0U);
+  }
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+  EXPECT_TRUE(allowed.ReadEvents(spec, [](const FactEventBatch& batch) {
+    EXPECT_EQ(batch.events.size(), 1U);
+    return Status::Conflict("test", "stop visitor");
+  }).IsConflict());
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+  EXPECT_EQ(database_->GetCommitPipelineMetrics().storage_read_working_bytes, 0U);
+}
+
+TEST_F(ColumnarFactScanTest, MemtablePointAndExactResultsOwnTheirQueryReservations) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.entity_range = EntityRange{9, 10};
+  const std::vector<std::string> keys{
+      EncodeFactKey(FactRef{PartId{7}, FactFamily::kVertexState, PropertyId{}, 9},
+                    ValidTime{10}, snapshot.ValueOrDie().commit_seq())};
+  internal::QueryReservation tiny(1);
+  internal::BudgetedCanonicalReader rejected(snapshot.ValueOrDie().canonical_reader(), &tiny);
+  const auto point = rejected.ReadStateAt(spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+  EXPECT_FALSE(point.ok());
+  if (!point.ok()) EXPECT_TRUE(point.status().IsResourceExhausted()) << point.status().ToString();
+  const auto exact = rejected.ReadExact(keys);
+  EXPECT_FALSE(exact.ok());
+  if (!exact.ok()) EXPECT_TRUE(exact.status().IsResourceExhausted()) << exact.status().ToString();
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+
+  internal::QueryReservation adequate(1 << 20);
+  std::optional<FactEvent> retained;
+  {
+    internal::BudgetedCanonicalReader reader(snapshot.ValueOrDie().canonical_reader(), &adequate);
+    auto found = reader.ReadStateAt(spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+    ASSERT_TRUE(found.ok()) << found.status().ToString();
+    retained = std::move(found).ConsumeValueOrDie();
+    ASSERT_TRUE(retained.has_value());
+    EXPECT_GE(adequate.used_bytes(), sizeof(FactEvent));
+  }
+  EXPECT_GE(adequate.used_bytes(), sizeof(FactEvent));
+  retained.reset();
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+  FactEventBatch retained_batch;
+  {
+    internal::BudgetedCanonicalReader reader(snapshot.ValueOrDie().canonical_reader(), &adequate);
+    auto found = reader.ReadExact(keys);
+    ASSERT_TRUE(found.ok()) << found.status().ToString();
+    ASSERT_EQ(found.ValueOrDie().events.size(), 1U);
+    EXPECT_EQ(found.ValueOrDie().events[0].ref.entity_id(), 9U);
+    EXPECT_GE(adequate.used_bytes(), found.ValueOrDie().events.capacity() * sizeof(FactEvent));
+    const auto held = adequate.used_bytes();
+    found.ValueOrDie().events.clear();
+    EXPECT_EQ(adequate.used_bytes(), held);
+    retained_batch = std::move(found).ConsumeValueOrDie();
+    EXPECT_EQ(adequate.used_bytes(), held);
+  }
+  EXPECT_GT(adequate.used_bytes(), 0U);
+  retained_batch = FactEventBatch{};
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+  auto missing = keys;
+  missing.push_back(EncodeFactKey(
+      FactRef{PartId{7}, FactFamily::kVertexState, PropertyId{}, 10},
+      ValidTime{10}, snapshot.ValueOrDie().commit_seq()));
+  internal::BudgetedCanonicalReader reader(snapshot.ValueOrDie().canonical_reader(), &adequate);
+  const auto failed = reader.ReadExact(missing);
+  ASSERT_FALSE(failed.ok());
+  EXPECT_TRUE(failed.status().IsCorruption()) << failed.status().ToString();
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+}
+
+TEST_F(ColumnarFactScanTest, TransactionOverlayLimitsAfterMergingDurableAndStagedEvents) {
+  CommitVertex(VertexId{20}, ValidTime{10});
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t id : {1U, 2U, 30U}) {
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex({PartId{7}, VertexId{id}}), ValidTime{10}).ok());
+  }
+  auto snapshot = transaction.ValueOrDie()->BeginReadSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.batch_row_limit = 1;
+  spec.max_rows = 2;
+  std::vector<uint64_t> ids;
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [&ids](const FactEventBatch& batch) {
+        for (const auto& event : batch.events) ids.push_back(event.ref.entity_id());
+        return Status::OK();
+      }).ok());
+  EXPECT_EQ(ids, (std::vector<uint64_t>{1, 2}));
+  spec.max_rows = 0;
+  size_t calls = 0;
+  EXPECT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [&calls](const FactEventBatch&) { ++calls; return Status::OK(); }).ok());
+  EXPECT_EQ(calls, 0U);
+  spec.batch_row_limit = 0;
+  EXPECT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [](const FactEventBatch&) { return Status::OK(); }).IsInvalidArgument());
+}
+
+TEST_F(ColumnarFactScanTest, TransactionOverlayStateLimitDoesNotTruncateCorrectionHistory) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Retract(
+      EntityFact::Vertex({PartId{7}, VertexId{9}}), ValidTime{20}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+      EntityFact::Vertex({PartId{7}, VertexId{10}}), ValidTime{10}).ok());
+  auto snapshot = transaction.ValueOrDie()->BeginReadSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  CanonicalStateReadSpec spec;
+  spec.facts.part_scope = PartScope::Exact(PartId{7});
+  spec.facts.batch_row_limit = 1;
+  spec.facts.max_rows = 1;
+  spec.max_rows = 1;
+  spec.valid_time = ValidTime{30};
+  spec.snapshot_seq = snapshot.ValueOrDie().commit_seq();
+  std::vector<uint64_t> ids;
+  ASSERT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadStateRows(
+      spec, [&](const std::vector<CanonicalStateRow>& rows) {
+        for (const auto& row : rows) ids.push_back(row.ref.entity_id());
+        return Status::OK();
+      }).ok());
+  EXPECT_EQ(ids, (std::vector<uint64_t>{10}));
+}
+
+TEST_F(ColumnarFactScanTest, TransactionOverlayOwnsPointEventAndColumnarReservations) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{7}, 0, "overlay_text", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 8192}).ok());
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Set(
+      PropertyFact::Vertex({PartId{7}, VertexId{9}}, PropertyId{7}),
+      ValidTime{10}, Value::String(std::string(4096, 's'))).ok());
+  auto snapshot = transaction.ValueOrDie()->BeginReadSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.family = FactFamily::kVertexProperty;
+  spec.property_id = PropertyId{7};
+  spec.entity_range = EntityRange{9, 10};
+  spec.projection = {FactColumnId::kEntityId, FactColumnId::kBytesValue};
+  internal::QueryReservation budget(1 << 20);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(budget);
+  {
+    auto point = snapshot.ValueOrDie().canonical_reader().ReadStateAt(
+        spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+    ASSERT_TRUE(point.ok()) << point.status().ToString();
+    ASSERT_TRUE(point.ValueOrDie().has_value());
+    EXPECT_EQ(std::get<std::string>(point.ValueOrDie()->value->data()), std::string(4096, 's'));
+    EXPECT_GE(budget.used_bytes(), 4096 + sizeof(FactEvent));
+  }
+  EXPECT_EQ(budget.used_bytes(), 0U);
+  size_t calls = 0;
+  const auto cancelled = snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [&](const FactEventBatch& batch) {
+        ++calls;
+        EXPECT_EQ(batch.events.size(), 1U);
+        EXPECT_GE(budget.used_bytes(), 2 * (4096 + sizeof(FactEvent)));
+        return Status::Conflict("overlay test", "cancel");
+      });
+  EXPECT_TRUE(cancelled.IsConflict());
+  EXPECT_EQ(calls, 1U);
+  EXPECT_EQ(budget.used_bytes(), 0U);
+  calls = 0;
+  const auto columns = snapshot.ValueOrDie().canonical_reader().ReadColumnar(
+      spec, [&](const FactColumnarBatch& batch) {
+        ++calls;
+        EXPECT_EQ(batch.row_count(), 1U);
+        EXPECT_EQ(std::get<std::vector<std::string>>(batch.columns[1].values)[0], std::string(4096, 's'));
+        EXPECT_GE(budget.used_bytes(), 3 * 4096);
+        return Status::Conflict("overlay columns", "cancel");
+      });
+  EXPECT_TRUE(columns.IsConflict());
+  EXPECT_EQ(calls, 1U);
+  EXPECT_EQ(budget.used_bytes(), 0U);
+  internal::QueryReservation tiny(1024);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+  auto point = snapshot.ValueOrDie().canonical_reader().ReadStateAt(
+      spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+  EXPECT_FALSE(point.ok());
+  if (!point.ok()) EXPECT_TRUE(point.status().IsResourceExhausted());
+  calls = 0;
+  EXPECT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [&](const FactEventBatch&) { ++calls; return Status::OK(); }).IsResourceExhausted());
+  EXPECT_TRUE(snapshot.ValueOrDie().canonical_reader().ReadColumnar(
+      spec, [&](const FactColumnarBatch&) { ++calls; return Status::OK(); }).IsResourceExhausted());
+  EXPECT_EQ(calls, 0U);
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+}
+
+TEST_F(ColumnarFactScanTest, ExactReadPeakIncludesRocksDbPinnedValueArray) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  const std::string key = EncodeFactKey(
+      FactRef{PartId{7}, FactFamily::kVertexState, PropertyId{}, 9},
+      ValidTime{10}, snapshot.ValueOrDie().commit_seq());
+  // Duplicate keys still require separate MultiGet output and pinned slots.
+  const std::vector<std::string> keys(128, key);
+  internal::QueryReservation budget(1 << 20);
+  internal::BudgetedCanonicalReader reader(snapshot.ValueOrDie().canonical_reader(), &budget);
+  {
+    auto result = reader.ReadExact(keys);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    ASSERT_EQ(result.ValueOrDie().events.size(), keys.size());
+    const uint64_t array_bytes = keys.size() *
+        (sizeof(DecodedFactKey) + sizeof(rocksdb::Slice) +
+         sizeof(rocksdb::ColumnFamilyHandle*) + sizeof(std::string) +
+         sizeof(rocksdb::Status) + sizeof(rocksdb::PinnableSlice) + sizeof(FactEvent));
+    const uint64_t engine_heap_keys = keys.size() - rocksdb::MultiGetContext::MAX_BATCH_SIZE;
+    EXPECT_GE(budget.peak_bytes(), array_bytes + engine_heap_keys *
+        (sizeof(rocksdb::KeyContext) + sizeof(rocksdb::KeyContext*)));
+    EXPECT_GT(budget.used_bytes(), 0U);
+  }
+  EXPECT_EQ(budget.used_bytes(), 0U);
+  internal::QueryReservation limited(64000);
+  internal::BudgetedCanonicalReader rejected(snapshot.ValueOrDie().canonical_reader(), &limited);
+  const auto result = rejected.ReadExact(keys);
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(result.status().IsResourceExhausted()) << result.status().ToString();
+  EXPECT_EQ(limited.used_bytes(), 0U);
+}
+
+TEST_F(ColumnarFactScanTest, MemtableStringDecodeAndBatchCopyAreBothBudgeted) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{7}, 0, "text", PropertyEntityKind::kVertex,
+      PhysicalType::kString, 8192}).ok());
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Set(
+      PropertyFact::Vertex({PartId{7}, VertexId{9}}, PropertyId{7}),
+      ValidTime{10}, Value::String(std::string(4096, 'x'))).ok());
+  const auto committed = transaction.ValueOrDie()->Commit();
+  ASSERT_TRUE(committed.ok());
+  ASSERT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.family = FactFamily::kVertexProperty;
+  spec.property_id = PropertyId{7};
+  spec.batch_row_limit = 1;
+  internal::QueryReservation budget(32 * 1024);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(budget);
+  for (bool all_parts : {false, true}) {
+    if (all_parts) spec.part_scope = PartScope::All();
+    size_t calls = 0;
+    const auto status = snapshot.ValueOrDie().canonical_reader().ReadEvents(
+        spec, [&](const FactEventBatch& batch) {
+          ++calls;
+          EXPECT_EQ(batch.events.size(), 1U);
+          EXPECT_GE(budget.used_bytes(), 2 * (4096 + sizeof(FactEvent)));
+          return Status::Conflict("test", "stop visitor");
+        });
+    EXPECT_TRUE(status.IsConflict()) << status.ToString();
+    EXPECT_EQ(calls, 1U);
+    EXPECT_EQ(budget.used_bytes(), 0U);
+  }
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.entity_range = EntityRange{9, 10};
+  {
+    auto point = snapshot.ValueOrDie().canonical_reader().ReadStateAt(
+        spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+    ASSERT_TRUE(point.ok()) << point.status().ToString();
+    ASSERT_TRUE(point.ValueOrDie().has_value());
+    EXPECT_EQ(std::get<std::string>(point.ValueOrDie()->value->data()),
+              std::string(4096, 'x'));
+    EXPECT_GE(budget.used_bytes(), 4096U);
+  }
+  EXPECT_EQ(budget.used_bytes(), 0U);
+  const std::vector<std::string> keys{
+      EncodeFactKey(PropertyFact::Vertex({PartId{7}, VertexId{9}}, PropertyId{7}).ref(),
+                    ValidTime{10}, snapshot.ValueOrDie().commit_seq())};
+  {
+    auto exact = snapshot.ValueOrDie().canonical_reader().ReadExact(keys, spec.read_memory);
+    ASSERT_TRUE(exact.ok()) << exact.status().ToString();
+    ASSERT_EQ(exact.ValueOrDie().events.size(), 1U);
+    EXPECT_EQ(std::get<std::string>(exact.ValueOrDie().events[0].value->data()),
+              std::string(4096, 'x'));
+    EXPECT_GE(budget.used_bytes(), 4096U);
+  }
+  EXPECT_EQ(budget.used_bytes(), 0U);
+  internal::QueryReservation too_small(1024);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(too_small);
+  const auto point = snapshot.ValueOrDie().canonical_reader().ReadStateAt(
+      spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+  ASSERT_FALSE(point.ok());
+  EXPECT_TRUE(point.status().IsResourceExhausted());
+  const auto exact = snapshot.ValueOrDie().canonical_reader().ReadExact(keys, spec.read_memory);
+  ASSERT_FALSE(exact.ok());
+  EXPECT_TRUE(exact.status().IsResourceExhausted());
+  EXPECT_EQ(too_small.used_bytes(), 0U);
+}
+
+TEST_F(ColumnarFactScanTest, MemtableEventBatchReservesBeforeCopyAndReleases) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.batch_row_limit = 4;
+  internal::QueryReservation tiny(1);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+  size_t calls = 0;
+  const auto rejected = snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [&](const FactEventBatch&) { ++calls; return Status::OK(); });
+  EXPECT_TRUE(rejected.IsResourceExhausted()) << rejected.ToString();
+  EXPECT_EQ(calls, 0U);
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+
+  // A batch limit is a maximum, not a demand to allocate every possible row.
+  spec.batch_row_limit = UINT32_MAX;
+  internal::QueryReservation adequate(1024);
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(adequate);
+  const auto cancelled = snapshot.ValueOrDie().canonical_reader().ReadEvents(
+      spec, [&](const FactEventBatch& batch) {
+        ++calls;
+        EXPECT_EQ(batch.events.size(), 1U);
+        EXPECT_GE(adequate.used_bytes(), batch.events.capacity() * sizeof(FactEvent));
+        return Status::Conflict("test", "stop visitor");
+      });
+  EXPECT_TRUE(cancelled.IsConflict()) << cancelled.ToString();
+  EXPECT_EQ(calls, 1U);
+  EXPECT_EQ(adequate.used_bytes(), 0U);
+}
+
+TEST_F(ColumnarFactScanTest, UnbudgetedWrapperPreservesExplicitRequestBudget) {
+  Commit(FactOperation::kPut, ValidTime{10});
+  FlushFactsAndReopen();
+  auto snapshot = database_->BeginSnapshot();
+  ASSERT_TRUE(snapshot.ok());
+  internal::QueryReservation tiny(1);
+  internal::BudgetedCanonicalReader reader(snapshot.ValueOrDie().canonical_reader(), nullptr);
+  FactReadSpec spec;
+  spec.part_scope = PartScope::Exact(PartId{7});
+  spec.entity_range = EntityRange{9, 10};
+  spec.read_memory = std::make_shared<internal::QueryReadMemory>(tiny);
+  size_t calls = 0;
+  const auto before = database_->GetCommitPipelineMetrics();
+  const auto point = reader.ReadStateAt(spec, ValidTime{20}, snapshot.ValueOrDie().commit_seq());
+  ASSERT_FALSE(point.ok());
+  EXPECT_TRUE(point.status().IsResourceExhausted()) << point.status().ToString();
+  EXPECT_TRUE(reader.ReadEvents(spec, [&](const auto&) {
+    ++calls;
+    return Status::OK();
+  }).IsResourceExhausted());
+  spec.projection = {FactColumnId::kEntityId};
+  EXPECT_TRUE(reader.ReadColumnar(spec, [&](const auto&) {
+    ++calls;
+    return Status::OK();
+  }).IsResourceExhausted());
+  CanonicalStateReadSpec state;
+  state.facts = spec;
+  state.valid_time = ValidTime{20};
+  state.snapshot_seq = snapshot.ValueOrDie().commit_seq();
+  EXPECT_TRUE(reader.ReadStateRows(state, [&](const auto&) {
+    ++calls;
+    return Status::OK();
+  }).IsResourceExhausted());
+  EXPECT_EQ(calls, 0U);
+  EXPECT_EQ(tiny.used_bytes(), 0U);
+  const auto after = database_->GetCommitPipelineMetrics();
+  EXPECT_EQ(after.storage_file_read_bytes, before.storage_file_read_bytes);
+  EXPECT_EQ(after.storage_read_working_bytes, 0U);
+}
+
+TEST_F(ColumnarFactScanTest, DerivedSourceMetadataUsesCanonicalQueryBudget) {
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (uint64_t entity = 1; entity <= 1024; ++entity) {
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EntityFact::Vertex(VertexRef{PartId{7}, VertexId{entity}}), ValidTime{10}).ok());
+  }
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  transaction.ValueOrDie().reset();
+  FlushFactsAndReopen();
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  Slot<ValidTime> valid_from = Slot<ValidTime>::Named("valid_from");
+  auto source = Query::Vertices(vertex, At{ValidTime{20}});
+  ASSERT_TRUE(source.ok());
+  auto metadata = source.ValueOrDie().ProjectMetadata(
+      vertex.id(), MetadataKind::kValidFrom, Project(valid_from));
+  ASSERT_TRUE(metadata.ok());
+  auto query = metadata.ValueOrDie().Select({Project(vertex), Project(valid_from)});
+  ASSERT_TRUE(query.ok());
+  auto analyzed = internal::AnalyzeQuery(query.ValueOrDie());
+  ASSERT_TRUE(analyzed.ok());
+  auto plan = analyzed.ValueOrDie();
+  internal::PhysicalPlan physical;
+  internal::CoverageSlice slice;
+  slice.source = internal::CoverageSource::kProjection;
+  slice.interval = {ValidTime{10}, ValidTime{30}};
+  slice.part_id = PartId{7};
+  slice.entity_min = 9;
+  slice.entity_max_exclusive = 10;
+  physical.coverage_slices.push_back(slice);
+  plan.physical_plan = std::make_shared<const internal::PhysicalPlan>(physical);
+  internal::ProjectionChain chain;
+  chain.header.kind = internal::ProjectionKind::kState;
+  chain.header.part_id = PartId{7};
+  chain.intervals = {{slice.interval, Value::Bool(true), 9}};
+  plan.projection_visitor = [chain](const auto&, internal::QueryReservation&,
+                                   const internal::ProjectionChainVisitor& visitor) {
+    return visitor(chain);
+  };
+  auto run = [&](internal::PreparedQueryPlan candidate, uint64_t memory) {
+    auto snapshot = database_->BeginSnapshot();
+    EXPECT_TRUE(snapshot.ok());
+    QueryOptions options;
+    options.budget.memory_bytes = memory;
+    return internal::QueryRuntime::Execute(candidate,
+        std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  };
+  auto source_only = plan;
+  source_only.metadata_bindings.clear();
+  source_only.output_columns.resize(1);
+  // The pull runtime also holds its existing 1 MiB materialization allowance.
+  constexpr uint64_t kSmallQuery = (1 << 20) + 16384;
+  auto control = run(source_only, kSmallQuery);
+  ASSERT_TRUE(control.ok()) << control.status().ToString();
+  auto control_batch = control.ValueOrDie().Next();
+  ASSERT_TRUE(control_batch.ok()) << control_batch.status().ToString();
+  ASSERT_TRUE(control_batch.ValueOrDie().has_value());
+  ASSERT_EQ(control_batch.ValueOrDie()->row_count(), 1U);
+  ASSERT_TRUE(control.ValueOrDie().Close().ok());
+  const auto before = database_->GetCommitPipelineMetrics();
+  auto bounded = run(plan, kSmallQuery);
+  ASSERT_TRUE(bounded.ok()) << bounded.status().ToString();
+  auto rejected = bounded.ValueOrDie().Next();
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+  const auto after = database_->GetCommitPipelineMetrics();
+  EXPECT_EQ(after.storage_file_read_bytes, before.storage_file_read_bytes);
+  EXPECT_EQ(after.storage_read_working_bytes, 0U);
+  auto allowed = run(plan, 16 << 20);
+  ASSERT_TRUE(allowed.ok());
+  auto batch = allowed.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  ASSERT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<ValidTime>(valid_from, 0), ValidTime{10});
+}
+
+TEST_F(ColumnarFactScanTest, RuntimePropertyMapCopiesRespectQueryMemoryBudget) {
+  ASSERT_TRUE(database_->RegisterProperty(PropertyDefinition{
+      PropertyId{17}, 0, "copy_budget", PropertyEntityKind::kVertex,
+      PhysicalType::kInt64, 4096}).ok());
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  const VertexRef ref{PartId{7}, VertexId{9}};
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(ref), ValidTime{10}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Set(
+      PropertyFact::Vertex(ref, PropertyId{17}), ValidTime{10}, Value::Int64(123)).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  transaction.ValueOrDie().reset();
+  for (bool graph : {false, true}) {
+    SCOPED_TRACE(graph ? "graph property copies" : "canonical property copies");
+    if (graph) {
+      auto edges = database_->BeginTransaction();
+      ASSERT_TRUE(edges.ok());
+      const VertexRef seed{PartId{7}, VertexId{8}};
+      ASSERT_TRUE(edges.ValueOrDie()->Assert(EntityFact::Vertex(seed), ValidTime{10}).ok());
+      ASSERT_TRUE(edges.ValueOrDie()->Assert(
+          EdgeIdentity{EdgeRef{PartId{7}, EdgeId{1}}, seed, ref, 1}, ValidTime{10}).ok());
+      ASSERT_TRUE(edges.ValueOrDie()->Commit().ok());
+    }
+    Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+    OptionalSlot<int64_t> property = OptionalSlot<int64_t>::Named("p");
+    auto source = Query::Vertices(vertex, At{ValidTime{20}});
+    ASSERT_TRUE(source.ok());
+    Slot<VertexRef> target = Slot<VertexRef>::Named("target");
+    Slot<EdgeRef> edge = Slot<EdgeRef>::Named("edge");
+    if (graph) {
+      source = source.ValueOrDie().Expand(
+          ExpandSpec{vertex, edge, target, ExpandDirection::kOut});
+      ASSERT_TRUE(source.ok());
+    }
+    auto bound = source.ValueOrDie().BindVertexProperty(graph ? target : vertex,
+                                                        PropertyId{17}, property);
+    ASSERT_TRUE(bound.ok());
+    auto query = bound.ValueOrDie().Select({Project(vertex), Project(property)});
+    ASSERT_TRUE(query.ok());
+    auto analyzed = internal::AnalyzeQuery(query.ValueOrDie());
+    ASSERT_TRUE(analyzed.ok());
+    auto plan = analyzed.ValueOrDie();
+    plan.property_bindings.front().definition = PropertyDefinition{
+        PropertyId{17}, 1, "copy_budget", PropertyEntityKind::kVertex,
+        PhysicalType::kInt64, 4096};
+    const auto binding = plan.property_bindings.front();
+    for (uint32_t slot = 10000; slot < 10384; ++slot) {
+      auto extra = binding;
+      extra.output.slot = SlotId{slot};
+      plan.property_bindings.push_back(extra);
+    }
+    auto run = [&](uint64_t memory) {
+      auto snapshot = database_->BeginSnapshot();
+      EXPECT_TRUE(snapshot.ok());
+      QueryOptions options;
+      options.budget.memory_bytes = memory;
+      return internal::QueryRuntime::Execute(plan,
+          std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+    };
+    auto small = run((1 << 20) + 32768);
+    ASSERT_TRUE(small.ok());
+    auto rejected = small.ValueOrDie().Next();
+    EXPECT_FALSE(rejected.ok());
+    EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+    EXPECT_TRUE(small.ValueOrDie().Close().ok());
+    auto allowed = run(16 << 20);
+    ASSERT_TRUE(allowed.ok());
+    auto batch = allowed.ValueOrDie().Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_TRUE(batch.ValueOrDie());
+    EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+    EXPECT_EQ(batch.ValueOrDie()->Get<int64_t>(property, 0), 123);
+    EXPECT_TRUE(allowed.ValueOrDie().Close().ok());
+  }
+}
+
+TEST_F(ColumnarFactScanTest, GraphExpansionPreservesVertexPointSeed) {
+  const VertexRef seed{PartId{7}, VertexId{1}};
+  const VertexRef middle{PartId{7}, VertexId{2}};
+  const VertexRef target{PartId{7}, VertexId{3}};
+  const VertexRef unrelated{PartId{7}, VertexId{4}};
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  for (const auto& vertex : {seed, middle, target, unrelated})
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(vertex), ValidTime{10}).ok());
+  for (const auto& identity : {
+      EdgeIdentity{EdgeRef{PartId{7}, EdgeId{1}}, seed, middle, 1},
+      EdgeIdentity{EdgeRef{PartId{7}, EdgeId{2}}, middle, target, 1},
+      EdgeIdentity{EdgeRef{PartId{7}, EdgeId{3}}, unrelated, middle, 1}})
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(identity, ValidTime{10}).ok());
+  auto committed = transaction.ValueOrDie()->Commit();
+  ASSERT_TRUE(committed.ok());
+  ASSERT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  transaction.ValueOrDie().reset();
+  const auto source_slot = Slot<VertexRef>::Named("source");
+  const auto middle_slot = Slot<VertexRef>::Named("middle");
+  const auto target_slot = Slot<VertexRef>::Named("target");
+  const auto first_edge = Slot<EdgeRef>::Named("first_edge");
+  const auto second_edge = Slot<EdgeRef>::Named("second_edge");
+  for (bool sequence : {false, true}) {
+    SCOPED_TRACE(sequence ? "two segments" : "one segment");
+    auto source = Query::VertexPoint(seed, source_slot, At{ValidTime{20}});
+    ASSERT_TRUE(source.ok());
+    auto expanded = source.ValueOrDie().Expand(
+        ExpandSpec{source_slot, first_edge, middle_slot, ExpandDirection::kOut});
+    ASSERT_TRUE(expanded.ok());
+    if (sequence) expanded = expanded.ValueOrDie().Expand(
+        ExpandSpec{middle_slot, second_edge, target_slot, ExpandDirection::kOut});
+    ASSERT_TRUE(expanded.ok());
+    const auto output = sequence ? target_slot : middle_slot;
+    auto query = expanded.ValueOrDie().Select({Project(output)});
+    ASSERT_TRUE(query.ok());
+    auto prepared = database_->PrepareQuery(query.ValueOrDie());
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    auto snapshot = database_->BeginSnapshot();
+    ASSERT_TRUE(snapshot.ok());
+    QueryOptions options;
+    options.budget.memory_bytes = 16 << 20;
+    auto cursor = prepared.ValueOrDie().Execute(
+        std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+    ASSERT_TRUE(cursor.ok()) << cursor.status().ToString();
+    auto batch = cursor.ValueOrDie().Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_TRUE(batch.ValueOrDie());
+    EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+    EXPECT_EQ(batch.ValueOrDie()->Get<VertexRef>(output, 0), sequence ? target : middle);
+    EXPECT_TRUE(cursor.ValueOrDie().Close().ok());
+  }
+}
+
+TEST_F(ColumnarFactScanTest, GraphExpansionFrontierCopiesRespectQueryMemoryBudget) {
+  const VertexRef seed{PartId{7}, VertexId{1}};
+  const VertexRef middle{PartId{7}, VertexId{2}};
+  constexpr uint64_t fanout = 1024;
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(seed), ValidTime{10}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(middle), ValidTime{10}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+      EdgeIdentity{EdgeRef{PartId{7}, EdgeId{1}}, seed, middle, 1}, ValidTime{10}).ok());
+  for (uint64_t index = 0; index < fanout; ++index) {
+    const VertexRef target{PartId{7}, VertexId{1000 + index}};
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(EntityFact::Vertex(target), ValidTime{10}).ok());
+    ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+        EdgeIdentity{EdgeRef{PartId{7}, EdgeId{2 + index}}, middle, target, 1},
+        ValidTime{10}).ok());
+  }
+  auto committed = transaction.ValueOrDie()->Commit();
+  ASSERT_TRUE(committed.ok());
+  ASSERT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted);
+  transaction.ValueOrDie().reset();
+  const auto source_slot = Slot<VertexRef>::Named("source");
+  const auto middle_slot = Slot<VertexRef>::Named("middle");
+  const auto target_slot = Slot<VertexRef>::Named("target");
+  const auto first_edge = Slot<EdgeRef>::Named("first_edge");
+  const auto second_edge = Slot<EdgeRef>::Named("second_edge");
+  for (bool sequence : {false, true}) {
+    SCOPED_TRACE(sequence ? "two segments" : "one segment");
+    auto source = Query::VertexPoint(sequence ? seed : middle, source_slot, At{ValidTime{20}});
+    ASSERT_TRUE(source.ok());
+    auto first = source.ValueOrDie().Expand(
+        ExpandSpec{source_slot, first_edge, sequence ? middle_slot : target_slot,
+                   ExpandDirection::kOut});
+    ASSERT_TRUE(first.ok());
+    auto second = first;
+    if (sequence) second = first.ValueOrDie().Expand(
+        ExpandSpec{middle_slot, second_edge, target_slot, ExpandDirection::kOut});
+    ASSERT_TRUE(second.ok());
+    auto query = second.ValueOrDie().Select({Project(target_slot)});
+    ASSERT_TRUE(query.ok());
+    auto analyzed = internal::AnalyzeQuery(query.ValueOrDie());
+    ASSERT_TRUE(analyzed.ok());
+    ASSERT_EQ(analyzed.ValueOrDie().graph_sequence.size(), sequence ? 2U : 1U);
+    auto run = [&](uint64_t memory) {
+      auto snapshot = database_->BeginSnapshot();
+      EXPECT_TRUE(snapshot.ok());
+      QueryOptions options;
+      options.budget.memory_bytes = memory;
+      return internal::QueryRuntime::Execute(analyzed.ValueOrDie(),
+          std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+    };
+    auto small = run((1 << 20) + (256 << 10));
+    ASSERT_TRUE(small.ok());
+    auto rejected = small.ValueOrDie().Next();
+    EXPECT_FALSE(rejected.ok());
+    EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+    EXPECT_TRUE(small.ValueOrDie().Close().ok());
+    auto allowed = run(16 << 20);
+    ASSERT_TRUE(allowed.ok());
+    auto batch = allowed.ValueOrDie().Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_TRUE(batch.ValueOrDie());
+    ASSERT_EQ(batch.ValueOrDie()->row_count(), fanout);
+    uint64_t sum = 0;
+    for (size_t row = 0; row < fanout; ++row)
+      sum += batch.ValueOrDie()->Get<VertexRef>(target_slot, row).vertex_id.value;
+    EXPECT_EQ(sum, 1547776U);
+    EXPECT_TRUE(allowed.ValueOrDie().Close().ok());
+  }
+}
+
+TEST_F(ColumnarFactScanTest, MetadataOutputNodesRespectQueryMemoryBudget) {
+  auto transaction = database_->BeginTransaction();
+  ASSERT_TRUE(transaction.ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Assert(
+      EntityFact::Vertex(VertexRef{PartId{7}, VertexId{9}}), ValidTime{10}).ok());
+  ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+  transaction.ValueOrDie().reset();
+  Slot<VertexRef> vertex = Slot<VertexRef>::Named("v");
+  Slot<ValidTime> valid_from = Slot<ValidTime>::Named("valid_from");
+  auto source = Query::Vertices(vertex, At{ValidTime{20}});
+  ASSERT_TRUE(source.ok());
+  auto metadata = source.ValueOrDie().ProjectMetadata(
+      vertex.id(), MetadataKind::kValidFrom, Project(valid_from));
+  ASSERT_TRUE(metadata.ok());
+  auto query = metadata.ValueOrDie().Select({Project(vertex), Project(valid_from)});
+  ASSERT_TRUE(query.ok());
+  auto analyzed = internal::AnalyzeQuery(query.ValueOrDie());
+  ASSERT_TRUE(analyzed.ok());
+  auto plan = analyzed.ValueOrDie();
+  const auto binding = plan.metadata_bindings.front();
+  // Many metadata slots for one source isolate retained map nodes from read
+  // buffers and source cardinality. The output still selects the first slot.
+  for (uint32_t slot = 10000; slot < 12048; ++slot) {
+    auto extra = binding;
+    extra.output.slot = SlotId{slot};
+    plan.metadata_bindings.push_back(extra);
+  }
+  auto run = [&](uint64_t memory) {
+    auto snapshot = database_->BeginSnapshot();
+    EXPECT_TRUE(snapshot.ok());
+    QueryOptions options;
+    options.budget.memory_bytes = memory;
+    return internal::QueryRuntime::Execute(plan,
+        std::move(snapshot).ConsumeValueOrDie(), Bindings{}, options);
+  };
+  auto small = run((1 << 20) + 16384);
+  ASSERT_TRUE(small.ok()) << small.status().ToString();
+  auto rejected = small.ValueOrDie().Next();
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_TRUE(rejected.status().IsResourceExhausted()) << rejected.status().ToString();
+  EXPECT_TRUE(small.ValueOrDie().Close().ok());
+  auto allowed = run(16 << 20);
+  ASSERT_TRUE(allowed.ok());
+  auto batch = allowed.ValueOrDie().Next();
+  ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+  ASSERT_TRUE(batch.ValueOrDie().has_value());
+  EXPECT_EQ(batch.ValueOrDie()->row_count(), 1U);
+  EXPECT_EQ(batch.ValueOrDie()->Get<ValidTime>(valid_from, 0), ValidTime{10});
+  EXPECT_TRUE(allowed.ValueOrDie().Close().ok());
 }
 
 TEST_F(ColumnarFactScanTest,
@@ -976,12 +1795,16 @@ TEST_F(ColumnarFactScanTest,
   database_.reset();
   FactStoreOptions store_options;
   store_options.path = path_;
-  const rocksdb::Options options = internal::MakeRocksDbOptions(store_options, false);
+  std::shared_ptr<rocksdb::Cache> cache;
+  const rocksdb::Options options = internal::MakeRocksDbOptions(
+      store_options, false, nullptr, &cache);
+  auto metrics = std::make_shared<rocksdb::cedar_parquet::CanonicalPageCacheMetrics>();
   std::unique_ptr<rocksdb::DB> raw_database;
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   ASSERT_TRUE(rocksdb::DB::Open(
                   options, path_,
-                  internal::MakeRocksDbColumnFamilyDescriptors(store_options, options),
+                  internal::MakeRocksDbColumnFamilyDescriptors(
+                      store_options, options, nullptr, {cache, metrics}),
                   &handles, &raw_database)
                   .ok());
   rocksdb::FlushOptions flush_options;
@@ -992,6 +1815,57 @@ TEST_F(ColumnarFactScanTest,
   spec.batch_row_limit = 2;
   spec.projection = {rocksdb::cedar_parquet::CedarParquetColumnId::kEntityId,
                      rocksdb::cedar_parquet::CedarParquetColumnId::kFactFamily};
+  // Populate the table-reader cache without admitting decoded pages, then
+  // request a new materialized column through the DB extension.
+  rocksdb::ReadOptions no_fill;
+  no_fill.fill_cache = false;
+  std::unique_ptr<rocksdb::Iterator> warm_reader(raw_database->NewIterator(no_fill, handles[1]));
+  warm_reader->SeekToFirst();
+  ASSERT_TRUE(warm_reader->Valid()) << warm_reader->status().ToString();
+  warm_reader.reset();
+  rocksdb::ReadOptions cache_only;
+  cache_only.read_tier = rocksdb::kBlockCacheTier;
+  size_t rejected_callbacks = 0;
+  const auto calls_before_rejections = metrics->file_read_calls.load();
+  const auto decodes_before_rejections = metrics->column_decodes.load();
+  const auto cache_miss = rocksdb::ScanCedarParquetFacts(
+      raw_database.get(), handles[1], cache_only, spec,
+      [&](const auto&) { ++rejected_callbacks; return rocksdb::Status::OK(); });
+  EXPECT_TRUE(cache_miss.IsIncomplete()) << cache_miss.ToString();
+  EXPECT_EQ(rejected_callbacks, 0U);
+  class RejectingQueryMemory final
+      : public rocksdb::cedar_parquet::CedarParquetQueryMemory {
+   public:
+    rocksdb::Status Reserve(uint64_t) override {
+      return rocksdb::Status::MemoryLimit("test query budget");
+    }
+    void Release(uint64_t) override {}
+    rocksdb::Status Pin(const void*, uint64_t,
+                        std::shared_ptr<const void>*) override {
+      return rocksdb::Status::MemoryLimit("test query pin budget");
+    }
+  };
+  rocksdb::ReadOptions tiny_query;
+  tiny_query.cedar_query_memory = std::make_shared<RejectingQueryMemory>();
+  const auto budget_miss = rocksdb::ScanCedarParquetFacts(
+      raw_database.get(), handles[1], tiny_query, spec,
+      [&](const auto&) { ++rejected_callbacks; return rocksdb::Status::OK(); });
+  EXPECT_TRUE(budget_miss.IsMemoryLimit()) << budget_miss.ToString();
+  EXPECT_EQ(rejected_callbacks, 0U);
+  EXPECT_EQ(metrics->file_read_calls.load(), calls_before_rejections);
+  EXPECT_EQ(metrics->column_decodes.load(), decodes_before_rejections);
+  spec.policy.admit = true;
+  ASSERT_TRUE(rocksdb::ScanCedarParquetFacts(
+      raw_database.get(), handles[1], no_fill, spec,
+      [](const auto&) { return rocksdb::Status::OK(); }).ok());
+  EXPECT_EQ(metrics->resident_charge_bytes.load(), 0U);
+  spec.policy.options.fill_cache = false;
+  ASSERT_TRUE(rocksdb::ScanCedarParquetFacts(
+      raw_database.get(), handles[1], rocksdb::ReadOptions(), spec,
+      [](const auto&) { return rocksdb::Status::OK(); }).ok());
+  EXPECT_EQ(metrics->resident_charge_bytes.load(), 0U);
+  spec.policy.options.fill_cache = true;
+  spec.policy.admit = false;
   std::vector<uint64_t> entities;
   ASSERT_TRUE(rocksdb::ScanCedarParquetFacts(
       raw_database.get(), handles[1], rocksdb::ReadOptions(), spec,

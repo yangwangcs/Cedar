@@ -18,6 +18,7 @@
 #include "cedar/core/status.h"
 #include "cedar/fact/fact.h"
 #include "cedar/fact/fact_scan.h"
+#include "cedar/fact/read_spec.h"
 #include "cedar/fact/meta_codec.h"
 #include "cedar/runtime/pressure_controller.h"
 #include "cedar/runtime/runtime_metrics.h"
@@ -157,19 +158,15 @@ struct FactStoreOptions {
   // (0 keeps the production batch of 1024). Small values let tests exercise
   // MultiGet batch boundaries without committing thousands of transactions.
   size_t sequence_validation_outcome_batch_size_for_testing = 0;
-  // Reopen fact cross-check policy (F18). When deep_recovery_validation is true
-  // every fact referenced by a committed sequence at or above the oldest
-  // readable boundary is read and decoded. When false (default) only facts at
-  // or above
-  // max(oldest_readable, visible - recovery_validation_recent_sequences + 1)
-  // are cross-checked; older corruption is detected on read instead. The
-  // default therefore keeps a bounded recent window of K=4096 committed
-  // sequences. Set this to true to roll back to the previous full-history
-  // reopen validation without changing the on-disk format or the unconditional
-  // structural [1..visible] sequence checks. See docs/release-notes.md.
-  bool deep_recovery_validation = false;
+  // Reopen fact cross-check policy. By default every fact referenced by a
+  // committed sequence at or above the oldest-readable boundary is read and
+  // decoded. Set deep_recovery_validation=false to explicitly select a bounded
+  // recent window; that policy can accept a missing fact outside the window
+  // and does not guarantee later reads will distinguish it from an absent fact.
+  // This does not change the on-disk format or the structural sequence checks.
+  bool deep_recovery_validation = true;
   // Bounded recent window size K used when deep_recovery_validation is false.
-  // Clamped to at least 1 by Open; the production default is 4096.
+  // Clamped to at least 1 by Open; default is 4096.
   uint64_t recovery_validation_recent_sequences = 4096;
   // Fires once at the end of each successful reopen validation pass that
   // FactStore::Open performs: "P1_sequence_validation" and
@@ -208,6 +205,9 @@ struct FactStoreOptions {
   // write batch (0 keeps the production bound of 1024). Values above the bound
   // are clamped to it, so production always satisfies the <=1024 contract.
   size_t sequence_prune_batch_size_for_testing = 0;
+  // Zero resolves to a bounded share of the storage profile's memory budget.
+  uint64_t storage_read_working_bytes = 0;
+  uint64_t storage_reader_metadata_bytes = 0;
 };
 
 struct SnapshotWriteDependency {
@@ -425,6 +425,23 @@ struct ValidationCacheMetrics {
   uint64_t canonical_page_pinned_charge_bytes = 0;
   uint64_t canonical_page_uncached_live_bytes = 0;
   uint64_t canonical_page_insert_failures = 0;
+  uint64_t column_page_cache_hits = 0;
+  uint64_t column_page_cache_misses = 0;
+  uint64_t column_page_cache_decodes = 0;
+  uint64_t column_page_resident_charge_bytes = 0;
+  uint64_t column_page_pinned_charge_bytes = 0;
+  uint64_t column_page_uncached_live_bytes = 0;
+  uint64_t storage_file_read_calls = 0;
+  uint64_t storage_file_read_bytes = 0;
+  uint64_t storage_read_working_bytes = 0;
+  uint64_t storage_read_working_peak_bytes = 0;
+  uint64_t storage_read_working_rejections = 0;
+  uint64_t parquet_reader_metadata_bytes = 0;
+  uint64_t parquet_reader_metadata_peak_bytes = 0;
+  uint64_t storage_reader_metadata_reserved_bytes = 0;
+  uint64_t storage_reader_metadata_peak_bytes = 0;
+  uint64_t storage_reader_metadata_rejections = 0;
+  uint64_t storage_reader_metadata_limit_bytes = 0;
   uint64_t canonical_validation_scans = 0;
   uint64_t canonical_validation_boundaries = 0;
   uint64_t recent_write_exact_hits = 0;
@@ -601,6 +618,9 @@ struct FactColumnarScanOptions {
   std::vector<FactColumnId> projection;
   uint32_t batch_row_limit = 1024;
   std::optional<uint64_t> max_rows;
+  std::shared_ptr<FactReadMemory> read_memory;
+  // Sequential scans look up cached pages by default without admitting misses.
+  bool admit_cache = false;
 };
 
 class FactStore {
@@ -743,7 +763,8 @@ class FactStore {
                                                    ValidTime valid_time) const;
   StatusOr<std::optional<FactEvent>> Read(const StoreSnapshot& snapshot,
                                           const FactRef& ref,
-                                          ValidTime valid_time) const;
+                                          ValidTime valid_time,
+                                          std::shared_ptr<FactReadMemory> read_memory = {}) const;
   StatusOr<TemporalNeighborhood> ReadTemporalNeighborhood(
       const StoreSnapshot& snapshot, const FactRef& ref,
       ValidTime valid_time) const;
@@ -756,12 +777,14 @@ class FactStore {
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
               const FactVisitor& visitor) const;
   Status Scan(const StoreSnapshot& snapshot, const FactPrefix& prefix,
-              const FactScanBounds& bounds, const FactVisitor& visitor) const;
+              const FactScanBounds& bounds, const FactVisitor& visitor,
+              std::shared_ptr<FactReadMemory> read_memory = {}) const;
   // Scans one Cedar fact family across every home partition. This is used by
   // graph adjacency fallback because PartId{0} is a real partition, not a
   // wildcard.
   Status ScanFamily(const StoreSnapshot& snapshot, FactFamily family,
-                    const FactVisitor& visitor) const;
+                    const FactVisitor& visitor,
+                    std::shared_ptr<FactReadMemory> read_memory = {}) const;
   Status ScanColumnar(const StoreSnapshot& snapshot, const FactPrefix& prefix,
                       const FactScanBounds& bounds,
                       const FactColumnarScanOptions& options,
@@ -789,9 +812,10 @@ class FactStore {
                                     const std::string& encoded_fact_key) const;
   // Reads exact fact keys through one RocksDB MultiGet while preserving the
   // caller's key order.  Missing values are canonical corruption.
-  StatusOr<std::vector<FactEvent>> ReadExactFacts(
+  StatusOr<FactEventBatch> ReadExactFacts(
       const StoreSnapshot& snapshot,
-      const std::vector<std::string>& encoded_fact_keys) const;
+      const std::vector<std::string>& encoded_fact_keys,
+      std::shared_ptr<FactReadMemory> read_memory = {}) const;
   StatusOr<StoreCommitResult> Commit(const StoreCommitBatch& batch);
   StatusOr<StoreCommitResult> CommitWithWalCallback(
       const StoreCommitBatch& batch, WalDurableCallback on_wal_durable,

@@ -103,6 +103,13 @@ Status Bindings::Bind(ParameterId parameter, QueryType type, BoundValue value) {
 
 StatusOr<Bindings::BoundValue> Bindings::Lookup(ParameterId parameter,
                                                  QueryType type) const {
+  auto value = LookupBorrowed(parameter, type);
+  if (!value.ok()) return value.status();
+  return *value.ValueOrDie();
+}
+
+StatusOr<const Bindings::BoundValue*> Bindings::LookupBorrowed(
+    ParameterId parameter, QueryType type) const {
   const auto found = std::find_if(
       bindings_.begin(), bindings_.end(), [parameter](const Binding& binding) {
         return binding.parameter == parameter;
@@ -113,7 +120,7 @@ StatusOr<Bindings::BoundValue> Bindings::Lookup(ParameterId parameter,
   if (found->type != type) {
     return Status::BindError("parameter value type differs from parameter type");
   }
-  return found->value;
+  return &found->value;
 }
 
 }  // namespace cedar

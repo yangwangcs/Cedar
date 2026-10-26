@@ -396,11 +396,18 @@ TEST_F(QueryCrashMatrixTest,
     DatabaseOptions options;
     options.path = database_path;
     options.storage_profile = StorageProfile::kDebugSmallThresholds;
+    // This fixture requires successful background flush/compaction before
+    // corrupting an SST; the profile's automatic 64 KiB read pool can reject
+    // those reads. Budget rejection has separate tests with deliberate limits.
+    options.storage_read_working_bytes = 384ULL << 10;
     auto opened = Database::Open(std::move(options));
     ASSERT_TRUE(opened.ok()) << opened.status().ToString();
     auto database = std::move(opened).ConsumeValueOrDie();
     for (uint64_t first_vertex = 1; first_vertex <= 4096; first_vertex += 128) {
-      auto transaction = database->BeginTransaction();
+      // Tiny thresholds deliberately trigger background flush/compaction.
+      // Setup must wait for admission and verify publication before corruption.
+      auto transaction = database->BeginTransaction(
+          TransactionOptions{.commit_deadline_us = 5'000'000});
       ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
       for (uint64_t vertex = first_vertex; vertex < first_vertex + 128; ++vertex) {
         ASSERT_TRUE(transaction.ValueOrDie()
@@ -409,7 +416,11 @@ TEST_F(QueryCrashMatrixTest,
                                  ValidTime{1})
                         .ok());
       }
-      ASSERT_TRUE(transaction.ValueOrDie()->Commit().ok());
+      const auto committed = transaction.ValueOrDie()->Commit();
+      ASSERT_TRUE(committed.ok()) << committed.status().ToString();
+      ASSERT_EQ(committed.ValueOrDie().outcome, CommitOutcome::kCommitted)
+          << mutation << " setup vertex=" << first_vertex << ": "
+          << committed.ValueOrDie().status.ToString();
     }
     ASSERT_TRUE(database->Close().ok());
 

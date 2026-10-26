@@ -386,19 +386,23 @@ struct DatabaseOptions {
   // the failure is logged and reported through the observer instead of being
   // silently ignored.
   bool strict_adjacency_rebuild = false;
-  // Reopen fact cross-check policy (F18). The default is the bounded recent
-  // window: the structural [1..visible] sequence checks still run for every
-  // committed sequence, while fact contents are cross-checked only for
+  // Reopen fact cross-check policy. The default validates every retained fact
+  // referenced by committed sequences. Set deep_recovery_validation = false
+  // to explicitly choose a bounded recent window: facts are checked only for
   // sequences at or above
   // max(oldest_readable, visible - recovery_validation_recent_sequences + 1).
-  // Damage to an older fact is detected when that fact is read instead of
-  // failing Open. Set deep_recovery_validation = true to roll back to the
-  // previous full-history reopen validation.
-  // recovery_validation_recent_sequences configures K (production default
-  // 4096, clamped to at least 1). This option never changes the on-disk format
-  // or the crash-recovery contract.
-  bool deep_recovery_validation = false;
+  // That policy can accept a missing fact outside the window and does not
+  // guarantee that later reads will distinguish it from an absent fact.
+  // recovery_validation_recent_sequences configures K (default 4096, clamped
+  // to at least 1) for the explicit bounded policy. This option does not change
+  // the on-disk format or crash-recovery contract.
+  bool deep_recovery_validation = true;
   uint64_t recovery_validation_recent_sequences = 4096;
+  // Temporary column-page input, decompression, and decoding memory. Zero is auto.
+  uint64_t storage_read_working_bytes = 0;
+  // Retained table readers and their Open scratch. Zero is auto; distinct from
+  // the transient page-read working pool and shared decoded-page cache.
+  uint64_t storage_reader_metadata_bytes = 0;
 };
 
 struct CommitPipelineMetrics {
@@ -451,6 +455,26 @@ struct CommitPipelineMetrics {
   uint64_t canonical_page_pinned_charge_bytes = 0;
   uint64_t canonical_page_uncached_live_bytes = 0;
   uint64_t canonical_page_insert_failures = 0;
+  uint64_t column_page_cache_hits = 0;
+  uint64_t column_page_cache_misses = 0;
+  uint64_t column_page_cache_decodes = 0;
+  uint64_t column_page_resident_charge_bytes = 0;
+  uint64_t column_page_pinned_charge_bytes = 0;
+  uint64_t column_page_uncached_live_bytes = 0;
+  uint64_t storage_file_read_calls = 0;
+  uint64_t storage_file_read_bytes = 0;
+  uint64_t storage_read_working_bytes = 0;
+  uint64_t storage_read_working_peak_bytes = 0;
+  uint64_t storage_read_working_rejections = 0;
+  uint64_t parquet_reader_metadata_bytes = 0;
+  uint64_t parquet_reader_metadata_peak_bytes = 0;
+  uint64_t storage_reader_metadata_reserved_bytes = 0;
+  uint64_t storage_reader_metadata_peak_bytes = 0;
+  uint64_t storage_reader_metadata_rejections = 0;
+  uint64_t storage_reader_metadata_limit_bytes = 0;
+  uint64_t projection_page_cache_hits = 0;
+  uint64_t projection_page_cache_misses = 0;
+  uint64_t projection_page_cache_resident_bytes = 0;
   uint64_t canonical_validation_scans = 0;
   uint64_t canonical_validation_boundaries = 0;
   uint64_t recent_write_exact_hits = 0;

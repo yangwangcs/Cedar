@@ -13,6 +13,7 @@
 #include "kernel/point_read.h"
 #include "query/runtime/graph_frontier.h"
 #include "query/temporal/state_reader.h"
+#include "storage/facts/read_memory_scope.h"
 
 namespace cedar {
 namespace {
@@ -300,8 +301,9 @@ class Snapshot::State final : public CanonicalFactReader {
                     const CanonicalFactBatchVisitor& visitor) const override;
   Status ReadColumnar(const FactReadSpec& spec,
                       const CanonicalColumnarBatchVisitor& visitor) const override;
-  StatusOr<std::vector<FactEvent>> ReadExact(
-      const std::vector<std::string>& encoded_keys) const override;
+  StatusOr<FactEventBatch> ReadExact(
+      const std::vector<std::string>& encoded_keys,
+      std::shared_ptr<FactReadMemory> read_memory = {}) const override;
 };
 
 namespace {
@@ -370,7 +372,7 @@ StatusOr<std::optional<FactEvent>> Snapshot::State::ReadStateAt(
   }
   const FactRef ref{spec.part_scope.parts.front(), spec.family, spec.property_id,
                     *spec.entity_range.min};
-  auto event = database->store.Read(snapshot, ref, valid_time);
+  auto event = database->store.Read(snapshot, ref, valid_time, spec.read_memory);
   if (!event.ok()) return event.status();
   if (event.ValueOrDie().has_value() &&
       snapshot_seq.value != 0 &&
@@ -407,29 +409,39 @@ Status Snapshot::State::ReadEvents(
   Status status = spec.Validate();
   if (!status.ok()) return status;
   if (!visitor) return Status::InvalidArgument("canonical reader", "missing visitor");
-  std::vector<FactEvent> batch;
-  batch.reserve(spec.batch_row_limit);
+  if (spec.max_rows.has_value() && *spec.max_rows == 0) return Status::OK();
+  const uint64_t batch_limit = spec.max_rows.has_value()
+                                   ? std::min<uint64_t>(spec.batch_row_limit, *spec.max_rows)
+                                   : spec.batch_row_limit;
+  internal::FactReadMemoryScope batch_memory(spec.read_memory.get());
+  internal::FactReadMemoryScope payload_memory(spec.read_memory.get());
+  FactEventBatch output;
+  std::vector<FactEvent>& batch = output.events;
   uint64_t emitted = 0;
   bool limit_reached = false;
-  auto append = [&batch, &visitor, &spec, &emitted,
+  auto append = [&batch, &output, &batch_memory, &payload_memory, batch_limit,
+                 &visitor, &spec, &emitted,
                  &limit_reached](const FactEvent& event) -> Status {
     if (spec.max_rows.has_value() && emitted >= *spec.max_rows) {
       limit_reached = true;
       return Status::QueryCancelled("canonical reader", "max_rows reached");
     }
+    Status reserved = internal::ReserveFactAppend(&batch, &batch_memory);
+    if (!reserved.ok()) return reserved;
+    reserved = payload_memory.Reserve(internal::FactValueHeapBytes(event.value));
+    if (!reserved.ok()) return reserved;
     batch.push_back(event);
     const uint64_t remaining = spec.max_rows.has_value()
                                    ? *spec.max_rows - emitted
                                    : UINT64_MAX;
     const bool reaches_limit = spec.max_rows.has_value() &&
                                batch.size() >= remaining;
-    if (!reaches_limit && batch.size() < batch.capacity()) return Status::OK();
-    FactEventBatch out{std::move(batch)};
-    batch = {};
-    batch.reserve(spec.batch_row_limit);
-    Status status = visitor(out);
+    if (!reaches_limit && batch.size() < batch_limit) return Status::OK();
+    Status status = visitor(output);
     if (!status.ok()) return status;
-    emitted += out.events.size();
+    emitted += batch.size();
+    batch.clear();
+    payload_memory.Reset();
     if (reaches_limit) {
       limit_reached = true;
       return Status::QueryCancelled("canonical reader", "max_rows reached");
@@ -444,14 +456,14 @@ Status Snapshot::State::ReadEvents(
                                 [&spec, &append](const FactEvent& event) {
       if (!MatchesReadSpec(spec, event)) return Status::OK();
       return append(event);
-    });
+    }, spec.read_memory);
   };
   if (spec.part_scope.kind == PartScopeKind::kAll) {
     status = database->store.ScanFamily(snapshot, spec.family,
                                          [&spec, &append](const FactEvent& event) {
       if (!MatchesReadSpec(spec, event)) return Status::OK();
       return append(event);
-    });
+    }, spec.read_memory);
   } else {
     status = Status::OK();
     for (PartId part : spec.part_scope.parts) {
@@ -461,11 +473,8 @@ Status Snapshot::State::ReadEvents(
   }
   if (!status.ok() && !limit_reached) return status;
   if (!batch.empty() && !limit_reached) {
-    if (!batch.empty()) {
-      FactEventBatch out{std::move(batch)};
-      status = visitor(out);
-      if (!status.ok()) return status;
-    }
+    status = visitor(output);
+    if (!status.ok()) return status;
   }
   return Status::OK();
 }
@@ -480,6 +489,7 @@ Status Snapshot::State::ReadColumnar(
   }
   FactColumnarScanOptions options;
   options.projection = spec.projection;
+  options.read_memory = spec.read_memory;
   options.batch_row_limit = spec.batch_row_limit;
   options.event_valid_from_min = spec.valid_from_min;
   options.event_valid_from_max = spec.valid_from_max;
@@ -538,12 +548,13 @@ Status Snapshot::State::ReadColumnar(
   return Status::OK();
 }
 
-StatusOr<std::vector<FactEvent>> Snapshot::State::ReadExact(
-    const std::vector<std::string>& encoded_keys) const {
+StatusOr<FactEventBatch> Snapshot::State::ReadExact(
+    const std::vector<std::string>& encoded_keys,
+    std::shared_ptr<FactReadMemory> read_memory) const {
   // FactStore validates every encoded key against this snapshot and performs
   // one RocksDB MultiGet, preserving the caller's key order and corruption
   // semantics for missing referenced facts.
-  return database->store.ReadExactFacts(snapshot, encoded_keys);
+  return database->store.ReadExactFacts(snapshot, encoded_keys, std::move(read_memory));
 }
 
 Snapshot::Snapshot(std::unique_ptr<State> state) : state_(std::move(state)) {}
@@ -595,8 +606,9 @@ const CanonicalFactReader& Snapshot::canonical_reader() const {
                           const CanonicalColumnarBatchVisitor&) const override {
         return Status::InvalidArgument("snapshot", "moved-from snapshot");
       }
-      StatusOr<std::vector<FactEvent>> ReadExact(
-          const std::vector<std::string>&) const override {
+      StatusOr<FactEventBatch> ReadExact(
+          const std::vector<std::string>&,
+          std::shared_ptr<FactReadMemory> = {}) const override {
         return Status::InvalidArgument("snapshot", "moved-from snapshot");
       }
     } invalid;

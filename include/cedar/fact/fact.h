@@ -5,7 +5,9 @@
 #define CEDAR_FACT_FACT_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <utility>
 
 #include "cedar/core/status.h"
 #include "cedar/types/value.h"
@@ -198,6 +200,23 @@ struct EdgeIdentity {
 };
 
 struct FactEvent {
+  FactEvent(FactRef fact_ref, ValidTime time, CommitSeq sequence,
+            FactOperation op = FactOperation::kPut, uint32_t epoch = 0,
+            std::optional<Value> payload = std::nullopt,
+            std::optional<EdgeIdentity> identity = std::nullopt,
+            std::shared_ptr<const void> owner = {})
+      : ref(fact_ref), valid_from(time), commit_seq(sequence), operation(op),
+        schema_epoch(epoch), value(std::move(payload)), edge_identity(identity),
+        read_memory_owner(std::move(owner)) {}
+  FactEvent(const FactEvent&) = default;
+  FactEvent& operator=(const FactEvent&) = default;
+  FactEvent(FactEvent&&) noexcept = default;
+  FactEvent& operator=(FactEvent&&) noexcept = default;
+  ~FactEvent() {
+    // The final-field owner releases after this body, before member teardown.
+    value.reset();
+  }
+
   FactRef ref;
   ValidTime valid_from;
   CommitSeq commit_seq;
@@ -205,6 +224,8 @@ struct FactEvent {
   uint32_t schema_epoch = 0;
   std::optional<Value> value;
   std::optional<EdgeIdentity> edge_identity;
+  // Runtime ownership only; never encoded into a fact record.
+  std::shared_ptr<const void> read_memory_owner;
 
   Status Validate() const;
 };

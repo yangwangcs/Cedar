@@ -275,6 +275,9 @@ if(NOT EXISTS "${CEDAR_ROCKSDB_LIBRARY}" OR
     message(FATAL_ERROR "Reusable RocksDB cache is incomplete: ${CEDAR_ROCKSDB_PREFIX}")
 endif()
 
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/cedar-engine-identity.txt"
+     CONTENT "engine_baseline=${CEDAR_ENGINE_BASELINE}\nengine_source_digest=${CEDAR_ENGINE_SOURCE_DIGEST}\nfingerprint=${CEDAR_ROCKSDB_FINGERPRINT}\nbuild_type=${CEDAR_ROCKSDB_BUILD_TYPE}\nlibrary=${CEDAR_ROCKSDB_LIBRARY}\nmanifest=${CEDAR_ROCKSDB_MANIFEST}\n")
+
 add_library(cedar_rocksdb_static STATIC IMPORTED GLOBAL)
 set_target_properties(cedar_rocksdb_static PROPERTIES
     IMPORTED_LOCATION "${CEDAR_ROCKSDB_LIBRARY}"

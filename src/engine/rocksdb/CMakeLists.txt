@@ -876,6 +876,7 @@ set(SOURCES
         table/cedar_parquet/cedar_parquet_table_builder.cc
         table/cedar_parquet/cedar_parquet_table_factory.cc
         table/cedar_parquet/cedar_parquet_table_reader.cc
+        table/cedar_parquet/cedar_parquet_read_budget.cc
         table/cedar_parquet/compact_protocol.cc
         table/cedar_parquet/parquet_metadata.cc
         table/cedar_parquet/parquet_bloom_filter.cc

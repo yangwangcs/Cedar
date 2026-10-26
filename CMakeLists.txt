@@ -68,6 +68,7 @@ add_library(cedar_core STATIC
     src/query/runtime/temporal_source.cc
     src/query/temporal/state_reader.cc
     src/query/runtime/fact_chain_cursor.cc
+    src/query/runtime/fact_history.cc
     src/query/read/read_catalog.cc
     src/query/read/read_binding_capsule.cc
     src/query/runtime/vector_kernels.cc
@@ -81,6 +82,7 @@ add_library(cedar_core STATIC
     src/query/projection/property_index.cc
     src/query/projection/property_index_builder.cc
     src/query/projection/projection_page_reader.cc
+    src/query/projection/projection_page_cache.cc
     src/query/projection/query_delta.cc
     src/query/observability/query_metrics.cc
     src/query/planner/query_planner.cc
@@ -90,6 +92,7 @@ add_library(cedar_core STATIC
     src/cypher/relationship_type.cc
     src/cypher/access_profile.cc
     src/cypher/binder.cc
+    src/cypher/semantic_key.cc
     src/cypher/compiler.cc
     src/cypher/api.cc
     src/cypher/session.cc
@@ -129,6 +132,17 @@ target_include_directories(cedar_core
     PRIVATE ${CMAKE_SOURCE_DIR}/src
             ${CEDAR_ENGINE_SOURCE_DIR})
 target_include_directories(cedar_core PRIVATE ${CEDAR_ROCKSDB_CODEC_INCLUDE_DIR})
+if(NOT WIN32)
+    set_property(SOURCE src/storage/rocks/rocks_adapter.cc APPEND PROPERTY
+        COMPILE_DEFINITIONS ROCKSDB_PLATFORM_POSIX ROCKSDB_LIB_IO_POSIX)
+endif()
+if(APPLE)
+    set_property(SOURCE src/storage/rocks/rocks_adapter.cc APPEND PROPERTY
+        COMPILE_DEFINITIONS OS_MACOSX HAVE_FULLFSYNC)
+elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    set_property(SOURCE src/storage/rocks/rocks_adapter.cc APPEND PROPERTY
+        COMPILE_DEFINITIONS OS_LINUX)
+endif()
 target_link_libraries(cedar_core PRIVATE cedar_rocksdb "${CEDAR_ROCKSDB_LZ4_LIBRARY}")
 set_property(TARGET cedar_core PROPERTY INTERFACE_LINK_LIBRARIES
     "$<BUILD_INTERFACE:cedar_rocksdb>")
@@ -177,9 +191,11 @@ if(BUILD_BENCHMARKS)
         ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(cedar_tcypher_optimization_bench PRIVATE cedar_core)
     add_executable(cedar_query_storage_read_bench
-        benchmarks/cedar_query_storage_read_bench.cc)
+        benchmarks/cedar_query_storage_read_bench.cc
+        benchmarks/columnar_cache_dataset.cc)
     target_include_directories(cedar_query_storage_read_bench PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CEDAR_ENGINE_SOURCE_DIR})
     target_link_libraries(cedar_query_storage_read_bench PRIVATE cedar_core)
     add_executable(cedar_read_side_complexity_bench
         benchmarks/cedar_read_side_complexity_bench.cc)

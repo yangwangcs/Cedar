@@ -77,6 +77,7 @@ target_link_libraries(test_tcypher_semantic_matrix PRIVATE cedar_core ${GTEST_MA
 gtest_discover_tests(test_tcypher_semantic_matrix TEST_PREFIX "TCypherSemanticMatrix.")
 
 add_executable(test_cypher_session cypher/test_cypher_session.cc)
+target_include_directories(test_cypher_session PRIVATE ${CEDAR_ENGINE_SOURCE_DIR})
 target_link_libraries(test_cypher_session PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_cypher_session TEST_PREFIX "CypherSession.")
 
@@ -93,8 +94,9 @@ target_link_libraries(test_schema_provider PRIVATE cedar_core ${GTEST_MAIN_TARGE
 gtest_discover_tests(test_schema_provider TEST_PREFIX "SchemaProvider.")
 
 add_executable(test_server_lifecycle server/test_server_lifecycle.cc)
+target_include_directories(test_server_lifecycle PRIVATE ${CEDAR_ENGINE_SOURCE_DIR})
 target_link_libraries(test_server_lifecycle PRIVATE cedar_core ${GTEST_MAIN_TARGET})
-gtest_discover_tests(test_server_lifecycle TEST_PREFIX "Server.")
+gtest_discover_tests(test_server_lifecycle TEST_PREFIX "Server." PROPERTIES TIMEOUT 30)
 
 add_executable(test_bolt_protocol server/test_bolt_protocol.cc)
 target_link_libraries(test_bolt_protocol PRIVATE cedar_core ${GTEST_MAIN_TARGET})
@@ -161,6 +163,10 @@ target_link_libraries(test_indexed_property_runtime PRIVATE cedar_core ${GTEST_M
 gtest_discover_tests(test_indexed_property_runtime)
 
 add_executable(test_projection_page_reader query/test_projection_page_reader.cc)
+add_executable(test_projection_page_cache query/test_projection_page_cache.cc)
+target_include_directories(test_projection_page_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_projection_page_cache PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_projection_page_cache TEST_PREFIX "ProjectionPageCache.")
 target_include_directories(test_projection_page_reader PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_projection_page_reader PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_projection_page_reader TEST_PREFIX "ProjectionPageReader.")
@@ -327,6 +333,10 @@ add_executable(test_cedar_parquet_table_reader
     ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/parquet_plain_page.cc)
 configure_cedar_parquet_test(test_cedar_parquet_table_reader)
 
+add_executable(test_cedar_parquet_read_budget
+    ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_read_budget_test.cc)
+configure_cedar_parquet_test(test_cedar_parquet_read_budget)
+
 add_executable(test_cedar_parquet_table_factory
     ${CMAKE_SOURCE_DIR}/src/engine/rocksdb/table/cedar_parquet/cedar_parquet_table_factory_test.cc)
 configure_cedar_parquet_test(test_cedar_parquet_table_factory)
@@ -389,6 +399,15 @@ add_executable(test_columnar_fact_scan storage/test_columnar_fact_scan.cc)
 target_include_directories(test_columnar_fact_scan PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/engine/rocksdb)
+if(NOT WIN32)
+  target_compile_definitions(test_columnar_fact_scan PRIVATE
+      ROCKSDB_PLATFORM_POSIX ROCKSDB_LIB_IO_POSIX)
+endif()
+if(APPLE)
+  target_compile_definitions(test_columnar_fact_scan PRIVATE OS_MACOSX HAVE_FULLFSYNC)
+elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
+  target_compile_definitions(test_columnar_fact_scan PRIVATE OS_LINUX)
+endif()
 target_link_libraries(test_columnar_fact_scan
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_columnar_fact_scan)
@@ -477,11 +496,37 @@ target_link_libraries(test_maintenance_controller
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_maintenance_controller)
 
+add_executable(test_l0_reader_metadata_boundary
+    storage/test_l0_reader_metadata_boundary.cc)
+target_include_directories(test_l0_reader_metadata_boundary
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_l0_reader_metadata_boundary
+    PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_l0_reader_metadata_boundary)
+
 add_executable(test_rocksdb_profile storage/test_rocksdb_profile.cc)
 target_include_directories(test_rocksdb_profile PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_rocksdb_profile
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_rocksdb_profile)
+
+add_executable(test_columnar_cache_bench_options
+    performance/test_columnar_cache_bench_options.cc)
+target_include_directories(test_columnar_cache_bench_options PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_columnar_cache_bench_options PRIVATE ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_columnar_cache_bench_options)
+
+if(TARGET cedar_query_storage_read_bench)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME BenchmarkMustObserveParquetReads
+      COMMAND ${CMAKE_COMMAND} -E env
+        CEDAR_CACHE_BENCH=$<TARGET_FILE:cedar_query_storage_read_bench>
+        ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_columnar_cache_dataset.py)
+    add_test(NAME ColumnarCacheMatrixContract
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/performance/test_columnar_cache_matrix.py)
+  endif()
+endif()
 
 add_executable(test_kernel_bench_options performance/test_kernel_bench_options.cc)
 target_include_directories(test_kernel_bench_options PRIVATE ${CMAKE_SOURCE_DIR})
@@ -515,7 +560,10 @@ if(TARGET cedar_query_bench)
 endif()
 
 add_executable(test_kernel_bounded_benchmark performance/test_kernel_bounded_benchmark.cc)
-target_include_directories(test_kernel_bounded_benchmark PRIVATE ${CMAKE_SOURCE_DIR})
+# ${CMAKE_SOURCE_DIR}/src exposes ResolveStorageProfile for the budget envelope
+# assertion; DatabaseOptions remains the public path in every other test.
+target_include_directories(test_kernel_bounded_benchmark
+    PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_kernel_bounded_benchmark
     PRIVATE cedar_kernel_bench_workload ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_kernel_bounded_benchmark)
@@ -607,6 +655,12 @@ target_include_directories(test_sequence_retention PRIVATE ${CMAKE_SOURCE_DIR}/s
 target_link_libraries(test_sequence_retention
     PRIVATE cedar_core ${GTEST_MAIN_TARGET})
 gtest_discover_tests(test_sequence_retention)
+
+add_executable(test_storage_review_regressions storage/test_storage_review_regressions.cc)
+target_include_directories(test_storage_review_regressions PRIVATE ${CMAKE_SOURCE_DIR}/src)
+configure_cedar_rocksdb_sync_point_test(test_storage_review_regressions)
+target_link_libraries(test_storage_review_regressions PRIVATE cedar_core ${GTEST_MAIN_TARGET})
+gtest_discover_tests(test_storage_review_regressions)
 
 add_executable(test_recovery_crash_matrix recovery/test_crash_matrix.cc)
 target_include_directories(test_recovery_crash_matrix PRIVATE ${CMAKE_SOURCE_DIR}/src)
